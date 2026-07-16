@@ -329,6 +329,8 @@ HTTP 500
 1. `openai_compat::complete` 在 deserialize 失败前先尝试 `ApiError` 形状 `{"error":{...}}`，命中就返回 `ProxyError::Upstream`；命中失败再返回原始 500。
 2. Router 在 fallback 全失败时把最后一段上游 body / status 包含进错误响应（不只 header）。
 
+**状态（2026-07-16 第一轮 commit）**：建议 #1 已修。新增 `looks_like_error_envelope()` 在 deserialize 前先识别 `{"error": {...}}` 形状，命中即返回 `ProxyError::Upstream { status: 400, body }`。`complete_surfaces_error_envelope_on_http_200` 测试用 wiremock 验证。建议 #2（Router 暴露 attempts 到错误路径）见 R1 状态第二段、由 Commit 6 解决。
+
 #### R2（P2）：fallback 链经过 copilot 时无 401 错误分支
 
 `src/providers/copilot.rs:173` 的 refresh 失败日志显示：`fetch_copilot_token` 任意错误（包含 401 之外的 5xx）都会清空 store 并触发 device flow。

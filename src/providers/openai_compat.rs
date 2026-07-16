@@ -50,6 +50,18 @@ impl OpenAiCompatProvider {
     }
 }
 
+/// Detect the OpenAI-style error envelope `{"error": {...}}` returned on
+/// HTTP 200 by some upstreams. Must be a top-level object with a single
+/// `error` key whose value is itself an object (so we don't confuse it
+/// with a legitimate assistant message that happens to contain the word
+/// "error").
+fn looks_like_error_envelope(v: &Value) -> bool {
+    let Value::Object(map) = v else {
+        return false;
+    };
+    matches!(map.get("error"), Some(Value::Object(_)))
+}
+
 #[async_trait]
 impl Provider for OpenAiCompatProvider {
     fn name(&self) -> &str {
@@ -91,6 +103,16 @@ impl Provider for OpenAiCompatProvider {
         }
 
         let parsed: Value = serde_json::from_str(&body)?;
+        if looks_like_error_envelope(&parsed) {
+            // Some upstreams (e.g. DeepSeek on unknown model) return HTTP 200
+            // with an OpenAI error envelope instead of a chat response. Treat
+            // it as a 400-class upstream failure so the client sees the real
+            // message instead of a generic 500 "missing field `object`".
+            return Err(ProxyError::Upstream {
+                status: 400,
+                body,
+            });
+        }
         let chat: crate::openai::ChatResponse = serde_json::from_value(parsed)?;
         let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
         let anthropic_resp = openai_to_anthropic_response(&chat, &req.model, &msg_id)?;
@@ -381,6 +403,49 @@ mod tests {
         expect_variant!(error, ProxyError::Upstream { status, body } => {
             assert_eq!(status, 429);
             assert_eq!(body, "rate limited");
+        });
+    }
+
+    #[tokio::test]
+    async fn complete_surfaces_error_envelope_on_http_200() {
+        // Some OpenAI-compatible upstreams return HTTP 200 with an error
+        // envelope (e.g. DeepSeek for an unknown model). Without this
+        // detection, ChatResponse deserialization fails with
+        // "missing field `object`" and the proxy returns a generic 500
+        // that hides the real upstream message.
+        let server = MockServer::start().await;
+        let envelope = json!({
+            "error": {
+                "message": "Model Not Exist",
+                "type": "invalid_request_error",
+                "code": "model_not_found"
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&envelope))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = OpenAiCompatProvider::new(
+            "test".to_string(),
+            server.uri(),
+            "key".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let error = provider
+            .complete(&request(false), &HashMap::new())
+            .await
+            .err()
+            .expect("error envelope should surface as Err");
+
+        expect_variant!(error, ProxyError::Upstream { status, body } => {
+            assert_eq!(status, 400);
+            assert!(body.contains("Model Not Exist"), "body was: {body}");
+            assert!(body.contains("model_not_found"), "body was: {body}");
         });
     }
 
