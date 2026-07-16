@@ -5,17 +5,18 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use axum::body::Body;
-use axum::extract::{Json, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{middleware, Router as AxumRouter};
+use axum::{middleware, Json, Router as AxumRouter};
 use bytes::Bytes;
 use futures_util::Stream;
 use serde_json::json;
 
 use crate::anthropic::{MessagesRequest, MessagesResponse};
 use crate::error::{ProxyError, Result};
+use crate::extractor::AppJson;
 use crate::providers::ProviderOutput;
 use crate::state::AppState;
 
@@ -52,7 +53,7 @@ async fn health_handler() -> &'static str {
 
 async fn messages_handler(
     State(state): State<AppState>,
-    Json(req): Json<MessagesRequest>,
+    AppJson(req): AppJson<MessagesRequest>,
 ) -> Result<Response> {
     let model_cfg = state
         .router
@@ -183,7 +184,7 @@ fn format_stream_error(err: &ProxyError) -> Bytes {
 
 async fn count_tokens_handler(
     State(_state): State<AppState>,
-    Json(_req): Json<serde_json::Value>,
+    AppJson(_req): AppJson<serde_json::Value>,
 ) -> impl IntoResponse {
     let s = serde_json::to_string(&_req).unwrap_or_default();
     let tokens = ((s.len() as f32) / 4.0).ceil() as u32;

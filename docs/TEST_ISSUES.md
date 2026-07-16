@@ -395,6 +395,14 @@ HTTP 400
 
 **建议**：包一层自定义 JSON extractor，把 axum 的 rejection 转成 `ProxyError::BadRequest`。
 
+**状态（2026-07-17 第六轮 commit）**：已修。新增 `src/extractor.rs` 模块，`AppJson<T>` 包装 axum 的 `Json<T>`：先检查 `Content-Type: application/json`，再委托给 axum 的 `Json<T>::from_request`，把任何 rejection（`JsonDataError` / `JsonSyntaxError` / `MissingJsonContentType` 等）映射成 `ProxyError::BadRequest`，通过现有 `IntoResponse` 实现渲染成 Anthropic envelope `{"type":"error","error":{"type":"Bad Request","message":"invalid request body: ..."}}`。`messages_handler` 和 `count_tokens_handler` 改用 `AppJson`，其他 handler 继续用 axum `Json` 渲染响应体（不受影响）。
+
+新增测试：
+- `extractor::is_json_content_type_accepts_plain_and_charset`：单测 content-type 白名单（plain / `; charset=utf-8` / 大小写不敏感）。
+- `extractor::is_json_content_type_rejects_other_types`：缺失 / `text/plain` / `application/x-www-form-urlencoded` 全部拒绝。
+- `tests/server.rs::malformed_json_returns_anthropic_error_envelope`：端到端：截断 JSON 触发 rejection，必须返回 `Content-Type: application/json`、body 是 Anthropic envelope、`error.type = "Bad Request"`、`message` 包含 "invalid request body"。
+- `tests/server.rs::missing_content_type_returns_anthropic_error_envelope`：无 `Content-Type` header 也走同一 envelope，message 包含 "application/json"。
+
 #### R5（P3）：`count_tokens` 估算与真实值偏离较大
 
 | 输入 | 估算 | 实际（来自 chat usage） |

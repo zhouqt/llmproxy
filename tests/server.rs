@@ -394,6 +394,90 @@ async fn unknown_model_and_malformed_json_are_rejected() {
 }
 
 #[tokio::test]
+async fn malformed_json_returns_anthropic_error_envelope() {
+    // R4: axum's default Json extractor returns `text/plain`
+    // "Failed to parse the request body as JSON..." for malformed input,
+    // which is inconsistent with every other error response (auth,
+    // unknown model, etc.) that uses the Anthropic error envelope.
+    // AppJson<T> wraps the rejection so the proxy emits the same
+    // `{"type":"error","error":{...}}` shape. See fix-R4 in
+    // docs/TEST_ISSUES.md.
+    let app = build_app(
+        None,
+        provider(
+            "primary",
+            CompleteBehavior::Json,
+            StreamBehavior::Bytes("unused"),
+        ),
+        None,
+    );
+
+    // Malformed JSON: truncated object.
+    let bad = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from("{"))
+        .unwrap();
+    let resp = app.clone().oneshot(bad).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // Body must be JSON, not text/plain.
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.starts_with("application/json"),
+        "expected JSON content-type, got: {ct}"
+    );
+    let body = body_json(resp).await;
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "Bad Request");
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("invalid request body"),
+        "error message should describe the parse failure, got: {msg}"
+    );
+    drop(app);
+}
+
+#[tokio::test]
+async fn missing_content_type_returns_anthropic_error_envelope() {
+    // R4: a POST without `Content-Type: application/json` is a
+    // malformed request — the proxy should reject it with the same
+    // Anthropic envelope instead of returning a default axum error.
+    let app = build_app(
+        None,
+        provider(
+            "primary",
+            CompleteBehavior::Json,
+            StreamBehavior::Bytes("unused"),
+        ),
+        None,
+    );
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .body(Body::from(r#"{"model":"claude-test","messages":[]}"#))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "Bad Request");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("application/json"),
+        "error message should mention the required content type"
+    );
+    drop(app);
+}
+
+#[tokio::test]
 async fn wrong_provider_output_types_return_internal_errors() {
     let complete_app = build_app(
         None,
