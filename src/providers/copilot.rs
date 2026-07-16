@@ -47,6 +47,34 @@ struct CopilotState {
     refresh_lock: Mutex<()>,
 }
 
+/// Distinguishes credential failures (must clear store + re-authenticate)
+/// from transient failures (network blip, upstream 5xx, malformed body —
+/// keep store, surface error to caller, do NOT trigger device flow).
+#[derive(Debug)]
+enum CopilotFetchError {
+    /// GitHub / Copilot actively rejected the token: 401, 403, or 404 on
+    /// the token-exchange endpoint. The stored github token is no longer
+    /// usable; the operator must re-authenticate.
+    AuthRejected { status: u16, body: String },
+    /// Network error, upstream 5xx, malformed JSON, missing token field,
+    /// etc. The stored credentials may still be valid; surface the error
+    /// and try again later.
+    Transient(String),
+}
+
+impl std::fmt::Display for CopilotFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CopilotFetchError::AuthRejected { status, body } => {
+                write!(f, "auth rejected ({status}): {body}")
+            }
+            CopilotFetchError::Transient(reason) => write!(f, "{reason}"),
+        }
+    }
+}
+
+impl std::error::Error for CopilotFetchError {}
+
 impl CopilotProvider {
     pub fn new(
         name: String,
@@ -184,22 +212,39 @@ impl CopilotProvider {
                 *self.state.tokens.write().await = Some(new_tokens);
                 Ok(())
             }
-            Err(e) => {
+            Err(CopilotFetchError::AuthRejected { status, body }) => {
                 tracing::warn!(
-                    "copilot token refresh failed ({e}); re-running device flow"
+                    provider = "copilot",
+                    status,
+                    body = %body,
+                    "copilot rejected stored credentials; re-running device flow"
                 );
                 self.state.store.clear().ok();
                 let gh = device_flow_blocking(&self.http).await?;
-                let new_tokens = self.fetch_copilot_token(&gh).await?;
+                let new_tokens = self
+                    .fetch_copilot_token(&gh)
+                    .await
+                    .map_err(|e| ProxyError::Other(anyhow::anyhow!("copilot token fetch after device flow failed: {e}")))?;
                 self.state.store.save(&new_tokens)?;
                 *self.state.tokens.write().await = Some(new_tokens);
                 Ok(())
             }
+            Err(CopilotFetchError::Transient(reason)) => {
+                // Network blip / 5xx / parse error: keep the stored token
+                // so the next attempt can use it, surface the failure to
+                // the caller, and do NOT trigger a blocking device flow.
+                tracing::warn!(
+                    provider = "copilot",
+                    reason = %reason,
+                    "copilot token refresh failed (transient); keeping stored credentials"
+                );
+                Err(ProxyError::Other(anyhow::anyhow!(reason)))
+            }
         }
     }
 
-    async fn fetch_copilot_token(&self, github_token: &str) -> Result<StoredTokens> {
-        let resp = self
+    async fn fetch_copilot_token(&self, github_token: &str) -> std::result::Result<StoredTokens, CopilotFetchError> {
+        let resp = match self
             .http
             .get(self.token_url())
             .header("authorization", format!("token {github_token}"))
@@ -207,19 +252,52 @@ impl CopilotProvider {
             .header("accept", "application/json")
             .header("x-github-api-version", GITHUB_API_VERSION)
             .send()
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(CopilotFetchError::Transient(format!(
+                    "network error contacting copilot token endpoint: {e}"
+                )));
+            }
+        };
         let status = resp.status();
-        let body: Value = resp.json().await?;
         if !status.is_success() {
-            return Err(ProxyError::Other(anyhow::anyhow!(
-                "copilot token fetch failed: {status} {body}"
+            // Read the body as text — many transient failures (5xx HTML
+            // error pages, 429 plain text, etc.) are not valid JSON and
+            // we don't want to fail at the parse step before we get a
+            // chance to classify the status.
+            let text = resp.text().await.unwrap_or_default();
+            // 401 / 403 / 404 mean the stored github token is invalid or
+            // lost access — the operator must re-authenticate. Anything
+            // else (5xx, 408, 429) is treated as transient so we don't
+            // wipe the store on a flaky upstream.
+            if matches!(status.as_u16(), 401 | 403 | 404) {
+                return Err(CopilotFetchError::AuthRejected {
+                    status: status.as_u16(),
+                    body: text,
+                });
+            }
+            return Err(CopilotFetchError::Transient(format!(
+                "copilot token fetch failed: {status} {text}"
             )));
         }
-        let token = body
-            .get("token")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ProxyError::Other(anyhow::anyhow!("missing token in response")))?
-            .to_string();
+        let body: Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(CopilotFetchError::Transient(format!(
+                    "copilot token response not valid JSON: {e}"
+                )));
+            }
+        };
+        let token = match body.get("token").and_then(|v| v.as_str()) {
+            Some(t) => t.to_string(),
+            None => {
+                return Err(CopilotFetchError::Transient(
+                    "missing token field in copilot response".to_string(),
+                ));
+            }
+        };
         let expires_at = body.get("expires_at").and_then(|v| v.as_i64()).unwrap_or_else(|| {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -528,7 +606,10 @@ mod tests {
             .fetch_copilot_token("github")
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("copilot token fetch failed"));
+        // 403 is now classified as AuthRejected (not Transient), so the
+        // error message reflects that — the caller uses this to decide
+        // whether to clear the store.
+        assert!(error.to_string().contains("auth rejected"));
         assert!(error.to_string().contains("403"));
 
         let server = MockServer::start().await;
@@ -1133,6 +1214,56 @@ mod tests {
         drop(memory);
         let disk = provider.state.store.load().unwrap().unwrap();
         assert_eq!(disk.github_access_token, "recovered-github-token");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_token_keeps_store_on_transient_5xx() {
+        // When the Copilot token endpoint returns a transient failure
+        // (5xx), refresh_token must NOT clear the store or trigger the
+        // device flow. It returns Err so the caller sees the failure,
+        // but the stored credentials remain intact for the next attempt.
+        let _env_guard = crate::oauth::device_flow::ENV_LOCK.lock().unwrap();
+        let server = MockServer::start().await;
+        // Copilot token endpoint always 503 (server error, transient).
+        Mock::given(method("GET"))
+            .and(path("/copilot_internal/v2/token"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("upstream down"))
+            .expect(1) // exactly one call — device flow must NOT run
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::from_path(dir.path().join("github_token.json"));
+        let pre_existing = stored_tokens("still-valid-github", "still-valid-copilot", 900);
+        store.save(&pre_existing).unwrap();
+        let state = Arc::new(CopilotState {
+            tokens: RwLock::new(Some(pre_existing.clone())),
+            store: store.clone(),
+            refresh_lock: Mutex::new(()),
+        });
+        let provider = CopilotProvider {
+            name: "copilot".to_string(),
+            vscode_version: "1.95.0".to_string(),
+            account_type: "individual".to_string(),
+            http: reqwest::Client::new(),
+            state,
+            api_base_override: Some(server.uri()),
+            copilot_token_url: format!("{}/copilot_internal/v2/token", server.uri()),
+        };
+
+        let result = provider.refresh_token().await;
+        assert!(result.is_err(), "transient 5xx must surface as Err");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("503"),
+            "transient error should preserve upstream status: {err}"
+        );
+
+        // Store must NOT have been cleared — the credentials are still
+        // valid, only the network/upstream blipped.
+        let disk = store.load().unwrap().expect("store must still exist");
+        assert_eq!(disk.github_access_token, "still-valid-github");
+        assert_eq!(disk.copilot_token, "still-valid-copilot");
     }
 
     /// Spawn a background task that advances paused tokio time every 7
