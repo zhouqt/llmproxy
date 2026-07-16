@@ -21,6 +21,21 @@ pub struct CooldownCache {
     inner: Arc<RwLock<HashMap<String, CooldownEntry>>>,
 }
 
+/// Maximum characters of `reason` we emit in a single `tracing::warn!`.
+/// CooldownEntry still stores the full body for debug snapshots.
+const LOG_REASON_MAX_CHARS: usize = 200;
+
+/// Truncate `s` to `max_chars` characters, appending an ellipsis marker
+/// when truncated. Operates on char boundaries so multi-byte UTF-8 is
+/// never split mid-codepoint.
+fn truncate_for_log(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(max_chars).collect();
+    format!("{truncated}… [+{} chars]", s.chars().count() - max_chars)
+}
+
 impl CooldownCache {
     pub fn new() -> Self {
         Self {
@@ -52,11 +67,17 @@ impl CooldownCache {
                 reason: reason.to_string(),
             },
         );
+        // Some upstreams (e.g. DeepSeek on auth failure) return bodies
+        // longer than a kilobyte. Emitting the full body in every
+        // `provider marked cooldown` warn floods the log and breaks
+        // log-line parsers that assume one event per line. Keep the
+        // full body in CooldownEntry (for debug snapshots) but truncate
+        // what hits the log.
         tracing::warn!(
             provider = provider,
             status = status,
             duration_secs = duration.as_secs(),
-            reason = reason,
+            reason = %truncate_for_log(reason, LOG_REASON_MAX_CHARS),
             "provider marked cooldown"
         );
     }
@@ -231,5 +252,58 @@ mod tests {
             assert!(!default_cache.is_cooling_down("anything").await);
             assert!(!new_cache.is_cooling_down("anything").await);
         });
+    }
+
+    #[test]
+    fn truncate_for_log_passes_through_short_strings() {
+        assert_eq!(truncate_for_log("short", 200), "short");
+        assert_eq!(truncate_for_log("", 200), "");
+    }
+
+    #[test]
+    fn truncate_for_log_truncates_long_strings_with_marker() {
+        let s = "x".repeat(500);
+        let out = truncate_for_log(&s, 200);
+        // 200 chars of 'x' + ellipsis marker + extra count
+        assert!(out.starts_with(&"x".repeat(200)), "got: {out}");
+        assert!(out.contains("…"), "expected ellipsis marker in: {out}");
+        assert!(
+            out.contains("[+300 chars]"),
+            "expected extra-count annotation in: {out}"
+        );
+    }
+
+    #[test]
+    fn truncate_for_log_respects_utf8_char_boundaries() {
+        // 4-byte chars: if we sliced mid-codepoint the function would panic
+        // or produce invalid UTF-8. Verify no panic and that the output
+        // round-trips through String.
+        let s = "🌀".repeat(300);
+        let out = truncate_for_log(&s, 200);
+        assert!(out.contains("…"));
+        // Must be valid UTF-8 (String constructor enforces this; we just
+        // assert the chars we kept are intact).
+        assert!(out.starts_with(&"🌀".repeat(200)));
+    }
+
+    #[tokio::test]
+    async fn mark_cooldown_keeps_full_reason_in_entry_but_logs_truncated() {
+        // CooldownEntry stores the full reason for debug snapshots, but
+        // the tracing::warn! macro receives a truncated version. We can't
+        // easily intercept tracing::warn! here without a subscriber; what
+        // we can check directly is that active_with_reason() still
+        // returns the un-truncated reason — i.e. truncation is purely
+        // a logging concern.
+        let c = CooldownCache::new();
+        let long_reason = "y".repeat(2000);
+        c.mark_cooldown("p", Duration::from_secs(5), 503, &long_reason)
+            .await;
+        let snapshot = c.active_with_reason().await;
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(
+            snapshot[0].3.len(),
+            2000,
+            "snapshot must keep the full reason for debug"
+        );
     }
 }

@@ -392,6 +392,8 @@ HTTP 400
 
 **建议**：要么文档明确 "rough estimate"，要么接入 provider 的 `/v1/tokenize` 或 tiktoken。
 
+**状态（2026-07-16 第四轮 commit）**：建议已实现。`src/cooldown.rs` 新增 `truncate_for_log(s, max_chars)` 辅助函数和 `LOG_REASON_MAX_CHARS = 200` 常量；`mark_cooldown` 的 `tracing::warn!` 调用改用 `truncate_for_log(reason, 200)`，截断后追加 `… [+N chars]` 标记；`CooldownEntry.reason` 仍存完整 body，`active_with_reason()` 快照不受影响。新增 4 个单测：`truncate_for_log_passes_through_short_strings`（短串透传）、`truncate_for_log_truncates_long_strings_with_marker`（长串截断 + 计数标记）、`truncate_for_log_respects_utf8_char_boundaries`（4 字节 emoji 跨边界不 panic）、`mark_cooldown_keeps_full_reason_in_entry_but_logs_truncated`（`active_with_reason` 仍然返回完整 body，确认截断仅影响日志）。
+
 #### R6（P3）：`claude-sonnet-4-5` 响应几乎所有 token 被 thinking 消耗
 
 非流式 `max_tokens=20` 的请求：
