@@ -1,0 +1,34 @@
+# Cargo build artifacts. .cargo/config.toml routes them to
+# /tmp/llmproxy-target, so this is mostly defensive.
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Local configuration with secrets — never commit. Use config.example.yaml
+# as the template and copy it to config.yaml.
+/config.yaml
+config.local.yaml
+*.local.yaml
+
+# Environment / secrets files
+.env
+.env.*
+*.env
+
+# Claude Code session data (per-machine, not source)
+/.claude/
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Coverage reports (regenerable)
+coverage/
+*.lcov
+*.profraw
+*.profdata

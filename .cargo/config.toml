@@ -1,0 +1,7 @@
+# Move Cargo's build output out of the project directory so the synced
+# tree only contains source. CARGO_TARGET_DIR also covers cargo-llvm-cov.
+[build]
+target-dir = "/tmp/llmproxy-target"
+
+[env]
+CARGO_TARGET_DIR = { value = "/tmp/llmproxy-target", force = false }

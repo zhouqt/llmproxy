@@ -1,0 +1,18 @@
+services:
+  llmproxy:
+    build: .
+    container_name: llmproxy
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./config.yaml:/etc/llmproxy/config.yaml:ro
+      - llmproxy-data:/root/.local/share/llmproxy
+    environment:
+      - LLMPROXY_API_KEY=${LLMPROXY_API_KEY:-sk-llmproxy-1234}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - MINIMAX_API_KEY=${MINIMAX_API_KEY:-}
+    restart: unless-stopped
+
+volumes:
+  llmproxy-data:

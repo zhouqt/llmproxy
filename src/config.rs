@@ -1,0 +1,448 @@
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::Path;
+
+use crate::error::{ProxyError, Result};
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    #[serde(default)]
+    pub server: ServerConfig,
+    #[serde(default)]
+    pub proxy: ProxyConfig,
+    #[serde(default)]
+    pub providers: Vec<ProviderConfig>,
+    #[serde(default)]
+    pub models: Vec<ModelConfig>,
+    #[serde(default)]
+    pub logging: LoggingConfig,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            server: ServerConfig::default(),
+            proxy: ProxyConfig::default(),
+            providers: Vec::new(),
+            models: Vec::new(),
+            logging: LoggingConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerConfig {
+    #[serde(default = "default_listen")]
+    pub listen: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+fn default_listen() -> String {
+    "127.0.0.1:8080".to_string()
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            listen: default_listen(),
+            api_key: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyConfig {
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProviderConfig {
+    GithubCopilot {
+        name: String,
+        #[serde(default = "default_vscode_version")]
+        vscode_version: String,
+        #[serde(default = "default_account_type")]
+        account_type: String,
+    },
+    Openrouter {
+        name: String,
+        api_key: String,
+        #[serde(default = "default_api_base_openrouter")]
+        api_base: String,
+        api_format: ApiFormat,
+    },
+    #[serde(rename = "openai_compat")]
+    OpenaiCompat {
+        name: String,
+        api_key: String,
+        api_base: String,
+        #[serde(default)]
+        model_rewrite: HashMap<String, String>,
+    },
+}
+
+fn default_vscode_version() -> String {
+    "1.95.0".to_string()
+}
+
+fn default_account_type() -> String {
+    "individual".to_string()
+}
+
+fn default_api_base_openrouter() -> String {
+    "https://openrouter.ai/api/v1".to_string()
+}
+
+impl ProviderConfig {
+    pub fn name(&self) -> &str {
+        match self {
+            ProviderConfig::GithubCopilot { name, .. } => name,
+            ProviderConfig::Openrouter { name, .. } => name,
+            ProviderConfig::OpenaiCompat { name, .. } => name,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ApiFormat {
+    Openai,
+    Anthropic,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelConfig {
+    pub name: String,
+    pub primary: String,
+    #[serde(default)]
+    pub fallback_chain: Vec<String>,
+    #[serde(default = "default_cooldown_seconds")]
+    pub cooldown_seconds: u64,
+    #[serde(default = "default_max_retries")]
+    pub max_retries_per_provider: u32,
+    #[serde(default = "default_max_retries")]
+    pub max_retries_total: u32,
+}
+
+fn default_cooldown_seconds() -> u64 {
+    300
+}
+
+fn default_max_retries() -> u32 {
+    2
+}
+
+impl ModelConfig {
+    pub fn chain(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.primary.as_str()).chain(self.fallback_chain.iter().map(String::as_str))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoggingConfig {
+    #[serde(default = "default_log_level")]
+    pub level: String,
+    #[serde(default = "default_log_format")]
+    pub format: String,
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+fn default_log_format() -> String {
+    "pretty".to_string()
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            format: default_log_format(),
+        }
+    }
+}
+
+impl Config {
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let raw = std::fs::read_to_string(path.as_ref())
+            .map_err(|e| ProxyError::Config(format!("read {}: {e}", path.as_ref().display())))?;
+        Self::parse(&raw)
+    }
+
+    pub fn parse(raw: &str) -> Result<Self> {
+        let expanded = expand_env_vars(raw);
+        let cfg: Config = serde_yaml::from_str(&expanded)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.providers.is_empty() {
+            return Err(ProxyError::Config("at least one provider required".into()));
+        }
+        if self.models.is_empty() {
+            return Err(ProxyError::Config("at least one model required".into()));
+        }
+
+        let provider_names: std::collections::HashSet<&str> =
+            self.providers.iter().map(|p| p.name()).collect();
+
+        for m in &self.models {
+            if !provider_names.contains(m.primary.as_str()) {
+                return Err(ProxyError::Config(format!(
+                    "model '{}' primary '{}' not in providers list",
+                    m.name, m.primary
+                )));
+            }
+            for fb in &m.fallback_chain {
+                if !provider_names.contains(fb.as_str()) {
+                    return Err(ProxyError::Config(format!(
+                        "model '{}' fallback '{}' not in providers list",
+                        m.name, fb
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn find_model(&self, name: &str) -> Option<&ModelConfig> {
+        self.models.iter().find(|m| m.name == name)
+    }
+
+    pub fn find_provider(&self, name: &str) -> Option<&ProviderConfig> {
+        self.providers.iter().find(|p| p.name() == name)
+    }
+}
+
+/// Expand ${VAR} / $VAR references in a string using process environment.
+fn expand_env_vars(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() {
+            if bytes[i + 1] == b'{' {
+                if let Some(end) = input[i + 2..].find('}') {
+                    let var = &input[i + 2..i + 2 + end];
+                    if let Ok(val) = std::env::var(var) {
+                        out.push_str(&val);
+                    } else {
+                        tracing::warn!("env var {} not set", var);
+                    }
+                    i += 3 + end;
+                    continue;
+                }
+            } else if bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_' {
+                let start = i + 1;
+                let mut end = start;
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
+                {
+                    end += 1;
+                }
+                let var = &input[start..end];
+                if let Ok(val) = std::env::var(var) {
+                    out.push_str(&val);
+                } else {
+                    tracing::warn!("env var {} not set", var);
+                }
+                i = end;
+                continue;
+            }
+        }
+        let ch = input[i..].chars().next().expect("valid UTF-8 boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_var_expansion() {
+        std::env::set_var("LLMPROXY_TEST_VAR", "hello");
+        let expanded = expand_env_vars("key=${LLMPROXY_TEST_VAR}-end");
+        assert_eq!(expanded, "key=hello-end");
+    }
+
+    #[test]
+    fn missing_env_var_expands_to_empty() {
+        std::env::remove_var("LLMPROXY_DEFINITELY_NOT_SET");
+        let expanded = expand_env_vars("foo=${LLMPROXY_DEFINITELY_NOT_SET}bar");
+        assert_eq!(expanded, "foo=bar");
+    }
+
+    #[test]
+    fn config_parses_minimal() {
+        let raw = r#"
+providers:
+  - name: copilot
+    type: github_copilot
+models:
+  - name: gpt-4
+    primary: copilot
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        assert_eq!(cfg.providers.len(), 1);
+        assert_eq!(cfg.models.len(), 1);
+        assert_eq!(cfg.server.listen, "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn config_rejects_unknown_provider() {
+        let raw = r#"
+providers:
+  - name: copilot
+    type: github_copilot
+models:
+  - name: gpt-4
+    primary: openrouter
+"#;
+        let err = Config::parse(raw).unwrap_err();
+        assert!(format!("{err}").contains("not in providers"));
+    }
+
+    #[test]
+    fn env_expansion_supports_unbraced_names_and_unicode() {
+        std::env::set_var("LLMPROXY_UNBRACED_VAR", "值");
+
+        let expanded = expand_env_vars("前缀-$LLMPROXY_UNBRACED_VAR-后缀");
+
+        assert_eq!(expanded, "前缀-值-后缀");
+        assert_eq!(expand_env_vars("literal-$9-${UNCLOSED"), "literal-$9-${UNCLOSED");
+    }
+
+    #[test]
+    fn validation_requires_providers_and_models() {
+        let no_providers = Config::default().validate().unwrap_err();
+        assert!(no_providers.to_string().contains("at least one provider"));
+
+        let no_models = Config {
+            providers: vec![ProviderConfig::GithubCopilot {
+                name: "copilot".to_string(),
+                vscode_version: default_vscode_version(),
+                account_type: default_account_type(),
+            }],
+            ..Config::default()
+        }
+        .validate()
+        .unwrap_err();
+        assert!(no_models.to_string().contains("at least one model"));
+    }
+
+    #[test]
+    fn validation_rejects_unknown_fallback() {
+        let config = Config {
+            providers: vec![ProviderConfig::GithubCopilot {
+                name: "copilot".to_string(),
+                vscode_version: default_vscode_version(),
+                account_type: default_account_type(),
+            }],
+            models: vec![ModelConfig {
+                name: "model".to_string(),
+                primary: "copilot".to_string(),
+                fallback_chain: vec!["missing".to_string()],
+                cooldown_seconds: 300,
+                max_retries_per_provider: 2,
+                max_retries_total: 2,
+            }],
+            ..Config::default()
+        };
+
+        let error = config.validate().unwrap_err();
+
+        assert!(error.to_string().contains("fallback 'missing'"));
+    }
+
+    #[test]
+    fn provider_defaults_names_lookup_and_chain_work() {
+        let raw = r#"
+providers:
+  - name: copilot
+    type: github_copilot
+  - name: router
+    type: openrouter
+    api_key: key
+    api_format: anthropic
+  - name: compat
+    type: openai_compat
+    api_key: key
+    api_base: https://example.test/v1
+models:
+  - name: model
+    primary: copilot
+    fallback_chain: [router, compat]
+"#;
+
+        let config = Config::parse(raw).unwrap();
+
+        assert_eq!(config.providers[0].name(), "copilot");
+        assert_eq!(config.providers[1].name(), "router");
+        assert_eq!(config.providers[2].name(), "compat");
+        match (&config.providers[0], &config.providers[1]) {
+            (
+                ProviderConfig::GithubCopilot {
+                    vscode_version,
+                    account_type,
+                    ..
+                },
+                ProviderConfig::Openrouter { api_base, .. },
+            ) => {
+                assert_eq!(vscode_version, "1.95.0");
+                assert_eq!(account_type, "individual");
+                assert_eq!(api_base, "https://openrouter.ai/api/v1");
+            }
+            _ => panic!("expected [copilot, openrouter] providers"),
+        }
+        assert!(config.find_provider("router").is_some());
+        assert!(config.find_provider("missing").is_none());
+        assert!(config.find_model("model").is_some());
+        assert!(config.find_model("missing").is_none());
+        assert_eq!(
+            config.models[0].chain().collect::<Vec<_>>(),
+            vec!["copilot", "router", "compat"]
+        );
+    }
+
+    #[test]
+    fn load_reads_file_and_reports_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "providers:\n  - name: p\n    type: github_copilot\nmodels:\n  - name: m\n    primary: p\n",
+        )
+        .unwrap();
+
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.models[0].name, "m");
+
+        let missing = Config::load(dir.path().join("missing.yaml")).unwrap_err();
+        assert!(missing.to_string().contains("read"));
+        assert!(missing.to_string().contains("missing.yaml"));
+    }
+
+    #[test]
+    fn parse_rejects_unknown_fields_and_invalid_yaml() {
+        let unknown = Config::parse("unknown: true").unwrap_err();
+        assert!(matches!(unknown, ProxyError::Yaml(_)));
+
+        let invalid = Config::parse("providers: [").unwrap_err();
+        assert!(matches!(invalid, ProxyError::Yaml(_)));
+    }
+}

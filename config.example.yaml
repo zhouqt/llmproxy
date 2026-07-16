@@ -1,0 +1,85 @@
+# LLM Proxy configuration example.
+#
+# Copy to config.yaml, fill in API keys (or set as env vars), then run:
+#   cargo run --release -- --config config.yaml
+
+server:
+  # Address the proxy listens on.
+  listen: "0.0.0.0:8080"
+  # Shared API key clients send via `Authorization: Bearer <key>` (or
+  # `x-api-key`). Leave unset to disable auth (only safe when bound to 127.0.0.1).
+  api_key: "${LLMPROXY_API_KEY}"
+
+# Outgoing proxy for all provider requests. Supports http://, https://,
+# socks5://, socks5h://. Useful for routing around regional blocks.
+# proxy:
+#   url: "socks5://127.0.0.1:1080"
+#   timeout_secs: 600
+
+providers:
+  # ─── GitHub Copilot ────────────────────────────────────────────────
+  # First request will trigger the device flow and print a one-time code.
+  # The token persists at ~/.local/share/llmproxy/github_token.json.
+  - name: copilot
+    type: github_copilot
+    vscode_version: "1.95.0"
+    account_type: individual   # individual | business | enterprise
+
+  # ─── OpenRouter (Anthropic-compatible endpoint) ────────────────────
+  - name: openrouter_anthropic
+    type: openrouter
+    api_key: "${OPENROUTER_API_KEY}"
+    api_base: "https://openrouter.ai/api/v1"
+    api_format: anthropic
+
+  # ─── OpenRouter (OpenAI-compatible endpoint) ───────────────────────
+  - name: openrouter_openai
+    type: openrouter
+    api_key: "${OPENROUTER_API_KEY}"
+    api_base: "https://openrouter.ai/api/v1"
+    api_format: openai
+
+  # ─── DeepSeek (OpenAI-compatible) ──────────────────────────────────
+  - name: deepseek
+    type: openai_compat
+    api_key: "${DEEPSEEK_API_KEY}"
+    api_base: "https://api.deepseek.com/v1"
+    model_rewrite:
+      "claude-sonnet-4-5": "deepseek-chat"
+      "claude-opus-4":     "deepseek-reasoner"
+
+  # ─── MiniMax / MiniMax (OpenAI-compatible) ───────────────────
+  - name: minimax
+    type: openai_compat
+    api_key: "${MINIMAX_API_KEY}"
+    api_base: "https://api.minimax.chat/v1"
+    model_rewrite:
+      "claude-sonnet-4-5": "MiniMax-Text-01"
+      "claude-opus-4":     "abab6.5s-chat"
+
+# Map a Claude Code model name to a primary provider plus a fallback chain.
+# When the primary returns 429 / 5xx / 401, the proxy auto-cools it down and
+# retries on the next provider in the chain.
+models:
+  - name: claude-sonnet-4-5
+    primary: openrouter_anthropic
+    fallback_chain:
+      - openrouter_openai
+      - copilot
+      - deepseek
+      - minimax
+    cooldown_seconds: 300          # how long to block the provider after a 429
+    max_retries_per_provider: 2
+
+  - name: claude-opus-4
+    primary: openrouter_anthropic
+    fallback_chain: [openrouter_openai, deepseek, minimax, copilot]
+    cooldown_seconds: 300
+
+  - name: gpt-4o
+    primary: openrouter_openai
+    fallback_chain: [copilot, deepseek]
+
+logging:
+  level: info   # trace | debug | info | warn | error
+  format: pretty  # pretty | json
