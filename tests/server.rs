@@ -156,6 +156,7 @@ fn build_app(
         router,
         cooldown,
         http: reqwest::Client::new(),
+        copilot: None,
     })
 }
 
@@ -563,4 +564,70 @@ async fn stream_chain_exhaustion_includes_failed_providers_header() {
         response.headers()["x-llmproxy-failed-providers"],
         "primary:429,backup:503"
     );
+}
+
+#[tokio::test]
+async fn admin_copilot_auth_returns_404_when_no_copilot_provider() {
+    // When the proxy is configured without a github_copilot provider,
+    // POST /admin/copilot/auth must return 404, not 500. See fix-R2.
+    let app = build_app(
+        Some("admin-key"),
+        provider(
+            "primary",
+            CompleteBehavior::Json,
+            StreamBehavior::Bytes("unused"),
+        ),
+        None,
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/admin/copilot/auth")
+                .header("authorization", "Bearer admin-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = body_json(response).await;
+    assert_eq!(body["error"]["type"], "not_found");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no github_copilot"),
+        "body was: {body}"
+    );
+}
+
+#[tokio::test]
+async fn admin_copilot_auth_requires_authentication() {
+    // The admin endpoint must be gated behind the same auth as /v1
+    // routes — anonymous callers must NOT be able to trigger bootstrap.
+    let app = build_app(
+        Some("admin-key"),
+        provider(
+            "primary",
+            CompleteBehavior::Json,
+            StreamBehavior::Bytes("unused"),
+        ),
+        None,
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/admin/copilot/auth")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }

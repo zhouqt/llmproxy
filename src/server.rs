@@ -1,4 +1,5 @@
-//! Axum server: routes for /v1/messages, /v1/models, /health, /v1/messages/count_tokens.
+//! Axum server: routes for /v1/messages, /v1/models, /health, /v1/messages/count_tokens,
+//! and /admin/copilot/auth (Copilot OAuth bootstrap trigger).
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -11,6 +12,7 @@ use axum::routing::{get, post};
 use axum::{middleware, Router as AxumRouter};
 use bytes::Bytes;
 use futures_util::Stream;
+use serde_json::json;
 
 use crate::anthropic::{MessagesRequest, MessagesResponse};
 use crate::error::{ProxyError, Result};
@@ -27,9 +29,20 @@ pub fn build_router(state: AppState) -> AxumRouter {
             crate::auth::require_auth,
         ));
 
+    // Admin routes are gated behind the same auth as the v1 API. Operators
+    // trigger Copilot OAuth bootstrap by POSTing here; the proxy prints
+    // the user code in stdout and the device flow runs in the background.
+    let admin = AxumRouter::new()
+        .route("/admin/copilot/auth", post(admin_copilot_auth_handler))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::require_auth,
+        ));
+
     AxumRouter::new()
         .route("/health", get(health_handler))
         .merge(api)
+        .merge(admin)
         .with_state(state)
 }
 
@@ -195,6 +208,65 @@ async fn list_models_handler(State(state): State<AppState>) -> impl IntoResponse
         "object": "list",
         "data": models,
     }))
+}
+
+/// Trigger GitHub Copilot OAuth bootstrap on demand.
+///
+/// Returns 200 with the device code info (operator shows it to the user),
+/// or 409 if a bootstrap is already in progress, or 404 if no Copilot
+/// provider is configured. The actual device flow + token exchange runs
+/// in a spawned task; this handler returns as soon as the device code is
+/// issued so the operator can move on. See fix-R2.
+async fn admin_copilot_auth_handler(State(state): State<AppState>) -> Response {
+    let Some(provider) = state.copilot.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "type": "error",
+                "error": {
+                    "type": "not_found",
+                    "message": "no github_copilot provider configured",
+                }
+            })),
+        )
+            .into_response();
+    };
+    match provider.start_bootstrap().await {
+        Ok(dc) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "ok",
+                "message": "bootstrap started; complete the device flow within the timeout",
+                "device_code": dc.device_code,
+                "user_code": dc.user_code,
+                "verification_uri": dc.verification_uri,
+                "expires_in": dc.expires_in,
+                "interval": dc.interval,
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            // "already in progress" is a normal conflict; surface it as
+            // 409 so the operator can retry after the existing flow
+            // finishes. Anything else is an internal error.
+            let msg = e.to_string();
+            if msg.contains("already in progress") {
+                (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "type": "error",
+                        "error": {
+                            "type": "conflict",
+                            "message": msg,
+                        }
+                    })),
+                )
+                    .into_response()
+            } else {
+                e.into_response()
+            }
+        }
+    }
 }
 
 #[cfg(test)]

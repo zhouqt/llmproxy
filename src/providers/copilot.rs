@@ -18,7 +18,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::anthropic::MessagesRequest;
 use crate::config::ApiFormat;
 use crate::error::{ProxyError, Result};
-use crate::oauth::device_flow::device_flow_blocking;
+use crate::oauth::device_flow::{request_device_code, DeviceCodeResponse};
 use crate::oauth::token_store::{StoredTokens, TokenStore};
 use crate::providers::openai_compat::OpenAiSseToAnthropic;
 use crate::providers::{Provider, ProviderOutput};
@@ -203,7 +203,19 @@ impl CopilotProvider {
         });
         let github_token = match existing.as_ref() {
             Some(t) => t.github_access_token.clone(),
-            None => device_flow_blocking(&self.http).await?,
+            None => {
+                // No stored credentials. Don't run the device flow here
+                // — that would block the request for up to 10 minutes
+                // while waiting for the operator to authorize. Instead,
+                // fast-fail with 401 so the fallback chain skips Copilot
+                // immediately. Bootstrap is owned by `start_bootstrap`
+                // (called from the background refresh loop and from
+                // POST /admin/copilot/auth). See fix-R2.
+                return Err(ProxyError::Upstream {
+                    status: 401,
+                    body: "github_copilot not authenticated".to_string(),
+                });
+            }
         };
 
         match self.fetch_copilot_token(&github_token).await {
@@ -217,17 +229,20 @@ impl CopilotProvider {
                     provider = "copilot",
                     status,
                     body = %body,
-                    "copilot rejected stored credentials; re-running device flow"
+                    "copilot rejected stored credentials; clearing store and signalling bootstrap needed"
                 );
                 self.state.store.clear().ok();
-                let gh = device_flow_blocking(&self.http).await?;
-                let new_tokens = self
-                    .fetch_copilot_token(&gh)
-                    .await
-                    .map_err(|e| ProxyError::Other(anyhow::anyhow!("copilot token fetch after device flow failed: {e}")))?;
-                self.state.store.save(&new_tokens)?;
-                *self.state.tokens.write().await = Some(new_tokens);
-                Ok(())
+                // Don't run the device flow inline — same reason as the
+                // empty-store branch above. The background loop will
+                // notice the cleared store on its next iteration and
+                // trigger bootstrap; operators can also call
+                // POST /admin/copilot/auth to start it immediately.
+                Err(ProxyError::Upstream {
+                    status: 401,
+                    body: format!(
+                        "github_copilot credentials rejected (was {status}); trigger bootstrap via /admin/copilot/auth"
+                    ),
+                })
             }
             Err(CopilotFetchError::Transient(reason)) => {
                 // Network blip / 5xx / parse error: keep the stored token
@@ -241,6 +256,70 @@ impl CopilotProvider {
                 Err(ProxyError::Other(anyhow::anyhow!(reason)))
             }
         }
+    }
+
+    /// Request a fresh device code, spawn a background task to complete
+    /// the OAuth device flow + Copilot-token exchange, and return the
+    /// user-facing device-code info immediately. Used by both the
+    /// background refresh loop and the admin endpoint so concurrent
+    /// triggers fail fast with "already in progress" instead of
+    /// duplicating the device flow. See fix-R2.
+    pub async fn start_bootstrap(self: Arc<Self>) -> Result<DeviceCodeResponse> {
+        // Best-effort check for a concurrent bootstrap. The actual
+        // bootstrap lock is re-acquired by the spawned task (see
+        // below) — this fast-path check just lets the caller fail
+        // immediately with a clear message instead of printing the
+        // banner twice. The race window is small: GitHub will reject
+        // the second device-code request anyway.
+        if self.state.refresh_lock.try_lock().is_err() {
+            return Err(ProxyError::Other(anyhow::anyhow!(
+                "copilot bootstrap already in progress"
+            )));
+        }
+
+        let dc = request_device_code(&self.http).await?;
+
+        // Print the user code so operators see it in the proxy logs
+        // even when bootstrap was triggered by the background loop
+        // (no admin endpoint was called).
+        println!();
+        println!("GitHub Copilot authentication required.");
+        println!("Open: {}", dc.verification_uri);
+        println!("Enter code: {}", dc.user_code);
+        println!("(waiting up to {} seconds)\n", dc.expires_in);
+
+        let provider_for_task = self.clone();
+        let name = self.name.clone();
+        let dc_for_task = dc.clone();
+        tokio::spawn(async move {
+            // Hold the refresh lock for the lifetime of the bootstrap
+            // so refresh_token and other concurrent start_bootstrap
+            // calls block until we're done.
+            let _g = provider_for_task.state.refresh_lock.lock().await;
+            let result = provider_for_task.complete_bootstrap(dc_for_task).await;
+            match result {
+                Ok(()) => tracing::info!(provider = %name, "copilot bootstrap completed"),
+                Err(e) => tracing::error!(provider = %name, error = %e, "copilot bootstrap failed"),
+            }
+        });
+
+        Ok(dc)
+    }
+
+    /// Background half of `start_bootstrap`: poll for the GitHub
+    /// access token, exchange it for a Copilot token, persist to the
+    /// store, and update in-memory state. The caller (spawned task)
+    /// must hold `state.refresh_lock` for the entire duration.
+    async fn complete_bootstrap(&self, dc: DeviceCodeResponse) -> Result<()> {
+        let gh = crate::oauth::device_flow::poll_device_token(&self.http, &dc).await?;
+        let new_tokens = self.fetch_copilot_token(&gh).await.map_err(|e| {
+            ProxyError::Other(anyhow::anyhow!(
+                "copilot token fetch after device flow failed: {e}"
+            ))
+        })?;
+        self.state.store.save(&new_tokens)?;
+        *self.state.tokens.write().await = Some(new_tokens);
+        Ok(())
     }
 
     async fn fetch_copilot_token(&self, github_token: &str) -> std::result::Result<StoredTokens, CopilotFetchError> {
@@ -326,8 +405,32 @@ impl CopilotProvider {
                     }
                 };
                 tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
-                if let Err(e) = self.refresh_token().await {
-                    tracing::error!("background copilot refresh failed: {e}");
+                // Decide based on whether the on-disk store actually
+                // holds credentials. The memory cache may be empty
+                // even when the store has a token (e.g. just after
+                // startup); in that case refresh_token will load it.
+                // refresh_token clears the store on AuthRejected, so
+                // the next iteration falls through to start_bootstrap.
+                let has_credentials = self
+                    .state
+                    .store
+                    .load()
+                    .ok()
+                    .flatten()
+                    .is_some();
+                if has_credentials {
+                    if let Err(e) = self.refresh_token().await {
+                        tracing::error!("background copilot refresh failed: {e}");
+                    }
+                } else if let Err(e) = self.clone().start_bootstrap().await {
+                    // Common: "bootstrap already in progress" — quiet.
+                    // Other errors (network blip, GitHub 5xx) are worth
+                    // logging so the operator sees why auth isn't
+                    // progressing.
+                    let msg = e.to_string();
+                    if !msg.contains("already in progress") {
+                        tracing::warn!("background copilot bootstrap failed: {e}");
+                    }
                 }
             }
         })
@@ -440,6 +543,10 @@ impl Provider for CopilotProvider {
 
     fn spawn_background(self: Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
         Some(self.spawn_refresh_loop())
+    }
+
+    fn as_any_copilot(self: Arc<Self>) -> Option<Arc<CopilotProvider>> {
+        Some(self)
     }
 }
 
@@ -1023,52 +1130,32 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn refresh_token_runs_device_flow_when_store_is_empty() {
-        // When no github token is on disk, refresh_token must run the full
-        // device flow to obtain one, then exchange it for a Copilot token.
-        // Exercises the `None => device_flow_blocking(...)` arm in
-        // refresh_token (production code path that previously had no
-        // coverage).
+    async fn refresh_token_returns_401_when_store_is_empty() {
+        // When no github token is on disk, refresh_token must NOT run the
+        // device flow inline — that would block the request for up to 10
+        // minutes. It must fast-fail with a clear 401 so the fallback
+        // chain skips Copilot immediately. Bootstrap is owned by
+        // `start_bootstrap`. See fix-R2.
         let _env_guard = crate::oauth::device_flow::ENV_LOCK.lock().unwrap();
         let server = MockServer::start().await;
-        // GitHub device flow mocks (routed via LLMPROXY_TEST_GITHUB_BASE_URL).
+        // The device-code endpoint must NOT be hit — refresh_token
+        // should bail out before even requesting a device code.
         Mock::given(method("POST"))
             .and(path("/login/device/code"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "device_code": "df-device",
-                "user_code": "DF-CODE",
+                "device_code": "should-not-be-used",
+                "user_code": "SHOULD-NOT-BE-USED",
                 "verification_uri": "https://example.test/device",
                 "expires_in": 600,
                 "interval": 5,
             })))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/login/oauth/access_token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "access_token": "device-flow-github"
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-        // Copilot token exchange (after device flow yields github token).
-        Mock::given(method("GET"))
-            .and(path("/copilot_internal/v2/token"))
-            .and(header("authorization", "token device-flow-github"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "token": "fresh-copilot-token",
-                "expires_at": now() + 900,
-                "refresh_in": 800
-            })))
-            .expect(1)
+            .expect(0)
             .mount(&server)
             .await;
 
         std::env::set_var("LLMPROXY_TEST_GITHUB_BASE_URL", &server.uri());
         let dir = tempfile::tempdir().unwrap();
         let store = TokenStore::from_path(dir.path().join("github_token.json"));
-        // Note: store has NO saved tokens — refresh_token must run device flow.
         let state = Arc::new(CopilotState {
             tokens: RwLock::new(None),
             store,
@@ -1085,59 +1172,44 @@ mod tests {
         };
         let _auto_advance = spawn_test_time_advance();
 
-        provider.refresh_token().await.unwrap();
+        let err = provider.refresh_token().await.err().expect("must fast-fail");
+        match err {
+            ProxyError::Upstream { status, body } => {
+                assert_eq!(status, 401);
+                assert!(body.contains("not authenticated"), "body: {body}");
+            }
+            other => panic!("expected Upstream 401, got: {other:?}"),
+        }
         std::env::remove_var("LLMPROXY_TEST_GITHUB_BASE_URL");
 
+        // Memory cache stays empty; bootstrap hasn't run.
         let memory = provider.state.tokens.read().await;
-        assert_eq!(
-            memory.as_ref().unwrap().copilot_token,
-            "fresh-copilot-token"
-        );
-        drop(memory);
-        let disk = provider.state.store.load().unwrap().unwrap();
-        assert_eq!(disk.github_access_token, "device-flow-github");
-        assert_eq!(disk.copilot_token, "fresh-copilot-token");
+        assert!(memory.is_none(), "refresh_token must not populate cache on fast-fail");
+        // Store stays empty (no file written).
+        assert!(provider.state.store.load().unwrap().is_none());
     }
 
     #[tokio::test(start_paused = true)]
-    async fn refresh_token_proceeds_when_store_load_fails() {
+    async fn refresh_token_warns_and_returns_401_when_store_load_fails() {
         // When the token store exists but is unreadable (here: contains
         // corrupted JSON), refresh_token must NOT silently treat the
         // failure as "no token" and proceed to device flow — it must log
-        // the error so the operator can see why their credentials didn't
-        // load. The end-state is still Ok (device flow runs), but the
-        // log path is exercised.
+        // the warn and fast-fail with 401 so the operator can see why
+        // credentials didn't load and the fallback chain skips Copilot.
+        // Device flow is owned by `start_bootstrap` now. See fix-R2.
         let _env_guard = crate::oauth::device_flow::ENV_LOCK.lock().unwrap();
         let server = MockServer::start().await;
+        // The device-code endpoint must NOT be hit.
         Mock::given(method("POST"))
             .and(path("/login/device/code"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "device_code": "df-device",
-                "user_code": "DF-CODE",
+                "device_code": "should-not-be-used",
+                "user_code": "SHOULD-NOT-BE-USED",
                 "verification_uri": "https://example.test/device",
                 "expires_in": 600,
                 "interval": 5,
             })))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/login/oauth/access_token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "access_token": "device-flow-github"
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/copilot_internal/v2/token"))
-            .and(header("authorization", "token device-flow-github"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "token": "fresh-copilot-token",
-                "expires_at": now() + 900,
-                "refresh_in": 800
-            })))
-            .expect(1)
+            .expect(0)
             .mount(&server)
             .await;
 
@@ -1146,7 +1218,7 @@ mod tests {
         let store_path = dir.path().join("github_token.json");
         // Write corrupted JSON so load() returns Err(Json).
         std::fs::write(&store_path, b"{not valid json").unwrap();
-        let store = TokenStore::from_path(store_path);
+        let store = TokenStore::from_path(store_path.clone());
         let state = Arc::new(CopilotState {
             tokens: RwLock::new(None),
             store,
@@ -1163,48 +1235,32 @@ mod tests {
         };
         let _auto_advance = spawn_test_time_advance();
 
-        // The load error is logged (warn-level) but does not abort the
-        // refresh path. Device flow still runs because existing=None.
-        provider.refresh_token().await.unwrap();
+        let err = provider.refresh_token().await.err().expect("must fast-fail");
+        match err {
+            ProxyError::Upstream { status, body } => {
+                assert_eq!(status, 401);
+                assert!(body.contains("not authenticated"), "body: {body}");
+            }
+            other => panic!("expected Upstream 401, got: {other:?}"),
+        }
         std::env::remove_var("LLMPROXY_TEST_GITHUB_BASE_URL");
 
-        // The corrupted file is replaced by the device-flow result.
-        let disk = provider.state.store.load().unwrap().unwrap();
-        assert_eq!(disk.github_access_token, "device-flow-github");
-        assert_eq!(disk.copilot_token, "fresh-copilot-token");
+        // Corrupted file is preserved — refresh_token doesn't rewrite
+        // it. Bootstrap (or a manual fix) is what should resolve this.
+        let raw = std::fs::read(&store_path).unwrap();
+        assert_eq!(raw, b"{not valid json");
     }
 
     #[tokio::test(start_paused = true)]
-    async fn refresh_token_reruns_device_flow_when_copilot_endpoint_rejects() {
+    async fn refresh_token_clears_store_and_returns_401_when_copilot_rejects() {
         // When the stored github token is rejected by the Copilot token
-        // endpoint, refresh_token should clear the store, re-run the device
-        // flow to get a new github token, and retry the exchange.
+        // endpoint (401), refresh_token must clear the store so the
+        // background loop / admin endpoint can re-bootstrap, but it
+        // must NOT inline a device flow — that would block the request
+        // for up to 10 minutes. Return Err 401 instead. See fix-R2.
         let _env_guard = crate::oauth::device_flow::ENV_LOCK.lock().unwrap();
         let server = MockServer::start().await;
-        // Device flow mocks (re-used for both initial and recovery runs).
-        Mock::given(method("POST"))
-            .and(path("/login/device/code"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "device_code": "rf-device",
-                "user_code": "RF-CODE",
-                "verification_uri": "https://example.test/device",
-                "expires_in": 600,
-                "interval": 5,
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/login/oauth/access_token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "access_token": "recovered-github-token"
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-        // Copilot token endpoint: first call (with stale github token)
-        // fails; second call (with new github token from device flow)
-        // succeeds.
+        // Copilot token endpoint rejects the stored token.
         Mock::given(method("GET"))
             .and(path("/copilot_internal/v2/token"))
             .and(header("authorization", "token stale-github"))
@@ -1212,15 +1268,17 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        Mock::given(method("GET"))
-            .and(path("/copilot_internal/v2/token"))
-            .and(header("authorization", "token recovered-github-token"))
+        // Device flow must NOT be triggered inline.
+        Mock::given(method("POST"))
+            .and(path("/login/device/code"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "token": "recovered-copilot-token",
-                "expires_at": now() + 900,
-                "refresh_in": 800
+                "device_code": "should-not-be-used",
+                "user_code": "SHOULD-NOT-BE-USED",
+                "verification_uri": "https://example.test/device",
+                "expires_in": 600,
+                "interval": 5,
             })))
-            .expect(1)
+            .expect(0)
             .mount(&server)
             .await;
 
@@ -1228,7 +1286,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = TokenStore::from_path(dir.path().join("github_token.json"));
         // Start with a stale github token so refresh_token will try the
-        // endpoint and fail before re-running the device flow.
+        // endpoint and fail.
         store
             .save(&stored_tokens("stale-github", "old-copilot", -10))
             .unwrap();
@@ -1238,7 +1296,7 @@ mod tests {
                 "old-copilot",
                 -10,
             ))),
-            store,
+            store: store.clone(),
             refresh_lock: Mutex::new(()),
         });
         let provider = CopilotProvider {
@@ -1252,17 +1310,206 @@ mod tests {
         };
         let _auto_advance = spawn_test_time_advance();
 
-        provider.refresh_token().await.unwrap();
+        let err = provider.refresh_token().await.err().expect("must fast-fail");
+        match err {
+            ProxyError::Upstream { status, body } => {
+                assert_eq!(status, 401);
+                assert!(
+                    body.contains("rejected") || body.contains("trigger bootstrap"),
+                    "body should explain the recovery path, got: {body}"
+                );
+            }
+            other => panic!("expected Upstream 401, got: {other:?}"),
+        }
         std::env::remove_var("LLMPROXY_TEST_GITHUB_BASE_URL");
 
+        // Store is cleared so the background loop sees no-token and
+        // triggers bootstrap on its next iteration.
+        assert!(
+            store.load().unwrap().is_none(),
+            "store must be cleared after AuthRejected"
+        );
+        // In-memory state stays stale (not overwritten with Err).
+        let memory = provider.state.tokens.read().await;
+        assert_eq!(
+            memory.as_ref().unwrap().github_access_token,
+            "stale-github",
+            "memory cache is not modified on the rejection path"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn start_bootstrap_runs_device_flow_and_persists_tokens() {
+        // Exercises start_bootstrap's spawned task: request device
+        // code, return DeviceCodeResponse immediately, then complete
+        // the device flow + Copilot token exchange in the background
+        // and persist the result. After the loop completes, the store
+        // and in-memory cache must both hold the new tokens. See fix-R2.
+        // Uses real (non-paused) tokio time because the spawned task's
+        // poll loop sleeps on tokio::time::sleep — pausing time would
+        // require manually advancing the clock from the test body, but
+        // the spawned task needs CPU time too.
+        let _env_guard = crate::oauth::device_flow::ENV_LOCK.lock().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/login/device/code"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "device_code": "sb-device",
+                "user_code": "SB-CODE",
+                "verification_uri": "https://example.test/device",
+                "expires_in": 600,
+                "interval": 5,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/login/oauth/access_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "bootstrap-github"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/copilot_internal/v2/token"))
+            .and(header("authorization", "token bootstrap-github"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "token": "bootstrap-copilot",
+                "expires_at": now() + 900,
+                "refresh_in": 800
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        std::env::set_var("LLMPROXY_TEST_GITHUB_BASE_URL", &server.uri());
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::from_path(dir.path().join("github_token.json"));
+        let state = Arc::new(CopilotState {
+            tokens: RwLock::new(None),
+            store: store.clone(),
+            refresh_lock: Mutex::new(()),
+        });
+        let provider = Arc::new(CopilotProvider {
+            name: "copilot".to_string(),
+            vscode_version: "1.95.0".to_string(),
+            account_type: "individual".to_string(),
+            http: reqwest::Client::new(),
+            state,
+            api_base_override: Some(server.uri()),
+            copilot_token_url: format!("{}/copilot_internal/v2/token", server.uri()),
+        });
+
+        // start_bootstrap returns immediately with the device code.
+        let dc = provider.clone().start_bootstrap().await.unwrap();
+        assert_eq!(dc.user_code, "SB-CODE");
+        assert_eq!(dc.device_code, "sb-device");
+        // Keep the env var set: the spawned task reads github_base_url()
+        // each time it polls, so we have to keep the override alive
+        // until bootstrap finishes (not just until start_bootstrap
+        // returns the device code).
+
+        // Poll the memory cache until the spawned bootstrap task
+        // completes (or we time out). With real time + interval=5s
+        // +1=6s poll, this should complete within ~6s.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            async {
+                loop {
+                    if provider.state.tokens.read().await.is_some() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            },
+        )
+        .await;
+        std::env::remove_var("LLMPROXY_TEST_GITHUB_BASE_URL");
+        assert!(result.is_ok(), "bootstrap task did not complete in 30s");
+
+        // Both store and memory cache must hold the new tokens.
         let memory = provider.state.tokens.read().await;
         assert_eq!(
             memory.as_ref().unwrap().copilot_token,
-            "recovered-copilot-token"
+            "bootstrap-copilot",
+            "background bootstrap must populate memory cache"
+        );
+        assert_eq!(
+            memory.as_ref().unwrap().github_access_token,
+            "bootstrap-github"
         );
         drop(memory);
-        let disk = provider.state.store.load().unwrap().unwrap();
-        assert_eq!(disk.github_access_token, "recovered-github-token");
+        let disk = store.load().unwrap().unwrap();
+        assert_eq!(disk.copilot_token, "bootstrap-copilot");
+        assert_eq!(disk.github_access_token, "bootstrap-github");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn start_bootstrap_returns_already_in_progress_when_concurrent() {
+        // When start_bootstrap is called while another bootstrap is
+        // already running, the second call must fail fast with a clear
+        // "already in progress" error instead of kicking off a second
+        // device flow. See fix-R2.
+        let _env_guard = crate::oauth::device_flow::ENV_LOCK.lock().unwrap();
+        let server = MockServer::start().await;
+        // The device-code endpoint must NOT be hit: the second call's
+        // try_lock fails before it ever reaches request_device_code.
+        Mock::given(method("POST"))
+            .and(path("/login/device/code"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "device_code": "should-not-be-used",
+                "user_code": "SHOULD-NOT-BE-USED",
+                "verification_uri": "https://example.test/device",
+                "expires_in": 600,
+                "interval": 5,
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        std::env::set_var("LLMPROXY_TEST_GITHUB_BASE_URL", &server.uri());
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::from_path(dir.path().join("github_token.json"));
+        let state = Arc::new(CopilotState {
+            tokens: RwLock::new(None),
+            store,
+            refresh_lock: Mutex::new(()),
+        });
+        let provider = Arc::new(CopilotProvider {
+            name: "copilot".to_string(),
+            vscode_version: "1.95.0".to_string(),
+            account_type: "individual".to_string(),
+            http: reqwest::Client::new(),
+            state,
+            api_base_override: Some(server.uri()),
+            copilot_token_url: format!("{}/copilot_internal/v2/token", server.uri()),
+        });
+
+        // Hold the lock manually to simulate an in-flight bootstrap.
+        let _lock_held = provider.state.refresh_lock.lock().await;
+
+        let err = provider
+            .clone()
+            .start_bootstrap()
+            .await
+            .err()
+            .expect("second start_bootstrap must fail when lock held");
+        match err {
+            ProxyError::Other(msg) => {
+                assert!(
+                    msg.to_string().contains("already in progress"),
+                    "expected 'already in progress', got: {msg}"
+                );
+            }
+            other => panic!("expected Other with 'already in progress', got: {other:?}"),
+        }
+        std::env::remove_var("LLMPROXY_TEST_GITHUB_BASE_URL");
+        // Drop the lock guard before the mock verification runs so the
+        // task holding the lock (none here) doesn't race with mock
+        // teardown.
+        drop(_lock_held);
     }
 
     #[tokio::test(start_paused = true)]

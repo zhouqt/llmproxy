@@ -5,11 +5,11 @@
 ## 结果摘要
 
 - 测试计划：`docs/TEST_PLAN.md`
-- 可执行测试：169 个全部通过
-  - library 单元测试：142
+- 可执行测试：192 个全部通过
+  - library 单元测试：160
   - binary 单元测试：13（其中 3 个是 subprocess 测试）
   - auth 集成测试：7
-  - server 集成测试：8
+  - server 集成测试：12
 - 覆盖率命令：`cargo llvm-cov --summary-only`
 - 行覆盖率：**98.34%**（5288 行，88 行未覆盖）
 - region 覆盖率：**96.93%**
@@ -353,6 +353,22 @@ HTTP 500
 
 **建议**：
 - 没有 token 时直接返回 `ProxyError::Upstream { status: 401, body: "github_copilot not authenticated" }`，跳过 refresh loop。
+
+**状态（2026-07-17 第二轮 commit）**：已修。三处改动：
+
+1. `refresh_token` 在 store 为空 / 加载失败时 fast-fail `Upstream { status: 401, body: "github_copilot not authenticated" }`，不再 inline device flow。
+2. `refresh_token` 区分 `AuthRejected`（401/403/404，仅清 store 不 device flow）和 `Transient`（5xx / 网络 / parse，保持 store 原样），返回 401 时 body 提示 "trigger bootstrap via /admin/copilot/auth"。
+3. 新增独立 admin endpoint `POST /admin/copilot/auth`（同样走 `require_auth` 中间件）：调用 `CopilotProvider::start_bootstrap`，立刻返回 device code（user_code / verification_uri / expires_in），后台任务负责 poll + 交换 + 持久化。`start_bootstrap` 用 `try_lock` 检测并发：第二次调用立刻返回 `409 already in progress`。
+
+新增测试：
+- `refresh_token_returns_401_when_store_is_empty`：store 为空 + wiremock `expect(0)` 验证 device flow endpoint 不被命中。
+- `refresh_token_warns_and_returns_401_when_store_load_fails`：corrupted JSON 触发 warn 但仍 fast-fail。
+- `refresh_token_clears_store_and_returns_401_when_copilot_rejects`：Copilot 401 后 store 被清，提示触发 bootstrap。
+- `refresh_token_keeps_store_on_transient_5xx`：5xx 保留 store，不触发 device flow。
+- `start_bootstrap_returns_already_in_progress_when_concurrent`：持有 lock 时第二次调用返回 "already in progress"。
+- `start_bootstrap_runs_device_flow_and_persists_tokens`：完整跑通 device code → access token → Copilot token → store + memory cache（real time 6s）。
+- `tests/server.rs::admin_copilot_auth_returns_404_when_no_copilot_provider`：未配置 copilot 时 endpoint 返回 404。
+- `tests/server.rs::admin_copilot_auth_requires_authentication`：endpoint 走 `require_auth` 中间件，无 token 返回 401。
 
 #### R3（P2）：`tracing::warn!` 的 `reason` 字段把整段上游 JSON 序列化进日志
 

@@ -83,12 +83,21 @@ fn build_state(
 ) -> Result<(AppState, Vec<tokio::task::JoinHandle<()>>), llmproxy::error::ProxyError> {
     let mut provider_map: HashMap<String, SharedProvider> = HashMap::new();
     let mut bg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    // Track the Copilot provider separately so the admin endpoint can
+    // reach it without a downcast through the trait object. We rely on
+    // the fact that at most one github_copilot provider is typically
+    // configured; if multiple are ever added the admin endpoint can be
+    // made name-keyed without touching the rest of the code.
+    let mut copilot: Option<Arc<llmproxy::providers::copilot::CopilotProvider>> = None;
     for p in &cfg.providers {
         let name = p.name().to_string();
         let built = providers::build(p, http.clone())
             .map_err(|e| llmproxy::error::ProxyError::Other(anyhow::anyhow!("building provider '{name}': {e}")))?;
         if let Some(h) = built.clone().spawn_background() {
             bg_handles.push(h);
+        }
+        if let Some(c) = built.clone().as_any_copilot() {
+            copilot = Some(c);
         }
         provider_map.insert(name, built);
     }
@@ -105,6 +114,7 @@ fn build_state(
         router,
         cooldown,
         http,
+        copilot,
     };
     Ok((state, bg_handles))
 }

@@ -37,6 +37,14 @@ pub trait Provider: Send + Sync {
         let _ = self;
         None
     }
+    /// Returns `Some(Arc<CopilotProvider>)` only when the concrete type is
+    /// the GitHub Copilot provider. The default returns `None`. Used by
+    /// `main.rs` to surface the provider to admin endpoints without
+    /// downcasting through the trait object.
+    fn as_any_copilot(self: Arc<Self>) -> Option<Arc<copilot::CopilotProvider>> {
+        let _ = self;
+        None
+    }
 }
 
 pub type SharedProvider = Arc<dyn Provider>;

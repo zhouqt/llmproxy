@@ -41,6 +41,7 @@ fn dummy_state(api_key: Option<String>) -> AppState {
         )),
         cooldown: llmproxy::cooldown::CooldownCache::new(),
         http: reqwest::Client::new(),
+        copilot: None,
     }
 }
 

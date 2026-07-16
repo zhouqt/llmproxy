@@ -130,6 +130,17 @@ pub async fn device_flow_blocking(http: &reqwest::Client) -> Result<String> {
     poll_loop(http, github_base_url(), &dc).await
 }
 
+/// Poll for the GitHub access token without printing the user code
+/// banner (caller is expected to print it). Used by `start_bootstrap`'s
+/// spawned task so the banner isn't duplicated when the device code
+/// was returned by an admin endpoint — see fix-R2.
+pub async fn poll_device_token(
+    http: &reqwest::Client,
+    dc: &DeviceCodeResponse,
+) -> Result<String> {
+    poll_loop(http, github_base_url(), dc).await
+}
+
 async fn poll_loop(
     http: &reqwest::Client,
     base_url: &str,
