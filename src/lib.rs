@@ -14,6 +14,7 @@ pub mod providers;
 pub mod router;
 pub mod server;
 pub mod state;
+pub mod tokenize;
 
 /// Test-only helper macro: match a value against a pattern, execute the
 /// body on success, or panic with a single canonical message on failure.

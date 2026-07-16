@@ -19,6 +19,7 @@ use crate::error::{ProxyError, Result};
 use crate::extractor::AppJson;
 use crate::providers::ProviderOutput;
 use crate::state::AppState;
+use crate::tokenize::estimate_request_tokens;
 
 pub fn build_router(state: AppState) -> AxumRouter {
     let api = AxumRouter::new()
@@ -184,10 +185,9 @@ fn format_stream_error(err: &ProxyError) -> Bytes {
 
 async fn count_tokens_handler(
     State(_state): State<AppState>,
-    AppJson(_req): AppJson<serde_json::Value>,
+    AppJson(req): AppJson<serde_json::Value>,
 ) -> impl IntoResponse {
-    let s = serde_json::to_string(&_req).unwrap_or_default();
-    let tokens = ((s.len() as f32) / 4.0).ceil() as u32;
+    let tokens = estimate_request_tokens(&req);
     Json(serde_json::json!({ "input_tokens": tokens }))
 }
 

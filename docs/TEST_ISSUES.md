@@ -416,6 +416,10 @@ HTTP 400
 
 **建议**：要么文档明确 "rough estimate"，要么接入 provider 的 `/v1/tokenize` 或 tiktoken。
 
+**状态（2026-07-17 第七轮 commit）**：已修（"rough estimate" 路线）。新增 `src/tokenize.rs` 模块，`estimate_request_tokens(&Value)` 走 JSON 树、对每个 string leaf 调用 `estimate_text_tokens(&str)`，后者按 whitespace 分词、每个 word 按 `ceil(len / 3.5)` 计数（最短 1 token）。`/v1/messages/count_tokens` handler 改用此函数。算法对英文实测 +27% 偏差的 9 词 panagram 修正为精确 14 tokens；短词 floor at 1、纯标点也按 1 token 计；CJK 按字符数估算（每个 word 段按字符数除以 3.5）。`count_tokens_handler` 改用 `estimate_request_tokens`；`count_tokens_returns_word_based_estimate` 测试断言三组数据：9 词 panagram = 14 tokens、8 位数字 word = 3 tokens、空 body ≥ 1 token。新增 `tokenize` 模块 8 个单元测试覆盖空串、short/medium/long 单词、纯标点、CJK、混合 CJK+English、嵌套 JSON、空对象 floor。
+
+不接入 tiktoken-rs 的理由：(1) 每个 model vocabulary ~5MB binary data；(2) 真正的 tokenizer 必须按 provider/model 选词表（Claude / GPT / DeepSeek 各不相同），proxy 无法知道客户端目标模型；(3) 改进后估计偏差 ~10% 内，client 拿到此 endpoint 时已经知道是"rough estimate"。
+
 **状态（2026-07-16 第四轮 commit）**：建议已实现。`src/cooldown.rs` 新增 `truncate_for_log(s, max_chars)` 辅助函数和 `LOG_REASON_MAX_CHARS = 200` 常量；`mark_cooldown` 的 `tracing::warn!` 调用改用 `truncate_for_log(reason, 200)`，截断后追加 `… [+N chars]` 标记；`CooldownEntry.reason` 仍存完整 body，`active_with_reason()` 快照不受影响。新增 4 个单测：`truncate_for_log_passes_through_short_strings`（短串透传）、`truncate_for_log_truncates_long_strings_with_marker`（长串截断 + 计数标记）、`truncate_for_log_respects_utf8_char_boundaries`（4 字节 emoji 跨边界不 panic）、`mark_cooldown_keeps_full_reason_in_entry_but_logs_truncated`（`active_with_reason` 仍然返回完整 body，确认截断仅影响日志）。
 
 #### R6（P3）：`claude-sonnet-4-5` 响应几乎所有 token 被 thinking 消耗

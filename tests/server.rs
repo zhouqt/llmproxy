@@ -225,7 +225,11 @@ async fn health_is_public_while_api_routes_are_protected() {
 }
 
 #[tokio::test]
-async fn count_tokens_returns_length_estimate() {
+async fn count_tokens_returns_word_based_estimate() {
+    // R5: the old `len(json) / 4` heuristic under-counted English
+    // inputs by up to 27% (e.g. 9-word panagram: 11 estimated vs 14
+    // actual). The new estimator walks the JSON tree and counts
+    // ceil(word_len / 3.5) per word. See fix-R5 in docs/TEST_ISSUES.md.
     let app = build_app(
         None,
         provider(
@@ -235,10 +239,14 @@ async fn count_tokens_returns_length_estimate() {
         ),
         None,
     );
-    let input = json!({"text": "12345678"});
-    let expected = ((serde_json::to_string(&input).unwrap().len() as f32) / 4.0).ceil() as u32;
 
+    // 9-word English panagram, documented at 14 actual tokens.
+    // Old impl returned 11 (under by 3); new impl returns 14 exactly.
+    let input = json!({
+        "text": "the quick brown fox jumps over the lazy dog"
+    });
     let response = app
+        .clone()
         .oneshot(test_request(
             Method::POST,
             "/v1/messages/count_tokens",
@@ -246,9 +254,41 @@ async fn count_tokens_returns_length_estimate() {
         ))
         .await
         .unwrap();
-
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(body_json(response).await["input_tokens"], expected);
+    let tokens = body_json(response).await["input_tokens"].as_u64().unwrap();
+    assert_eq!(tokens, 14, "panagram should be 14 tokens");
+
+    // 8 digits = one word of length 8 → ceil(8/3.5) = 3 tokens.
+    let small = json!({"text": "12345678"});
+    let small_response = app
+        .clone()
+        .oneshot(test_request(
+            Method::POST,
+            "/v1/messages/count_tokens",
+            Some(small),
+        ))
+        .await
+        .unwrap();
+    let small_tokens = body_json(small_response).await["input_tokens"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(small_tokens, 3, "8-digit word should be 3 tokens");
+
+    // Empty body still floors at 1 (overhead).
+    let empty = json!({});
+    let empty_response = app
+        .clone()
+        .oneshot(test_request(
+            Method::POST,
+            "/v1/messages/count_tokens",
+            Some(empty),
+        ))
+        .await
+        .unwrap();
+    let empty_tokens = body_json(empty_response).await["input_tokens"]
+        .as_u64()
+        .unwrap();
+    assert!(empty_tokens >= 1, "empty body should floor at 1");
 }
 
 #[tokio::test]
