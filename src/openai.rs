@@ -183,12 +183,26 @@ pub struct ChatUsage {
     pub total_tokens: u32,
     #[serde(default)]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
+    /// Breakdown of the completion_tokens: how many were spent on
+    /// reasoning / thinking. Returned by DeepSeek-R1 and other
+    /// reasoning models. Not surfaced to the Anthropic client today
+    /// (Anthropic's `Usage` schema has no equivalent field) — kept
+    /// here so the proxy can warn operators when output is dominated
+    /// by reasoning. See fix-R6 in docs/TEST_ISSUES.md.
+    #[serde(default)]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PromptTokensDetails {
     #[serde(default)]
     pub cached_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CompletionTokensDetails {
+    #[serde(default)]
+    pub reasoning_tokens: Option<u32>,
 }
 
 #[cfg(test)]

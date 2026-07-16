@@ -436,6 +436,13 @@ HTTP 400
 1. 文档提示 DeepSeek 模型强制开启 thinking，需要更大 `max_tokens`。
 2. 或者把 thinking 块折叠到 `text` 之后单独发送（需要客户端支持）。
 
+**状态（2026-07-17 第八轮 commit）**：已修（建议 #1 路线）。`ChatUsage` 新增 `completion_tokens_details: Option<CompletionTokensDetails>` 字段，携带 `reasoning_tokens: Option<u32>`。OpenAI 风格 upstream（DeepSeek-R1 / Claude-with-thinking）会在 usage 里返回这字段；之前没解析就直接丢掉，现在 `serde_json::from_value` 能识别并保留。在 `openai_to_anthropic_response` 末尾加了一条 `tracing::warn!`：当 `reasoning_tokens >= completion_tokens` 且 `completion_tokens > 0` 时记录 "response consumed by reasoning; client will see no visible text — request a larger max_tokens"，让 operator 在日志里立刻看到这条问题（而不是等到 client 报 "empty response"）。不修改 wire format：Anthropic `Usage` schema 没有 `reasoning_tokens` 字段，把 reasoning 折叠到 visible text 会改变 client 已经信任的语义；新增 Tracing 字段不破坏向后兼容性。
+
+新增测试：
+- `conversion::response::tests::parses_reasoning_tokens_in_completion_details`：DeepSeek 风格的 usage 字段能被正确解析，reasoning_tokens=18 + completion_tokens=20 不破坏 conversion。
+- `conversion::response::tests::parses_without_completion_tokens_details`：标准 OpenAI /v1/chat/completions 没有 `completion_tokens_details`，仍然 parse 干净（Option 字段为 None）。
+- `conversion::response::tests::reasoning_dominates_output_does_not_break_conversion`：reasoning_tokens == completion_tokens 时 conversion 仍成功、Thinking block 保留、stop_reason 映射 "length" → "max_tokens"，client 能拿到完整响应只是 visible text 为空。
+
 #### R7（P2）：fallback 链全部 cooldown 时静默选 `cooldown_duration` 最短的 provider
 
 容器日志无对应观察（所有 cooldown 都是 5s，目前链够用），但代码层面已在 `src/router.rs:70-71` 标注：`"all providers cooling down; using soonest-expiring"` 只是 warn log，仍然把请求打给那个 provider。

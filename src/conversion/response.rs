@@ -67,6 +67,33 @@ pub fn openai_to_anthropic_response(
         })
         .unwrap_or_default();
 
+    // R6: when reasoning models (DeepSeek-R1, claude-sonnet-4-5 with
+    // thinking enabled) burn most or all of `max_tokens` on internal
+    // reasoning, the client gets back a response with stop_reason =
+    // max_tokens and zero visible text — which looks like an empty
+    // response from the client's point of view. Warn at the proxy
+    // layer so operators see this happening (and can tell the client
+    // to send a larger max_tokens), without changing the wire
+    // response (Anthropic's Usage schema has no reasoning_tokens
+    // field; folding thinking into visible text would change the
+    // semantics the client signed up for).
+    if let Some(u) = resp.usage.as_ref() {
+        if let Some(reasoning) = u
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|d| d.reasoning_tokens)
+        {
+            if u.completion_tokens > 0 && reasoning >= u.completion_tokens {
+                tracing::warn!(
+                    model = model,
+                    completion_tokens = u.completion_tokens,
+                    reasoning_tokens = reasoning,
+                    "response consumed by reasoning; client will see no visible text — request a larger max_tokens"
+                );
+            }
+        }
+    }
+
     Ok(MessagesResponse {
         id: message_id.to_string(),
         kind: "message".to_string(),
@@ -281,5 +308,114 @@ mod tests {
         assert_eq!(out.kind, "message");
         assert_eq!(out.role, "assistant");
         assert!(out.stop_reason.is_none());
+    }
+
+    #[test]
+    fn parses_reasoning_tokens_in_completion_details() {
+        // DeepSeek-R1 / claude-sonnet-4-5 with thinking enabled return
+        // completion_tokens_details.reasoning_tokens. The proxy must
+        // accept the field (not fail the parse) even when the
+        // reasoning_tokens count is high — we use it only for the
+        // R6 warning path. See fix-R6 in docs/TEST_ISSUES.md.
+        let resp: ChatResponse = serde_json::from_value(serde_json::json!({
+            "id": "x", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 20,
+                "total_tokens": 30,
+                "completion_tokens_details": {"reasoning_tokens": 18}
+            }
+        }))
+        .unwrap();
+
+        let reasoning = resp
+            .usage
+            .as_ref()
+            .unwrap()
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|d| d.reasoning_tokens);
+        assert_eq!(reasoning, Some(18));
+        // Conversion still succeeds and total output_tokens stays 20
+        // (we don't break out reasoning in the Anthropic Usage today).
+        let out = openai_to_anthropic_response(&resp, "model", "msg_1").unwrap();
+        assert_eq!(out.usage.output_tokens, 20);
+    }
+
+    #[test]
+    fn parses_without_completion_tokens_details() {
+        // Upstreams that don't include completion_tokens_details
+        // (OpenAI's standard /v1/chat/completions) must still parse
+        // cleanly. The new field is Option-typed so its absence is a
+        // no-op.
+        let resp: ChatResponse = serde_json::from_value(serde_json::json!({
+            "id": "x", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
+            }
+        }))
+        .unwrap();
+
+        assert!(resp
+            .usage
+            .as_ref()
+            .unwrap()
+            .completion_tokens_details
+            .is_none());
+    }
+
+    #[test]
+    fn reasoning_dominates_output_does_not_break_conversion() {
+        // R6: when reasoning_tokens equals completion_tokens, the
+        // model burned every output token on internal thinking and
+        // the client sees no visible text. The conversion must
+        // succeed (so the Thinking block reaches the client) and the
+        // warn-log fires. We don't capture tracing output here — we
+        // only assert the conversion succeeds with the expected
+        // content blocks and usage; the warning side-effect is
+        // covered by the warn-emit code path itself being exercised.
+        let resp: ChatResponse = serde_json::from_value(serde_json::json!({
+            "id": "x", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "thinking... thinking... thinking..."
+                },
+                "finish_reason": "length"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 20,
+                "total_tokens": 30,
+                "completion_tokens_details": {"reasoning_tokens": 20}
+            }
+        }))
+        .unwrap();
+
+        let out = openai_to_anthropic_response(&resp, "model", "msg_1").unwrap();
+        // The conversion succeeds — Thinking block is preserved for
+        // any client that knows how to read it.
+        assert_eq!(out.content.len(), 1);
+        assert!(matches!(&out.content[0], ResponseBlock::Thinking { .. }));
+        // stop_reason maps "length" → "max_tokens" so the client
+        // sees why the response ended without visible text.
+        assert_eq!(out.stop_reason.as_deref(), Some("max_tokens"));
+        // usage still reports the full 20 (we don't surface reasoning
+        // separately — Anthropic's schema has no field for it).
+        assert_eq!(out.usage.output_tokens, 20);
     }
 }
