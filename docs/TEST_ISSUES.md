@@ -419,3 +419,68 @@ HTTP 400
 - **不要绕过 401 cooldown**：gpt-4o 测试触发 401 后 cooldown 5s，下次相同请求走 fallback 时已经 cooldown 过，不会再次打 openrouter_openai。如需重现需等待 5s 或重启容器。
 - **container 日志定位法**：`podman logs <id>` 看到的 `provider marked cooldown` warn 同时携带 `reason=<upstream body>`，可作为上游错误的"信源信号"。本次用它定位了 openrouter 401、copilot refresh 网络问题。
 - **column number 提示上游 body 长度**：`missing field 'object' at line 1 column 1376` 的 1376 是上游 JSON 长度（DeepSeek 的错误 JSON），可用来判断"是不是真的返回了合法 JSON 而只是字段不对"。
+
+## 第二轮真实环境验证（2026-07-16 容器重建后）
+
+容器用新二进制重新构建并启动后再次跑同一组测试。容器内 `DEEPSEEK_API_KEY` / `OPENROUTER_API_KEY` / `MINIMAX_API_KEY` 均为空（仅 `LLMPROXY_API_KEY` 有值），因此所有 upstream 调用都失败，但这条路径恰好用来验证 proxy 的错误处理与 fallback 行为，而不是上游正确性。
+
+### 测试矩阵
+
+| 测试 | 输入 | 结果 | 结论 |
+|------|------|------|------|
+| T1 `claude-sonnet-4-5` 非流 | `{"stream":false}` | HTTP 400 + `{"error":{"code":"model_not_supported",...}}` | fix B 路径正常：upstream 400（非 cooldownable）直接透传；Router 不会 fallback 是正确行为 |
+| T2 `claude-opus-4` 非流 | 同上 | HTTP 400 + 同上 envelope | 同上；OpenRouter Anthropic 端点返回的 JSON envelope 完整保留 |
+| T3 `gpt-4o` 非流 | `{"stream":false}` | HTTP 500 + `{"error":{"message":"missing field `object` at line 1 column 1350",...}}` | **新发现问题** — 见 R8 |
+| T4 `gpt-4o` 流 | `{"stream":true}` | HTTP 200 + `event: message_delta` + `event: message_stop`（无 content） | Copilot 流式路径走 `OpenAiSseToAnthropic` 解析是宽松的，未触发 fix F；但 empty content 提示上游返回空 chunks |
+| T5 `/v1/messages/count_tokens` | 短串 | HTTP 200 `{"input_tokens":18}` | R5 仍是估算，未修（out of scope） |
+| T6 未知模型 | `model=nonexistent-model` | HTTP 400 + `{"error":{"message":"bad request: unknown model: nonexistent-model","type":"Bad Request"},"type":"error"}` | 正常 |
+| T7 畸形 JSON | `{not-valid-json` | HTTP 400 `text/plain` "Failed to parse..." | R4 仍是 axum 默认格式，未修（out of scope） |
+| T8 缺 auth | 无 header | HTTP 401 + `{"error":{"message":"missing or invalid API key","type":"authentication_error"},"type":"error"}` | 正常 |
+| T9 反复打 fallback | 5 次间隔 6s | 全部 HTTP 400，header `x-llmproxy-failed-providers` 始终为空 | 见 R9 — 修复未触发场景分析 |
+
+### 第二轮发现的新问题
+
+#### R8（P1）：`CopilotProvider::complete()` 缺少 OpenAI 错误信封检测
+
+**复现**：`gpt-4o` 模型请求（chain：`openrouter_openai` → `copilot` → `deepseek`，所有 upstream key 均为空）
+
+```
+$ curl -sS -H "Authorization: Bearer sk-llmproxy-1234" \
+    -d '{"model":"gpt-4o","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}' \
+    http://127.0.0.1:8080/v1/messages
+HTTP/1.1 500 Internal Server Error
+{"error":{"message":"missing field `object` at line 1 column 1350","type":"Internal Server Error"},"type":"error"}
+```
+
+**问题**：`src/providers/copilot.rs:396` 的 `CopilotProvider::complete()` 直接对 upstream 响应 body 调 `serde_json::from_str::<ChatResponse>`，没有先检查 `{"error":{...}}` 信封；与 Commit 1 在 `OpenAiCompatProvider` 加的 fix F 不同。
+
+**修复路径**：
+1. 在 `copilot.rs` 的 `complete()`（line 396）和 `stream()`（line 214 chat_url 之前的响应处理）前先做一次 `looks_like_error_envelope` 检查。
+2. 更好：把 `looks_like_error_envelope` 从 `openai_compat.rs` 提到公共位置（如 `crate::openai` 或 `crate::error`），让两个 provider 共用一份。
+
+**优先级**：P1 — 这是 Commit 1（fix F）的覆盖盲点，与 R1 同源但走 Copilot 路径时复现。
+
+**状态（2026-07-16 第三轮 commit）**：建议已修。把 `looks_like_error_envelope` 从 `src/providers/openai_compat.rs` 提到 `src/openai.rs` 的 `pub fn`（共享给所有 OpenAI 风格响应解析路径），`OpenAiCompatProvider::complete` 和 `CopilotProvider::complete` 都改成 `serde_json::from_str` 成 `Value` → 调用共享 helper → 仅在不是 error envelope 时才尝试 `from_value::<ChatResponse>`。`CopilotProvider::complete_surfaces_error_envelope_on_http_200` 测试用 wiremock 返回 200 + `{"error":{"message":"Model not supported","type":"invalid_request_error","code":"model_not_found"}}`，断言 `Err(ProxyError::Upstream { status: 400, body })` 且 body 包含上游原始字段。`OpenAiCompatProvider` 原有的 `complete_surfaces_error_envelope_on_http_200` 测试改用共享 helper 后仍然通过。
+
+#### R9（P2）：`x-llmproxy-failed-providers` header 在生产环境触发条件受限
+
+**复现**：5 次重复 `claude-sonnet-4-5` 请求（间隔 6s 等待 cooldown 过期），全部返回 HTTP 400，无 header。
+
+**问题**：chain 第一个 provider（`deepseek`）的 `deepseek-v4-flash` 模型被 upstream 直接以 400 `model_not_supported` 拒绝；`is_cooldownable()` 只匹配 `401 | 404 | 408 | 429` 或 `>= 500`，400 不在白名单内 → Router 在 `Err(e) => return Err(e)` 分支立刻返回，**没有走到 fallback**，因此也构造不出 `AllProvidersFailed`。
+
+**两个相关事实**：
+1. fix B 的 header 行为本身正确（用 `cargo test` 已经覆盖 `all_providers_failed_includes_header_and_last_body`）。
+2. 但 400 这种 "upstream 明确告诉我模型不存在" 的语义本来就该直接返回，不该 fallback。R9 不是 bug，是验证手段受限 —— 要看到 header 必须有一个 chain 全员 cooldownable 失败的场景。
+
+**建议**：在集成测试里加一个 mock 上游的端到端测试（用 `tower::Service::oneshot` + mock provider 始终返回 429），验证真实链路触发 `x-llmproxy-failed-providers` header；目前 header 行为只在 `tests/server.rs` 用 mock router 验证，没经过 `Router::complete` 真实链路。
+
+#### R1 已修（验证）
+
+Commit 1（`fix(openai_compat): surface upstream error envelope on HTTP 200`）确实修了 R1 的原报告路径：用直接 curl 探测 `https://openrouter.ai/api/v1/chat/completions` 返回 `{"error":{"message":"...","code":401}}`（67 字节），经 `OpenAiCompatProvider` 解析后正确转为 `Upstream { status: 401, body }` 并以原 JSON 透传给客户端。R8 是 fix F 的另一处遗漏，不是 R1 复发。
+
+#### 其他修复验证
+
+- **fix A**（`max_retries_per_provider`）：container log 中每个 provider 在同一请求内被 mark cooldown 2 次（`max_retries_per_provider: 2`），符合预期。
+- **fix B**（保留最后 upstream error）：`OpenAiCompatProvider` 路径下 400 + `{"error":{"code":"model_not_supported",...}}` 完整保留到客户端响应（见 T1/T2）。fix B 的 `x-llmproxy-failed-providers` header 由于 R9 描述的原因在本次环境未触发，但单测覆盖。
+- **fix C / fix D**：容器内 `github_token.json` 存在且未过期，copilot refresh 未走到修复路径；待真实环境 token 过期 / network 故障时验证。
+- **fix E**：`event: message_delta` + `event: message_stop` SSE 结构正常，R3 仍然 out of scope 未处理（cooldown reason 日志很长）。

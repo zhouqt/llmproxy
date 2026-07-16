@@ -393,7 +393,18 @@ impl Provider for CopilotProvider {
                 body: text,
             });
         }
-        let chat: crate::openai::ChatResponse = serde_json::from_str(&text)?;
+        // GitHub Copilot (like DeepSeek) returns HTTP 200 with an OpenAI
+        // error envelope when the model name isn't recognized, instead of
+        // a 4xx. Detect the envelope before deserializing as ChatResponse
+        // so the client sees the real upstream message rather than a
+        // generic 500 "missing field `object`" — see fix-R8 in
+        // docs/TEST_ISSUES.md.
+        let parsed: serde_json::Value = serde_json::from_str(&text)
+            .map_err(ProxyError::Json)?;
+        if crate::openai::looks_like_error_envelope(&parsed) {
+            return Err(ProxyError::Upstream { status: 400, body: text });
+        }
+        let chat: crate::openai::ChatResponse = serde_json::from_value(parsed)?;
         let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
         let anthropic =
             crate::conversion::openai_to_anthropic_response(&chat, &req.model, &msg_id)?;
@@ -850,6 +861,44 @@ mod tests {
             stream,
             ProxyError::Upstream { status: 503, ref body } if body == "unavailable"
         ));
+    }
+
+    #[tokio::test]
+    async fn complete_surfaces_error_envelope_on_http_200() {
+        // GitHub Copilot returns HTTP 200 with an OpenAI error envelope
+        // when the requested model isn't supported. Without the envelope
+        // check (mirroring OpenAiCompatProvider's fix-F), ChatResponse
+        // deserialization fails with "missing field `object`" and the
+        // client sees a generic 500. See fix-R8 in docs/TEST_ISSUES.md.
+        let server = MockServer::start().await;
+        let envelope = json!({
+            "error": {
+                "message": "Model not supported",
+                "type": "invalid_request_error",
+                "code": "model_not_found"
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&envelope))
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+
+        let error = provider
+            .complete(&request(false), &HashMap::new())
+            .await
+            .err()
+            .expect("error envelope should surface as Err");
+
+        expect_variant!(error, ProxyError::Upstream { status, body } => {
+            assert_eq!(status, 400);
+            assert!(body.contains("Model not supported"), "body was: {body}");
+            assert!(body.contains("model_not_found"), "body was: {body}");
+        });
     }
 
     #[tokio::test(start_paused = true)]

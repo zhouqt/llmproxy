@@ -17,6 +17,7 @@ use crate::anthropic::{MessagesRequest, StreamEvent};
 use crate::config::ApiFormat;
 use crate::conversion::{anthropic_to_openai_request, openai_to_anthropic_response};
 use crate::error::{ProxyError, Result};
+use crate::openai::looks_like_error_envelope;
 use crate::providers::{Provider, ProviderOutput};
 
 pub struct OpenAiCompatProvider {
@@ -55,12 +56,6 @@ impl OpenAiCompatProvider {
 /// `error` key whose value is itself an object (so we don't confuse it
 /// with a legitimate assistant message that happens to contain the word
 /// "error").
-fn looks_like_error_envelope(v: &Value) -> bool {
-    let Value::Object(map) = v else {
-        return false;
-    };
-    matches!(map.get("error"), Some(Value::Object(_)))
-}
 
 #[async_trait]
 impl Provider for OpenAiCompatProvider {

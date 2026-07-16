@@ -5,6 +5,24 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+// ─── Error envelope detection ─────────────────────────────────────────────
+
+/// Detect the OpenAI-style error envelope `{"error": {...}}` returned on
+/// HTTP 200 by some upstreams (notably DeepSeek and GitHub Copilot for
+/// unknown models). Used by every provider that deserializes a ChatResponse
+/// from a 200 body so a non-conformant body surfaces as an upstream error
+/// instead of a generic "missing field `object`" 500.
+///
+/// Must be a top-level object with a single `error` key whose value is
+/// itself an object — that shape disambiguates from a legitimate
+/// assistant message that happens to contain the word "error".
+pub fn looks_like_error_envelope(v: &Value) -> bool {
+    let Value::Object(map) = v else {
+        return false;
+    };
+    matches!(map.get("error"), Some(Value::Object(_)))
+}
+
 // ─── Request ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
