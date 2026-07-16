@@ -455,11 +455,18 @@ async fn upstream_stream_item_error_terminates_body() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(response
+    // The body must contain an `event: error` SSE chunk so the client
+    // can distinguish an aborted stream from a normal end-of-stream.
+    let body = response
         .into_body()
         .collect()
         .await
         .unwrap()
-        .to_bytes()
-        .is_empty());
+        .to_bytes();
+    let body_str = std::str::from_utf8(&body).unwrap();
+    assert!(
+        body_str.contains("event: error"),
+        "expected event:error in body, got: {body_str}"
+    );
+    assert!(body_str.contains("upstream_error"));
 }

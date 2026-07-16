@@ -87,7 +87,7 @@ fn stream_response(output: ProviderOutput, attempts: Vec<crate::router::RouteAtt
 
     let inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, ProxyError>> + Send>> =
         Box::into_pin(stream);
-    let mapped = MappedStream { inner, done: false };
+    let mapped = MappedStream::new(inner);
     let body = Body::from_stream(mapped);
 
     let mut resp = Response::new(body);
@@ -107,11 +107,22 @@ fn stream_response(output: ProviderOutput, attempts: Vec<crate::router::RouteAtt
 }
 
 /// Adapter: wraps a `Result<Bytes, ProxyError>` stream as a
-/// `Result<Bytes, std::io::Error>` stream for axum's body. Logs and
-/// terminates on upstream errors.
+/// `Result<Bytes, std::io::Error>` stream for axum's body. Emits an
+/// Anthropic `event: error` SSE chunk before terminating so clients
+/// don't see an incomplete body with no signal that something went
+/// wrong.
 pub struct MappedStream {
     inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, ProxyError>> + Send>>,
     done: bool,
+}
+
+impl MappedStream {
+    pub fn new(inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, ProxyError>> + Send>>) -> Self {
+        Self {
+            inner,
+            done: false,
+        }
+    }
 }
 
 impl Stream for MappedStream {
@@ -125,8 +136,16 @@ impl Stream for MappedStream {
             Poll::Ready(Some(Ok(b))) => Poll::Ready(Some(Ok(b))),
             Poll::Ready(Some(Err(e))) => {
                 tracing::error!("upstream stream error: {e}");
+                // Emit a synthetic Anthropic `event: error` SSE chunk so
+                // the client can distinguish "stream ended normally"
+                // from "stream aborted by upstream failure" — without
+                // this, the body just truncates with 200 OK and no
+                // message_stop, which Anthropic SDKs report as a
+                // confusing parse error. Mark `done` so the next poll
+                // terminates the stream instead of emitting the chunk
+                // again.
                 self.done = true;
-                Poll::Ready(None)
+                Poll::Ready(Some(Ok(format_stream_error(&e))))
             }
             Poll::Ready(None) => {
                 self.done = true;
@@ -135,6 +154,18 @@ impl Stream for MappedStream {
             Poll::Pending => Poll::Pending,
         }
     }
+}
+
+/// Encode a [`ProxyError`] as an Anthropic SSE `event: error` chunk.
+fn format_stream_error(err: &ProxyError) -> Bytes {
+    let payload = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "upstream_error",
+            "message": err.to_string(),
+        }
+    });
+    Bytes::from(format!("event: error\ndata: {payload}\n\n"))
 }
 
 async fn count_tokens_handler(
@@ -236,17 +267,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mapped_stream_terminates_on_inner_error() {
-        // An upstream error should be swallowed (logged, not propagated as
-        // a body error) and the stream should then end.
+    async fn mapped_stream_emits_error_event_then_terminates_on_inner_error() {
+        // An upstream error must NOT just truncate the body — the client
+        // would see 200 OK and no message_stop, with no signal that
+        // anything went wrong. We inject an Anthropic `event: error`
+        // chunk so the SDK can distinguish aborted streams from normal
+        // end-of-stream.
         let mut s = MappedStream {
             inner: make_stream(vec![Err(ProxyError::Internal("boom".into()))]),
             done: false,
         };
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
-        let poll = Pin::new(&mut s).poll_next(&mut cx);
-        assert!(matches!(poll, std::task::Poll::Ready(None)));
+
+        // First poll: the synthetic error chunk.
+        let b1 = assert_poll_ready_some_ok(
+            Pin::new(&mut s).poll_next(&mut cx),
+            "error event",
+        );
+        let s1 = std::str::from_utf8(&b1).unwrap();
+        assert!(
+            s1.contains("event: error"),
+            "expected event:error, got: {s1}"
+        );
+        assert!(s1.contains("boom"), "error body must contain message: {s1}");
+        assert!(
+            s1.contains("upstream_error"),
+            "error type must be upstream_error: {s1}"
+        );
+
+        // Second poll: stream ends.
+        let p2 = Pin::new(&mut s).poll_next(&mut cx);
+        assert!(matches!(p2, Poll::Ready(None)));
         assert!(s.done);
     }
 
@@ -277,6 +329,18 @@ mod tests {
         let p3 = Pin::new(&mut s).poll_next(&mut cx);
         assert!(matches!(p3, Poll::Ready(None)));
         assert!(s.done);
+    }
+
+    #[test]
+    fn format_stream_error_contains_event_and_message() {
+        // Standalone unit test for the helper so future SSE-format
+        // changes are caught here.
+        let bytes = format_stream_error(&ProxyError::Internal("disk full".into()));
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(s.starts_with("event: error\n"));
+        assert!(s.contains("disk full"));
+        assert!(s.contains("upstream_error"));
+        assert!(s.ends_with("\n\n"));
     }
 
     #[test]
