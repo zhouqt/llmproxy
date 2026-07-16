@@ -416,6 +416,8 @@ HTTP 400
 
 **建议**：当 fallback 链全员 cooldown 且总冷却时间 > 某阈值时返回 `ProxyError::AllProvidersCoolingDown`（HTTP 503 + `Retry-After`），而不是把请求浪费掉。
 
+**状态（2026-07-16 第五轮 commit）**：建议已修。`ProxyError::AllProvidersCoolingDown` 从 tuple 改成 struct variant，携带 `retry_after_secs: Option<u64>`：`None` 表示"没有任何候选 provider 在管或全部未知"（无意义的 Retry-After 也不该出现），`Some(n)` 表示"全部候选都处于 cooldown，soonest-remaining ≈ n 秒"。`Router::select_provider` 不再 silently 选 soonest-expiring 并发请求，而是返回 `AllProvidersCoolingDown { retry_after_secs: Some(soonest.as_secs().max(1)) }`；`Router::complete` / `Router::stream` 在所有候选 provider 一开始就 cooldown 时也用同样的 struct 形式（`retry_after_secs: None`，因为这种情况没有可比时间窗）。`ProxyError::IntoResponse` 在 `retry_after_secs: Some(secs)` 时给响应加 `Retry-After: <secs>` header。更新三个旧 router 测试 `select_provider_uses_soonest_when_all_are_cooling`、`select_provider_prefers_shorter_remaining_cooldown`、`select_provider_errors_when_chain_has_no_known_provider` 为断言错误并校验 `retry_after_secs` 范围（留 1 秒 boundary 余量）；新增 router 测试 `select_provider_retry_after_is_primary_when_primary_remaining_is_shorter` 验证 primary 剩余更短时 `retry_after_secs` 取自 primary；新增 error.rs 测试 `all_providers_cooling_down_with_retry_after_sets_header`、`all_providers_cooling_down_without_retry_after_omits_header` 锁定 header 行为；error.rs 旧测试 `status_code_per_variant` 中 tuple 形式构造同步改成 struct 形式。
+
 ### 测试方法学笔记
 
 - **不要绕过 401 cooldown**：gpt-4o 测试触发 401 后 cooldown 5s，下次相同请求走 fallback 时已经 cooldown 过，不会再次打 openrouter_openai。如需重现需等待 5s 或重启容器。

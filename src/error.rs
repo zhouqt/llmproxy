@@ -14,8 +14,16 @@ pub enum ProxyError {
     #[error("provider not found: {0}")]
     ProviderNotFound(String),
 
-    #[error("all providers cooling down for model {0}")]
-    AllProvidersCoolingDown(String),
+    #[error("all providers cooling down for model {model}")]
+    AllProvidersCoolingDown {
+        model: String,
+        /// `Retry-After` hint (seconds) for the caller. `None` means
+        /// every candidate provider is on cooldown but no further
+        /// information is available (e.g. the chain has no known
+        /// providers); `Some(0)` is reserved for "retry immediately"
+        /// and is not currently produced.
+        retry_after_secs: Option<u64>,
+    },
 
     /// Every candidate provider either failed an upstream call or was
     /// on cooldown; `attempts` records the upstream attempts that
@@ -65,7 +73,7 @@ impl ProxyError {
             ProxyError::Unauthorized => StatusCode::UNAUTHORIZED,
             ProxyError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ProxyError::ProviderNotFound(_) => StatusCode::NOT_FOUND,
-            ProxyError::AllProvidersCoolingDown(_) => StatusCode::SERVICE_UNAVAILABLE,
+            ProxyError::AllProvidersCoolingDown { .. } => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::AllProvidersFailed { .. } => StatusCode::BAD_GATEWAY,
             ProxyError::Upstream { status, .. } => {
                 StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
@@ -137,7 +145,24 @@ impl IntoResponse for ProxyError {
                 "message": self.to_string(),
             }
         });
-        (status, Json(body)).into_response()
+
+        // Surface `Retry-After` for the all-cooldown case so clients can
+        // back off instead of retrying into another cooldown window. The
+        // header value is the soonest-expiring cooldown remaining (in
+        // whole seconds, rounded up); we deliberately don't include it
+        // for the "no known providers" sub-case (retry_after_secs = None)
+        // because there's nothing meaningful to wait for.
+        let mut resp = (status, Json(body)).into_response();
+        if let ProxyError::AllProvidersCoolingDown {
+            retry_after_secs: Some(secs),
+            ..
+        } = &self
+        {
+            if let Ok(v) = secs.to_string().parse() {
+                resp.headers_mut().insert("retry-after", v);
+            }
+        }
+        resp
     }
 }
 
@@ -162,7 +187,11 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(
-            ProxyError::AllProvidersCoolingDown("x".into()).status_code(),
+            ProxyError::AllProvidersCoolingDown {
+                model: "x".into(),
+                retry_after_secs: None,
+            }
+            .status_code(),
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(
@@ -285,6 +314,31 @@ mod tests {
         assert_eq!(
             err.failed_providers_header().as_deref(),
             Some("primary:429,backup:503")
+        );
+    }
+
+    #[test]
+    fn all_providers_cooling_down_with_retry_after_sets_header() {
+        let err = ProxyError::AllProvidersCoolingDown {
+            model: "m".into(),
+            retry_after_secs: Some(7),
+        };
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers()["retry-after"], "7");
+    }
+
+    #[test]
+    fn all_providers_cooling_down_without_retry_after_omits_header() {
+        let err = ProxyError::AllProvidersCoolingDown {
+            model: "m".into(),
+            retry_after_secs: None,
+        };
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            resp.headers().get("retry-after").is_none(),
+            "retry-after must be absent when we have no cooldown info"
         );
     }
 

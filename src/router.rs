@@ -64,15 +64,20 @@ impl Router {
             }
         }
 
-        if let Some((name, p, _)) = best {
-            tracing::warn!(
-                model = model.name,
-                provider = name.as_str(),
-                "all providers cooling down; using soonest-expiring"
-            );
-            return Ok((name, p));
+        // Every candidate is on cooldown. Returning the soonest-expiring
+        // would just trigger another cooldown mark and hand the caller
+        // a generic 5xx. Fail fast with 503 + `Retry-After` instead so
+        // clients back off — see fix-R7 in docs/TEST_ISSUES.md.
+        if let Some((_, _, remaining)) = best {
+            return Err(ProxyError::AllProvidersCoolingDown {
+                model: model.name.clone(),
+                retry_after_secs: Some(remaining.as_secs().max(1)),
+            });
         }
-        Err(ProxyError::AllProvidersCoolingDown(model.name.clone()))
+        Err(ProxyError::AllProvidersCoolingDown {
+            model: model.name.clone(),
+            retry_after_secs: None,
+        })
     }
 
     /// Execute a complete request with retries across the chain.
@@ -157,7 +162,10 @@ impl Router {
         // Every candidate was on cooldown from the start, or every
         // configured provider name was unknown — we never even fired a
         // request, so the "all cooling down" framing is accurate.
-        Err(ProxyError::AllProvidersCoolingDown(model.name.clone()))
+        Err(ProxyError::AllProvidersCoolingDown {
+            model: model.name.clone(),
+            retry_after_secs: None,
+        })
     }
 
     /// Execute a streaming request. Returns the first provider's stream; if
@@ -225,7 +233,10 @@ impl Router {
                 last: Box::new(err),
             });
         }
-        Err(ProxyError::AllProvidersCoolingDown(model.name.clone()))
+        Err(ProxyError::AllProvidersCoolingDown {
+            model: model.name.clone(),
+            retry_after_secs: None,
+        })
     }
 }
 
@@ -538,7 +549,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn select_provider_uses_soonest_when_all_are_cooling() {
+    async fn select_provider_returns_retry_after_matching_soonest_cooldown() {
+        // When every candidate provider is on cooldown, the router must
+        // fail fast with 503 + Retry-After instead of calling the
+        // soonest-expiring provider (which would just trip another
+        // cooldown and hand the client a generic 5xx) — see fix-R7
+        // in docs/TEST_ISSUES.md.
         let router = build_test_router();
         let model = router.find_model("m").unwrap();
         router
@@ -550,10 +566,24 @@ mod tests {
             .mark_cooldown("backup", Duration::from_secs(10), 503, "backup")
             .await;
 
-        let (name, _) = router.select_provider(model).await.unwrap();
+        let err = router
+            .select_provider(model)
+            .await
+            .err()
+            .expect("all providers cooling down must error");
 
-        assert_eq!(name, "backup");
-        assert_eq!(router.config().models[0].name, "m");
+        // retry_after_secs is the soonest-remaining cooldown (backup = 10s);
+        // allow 9 in case scheduler crossed a second boundary.
+        assert!(
+            matches!(
+                err,
+                ProxyError::AllProvidersCoolingDown {
+                    ref model,
+                    retry_after_secs: Some(secs),
+                } if model == "m" && (9..=10).contains(&secs)
+            ),
+            "expected AllProvidersCoolingDown with retry_after ~10, got: {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -574,7 +604,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ProxyError::AllProvidersCoolingDown(ref model) if model == "m"
+            ProxyError::AllProvidersCoolingDown { ref model, .. } if model == "m"
         ));
     }
 
@@ -668,8 +698,8 @@ mod tests {
         // not AllProvidersFailed. The router distinguishes the two cases:
         // "no attempt happened" stays as AllProvidersCoolingDown,
         // "at least one attempt failed" becomes AllProvidersFailed.
-        assert!(matches!(complete, ProxyError::AllProvidersCoolingDown(_)));
-        assert!(matches!(stream, ProxyError::AllProvidersCoolingDown(_)));
+        assert!(matches!(complete, ProxyError::AllProvidersCoolingDown { .. }));
+        assert!(matches!(stream, ProxyError::AllProvidersCoolingDown { .. }));
     }
 
     #[tokio::test]
@@ -851,10 +881,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn select_provider_prefers_shorter_remaining_cooldown() {
-        // When all providers are cooling down, the one with the shortest
-        // remaining time wins. Mark primary with a short cooldown and backup
-        // with a long one and verify primary is selected.
+    async fn select_provider_retry_after_is_primary_when_primary_remaining_is_shorter() {
+        // When all providers are cooling down, the router must return
+        // AllProvidersCoolingDown with retry_after_secs equal to the
+        // soonest-remaining cooldown — here primary expires first, so
+        // the value comes from primary's 5s window. See fix-R7 in
+        // docs/TEST_ISSUES.md.
         let router = build_test_router();
         let model = router.find_model("m").unwrap();
         router
@@ -866,8 +898,22 @@ mod tests {
             .mark_cooldown("backup", Duration::from_secs(120), 503, "")
             .await;
 
-        let (name, _) = router.select_provider(model).await.unwrap();
-        assert_eq!(name, "primary");
+        let err = router
+            .select_provider(model)
+            .await
+            .err()
+            .expect("all providers cooling down must error");
+
+        assert!(
+            matches!(
+                err,
+                ProxyError::AllProvidersCoolingDown {
+                    retry_after_secs: Some(secs),
+                    ..
+                } if (1..=5).contains(&secs)
+            ),
+            "expected retry_after_secs from primary's 5s window, got: {err:?}"
+        );
     }
 
     #[tokio::test]
