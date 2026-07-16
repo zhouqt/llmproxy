@@ -470,3 +470,56 @@ async fn upstream_stream_item_error_terminates_body() {
     );
     assert!(body_str.contains("upstream_error"));
 }
+
+#[tokio::test]
+async fn all_providers_failed_includes_header_and_last_body() {
+    // Both providers return 500 — the chain is exhausted. The client
+    // must see the *last* upstream error in the body (so it knows
+    // what really went wrong) AND the per-provider summary in the
+    // `x-llmproxy-failed-providers` header (so it knows the chain
+    // was exhausted, not just one provider). Without this, callers
+    // see a generic "all cooling down" message and lose the real
+    // cause — see fix-B in TEST_ISSUES.md.
+    let app = build_app(
+        None,
+        provider(
+            "primary",
+            CompleteBehavior::Error(500),
+            StreamBehavior::Bytes("unused"),
+        ),
+        Some(provider(
+            "backup",
+            CompleteBehavior::Error(500),
+            StreamBehavior::Bytes("unused"),
+        )),
+    );
+
+    let response = app
+        .oneshot(test_request(
+            Method::POST,
+            "/v1/messages",
+            Some(messages_request(false)),
+        ))
+        .await
+        .unwrap();
+
+    // The response status reflects the *last* upstream status (500),
+    // not a generic 502 — the caller should be able to see what the
+    // final upstream actually returned, not a proxy-level error code
+    // that hides which provider failed and why.
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        response.headers()["x-llmproxy-failed-providers"],
+        "primary:500,backup:500"
+    );
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body_str = std::str::from_utf8(&body_bytes).unwrap();
+    // Body preserves the last upstream status / body so the caller can
+    // diagnose the failure. TestProvider::complete uses "upstream failed"
+    // for the body, which the upstream-JSON path then forwards as the
+    // response body.
+    assert!(
+        body_str.contains("upstream failed"),
+        "expected last upstream body in response, got: {body_str}"
+    );
+}

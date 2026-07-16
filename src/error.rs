@@ -4,6 +4,8 @@ use axum::Json;
 use serde_json::json;
 use thiserror::Error;
 
+use crate::router::RouteAttempt;
+
 #[derive(Debug, Error)]
 pub enum ProxyError {
     #[error("configuration error: {0}")]
@@ -14,6 +16,20 @@ pub enum ProxyError {
 
     #[error("all providers cooling down for model {0}")]
     AllProvidersCoolingDown(String),
+
+    /// Every candidate provider either failed an upstream call or was
+    /// on cooldown; `attempts` records the upstream attempts that
+    /// actually fired (used to populate the `x-llmproxy-failed-providers`
+    /// header), and `last` is the most recent upstream error so the
+    /// caller can see the real cause instead of a generic "all cooling
+    /// down" message.
+    #[error("all providers failed for model {model}: last error: {last}")]
+    AllProvidersFailed {
+        model: String,
+        attempts: Vec<RouteAttempt>,
+        #[source]
+        last: Box<ProxyError>,
+    },
 
     #[error("upstream error: status={status}, body={body}")]
     Upstream { status: u16, body: String },
@@ -50,6 +66,7 @@ impl ProxyError {
             ProxyError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ProxyError::ProviderNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::AllProvidersCoolingDown(_) => StatusCode::SERVICE_UNAVAILABLE,
+            ProxyError::AllProvidersFailed { .. } => StatusCode::BAD_GATEWAY,
             ProxyError::Upstream { status, .. } => {
                 StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
             }
@@ -65,11 +82,46 @@ impl ProxyError {
             _ => false,
         }
     }
+
+    /// Per-provider failure records for the `x-llmproxy-failed-providers`
+    /// header. Returns `None` for errors that didn't actually go through
+    /// the router (e.g. malformed JSON, bad request shape).
+    pub fn failed_providers_header(&self) -> Option<String> {
+        match self {
+            ProxyError::AllProvidersFailed { attempts, .. } => {
+                Some(format_attempts_header(attempts))
+            }
+            _ => None,
+        }
+    }
+}
+
+fn format_attempts_header(attempts: &[RouteAttempt]) -> String {
+    attempts
+        .iter()
+        .map(|a| format!("{}:{}", a.provider, a.status))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
         let status = self.status_code();
+
+        if let ProxyError::AllProvidersFailed { attempts, last, .. } = self {
+            // Defer to the wrapped upstream error for status & body, but
+            // tack the per-provider failure summary onto the response so
+            // operators can see which providers actually returned errors
+            // (the upstream body only shows the *last* attempt's status).
+            let mut resp = last.into_response();
+            if !attempts.is_empty() {
+                if let Ok(v) = format_attempts_header(&attempts).parse() {
+                    resp.headers_mut()
+                        .insert("x-llmproxy-failed-providers", v);
+                }
+            }
+            return resp;
+        }
 
         if let ProxyError::Upstream { body, .. } = &self {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
@@ -190,5 +242,83 @@ mod tests {
         };
         // We don't crash — fall back to BAD_GATEWAY.
         assert_eq!(err.status_code(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn all_providers_failed_status_is_bad_gateway() {
+        let err = ProxyError::AllProvidersFailed {
+            model: "m".into(),
+            attempts: vec![RouteAttempt {
+                provider: "primary".into(),
+                status: 503,
+                body: "x".into(),
+            }],
+            last: Box::new(ProxyError::Upstream {
+                status: 503,
+                body: "down".into(),
+            }),
+        };
+        assert_eq!(err.status_code(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn all_providers_failed_failed_providers_header_is_comma_separated() {
+        let err = ProxyError::AllProvidersFailed {
+            model: "m".into(),
+            attempts: vec![
+                RouteAttempt {
+                    provider: "primary".into(),
+                    status: 429,
+                    body: "x".into(),
+                },
+                RouteAttempt {
+                    provider: "backup".into(),
+                    status: 503,
+                    body: "y".into(),
+                },
+            ],
+            last: Box::new(ProxyError::Upstream {
+                status: 503,
+                body: "down".into(),
+            }),
+        };
+        assert_eq!(
+            err.failed_providers_header().as_deref(),
+            Some("primary:429,backup:503")
+        );
+    }
+
+    #[test]
+    fn all_providers_failed_into_response_sets_failed_providers_header() {
+        // The HTTP response must carry both the upstream body (so the
+        // caller sees the *last* provider's real error) and the
+        // per-provider failure summary as a header — without the
+        // header, operators only see one provider's status and can't
+        // tell that the chain was exhausted.
+        let err = ProxyError::AllProvidersFailed {
+            model: "m".into(),
+            attempts: vec![
+                RouteAttempt {
+                    provider: "primary".into(),
+                    status: 500,
+                    body: "primary down".into(),
+                },
+                RouteAttempt {
+                    provider: "backup".into(),
+                    status: 502,
+                    body: "backup down".into(),
+                },
+            ],
+            last: Box::new(ProxyError::Upstream {
+                status: 502,
+                body: "backup down".into(),
+            }),
+        };
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            resp.headers()["x-llmproxy-failed-providers"],
+            "primary:500,backup:502"
+        );
     }
 }

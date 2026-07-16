@@ -82,6 +82,7 @@ impl Router {
         req: &MessagesRequest,
     ) -> Result<(ProviderOutput, Vec<RouteAttempt>)> {
         let mut attempts: Vec<RouteAttempt> = Vec::new();
+        let mut last_error: Option<ProxyError> = None;
         let mut tried: Vec<String> = Vec::new();
         let chain: Vec<String> = model.chain().map(String::from).collect();
         let max_total = (model.max_retries_total as usize) * chain.len().max(1);
@@ -125,6 +126,7 @@ impl Router {
                             self.cooldown
                                 .mark_cooldown(name, ttl, *status, &body)
                                 .await;
+                            last_error = Some(e);
                         } else {
                             return Err(e);
                         }
@@ -141,6 +143,20 @@ impl Router {
             }
         }
 
+        if let Some(err) = last_error {
+            // At least one upstream actually returned an error; surface
+            // the *last* one so the operator can see what really happened,
+            // instead of the generic "all cooling down" message that
+            // would imply we never even tried.
+            return Err(ProxyError::AllProvidersFailed {
+                model: model.name.clone(),
+                attempts,
+                last: Box::new(err),
+            });
+        }
+        // Every candidate was on cooldown from the start, or every
+        // configured provider name was unknown — we never even fired a
+        // request, so the "all cooling down" framing is accurate.
         Err(ProxyError::AllProvidersCoolingDown(model.name.clone()))
     }
 
@@ -153,6 +169,7 @@ impl Router {
         req: &MessagesRequest,
     ) -> Result<(SharedProvider, ProviderOutput, Vec<RouteAttempt>)> {
         let mut attempts: Vec<RouteAttempt> = Vec::new();
+        let mut last_error: Option<ProxyError> = None;
         let mut tried: Vec<String> = Vec::new();
         let chain: Vec<String> = model.chain().map(String::from).collect();
 
@@ -191,6 +208,7 @@ impl Router {
                             Duration::from_secs(5)
                         };
                         self.cooldown.mark_cooldown(name, ttl, *status, &body).await;
+                        last_error = Some(e);
                         continue;
                     } else {
                         return Err(e);
@@ -200,6 +218,13 @@ impl Router {
             }
         }
 
+        if let Some(err) = last_error {
+            return Err(ProxyError::AllProvidersFailed {
+                model: model.name.clone(),
+                attempts,
+                last: Box::new(err),
+            });
+        }
         Err(ProxyError::AllProvidersCoolingDown(model.name.clone()))
     }
 }
@@ -638,6 +663,11 @@ mod tests {
             .err()
             .expect("request should fail");
 
+        // No upstream call ever fired — both providers were on cooldown
+        // from the start — so this is the legacy "all cooling down" path,
+        // not AllProvidersFailed. The router distinguishes the two cases:
+        // "no attempt happened" stays as AllProvidersCoolingDown,
+        // "at least one attempt failed" becomes AllProvidersFailed.
         assert!(matches!(complete, ProxyError::AllProvidersCoolingDown(_)));
         assert!(matches!(stream, ProxyError::AllProvidersCoolingDown(_)));
     }
@@ -654,7 +684,7 @@ mod tests {
             .err()
             .expect("request should fail");
 
-        assert!(matches!(error, ProxyError::AllProvidersCoolingDown(_)));
+        assert!(matches!(error, ProxyError::AllProvidersFailed { .. }));
         assert!(router.cooldown().is_cooling_down("primary").await);
         assert!(!router.cooldown().is_cooling_down("backup").await);
     }
@@ -753,7 +783,7 @@ mod tests {
             .await
             .err()
             .expect("request should fail");
-        assert!(matches!(error, ProxyError::AllProvidersCoolingDown(_)));
+        assert!(matches!(error, ProxyError::AllProvidersFailed { .. }));
         // Each provider was attempted exactly once even though the chain
         // listed primary twice.
         assert_eq!(
@@ -817,7 +847,7 @@ mod tests {
             .await
             .err()
             .expect("request should fail");
-        assert!(matches!(error, ProxyError::AllProvidersCoolingDown(_)));
+        assert!(matches!(error, ProxyError::AllProvidersFailed { .. }));
     }
 
     #[tokio::test]
@@ -838,6 +868,81 @@ mod tests {
 
         let (name, _) = router.select_provider(model).await.unwrap();
         assert_eq!(name, "primary");
+    }
+
+    #[tokio::test]
+    async fn complete_returns_all_providers_failed_with_last_error_when_chain_exhausted() {
+        // When every candidate actually fires and returns an upstream
+        // error, the router must surface the last one as
+        // AllProvidersFailed (not AllProvidersCoolingDown) so operators
+        // can see the real cause — see fix-B in TEST_ISSUES.md.
+        let mut providers = HashMap::new();
+        for name in ["primary", "backup"] {
+            providers.insert(
+                name.to_string(),
+                Arc::new(MockProvider {
+                    name: name.into(),
+                    fail_status: 503,
+                    fail_count: u32::MAX,
+                    call_count: AtomicU32::new(0),
+                }) as SharedProvider,
+            );
+        }
+        let cfg = Config {
+            server: Default::default(),
+            proxy: Default::default(),
+            providers: vec![
+                ProviderConfig::OpenaiCompat {
+                    name: "primary".into(),
+                    api_key: "k".into(),
+                    api_base: "http://x".into(),
+                    model_rewrite: Default::default(),
+                },
+                ProviderConfig::OpenaiCompat {
+                    name: "backup".into(),
+                    api_key: "k".into(),
+                    api_base: "http://x".into(),
+                    model_rewrite: Default::default(),
+                },
+            ],
+            models: vec![ModelConfig {
+                name: "m".into(),
+                primary: "primary".into(),
+                fallback_chain: vec!["backup".into()],
+                cooldown_seconds: 60,
+                max_retries_per_provider: 1,
+                max_retries_total: 3,
+            }],
+            logging: Default::default(),
+        };
+        let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
+        let model = router.find_model("m").unwrap();
+
+        let err = router
+            .complete(model, &dummy_request())
+            .await
+            .err()
+            .expect("request should fail");
+        match err {
+            ProxyError::AllProvidersFailed { model, attempts, last } => {
+                assert_eq!(model, "m");
+                assert_eq!(attempts.len(), 2);
+                assert_eq!(attempts[0].provider, "primary");
+                assert_eq!(attempts[0].status, 503);
+                assert_eq!(attempts[1].provider, "backup");
+                assert_eq!(attempts[1].status, 503);
+                // `last` must be the last upstream error (backup's),
+                // not the legacy generic "all cooling down" message.
+                match last.as_ref() {
+                    ProxyError::Upstream { status, body } => {
+                        assert_eq!(*status, 503);
+                        assert_eq!(body, "rate limited");
+                    }
+                    other => panic!("expected wrapped Upstream, got {other:?}"),
+                }
+            }
+            other => panic!("expected AllProvidersFailed, got {other:?}"),
+        }
     }
 
     #[tokio::test]
