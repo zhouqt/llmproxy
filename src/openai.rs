@@ -150,11 +150,30 @@ pub struct FunctionDef {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatResponse {
     pub id: String,
+    /// `object` is the OpenAI discriminator (`"chat.completion"`). Some
+    /// upstreams that speak OpenAI-compatible JSON omit it (notably
+    /// GitHub Copilot's `/chat/completions` endpoint). Tolerate the
+    /// missing field so a successful response doesn't surface as a
+    /// generic "missing field `object`" 500.
+    #[serde(default = "default_chat_object")]
     pub object: String,
+    /// `created` is the OpenAI timestamp; Copilot's `/chat/completions`
+    /// response omits it. Optional so a successful 200 body still
+    /// deserializes — we don't currently surface `created` to clients
+    /// anyway.
+    #[serde(default)]
     pub created: i64,
     pub model: String,
     pub choices: Vec<ChatChoice>,
     pub usage: Option<ChatUsage>,
+}
+
+fn default_chat_object() -> String {
+    "chat.completion".to_string()
+}
+
+fn default_chunk_object() -> String {
+    "chat.completion.chunk".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -218,6 +237,81 @@ mod tests {
             assert!(name.is_none());
         });
     }
+
+    #[test]
+    fn chat_response_accepts_missing_object_field() {
+        // GitHub Copilot's /chat/completions response omits the `object`
+        // discriminator. Treating the field as required makes a successful
+        // 200 response surface as a generic 500 "missing field `object`"
+        // and, worse, the Json deserialization error is not cooldownable
+        // — so the router exits the fallback chain before reaching
+        // downstream providers. Tolerate the missing field instead.
+        let body = serde_json::json!({
+            "id": "chatcmpl-x",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "model": "gpt-4o",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        });
+        let resp: ChatResponse = serde_json::from_value(body).unwrap();
+        assert_eq!(resp.object, "chat.completion");
+        assert_eq!(resp.choices.len(), 1);
+    }
+
+    #[test]
+    fn chat_response_accepts_missing_created_field() {
+        // Copilot also omits the OpenAI `created` timestamp. Optional
+        // because we don't surface `created` to the Anthropic client
+        // anyway.
+        let body = serde_json::json!({
+            "id": "chatcmpl-x",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "model": "m"
+        });
+        let resp: ChatResponse = serde_json::from_value(body).unwrap();
+        assert_eq!(resp.created, 0);
+    }
+
+    #[test]
+    fn chat_response_overrides_object_when_present() {
+        let body = serde_json::json!({
+            "id": "chatcmpl-x",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "model": "m"
+        });
+        let resp: ChatResponse = serde_json::from_value(body).unwrap();
+        assert_eq!(resp.object, "chat.completion");
+    }
+
+    #[test]
+    fn chat_chunk_accepts_missing_object_field() {
+        // Same reason as ChatResponse: Copilot's SSE chunks omit `object`.
+        let body = serde_json::json!({
+            "id": "c",
+            "created": 0,
+            "model": "m",
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "hi"},
+                "finish_reason": null
+            }]
+        });
+        let chunk: ChatChunk = serde_json::from_value(body).unwrap();
+        assert_eq!(chunk.object, "chat.completion.chunk");
+    }
 }
 
 // ─── Streaming chunks ────────────────────────────────────────────────────
@@ -225,7 +319,16 @@ mod tests {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatChunk {
     pub id: String,
+    /// `object` is the OpenAI discriminator (`"chat.completion.chunk"`).
+    /// Some upstreams omit it (e.g. GitHub Copilot's SSE chunks).
+    /// Tolerate the missing field rather than dropping every chunk on
+    /// the floor — see the `ChatResponse.object` note for the same
+    /// reasoning on the non-streaming path.
+    #[serde(default = "default_chunk_object")]
     pub object: String,
+    /// `created` is the OpenAI timestamp; Copilot's SSE chunks omit it.
+    /// Optional so deserialization still succeeds on those streams.
+    #[serde(default)]
     pub created: i64,
     pub model: String,
     pub choices: Vec<ChunkChoice>,

@@ -519,6 +519,31 @@ HTTP/1.1 500 Internal Server Error
 
 Commit 1（`fix(openai_compat): surface upstream error envelope on HTTP 200`）确实修了 R1 的原报告路径：用直接 curl 探测 `https://openrouter.ai/api/v1/chat/completions` 返回 `{"error":{"message":"...","code":401}}`（67 字节），经 `OpenAiCompatProvider` 解析后正确转为 `Upstream { status: 401, body }` 并以原 JSON 透传给客户端。R8 是 fix F 的另一处遗漏，不是 R1 复发。
 
+#### R10（P1）：GitHub Copilot 的 OpenAI 兼容响应缺少 `object`/`created` 字段
+
+**复现**：`gpt-4o` 模型请求（chain：`openrouter_openai` → `copilot` → `deepseek`）
+
+```
+$ curl -sS -H "Authorization: Bearer sk-llmproxy-1234" \
+    -d '{"model":"gpt-4o","max_tokens":50,"messages":[{"role":"user","content":"hi"}]}' \
+    http://127.0.0.1:8080/v1/messages
+HTTP/1.1 500 Internal Server Error
+{"error":{"message":"missing field `object`","type":"Internal Server Error"},"type":"error"}
+```
+
+**问题**：`src/openai.rs` 的 `ChatResponse` 和 `ChatChunk` 把 `object` 和 `created` 声明为必填字段。GitHub Copilot 的 `/chat/completions` 响应虽然 HTTP 200，但**不包含** `object` 和 `created`（实测 curl 出来的 JSON 只含 `id`、`choices`、`usage`、`model`、`prompt_filter_results`、`service_tier`、`system_fingerprint`、`copilot_usage`）。`serde_json::from_str::<ChatResponse>` 报错 → 返回 `ProxyError::Json(_)`。这是 R8 的"非信封类反序列化失败"分支：R8 修了 `{"error":{...}}` 信封检测，但 ChatResponse 的强必填字段没改。
+
+**为什么严重**：错误类型是 `Json`，不是 `Upstream`。Router 的 `is_cooldownable()` 只把 `Upstream` 视为 cooldownable，`Json` 直接走 `Err(e) => return Err(e)` 分支，**整个 fallback 链立即中断** —— Copilot 这一步返回 Json 错误后 DeepSeek 永远不会被尝试，客户端只看到 "missing field `object`"。
+
+**修复路径**：
+1. `ChatResponse.object` 改为 `#[serde(default = "default_chat_object")]`（缺失时填 `"chat.completion"`）。
+2. `ChatResponse.created` 改为 `#[serde(default)]`（缺失时填 `0`，反正我们也不把 `created` 透传给 Anthropic 客户端）。
+3. `ChatChunk` 同样处理 `object` 和 `created`（流式路径需要）。
+
+**优先级**：P1 — 用户可见的 fallback 链整体断裂，"missing field `object`" 完全是误导性的错误信息。
+
+**状态（2026-07-17 第九轮 commit）**：建议已修。`ChatResponse.object` / `ChatChunk.object` 加 `#[serde(default = "...")]` 填充合理默认值；`ChatResponse.created` / `ChatChunk.created` 加 `#[serde(default)]` 填充 0。容器重建后实测：`gpt-4o` 走 `openrouter_openai 401 (×2)` → `copilot` 成功 fallback，响应 `{"role":"assistant","content":[{"text":"Hello! How can I assist you today? 😊"}],...}`，header `x-llmproxy-failed-providers: openrouter_openai:401,openrouter_openai:401`。流式同样验证：`event: message_start` → `event: content_block_delta`（"Hello" → "!" → " How" → ...） → `event: message_delta` + `event: message_stop`，符合 Anthropic SSE 规范。新增三个单测锁定语义：`chat_response_accepts_missing_object_field`（用真实 Copilot 响应形状反序列化、验证 `object` 默认值）、`chat_response_accepts_missing_created_field`、`chat_chunk_accepts_missing_object_field`。
+
 #### 其他修复验证
 
 - **fix A**（`max_retries_per_provider`）：container log 中每个 provider 在同一请求内被 mark cooldown 2 次（`max_retries_per_provider: 2`），符合预期。
