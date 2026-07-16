@@ -55,7 +55,15 @@ impl CopilotProvider {
         http: reqwest::Client,
     ) -> Result<Self> {
         let store = TokenStore::new()?;
-        let initial = store.load().unwrap_or(None);
+        let initial = store.load().unwrap_or_else(|e| {
+            tracing::warn!(
+                provider = "copilot",
+                error = %e,
+                path = %store.path().display(),
+                "failed to read token store; treating as empty"
+            );
+            None
+        });
         let state = Arc::new(CopilotState {
             tokens: RwLock::new(initial),
             store,
@@ -156,7 +164,15 @@ impl CopilotProvider {
     pub async fn refresh_token(&self) -> Result<()> {
         let _guard = self.state.refresh_lock.lock().await;
 
-        let existing = self.state.store.load().unwrap_or(None);
+        let existing = self.state.store.load().unwrap_or_else(|e| {
+            tracing::warn!(
+                provider = "copilot",
+                error = %e,
+                path = %self.state.store.path().display(),
+                "failed to read token store; treating as empty"
+            );
+            None
+        });
         let github_token = match existing.as_ref() {
             Some(t) => t.github_access_token.clone(),
             None => device_flow_blocking(&self.http).await?,
@@ -948,6 +964,81 @@ mod tests {
             "fresh-copilot-token"
         );
         drop(memory);
+        let disk = provider.state.store.load().unwrap().unwrap();
+        assert_eq!(disk.github_access_token, "device-flow-github");
+        assert_eq!(disk.copilot_token, "fresh-copilot-token");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_token_proceeds_when_store_load_fails() {
+        // When the token store exists but is unreadable (here: contains
+        // corrupted JSON), refresh_token must NOT silently treat the
+        // failure as "no token" and proceed to device flow — it must log
+        // the error so the operator can see why their credentials didn't
+        // load. The end-state is still Ok (device flow runs), but the
+        // log path is exercised.
+        let _env_guard = crate::oauth::device_flow::ENV_LOCK.lock().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/login/device/code"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "device_code": "df-device",
+                "user_code": "DF-CODE",
+                "verification_uri": "https://example.test/device",
+                "expires_in": 600,
+                "interval": 5,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/login/oauth/access_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "device-flow-github"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/copilot_internal/v2/token"))
+            .and(header("authorization", "token device-flow-github"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "token": "fresh-copilot-token",
+                "expires_at": now() + 900,
+                "refresh_in": 800
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        std::env::set_var("LLMPROXY_TEST_GITHUB_BASE_URL", &server.uri());
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("github_token.json");
+        // Write corrupted JSON so load() returns Err(Json).
+        std::fs::write(&store_path, b"{not valid json").unwrap();
+        let store = TokenStore::from_path(store_path);
+        let state = Arc::new(CopilotState {
+            tokens: RwLock::new(None),
+            store,
+            refresh_lock: Mutex::new(()),
+        });
+        let provider = CopilotProvider {
+            name: "copilot".to_string(),
+            vscode_version: "1.95.0".to_string(),
+            account_type: "individual".to_string(),
+            http: reqwest::Client::new(),
+            state,
+            api_base_override: Some(server.uri()),
+            copilot_token_url: format!("{}/copilot_internal/v2/token", server.uri()),
+        };
+        let _auto_advance = spawn_test_time_advance();
+
+        // The load error is logged (warn-level) but does not abort the
+        // refresh path. Device flow still runs because existing=None.
+        provider.refresh_token().await.unwrap();
+        std::env::remove_var("LLMPROXY_TEST_GITHUB_BASE_URL");
+
+        // The corrupted file is replaced by the device-flow result.
         let disk = provider.state.store.load().unwrap().unwrap();
         assert_eq!(disk.github_access_token, "device-flow-github");
         assert_eq!(disk.copilot_token, "fresh-copilot-token");
