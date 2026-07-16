@@ -102,6 +102,11 @@ impl Router {
             tried.push(name.clone());
 
             // Try the primary provider up to max_retries_per_provider times.
+            // Each attempt that returns a cooldownable error marks the
+            // provider on cooldown and falls through to the next iteration;
+            // when the loop exhausts, control returns to the outer chain
+            // loop which moves to the next provider. We do NOT `break` on
+            // the first error — that's the whole point of this counter.
             for _ in 0..model.max_retries_per_provider {
                 match provider.complete(req, &HashMap::new()).await {
                     Ok(out) => return Ok((out, attempts)),
@@ -120,7 +125,6 @@ impl Router {
                             self.cooldown
                                 .mark_cooldown(name, ttl, *status, &body)
                                 .await;
-                            break; // fall through to next provider in chain
                         } else {
                             return Err(e);
                         }
@@ -167,6 +171,11 @@ impl Router {
             };
             tried.push(name.clone());
 
+            // Streaming has no inner retry: a stream() call is a single HTTP
+            // request whose response begins streaming immediately on
+            // success. Retrying after the first byte has flowed is unsafe
+            // (we'd double-emit content to the client), so the per-provider
+            // attempt count for streaming is implicitly 1.
             match provider.stream(req, &HashMap::new()).await {
                 Ok(out) => return Ok((provider, out, attempts)),
                 Err(e) if e.is_cooldownable() => {
@@ -361,6 +370,119 @@ mod tests {
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].provider, "primary");
         assert_eq!(attempts[0].status, 429);
+    }
+
+    #[tokio::test]
+    async fn complete_retries_per_provider_count() {
+        // max_retries_per_provider must actually retry against the same
+        // provider. Configure primary to fail twice then succeed, with
+        // max_retries_per_provider = 3 — the third attempt must hit
+        // primary (not the backup) and produce a successful response.
+        let call_count = Arc::new(AtomicU32::new(0));
+        let primary = Arc::new(CountingMockProvider {
+            name: "primary".into(),
+            fail_count: 2,
+            call_count: call_count.clone(),
+        }) as SharedProvider;
+        let backup = Arc::new(CountingMockProvider {
+            name: "backup".into(),
+            fail_count: 0,
+            call_count: Arc::new(AtomicU32::new(0)),
+        }) as SharedProvider;
+
+        let mut providers = HashMap::new();
+        providers.insert("primary".to_string(), primary);
+        providers.insert("backup".to_string(), backup);
+
+        let cfg = Config {
+            server: Default::default(),
+            proxy: Default::default(),
+            providers: vec![
+                ProviderConfig::OpenaiCompat {
+                    name: "primary".into(),
+                    api_key: "k".into(),
+                    api_base: "http://x".into(),
+                    model_rewrite: Default::default(),
+                },
+                ProviderConfig::OpenaiCompat {
+                    name: "backup".into(),
+                    api_key: "k".into(),
+                    api_base: "http://x".into(),
+                    model_rewrite: Default::default(),
+                },
+            ],
+            models: vec![ModelConfig {
+                name: "m".into(),
+                primary: "primary".into(),
+                fallback_chain: vec!["backup".into()],
+                cooldown_seconds: 60,
+                max_retries_per_provider: 3,
+                max_retries_total: 3,
+            }],
+            logging: Default::default(),
+        };
+        let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
+        let model = router.find_model("m").unwrap();
+
+        let (out, attempts) = router.complete(model, &dummy_request()).await.unwrap();
+        assert!(matches!(out, ProviderOutput::Json(_)));
+        // Primary was hit exactly 3 times: 2 failures + 1 success.
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+        // The attempts vector records the two failures before the success.
+        assert_eq!(attempts.len(), 2);
+        for a in &attempts {
+            assert_eq!(a.provider, "primary");
+            assert_eq!(a.status, 429);
+        }
+    }
+
+    /// Helper for `complete_retries_per_provider_count`: like MockProvider
+    /// but tracks call count in an externally-shared AtomicU32 so the
+    /// assertion can read it.
+    struct CountingMockProvider {
+        name: String,
+        fail_count: u32,
+        call_count: Arc<AtomicU32>,
+    }
+
+    #[async_trait]
+    impl Provider for CountingMockProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn api_format(&self) -> ApiFormat {
+            ApiFormat::Openai
+        }
+        async fn complete(
+            &self,
+            _req: &MessagesRequest,
+            _model_rewrite: &HashMap<String, String>,
+        ) -> Result<ProviderOutput> {
+            let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_count {
+                return Err(ProxyError::Upstream {
+                    status: 429,
+                    body: format!("fail #{n}"),
+                });
+            }
+            Ok(ProviderOutput::Json(serde_json::json!({
+                "id": "msg_ok",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ok"}],
+                "model": "m",
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+        }
+        async fn stream(
+            &self,
+            _req: &MessagesRequest,
+            _model_rewrite: &HashMap<String, String>,
+        ) -> Result<ProviderOutput> {
+            unimplemented!()
+        }
     }
 
     #[tokio::test]
