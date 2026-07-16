@@ -523,3 +523,44 @@ async fn all_providers_failed_includes_header_and_last_body() {
         "expected last upstream body in response, got: {body_str}"
     );
 }
+
+#[tokio::test]
+async fn stream_chain_exhaustion_includes_failed_providers_header() {
+    // Streaming-path counterpart of
+    // `all_providers_failed_includes_header_and_last_body`: both
+    // providers fail at stream() time with cooldownable statuses, so
+    // the chain is exhausted before any bytes start flowing. The
+    // client must see `x-llmproxy-failed-providers` summarising which
+    // providers were tried (otherwise it just sees a 5xx with no clue
+    // why). See fix-R9 in docs/TEST_ISSUES.md.
+    let app = build_app(
+        None,
+        provider(
+            "primary",
+            CompleteBehavior::Json,
+            StreamBehavior::Error(429),
+        ),
+        Some(provider(
+            "backup",
+            CompleteBehavior::Json,
+            StreamBehavior::Error(503),
+        )),
+    );
+
+    let response = app
+        .oneshot(test_request(
+            Method::POST,
+            "/v1/messages",
+            Some(messages_request(true)),
+        ))
+        .await
+        .unwrap();
+
+    // Last upstream status (503) is forwarded as the response status;
+    // 429 is non-terminal so the chain falls through to backup.
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response.headers()["x-llmproxy-failed-providers"],
+        "primary:429,backup:503"
+    );
+}

@@ -478,6 +478,8 @@ HTTP/1.1 500 Internal Server Error
 
 **建议**：在集成测试里加一个 mock 上游的端到端测试（用 `tower::Service::oneshot` + mock provider 始终返回 429），验证真实链路触发 `x-llmproxy-failed-providers` header；目前 header 行为只在 `tests/server.rs` 用 mock router 验证，没经过 `Router::complete` 真实链路。
 
+**状态（2026-07-16 第六轮 commit）**：覆盖已补齐。`tests/server.rs::all_providers_failed_includes_header_and_last_body` 已经走真实 `Router::complete` 链路（非流式链耗尽，header `primary:500,backup:500`），所以非流式端到端覆盖之前就成立；本轮新增 `stream_chain_exhaustion_includes_failed_providers_header` 走流式路径：两个 provider 的 `stream()` 都返回 cooldownable Err，handler 路径在 `router.stream()?` 处拿到 `AllProvidersFailed`，`IntoResponse` 透传最后一段 status（503）+ header `primary:429,backup:503`。完整链路 `axum → messages_handler → router.stream → AllProvidersFailed → IntoResponse → header` 现在两条路径都有集成测试覆盖。
+
 #### R1 已修（验证）
 
 Commit 1（`fix(openai_compat): surface upstream error envelope on HTTP 200`）确实修了 R1 的原报告路径：用直接 curl 探测 `https://openrouter.ai/api/v1/chat/completions` 返回 `{"error":{"message":"...","code":401}}`（67 字节），经 `OpenAiCompatProvider` 解析后正确转为 `Upstream { status: 401, body }` 并以原 JSON 透传给客户端。R8 是 fix F 的另一处遗漏，不是 R1 复发。
