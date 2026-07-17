@@ -5,7 +5,7 @@
 
 server:
   # Address the proxy listens on.
-  listen: "0.0.0.0:8080"
+  listen: "0.0.0.0:9090"
   # Shared API key clients send via `Authorization: Bearer <key>` (or
   # `x-api-key`). Leave unset to disable auth (only safe when bound to 127.0.0.1).
   api_key: "${LLMPROXY_API_KEY}"
@@ -45,8 +45,9 @@ providers:
     api_key: "${DEEPSEEK_API_KEY}"
     api_base: "https://api.deepseek.com/v1"
     model_rewrite:
-      "claude-sonnet-4-5": "deepseek-chat"
-      "claude-opus-4":     "deepseek-reasoner"
+      "claude-haiku-4.6": "deepseek-v4-flash"
+      "claude-sonnet-4.6": "deepseek-v4-flash"
+      "claude-opus-4.6":     "deepseek-v4-pro"
 
   # ─── MiniMax / MiniMax (OpenAI-compatible) ───────────────────
   - name: minimax
@@ -54,15 +55,38 @@ providers:
     api_key: "${MINIMAX_API_KEY}"
     api_base: "https://api.minimax.chat/v1"
     model_rewrite:
-      "claude-sonnet-4-5": "MiniMax-Text-01"
-      "claude-opus-4":     "abab6.5s-chat"
+      "claude-haiku-4.6": "MiniMax-M2.7"
+      "claude-sonnet-4.6": "MiniMax-M3"
+      "claude-opus-4.6":     "MiniMax-M3"
+
+  # ─── OpenCode Zen (free-tier OpenAI-compatible gateway) ──────────
+  # Public endpoint at https://opencode.ai/zen/v1. Bearer auth via
+  # OPENCODE_API_KEY; free-tier accounts can only call `-free` models
+  # (hy3-free, mimo-v2.5-free, deepseek-v4-flash-free, ...). Any
+  # paid-tier model name returns 401 CreditsError. Mappings below
+  # point Claude names at the free models.
+  - name: opencode_zen
+    type: openai_compat
+    api_key: "${OPENCODE_API_KEY}"
+    api_base: "https://opencode.ai/zen/v1"
+    model_rewrite:
+      "claude-haiku-4.6": "hy3-free"
+      "claude-sonnet-4.6": "mimo-v2.5-free"
+      "claude-opus-4.6": "mimo-v2.5-free"
 
 # Map a Claude Code model name to a primary provider plus a fallback chain.
 # When the primary returns 429 / 5xx / 401, the proxy auto-cools it down and
 # retries on the next provider in the chain.
 models:
-  - name: claude-sonnet-4-5
-    primary: openrouter_anthropic
+  - name: claude-haiku-4.6
+    primary: deepseek
+    fallback_chain:
+      - copilot
+    cooldown_seconds: 300          # how long to block the provider after a 429
+    max_retries_per_provider: 2
+
+  - name: claude-sonnet-4.6
+    primary: deepseek
     fallback_chain:
       - openrouter_openai
       - copilot
@@ -76,9 +100,22 @@ models:
     fallback_chain: [openrouter_openai, deepseek, minimax, copilot]
     cooldown_seconds: 300
 
+  - name: claude-sonnet-4.6
+    primary: deepseek
+    fallback_chain:
+      - openrouter_openai
+      - copilot
+      - openrouter_anthropic
+      - minimax
+    cooldown_seconds: 300
+    max_retries_per_provider: 2
+
   - name: gpt-4o
     primary: openrouter_openai
     fallback_chain: [copilot, deepseek]
+
+  - name: deepseek-v4-flash-free
+    primary: opencode_zen
 
 logging:
   level: info   # trace | debug | info | warn | error

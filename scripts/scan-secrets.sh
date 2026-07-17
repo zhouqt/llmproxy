@@ -62,7 +62,11 @@ PATTERNS=(
 )
 
 # Whitelisted substrings — known-safe values used by tests / docs.
-WHITELIST_REGEX='sk-llmproxy-1234'
+# sk-llmproxy-1234: integration-test key (wiremock + live container)
+# sk-fakeabc123def456ghi789jkl012: scanner's own documentation example
+#   in scripts/hooks/pre-commit's commit message; intentionally a fake
+#   key that exercises the `FOUND` path without being a real secret.
+WHITELIST_REGEX='sk-llmproxy-1234|sk-fakeabc123def456ghi789jkl012'
 
 matches=0
 
