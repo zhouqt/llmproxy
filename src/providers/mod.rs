@@ -31,6 +31,17 @@ pub trait Provider: Send + Sync {
     fn api_format(&self) -> ApiFormat;
     async fn complete(&self, req: &MessagesRequest, model_rewrite: &std::collections::HashMap<String, String>) -> Result<ProviderOutput>;
     async fn stream(&self, req: &MessagesRequest, model_rewrite: &std::collections::HashMap<String, String>) -> Result<ProviderOutput>;
+    /// Whether this provider can serve `model` without the proxy sending an
+    /// unmapped name upstream. Providers with an empty rewrite table accept
+    /// any model name verbatim (they expose a model catalog of their own);
+    /// providers with a non-empty rewrite table only accept names that are
+    /// keys in that table. The router uses this to skip providers that
+    /// would otherwise forward an unsupported model and trip a 400 from
+    /// upstream — see fix-R11 in docs/TEST_ISSUES.md.
+    fn can_serve_model(&self, model: &str) -> bool {
+        let _ = model;
+        true
+    }
     /// Optionally spawn a background task (e.g. token refresh). Returns a
     /// handle the server can abort on shutdown.
     fn spawn_background(self: Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {

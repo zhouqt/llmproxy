@@ -544,6 +544,31 @@ HTTP/1.1 500 Internal Server Error
 
 **状态（2026-07-17 第九轮 commit）**：建议已修。`ChatResponse.object` / `ChatChunk.object` 加 `#[serde(default = "...")]` 填充合理默认值；`ChatResponse.created` / `ChatChunk.created` 加 `#[serde(default)]` 填充 0。容器重建后实测：`gpt-4o` 走 `openrouter_openai 401 (×2)` → `copilot` 成功 fallback，响应 `{"role":"assistant","content":[{"text":"Hello! How can I assist you today? 😊"}],...}`，header `x-llmproxy-failed-providers: openrouter_openai:401,openrouter_openai:401`。流式同样验证：`event: message_start` → `event: content_block_delta`（"Hello" → "!" → " How" → ...） → `event: message_delta` + `event: message_stop`，符合 Anthropic SSE 规范。新增三个单测锁定语义：`chat_response_accepts_missing_object_field`（用真实 Copilot 响应形状反序列化、验证 `object` 默认值）、`chat_response_accepts_missing_created_field`、`chat_chunk_accepts_missing_object_field`。
 
+#### R11（P1）：未映射到 provider 的 model name 会切断 fallback 链
+
+**复现**：`claude-sonnet-4.5` 模型请求（chain：`deepseek` → `openrouter_openai` → `copilot` → `openrouter_anthropic` → `minimax`）。`deepseek` / `minimax` 的 `model_rewrite` 只声明了 `claude-{haiku,sonnet,opus}-4.6`，不包含 `claude-sonnet-4.5`；`copilot` 使用 dynamic catalog，请求时会拒绝不在其 catalog 中的名字。
+
+**问题**：两种独立但同源的失败路径：
+1. **dispatch 前**：`Router` 没有任何机制判断"这个 provider 的 `model_rewrite` 不包含这个 model"。直接把名字转发给上游 → 上游返回 `400` + 含 `model_not_supported` 的 JSON。`is_cooldownable()` 只认 `401/404/408/429/5xx`，400 不在内 → chain 立刻 `Err(e) => return Err(e)` 终止,fallback 退化为单点试错。
+2. **runtime**：即使 client 切到已声明的 `claude-sonnet-4.6`，copilot 的 400 + `model_not_supported` body 仍然把整条链切断。client 看到的是 `400` + 上游的错误消息，完全无法触达下游的 deepseek / openrouter / minimax。
+
+这两种情况都在没有 R11 的修复前表现为同一个症状：chain 在中途的死胡同上挂掉，诊断信息完全不可见。
+
+**修复路径**：
+1. `Provider` trait 加 `can_serve_model(model: &str) -> bool` 钩子，默认 `true`；`OpenAiCompatProvider` 实现为 `self.model_rewrite.is_empty() || self.model_rewrite.contains_key(model)`。空表语义是"provider 暴露自己的 model catalog，名字原样转发"；非空表语义是"严格允许列表"。
+2. `Router::complete` 和 `Router::stream` 在 dispatch 前调用 `can_serve_model`：跳过的 provider 进入 `unmappable` 列表（不计入 attempts，避免污染 `x-llmproxy-failed-providers` header）。
+3. **整条 chain 全部 unmappable** 时返回 `ProxyError::BadRequest(...)`（400 + 清晰消息"no provider in chain 'X' can serve model 'Y'"），让 operator 立刻看到是配置 gap 而非上游故障。
+4. 新增内部 `is_model_unsupported(err: &ProxyError) -> bool` heuristic：400-class status + body 含 `not supported` / `not_supported` / `not_found` / `not exist` / `not a valid` / `model_not_*` 子串，或 DeepSeek 风格的"`supported api model` ... `you passed`"。匹配时按 60s TTL 标记该 provider 冷却、记录 attempt，继续走下一个 provider。
+5. heuristic 故意排除裸 `"model"`（`"missing field `model`"` 仍必须 surface 给 operator），以及非 4xx status（5xx + 含 model 的错误仍走原有 cooldownable 分支）。
+
+**优先级**：P1 — 任何 provider 把 supported_models 当真相源（Copilot dynamic catalog、DeepSeek 严格白名单、其他 OpenAI-compat 服务）都会触发，整条 fallback 形同虚设，client 经常只能看到上游的原始 400。
+
+**状态（2026-07-17 第十轮 commit）**：建议已修。
+- `src/providers/mod.rs` 加 trait method + 默认实现 `true`（其他 provider 不受影响）。
+- `src/providers/openai_compat.rs` 实现 `can_serve_model` + 2 个单测 `can_serve_model_accepts_anything_when_rewrite_is_empty` / `can_serve_model_matches_keys_when_rewrite_is_non_empty`。
+- `src/router.rs` 新增 `is_model_unsupported` 模块级 helper + dispatch skip + runtime skip + BadRequest 三层语义。`Router::complete` / `Router::stream` 都改：`unmappable` 与 `tried` 分开记录（前者只用于"全 unmappable"判定），新增两个错误分支（`Err(e) if is_model_unsupported(&e)` 处理 400 + model body），新增 5 个新测试覆盖 dispatch path（`complete_skips_provider_that_cannot_serve_model_and_uses_next` / `complete_returns_bad_request_when_no_provider_can_serve_model` / `complete_skips_mismatched_provider_but_still_falls_back_on_cooldownable_error` / `stream_skips_provider_that_cannot_serve_model_and_uses_next` / `stream_returns_bad_request_when_no_provider_can_serve_model`）+ 1 个 runtime 测试 (`complete_skips_provider_returning_runtime_model_unsupported`) + 1 个反向测试 (`complete_does_not_skip_provider_returning_generic_400` 验证 generic 400 仍 surface 错误，不会被 heuristic 误吞) + 2 个 helper 测试 (`is_model_unsupported_recognises_common_shapes` 覆盖 Copilot / DeepSeek / OpenAI 三种 envelope，以及反向 `is_model_unsupported_only_for_4xx_status`)。
+- 全量回归：`cargo test --lib --tests` 通过 188 + 13 + 7 + 14 = 222 个测试。
+
 #### 其他修复验证
 
 - **fix A**（`max_retries_per_provider`）：container log 中每个 provider 在同一请求内被 mark cooldown 2 次（`max_retries_per_provider: 2`），符合预期。

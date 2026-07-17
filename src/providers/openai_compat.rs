@@ -67,6 +67,15 @@ impl Provider for OpenAiCompatProvider {
         ApiFormat::Openai
     }
 
+    fn can_serve_model(&self, model: &str) -> bool {
+        // Empty rewrite table means "this provider exposes its own model
+        // catalog — pass the name through verbatim". A non-empty table
+        // is an explicit allow-list; the proxy must not forward names
+        // that aren't in it, because doing so produces a misleading 400
+        // from the upstream and breaks the fallback chain — see fix-R11.
+        self.model_rewrite.is_empty() || self.model_rewrite.contains_key(model)
+    }
+
     async fn complete(
         &self,
         req: &MessagesRequest,
@@ -680,5 +689,44 @@ mod tests {
             matches!(poll, std::task::Poll::Pending),
             "expected Poll::Pending from a pending inner stream"
         );
+    }
+
+    fn provider_with_rewrite(rewrite: HashMap<String, String>) -> OpenAiCompatProvider {
+        OpenAiCompatProvider::new(
+            "p".to_string(),
+            "https://x/v1/".to_string(),
+            "k".to_string(),
+            rewrite,
+            reqwest::Client::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn can_serve_model_accepts_anything_when_rewrite_is_empty() {
+        // An empty model_rewrite means "this provider exposes its own
+        // model catalog; pass names through verbatim" — see fix-R11.
+        let p = provider_with_rewrite(HashMap::new());
+        assert!(p.can_serve_model("any-random-name"));
+        assert!(p.can_serve_model("claude-sonnet-4.5"));
+        assert!(p.can_serve_model(""));
+    }
+
+    #[test]
+    fn can_serve_model_matches_keys_when_rewrite_is_non_empty() {
+        let mut rewrite = HashMap::new();
+        rewrite.insert("claude-haiku-4.6".to_string(), "deepseek-v4-flash".to_string());
+        rewrite.insert("claude-sonnet-4.6".to_string(), "deepseek-v4-flash".to_string());
+        let p = provider_with_rewrite(rewrite);
+
+        // Mapped names are accepted.
+        assert!(p.can_serve_model("claude-haiku-4.6"));
+        assert!(p.can_serve_model("claude-sonnet-4.6"));
+
+        // Unmapped names are rejected — forwarding them would surface
+        // as a misleading 400 from upstream and break the fallback chain.
+        assert!(!p.can_serve_model("claude-sonnet-4.5"));
+        assert!(!p.can_serve_model("gpt-4o"));
+        assert!(!p.can_serve_model(""));
     }
 }
