@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Git pre-commit hook — runs scripts/scan-secrets.sh (full audit).
+# Block commits when an API key pattern is detected anywhere in the
+# working tree or git history.
+#
+# This file lives at scripts/hooks/pre-commit in the repo. After
+# cloning, run scripts/install-hooks.sh once to symlink it into
+# .git/hooks/.
+#
+# We invoke scan-secrets.sh via $0's dirname rather than a hardcoded
+# path so the hook keeps working if the repo is moved or symlinked
+# (e.g. the Dropbox-synced mirror at /home/zhouqt/src/llmproxy).
+
+set -euo pipefail
+
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$HOOK_DIR/../.." && pwd)"
+SCAN="$REPO_ROOT/scripts/scan-secrets.sh"
+
+if [ ! -x "$SCAN" ]; then
+  echo "scan-secrets.sh not found or not executable at $SCAN" >&2
+  echo "Run scripts/install-hooks.sh first, or fix the path." >&2
+  exit 2
+fi
+
+exec "$SCAN"
