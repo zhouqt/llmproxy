@@ -48,6 +48,18 @@ pub struct ChatRequest {
     pub user: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// OpenAI prompt-cache namespace. Set by the request translator
+    /// when the Anthropic client sent any `cache_control` block AND
+    /// provided `metadata.user_id`; otherwise `None` so the field is
+    /// absent from the wire. See `conversion::cache_hint`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    /// OpenAI prompt-cache TTL. `"in_memory"` (~5–10 min) maps to
+    /// Anthropic's `ephemeral` / `ephemeral_5m`; `"24h"` maps to
+    /// Anthropic's `ephemeral_1h`. `None` when the request had no
+    /// `cache_control` markers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_retention: Option<String>,
     #[serde(flatten)]
     pub extra: Value,
 }
