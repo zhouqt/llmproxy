@@ -66,11 +66,20 @@ providers:
   #   account_type   — "individual" | "business" | "enterprise".
   #                    Determines which Copilot SKU the proxy targets.
   #                    Default: "individual".
+  #   model_rewrite  — optional map: incoming-model-name → upstream-model-name.
+  #                    Empty (default) accepts any model name verbatim —
+  #                    the proxy forwards the Anthropic `model` value as-is
+  #                    to Copilot's Chat Completions endpoint. A non-empty
+  #                    table is an explicit allow-list: only model names
+  #                    present as keys are considered servable, and the
+  #                    mapped value is sent upstream (useful when routing
+  #                    `claude-sonnet-4.6` to a Copilot-side alias).
   #   use_proxy      — see top-of-file proxy section. Default: false.
   - name: copilot
     type: github_copilot
     vscode_version: "1.95.0"
     account_type: individual
+    model_rewrite: {}
     use_proxy: true
 
   # ─── anthropic (native Anthropic Messages passthrough) ──────────────
