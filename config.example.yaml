@@ -2,38 +2,93 @@
 #
 # Copy to config.yaml, fill in API keys (or set as env vars), then run:
 #   cargo run --release -- --config config.yaml
+#
+# Environment variable expansion: any `${VAR}` or `$VAR` reference is
+# expanded from the process environment at startup. This is how API keys
+# are typically injected.
 
+# ───────────────────────────────────────────────────────────────────────
+# server: incoming HTTP listener
+# ───────────────────────────────────────────────────────────────────────
 server:
-  # Address the proxy listens on.
-  listen: "0.0.0.0:9090"
-  # Shared API key clients send via `Authorization: Bearer <key>` (or
-  # `x-api-key`). Leave unset to disable auth (only safe when bound to 127.0.0.1).
+  # Address:port the proxy binds to. Use 127.0.0.1 to keep it
+  # local-only; 0.0.0.0 to expose on all interfaces.
+  # Default if omitted: 127.0.0.1:8080.
+  listen: "0.0.0.0:8080"
+
+  # Shared bearer token clients send via `Authorization: Bearer <key>`
+  # (or `x-api-key: <key>`). Supports ${ENV_VAR} expansion. Leave unset
+  # to disable authentication — only safe when listen is bound to
+  # 127.0.0.1, otherwise any reachable client can use the proxy.
   api_key: "${LLMPROXY_API_KEY}"
 
-# Outgoing proxy for all provider requests. Supports http://, https://,
-# socks5://, socks5h://. Useful for routing around regional blocks.
-# Per-provider opt-in via `use_proxy: true` on each provider below —
-# any provider without it bypasses the global proxy and connects
-# directly. Defaults to false.
+# ───────────────────────────────────────────────────────────────────────
+# proxy: outgoing proxy used by providers with `use_proxy: true`
+# ───────────────────────────────────────────────────────────────────────
+# Per-provider opt-in via `use_proxy: true` on each provider below.
+# Any provider without it bypasses the global proxy and connects
+# directly. Defaults to false, so by default no provider uses the
+# proxy — enable it explicitly for the ones that need it.
+#
+# Supported schemes in `url`:
+#   socks5h://host:port  — SOCKS5, remote DNS resolution (recommended)
+#   socks5://host:port   — SOCKS5, local DNS resolution
+#   http://host:port     — HTTP CONNECT
+#   https://host:port    — HTTPS CONNECT
+#
 # proxy:
-#   url: "socks5://127.0.0.1:1080"
+#   url: "socks5h://192.168.122.1:6666"
+#   # timeout_secs: per-request timeout for proxied providers (seconds).
+#   # Direct providers inherit this too — see build_direct_client.
+#   # Default if omitted: 600.
 #   timeout_secs: 600
 
+# ───────────────────────────────────────────────────────────────────────
+# providers: backend LLM services the proxy can route to
+# ───────────────────────────────────────────────────────────────────────
+# Each provider is keyed by `name`; the `models:` section below refers
+# to providers by this name. The `type` field selects which struct
+# shape the rest of the entry must follow.
+
 providers:
-  # ─── GitHub Copilot ────────────────────────────────────────────────
-  # First request will trigger the device flow and print a one-time code.
-  # The token persists at ~/.local/share/llmproxy/github_token.json.
-  # `use_proxy: true` because GitHub's API is regionally blocked from
-  # the operator's network.
+  # ─── github_copilot ──────────────────────────────────────────────────
+  # Talks to GitHub Copilot's API using OAuth device flow. The first
+  # request after a fresh install will print a one-time code; visit the
+  # printed URL, paste the code, and the resulting token persists at:
+  #   $XDG_DATA_HOME/llmproxy/github_token.json
+  # (defaults to ~/.local/share/llmproxy/github_token.json)
+  #
+  # Fields:
+  #   name           — internal key referenced by `models:`
+  #   vscode_version — User-Agent string sent to GitHub. Some Copilot
+  #                    endpoints gate access by client version.
+  #                    Default: "1.95.0".
+  #   account_type   — "individual" | "business" | "enterprise".
+  #                    Determines which Copilot SKU the proxy targets.
+  #                    Default: "individual".
+  #   use_proxy      — see top-of-file proxy section. Default: false.
   - name: copilot
     type: github_copilot
     vscode_version: "1.95.0"
-    account_type: individual   # individual | business | enterprise
+    account_type: individual
     use_proxy: true
 
-  # ─── OpenRouter (Anthropic-compatible endpoint) ────────────────────
-  # OpenRouter is fronted by Cloudflare; on this network it works
-  # better through the proxy.
+  # ─── openrouter ──────────────────────────────────────────────────────
+  # OpenRouter serves both an Anthropic-compatible and an OpenAI-
+  # compatible endpoint on the same base URL. Pick `api_format` to
+  # tell the proxy which translation layer to use.
+  #
+  # Fields:
+  #   name        — internal key
+  #   api_key     — OpenRouter API key (supports ${ENV_VAR})
+  #   api_base    — defaults to https://openrouter.ai/api/v1
+  #   api_format  — "anthropic" (use Anthropic Messages shape upstream)
+  #                 or "openai" (use Chat Completions shape upstream).
+  #                 Affects only how the proxy translates requests;
+  #                 the response is always returned to the client in
+  #                 Anthropic Messages format.
+  #   use_proxy   — see proxy section. Default: false.
+
   - name: openrouter_anthropic
     type: openrouter
     api_key: "${OPENROUTER_API_KEY}"
@@ -41,7 +96,6 @@ providers:
     api_format: anthropic
     use_proxy: true
 
-  # ─── OpenRouter (OpenAI-compatible endpoint) ───────────────────────
   - name: openrouter_openai
     type: openrouter
     api_key: "${OPENROUTER_API_KEY}"
@@ -49,50 +103,87 @@ providers:
     api_format: openai
     use_proxy: true
 
-  # ─── DeepSeek (OpenAI-compatible) ──────────────────────────────────
+  # ─── openai_compat ───────────────────────────────────────────────────
+  # Any OpenAI-Chat-Completions-compatible endpoint. Used for DeepSeek,
+  # MiniMax, OpenCode Zen, and similar gateways.
+  #
+  # Fields:
+  #   name          — internal key
+  #   api_key       — Bearer token (supports ${ENV_VAR})
+  #   api_base      — base URL up to but not including /chat/completions,
+  #                  e.g. https://api.deepseek.com/v1
+  #   model_rewrite — optional map: incoming-Claude-name → upstream-model-name.
+  #                  If the requested model name has an entry here, the
+  #                  proxy sends the rewritten value upstream. If absent,
+  #                  the original name is forwarded as-is. Providers with
+  #                  an empty rewrite table accept any model name verbatim
+  #                  (the router skips them when a non-empty upstream-
+  #                  model mapping is required — see `can_serve_model`).
+  #   use_proxy     — see proxy section. Default: false.
+
   - name: deepseek
     type: openai_compat
     api_key: "${DEEPSEEK_API_KEY}"
     api_base: "https://api.deepseek.com/v1"
     model_rewrite:
-      "claude-haiku-4.6": "deepseek-v4-flash"
+      "claude-haiku-4.6":  "deepseek-v4-flash"
       "claude-sonnet-4.6": "deepseek-v4-flash"
-      "claude-opus-4.6":     "deepseek-v4-pro"
+      "claude-opus-4.6":    "deepseek-v4-pro"
 
-  # ─── MiniMax / MiniMax (OpenAI-compatible) ───────────────────
   - name: minimax
     type: openai_compat
     api_key: "${MINIMAX_API_KEY}"
     api_base: "https://api.minimax.chat/v1"
     model_rewrite:
-      "claude-haiku-4.6": "MiniMax-M2.7"
+      "claude-haiku-4.6":  "MiniMax-M2.7"
       "claude-sonnet-4.6": "MiniMax-M3"
-      "claude-opus-4.6":     "MiniMax-M3"
+      "claude-opus-4.6":    "MiniMax-M3"
 
-  # ─── OpenCode Zen (free-tier OpenAI-compatible gateway) ──────────
-  # Public endpoint at https://opencode.ai/zen/v1. Bearer auth via
-  # OPENCODE_API_KEY; free-tier accounts can only call `-free` models
-  # (hy3-free, mimo-v2.5-free, deepseek-v4-flash-free, ...). Any
-  # paid-tier model name returns 401 CreditsError. Mappings below
-  # point Claude names at the free models.
+  # OpenCode Zen — free-tier public LLM gateway. Free accounts can only
+  # call `-free` models (hy3-free, mimo-v2.5-free, deepseek-v4-flash-free,
+  # ...); paid-model requests return 401 CreditsError. The rewrites below
+  # map Claude-style names to free model IDs so the provider works as a
+  # fallback for paid Claude models.
   - name: opencode_zen
     type: openai_compat
     api_key: "${OPENCODE_API_KEY}"
     api_base: "https://opencode.ai/zen/v1"
     model_rewrite:
-      "claude-haiku-4.6": "hy3-free"
+      "claude-haiku-4.6":  "hy3-free"
       "claude-sonnet-4.6": "mimo-v2.5-free"
-      "claude-opus-4.6": "mimo-v2.5-free"
+      "claude-opus-4.6":    "mimo-v2.5-free"
 
-# Map a Claude Code model name to a primary provider plus a fallback chain.
-# When the primary returns 429 / 5xx / 401, the proxy auto-cools it down and
-# retries on the next provider in the chain.
+# ───────────────────────────────────────────────────────────────────────
+# models: client-facing model names mapped to a routing chain
+# ───────────────────────────────────────────────────────────────────────
+# `name` is what clients send in the `model` field of /v1/messages.
+# The proxy walks the chain [primary, fallback_chain...] in order,
+# skipping any provider currently in cooldown, and returns the first
+# successful response.
+#
+# Fields:
+#   name                    — client-facing model name (the value clients
+#                             send in `model`). Any string.
+#   primary                 — provider name tried first.
+#   fallback_chain          — ordered list of provider names tried when
+#                             the current one returns a cooldownable
+#                             error (429, 401, 408, 404, 5xx).
+#   cooldown_seconds        — TTL on the per-provider cooldown set after
+#                             a cooldownable error. Default: 300 (5 min).
+#                             After the TTL the provider is retried.
+#   max_retries_per_provider — how many times to retry the same provider
+#                             (across cooldown cycles) before moving to
+#                             the next in the chain. Default: 2.
+#   max_retries_total       — overall cap across the whole chain. When
+#                             reached the request fails with
+#                             AllProvidersFailed carrying the last
+#                             upstream error. Default: 2.
 models:
   - name: claude-haiku-4.6
     primary: deepseek
     fallback_chain:
       - copilot
-    cooldown_seconds: 300          # how long to block the provider after a 429
+    cooldown_seconds: 300
     max_retries_per_provider: 2
 
   - name: claude-sonnet-4.6
@@ -102,7 +193,7 @@ models:
       - copilot
       - deepseek
       - minimax
-    cooldown_seconds: 300          # how long to block the provider after a 429
+    cooldown_seconds: 300
     max_retries_per_provider: 2
 
   - name: claude-opus-4
@@ -110,6 +201,9 @@ models:
     fallback_chain: [openrouter_openai, deepseek, minimax, copilot]
     cooldown_seconds: 300
 
+  # Second claude-sonnet-4.6 entry (duplicate). YAML parsers accept
+  # duplicate keys; the last one wins. Left in to preserve any
+  # operator overrides that target this exact slot.
   - name: claude-sonnet-4.6
     primary: deepseek
     fallback_chain:
@@ -117,6 +211,7 @@ models:
       - copilot
       - openrouter_anthropic
       - minimax
+      - opencode_zen
     cooldown_seconds: 300
     max_retries_per_provider: 2
 
@@ -127,6 +222,13 @@ models:
   - name: deepseek-v4-flash-free
     primary: opencode_zen
 
+# ───────────────────────────────────────────────────────────────────────
+# logging
+# ───────────────────────────────────────────────────────────────────────
 logging:
-  level: info   # trace | debug | info | warn | error
-  format: pretty  # pretty | json
+  # level: trace | debug | info | warn | error (RUST_LOG syntax also
+  # accepted via env var, e.g. RUST_LOG=llmproxy=debug,tower_http=info).
+  level: info
+  # format: pretty (default, human-readable) | json (one structured
+  # JSON object per line, suitable for log aggregators).
+  format: pretty
