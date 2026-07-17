@@ -73,35 +73,43 @@ providers:
     account_type: individual
     use_proxy: true
 
-  # ─── openrouter ──────────────────────────────────────────────────────
-  # OpenRouter serves both an Anthropic-compatible and an OpenAI-
-  # compatible endpoint on the same base URL. Pick `api_format` to
-  # tell the proxy which translation layer to use.
+  # ─── anthropic (native Anthropic Messages passthrough) ──────────────
+  # Talks to any backend exposing the native Anthropic Messages API
+  # (i.e. POST /v1/messages with anthropic-version header). The proxy
+  # forwards the request body verbatim and streams the response
+  # unchanged — no request/response translation. Use this for
+  # OpenRouter's `/api/v1/messages` endpoint, AWS Bedrock with an
+  # Anthropic-compatible adapter, or any other gateway speaking
+  # Anthropic Messages without conversion.
+  #
+  # For OpenAI Chat Completions-style upstreams use `type: openai_compat`
+  # below instead.
   #
   # Fields:
-  #   name        — internal key
-  #   api_key     — OpenRouter API key (supports ${ENV_VAR})
-  #   api_base    — defaults to https://openrouter.ai/api/v1
-  #   api_format  — "anthropic" (use Anthropic Messages shape upstream)
-  #                 or "openai" (use Chat Completions shape upstream).
-  #                 Affects only how the proxy translates requests;
-  #                 the response is always returned to the client in
-  #                 Anthropic Messages format.
-  #   use_proxy   — see proxy section. Default: false.
+  #   name          — internal key
+  #   api_key       — bearer token (supports ${ENV_VAR})
+  #   api_base      — base URL up to but not including `/v1/messages`,
+  #                   defaults to https://openrouter.ai/api/v1
+  #   model_rewrite — optional map: incoming-model-name → upstream-model-name.
+  #                   Empty (default) accepts any model name verbatim;
+  #                   a non-empty table is an explicit allow-list (the
+  #                   router skips this provider for unmapped names).
+  #   use_proxy     — see proxy section. Default: false.
 
   - name: openrouter_anthropic
-    type: openrouter
+    type: anthropic
     api_key: "${OPENROUTER_API_KEY}"
     api_base: "https://openrouter.ai/api/v1"
-    api_format: anthropic
     use_proxy: true
 
-  - name: openrouter_openai
-    type: openrouter
-    api_key: "${OPENROUTER_API_KEY}"
-    api_base: "https://openrouter.ai/api/v1"
-    api_format: openai
-    use_proxy: true
+  - name: minimax
+    type: anthropic
+    api_key: "${MINIMAX_API_KEY}"
+    api_base: "https://api.minimaxi.com/anthropic"
+    model_rewrite:
+      "claude-haiku-4.6":  "MiniMax-M2.7"
+      "claude-sonnet-4.6": "MiniMax-M3"
+      "claude-opus-4.6":    "MiniMax-M3"
 
   # ─── openai_compat ───────────────────────────────────────────────────
   # Any OpenAI-Chat-Completions-compatible endpoint. Used for DeepSeek,
@@ -130,15 +138,6 @@ providers:
       "claude-sonnet-4.6": "deepseek-v4-flash"
       "claude-opus-4.6":    "deepseek-v4-pro"
 
-  - name: minimax
-    type: openai_compat
-    api_key: "${MINIMAX_API_KEY}"
-    api_base: "https://api.minimax.chat/v1"
-    model_rewrite:
-      "claude-haiku-4.6":  "MiniMax-M2.7"
-      "claude-sonnet-4.6": "MiniMax-M3"
-      "claude-opus-4.6":    "MiniMax-M3"
-
   # OpenCode Zen — free-tier public LLM gateway. Free accounts can only
   # call `-free` models (hy3-free, mimo-v2.5-free, deepseek-v4-flash-free,
   # ...); paid-model requests return 401 CreditsError. The rewrites below
@@ -149,9 +148,10 @@ providers:
     api_key: "${OPENCODE_API_KEY}"
     api_base: "https://opencode.ai/zen/v1"
     model_rewrite:
-      "claude-haiku-4.6":  "hy3-free"
-      "claude-sonnet-4.6": "mimo-v2.5-free"
-      "claude-opus-4.6":    "mimo-v2.5-free"
+      "deepseek-v4-flash-free": "deepseek-v4-flash-free"
+      "claude-haiku-4.6": "deepseek-v4-flash-free"
+      "claude-sonnet-4.6": "deepseek-v4-flash-free"
+      "claude-opus-4.6": "deepseek-v4-flash-free"
 
 # ───────────────────────────────────────────────────────────────────────
 # models: client-facing model names mapped to a routing chain
@@ -160,6 +160,8 @@ providers:
 # The proxy walks the chain [primary, fallback_chain...] in order,
 # skipping any provider currently in cooldown, and returns the first
 # successful response.
+# YAML parsers accept duplicate keys; the last one wins. Left in to
+# preserve any operator overrides that target this exact slot.
 #
 # Fields:
 #   name                    — client-facing model name (the value clients
@@ -196,24 +198,10 @@ models:
     cooldown_seconds: 300
     max_retries_per_provider: 2
 
-  - name: claude-opus-4
+  - name: claude-opus-4.6
     primary: openrouter_anthropic
     fallback_chain: [openrouter_openai, deepseek, minimax, copilot]
     cooldown_seconds: 300
-
-  # Second claude-sonnet-4.6 entry (duplicate). YAML parsers accept
-  # duplicate keys; the last one wins. Left in to preserve any
-  # operator overrides that target this exact slot.
-  - name: claude-sonnet-4.6
-    primary: deepseek
-    fallback_chain:
-      - openrouter_openai
-      - copilot
-      - openrouter_anthropic
-      - minimax
-      - opencode_zen
-    cooldown_seconds: 300
-    max_retries_per_provider: 2
 
   - name: gpt-4o
     primary: openrouter_openai

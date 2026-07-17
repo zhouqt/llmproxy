@@ -79,12 +79,20 @@ pub enum ProviderConfig {
         #[serde(default)]
         use_proxy: bool,
     },
-    Openrouter {
+    /// Native Anthropic Messages passthrough provider. Sends the
+    /// Anthropic request body verbatim to `{api_base}/messages` and
+    /// streams the response unchanged. Used for OpenRouter's native
+    /// `/v1/messages` endpoint and any other gateway that speaks
+    /// Anthropic Messages without translation.
+    Anthropic {
         name: String,
         api_key: String,
-        #[serde(default = "default_api_base_openrouter")]
+        #[serde(default = "default_api_base_anthropic")]
         api_base: String,
-        api_format: ApiFormat,
+        #[serde(default)]
+        model_rewrite: HashMap<String, String>,
+        /// Whether this provider should route its outbound requests
+        /// through the global SOCKS/HTTP proxy. Defaults to `false`.
         #[serde(default)]
         use_proxy: bool,
     },
@@ -108,7 +116,7 @@ fn default_account_type() -> String {
     "individual".to_string()
 }
 
-fn default_api_base_openrouter() -> String {
+fn default_api_base_anthropic() -> String {
     "https://openrouter.ai/api/v1".to_string()
 }
 
@@ -116,7 +124,7 @@ impl ProviderConfig {
     pub fn name(&self) -> &str {
         match self {
             ProviderConfig::GithubCopilot { name, .. } => name,
-            ProviderConfig::Openrouter { name, .. } => name,
+            ProviderConfig::Anthropic { name, .. } => name,
             ProviderConfig::OpenaiCompat { name, .. } => name,
         }
     }
@@ -126,17 +134,10 @@ impl ProviderConfig {
     pub fn use_proxy(&self) -> bool {
         match self {
             ProviderConfig::GithubCopilot { use_proxy, .. }
-            | ProviderConfig::Openrouter { use_proxy, .. }
+            | ProviderConfig::Anthropic { use_proxy, .. }
             | ProviderConfig::OpenaiCompat { use_proxy, .. } => *use_proxy,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ApiFormat {
-    Openai,
-    Anthropic,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -399,9 +400,8 @@ providers:
   - name: copilot
     type: github_copilot
   - name: router
-    type: openrouter
+    type: anthropic
     api_key: key
-    api_format: anthropic
   - name: compat
     type: openai_compat
     api_key: key
@@ -424,13 +424,13 @@ models:
                     account_type,
                     ..
                 },
-                ProviderConfig::Openrouter { api_base, .. },
+                ProviderConfig::Anthropic { api_base, .. },
             ) => {
                 assert_eq!(vscode_version, "1.95.0");
                 assert_eq!(account_type, "individual");
                 assert_eq!(api_base, "https://openrouter.ai/api/v1");
             }
-            _ => panic!("expected [copilot, openrouter] providers"),
+            _ => panic!("expected [copilot, anthropic] providers"),
         }
         assert!(config.find_provider("router").is_some());
         assert!(config.find_provider("missing").is_none());
