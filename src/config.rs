@@ -496,4 +496,94 @@ models:
         let invalid = Config::parse("providers: [").unwrap_err();
         assert!(matches!(invalid, ProxyError::Yaml(_)));
     }
+
+    #[test]
+    fn openai_responses_variant_parses_yaml_with_defaults() {
+        // The new Responses API provider type must parse a minimal
+        // YAML block — model_rewrite and use_proxy have defaults so
+        // only the required fields (name, api_key, api_base) are
+        // strictly necessary.
+        let raw = r#"
+providers:
+  - name: openai_direct
+    type: openai_responses
+    api_key: "${OPENAI_API_KEY}"
+    api_base: "https://api.openai.com/v1"
+models:
+  - name: gpt-5
+    primary: openai_direct
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        match &cfg.providers[0] {
+            ProviderConfig::OpenaiResponses {
+                name,
+                api_key,
+                api_base,
+                model_rewrite,
+                use_proxy,
+            } => {
+                assert_eq!(name, "openai_direct");
+                assert_eq!(api_base, "https://api.openai.com/v1");
+                // api_key is the env-expanded value of ${OPENAI_API_KEY}
+                // which is unset in test, so it expands to empty.
+                assert_eq!(api_key, "");
+                assert!(model_rewrite.is_empty());
+                assert!(!use_proxy);
+            }
+            other => panic!("expected OpenaiResponses, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn openai_responses_variant_picks_up_model_rewrite_and_use_proxy() {
+        // Non-default fields must survive the YAML round-trip and be
+        // reachable via the accessor helpers.
+        let raw = r#"
+providers:
+  - name: openai_direct
+    type: openai_responses
+    api_key: "k"
+    api_base: "https://api.openai.com/v1"
+    model_rewrite:
+      "claude-sonnet-4.6": "gpt-5"
+      "claude-opus-4.6": "gpt-5"
+    use_proxy: true
+models:
+  - name: gpt-5
+    primary: openai_direct
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        let p = &cfg.providers[0];
+        assert_eq!(p.name(), "openai_direct");
+        assert!(p.use_proxy());
+        match p {
+            ProviderConfig::OpenaiResponses {
+                model_rewrite, ..
+            } => {
+                assert_eq!(model_rewrite.len(), 2);
+                assert_eq!(model_rewrite.get("claude-sonnet-4.6").unwrap(), "gpt-5");
+                assert_eq!(model_rewrite.get("claude-opus-4.6").unwrap(), "gpt-5");
+            }
+            _ => panic!("expected OpenaiResponses"),
+        }
+    }
+
+    #[test]
+    fn openai_responses_rejects_unknown_fields() {
+        // deny_unknown_fields is on every variant; an unrecognized
+        // key on openai_responses must surface as a YAML error.
+        let raw = r#"
+providers:
+  - name: openai_direct
+    type: openai_responses
+    api_key: "k"
+    api_base: "https://api.openai.com/v1"
+    bogus_field: true
+models:
+  - name: gpt-5
+    primary: openai_direct
+"#;
+        let err = Config::parse(raw).unwrap_err();
+        assert!(matches!(err, ProxyError::Yaml(_)), "got: {err:?}");
+    }
 }

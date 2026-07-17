@@ -368,4 +368,179 @@ mod tests {
         let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
         assert!(t.finalize().is_empty());
     }
+
+    #[test]
+    fn failed_status_maps_to_end_turn() {
+        // response.failed is treated like completed for stop_reason
+        // purposes — both surface as end_turn on the Anthropic side,
+        // so the client sees a normal terminal event.
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let tail = t.push_event(&ResponsesStreamEvent::ResponseFailed {
+            response: Box::new(placeholder_response("failed")),
+        });
+        assert!(tail.is_empty(), "failed event alone must not emit immediately");
+        let final_events = t.finalize();
+        let message_delta = final_events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { delta } => Some(delta),
+                _ => None,
+            })
+            .expect("finalize should emit MessageDelta");
+        assert_eq!(message_delta.stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[test]
+    fn incomplete_status_maps_to_max_tokens() {
+        // response.incomplete surfaces as max_tokens so the client
+        // knows the response was cut off at the token budget.
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseIncomplete {
+            response: Box::new(placeholder_response("incomplete")),
+        });
+        let final_events = t.finalize();
+        let message_delta = final_events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { delta } => Some(delta),
+                _ => None,
+            })
+            .expect("finalize should emit MessageDelta");
+        assert_eq!(message_delta.stop_reason.as_deref(), Some("max_tokens"));
+    }
+
+    #[test]
+    fn multiple_output_items_get_distinct_block_indices() {
+        // The Responses stream can emit several output items in
+        // parallel (e.g. text + function_call). Each must map to a
+        // distinct Anthropic block index, so deltas for output_index=1
+        // don't leak into output_index=0's block.
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::Message {
+                id: "msg_a".into(),
+                role: "assistant".into(),
+                status: "in_progress".into(),
+                content: vec![OutputContentPart::OutputText {
+                    text: String::new(),
+                    annotations: None,
+                }],
+            },
+        });
+        // First block is at index 0.
+        assert!(matches!(evs[0], StreamEvent::ContentBlockStart { index: 0, .. }));
+
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 1,
+            item: OutputItem::FunctionCall {
+                id: "fc_b".into(),
+                call_id: "call_b".into(),
+                name: "lookup".into(),
+                arguments: "{}".into(),
+                status: "in_progress".into(),
+            },
+        });
+        // Second block is at index 1, not 0.
+        assert!(matches!(evs[0], StreamEvent::ContentBlockStart { index: 1, .. }));
+
+        // A delta on output_index=1 must land on block 1.
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseFunctionCallArgumentsDelta {
+            item_id: "fc_b".into(),
+            output_index: 1,
+            delta: "{\"x\":1}".into(),
+        });
+        assert!(matches!(
+            evs[0],
+            StreamEvent::ContentBlockDelta { index: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn content_part_added_and_done_events_are_noops() {
+        // response.content_part.added / done are not modeled — they
+        // must not panic and must not emit extra events. (For now we
+        // fold multiple parts into the same block opened by
+        // response.output_item.added.)
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseContentPartAdded {
+            item_id: "msg_x".into(),
+            output_index: 0,
+            content_index: 0,
+            part: OutputContentPart::OutputText {
+                text: String::new(),
+                annotations: None,
+            },
+        });
+        assert!(evs.is_empty());
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseContentPartDone {
+            item_id: "msg_x".into(),
+            output_index: 0,
+            content_index: 0,
+            part: OutputContentPart::OutputText {
+                text: "full".into(),
+                annotations: None,
+            },
+        });
+        assert!(evs.is_empty());
+    }
+
+    #[test]
+    fn finalize_closes_unclosed_blocks() {
+        // If the upstream stream ends mid-block (no
+        // response.output_item.done), finalize() must still emit
+        // content_block_stop for every block we've opened so the
+        // client's content block accounting stays balanced.
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::Message {
+                id: "msg_a".into(),
+                role: "assistant".into(),
+                status: "in_progress".into(),
+                content: vec![OutputContentPart::OutputText {
+                    text: String::new(),
+                    annotations: None,
+                }],
+            },
+        });
+        // Stream ends without done events for this block.
+        let final_events = t.finalize();
+        let stops: Vec<u32> = final_events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ContentBlockStop { index } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stops, vec![0]);
+        // And the tail must include message_delta + message_stop.
+        assert!(matches!(final_events.last(), Some(StreamEvent::MessageStop)));
+    }
+
+    #[test]
+    fn unknown_stream_event_does_not_panic_or_emit() {
+        // Future Responses API events we haven't modeled fall through
+        // to the Unknown variant. The translator must skip them
+        // without producing phantom Anthropic events.
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let evs = t.push_event(&ResponsesStreamEvent::Unknown);
+        assert!(evs.is_empty());
+    }
 }

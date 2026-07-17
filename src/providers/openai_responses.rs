@@ -525,4 +525,203 @@ mod tests {
         assert!(!p.can_serve_model("gpt-5"));
         assert!(!p.can_serve_model(""));
     }
+
+    #[test]
+    fn trailing_slash_on_api_base_is_stripped() {
+        // Operators frequently write api_base as `https://x/v1/` —
+        // the constructor must normalize so we don't end up with
+        // `/v1//responses` on the wire (some servers reject double
+        // slashes, some accept them but it's noise in logs).
+        let p = OpenaiResponsesProvider::new(
+            "p".to_string(),
+            "https://example.test/v1/".to_string(),
+            "k".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        assert_eq!(p.responses_url(), "https://example.test/v1/responses");
+    }
+
+    #[test]
+    fn multiple_trailing_slashes_are_stripped() {
+        let p = OpenaiResponsesProvider::new(
+            "p".to_string(),
+            "https://example.test/v1///".to_string(),
+            "k".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        // trim_end_matches('/') removes all trailing slashes; we
+        // then re-append exactly one. The result has no //.
+        assert_eq!(p.responses_url(), "https://example.test/v1/responses");
+    }
+
+    #[tokio::test]
+    async fn complete_merges_runtime_rewrite_with_configured() {
+        // Mirrors OpenAiCompatProvider's behavior: when both
+        // configured and runtime rewrite maps contain the same key,
+        // runtime wins. The merged table is what gets applied to
+        // req.model before sending upstream.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(body_partial_json(json!({"model": "runtime-rewrite-wins"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(responses_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut configured = HashMap::new();
+        configured.insert(
+            "claude-sonnet-4-20250514".to_string(),
+            "configured-loses".to_string(),
+        );
+        let provider = OpenaiResponsesProvider::new(
+            "p".to_string(),
+            server.uri(),
+            "k".to_string(),
+            configured,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let mut runtime = HashMap::new();
+        runtime.insert(
+            "claude-sonnet-4-20250514".to_string(),
+            "runtime-rewrite-wins".to_string(),
+        );
+
+        let output = provider.complete(&request(false), &runtime).await.unwrap();
+        expect_variant!(output, ProviderOutput::Json(_body) => {});
+    }
+
+    #[tokio::test]
+    async fn complete_sends_request_as_json_with_expected_fields() {
+        // Verify the actual wire body shape: model (unchanged when
+        // no rewrite applies), stream=false, input[] with role+content,
+        // max_output_tokens, and bearer auth header. This is what an
+        // OpenAI-side log would see.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(header("authorization", "Bearer secret-key-xyz"))
+            .and(body_partial_json(json!({
+                "model": "claude-sonnet-4-20250514",
+                "stream": false,
+                "max_output_tokens": 64,
+                "input": [{"role": "user", "content": "hello"}]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(responses_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = OpenaiResponsesProvider::new(
+            "p".to_string(),
+            format!("{}/v1/", server.uri()),
+            "secret-key-xyz".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let _ = provider.complete(&request(false), &HashMap::new()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn complete_emits_instructions_field_when_request_has_system() {
+        // Anthropic's `system` must reach the wire as Responses'
+        // `instructions`. body_partial_json with `instructions`
+        // verifies presence + value. The model name on the wire
+        // matches req.model since no rewrite applies.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(body_partial_json(json!({
+                "model": "claude-sonnet-4-20250514",
+                "instructions": "be terse"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(responses_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = OpenaiResponsesProvider::new(
+            "p".to_string(),
+            server.uri(),
+            "k".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let mut req = request(false);
+        req.system = Some(crate::anthropic::SystemPrompt::Text("be terse".into()));
+
+        let _ = provider.complete(&req, &HashMap::new()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn complete_propagates_malformed_response_body() {
+        // A 200 with a body that doesn't decode as ResponsesResponse
+        // (e.g. truncated JSON) must surface as ProxyError::Json so
+        // the caller sees the parse failure, not a misleading 500.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not-json"))
+            .mount(&server)
+            .await;
+        let provider = OpenaiResponsesProvider::new(
+            "p".to_string(),
+            server.uri(),
+            "k".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let error = provider
+            .complete(&request(false), &HashMap::new())
+            .await
+            .err()
+            .expect("malformed body should fail");
+        assert!(matches!(error, ProxyError::Json(_)), "got: {error:?}");
+    }
+
+    #[tokio::test]
+    async fn stream_skips_malformed_sse_chunks_without_terminating() {
+        // Streaming upstreams often interleave heartbeats or partial
+        // data, so the adapter silently skips SSE lines that fail to
+        // parse rather than terminating the whole stream. This
+        // verifies that: a chunk of "garbage" followed by a valid
+        // event must still produce the valid event downstream.
+        let server = MockServer::start().await;
+        let sse = concat!(
+            "data: not-json\n\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"object\":\"response\",\"created_at\":0,\"model\":\"m\",\"status\":\"in_progress\",\"output\":[],\"usage\":{}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&server)
+            .await;
+        let provider = OpenaiResponsesProvider::new(
+            "p".to_string(),
+            server.uri(),
+            "k".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let output = provider.stream(&request(true), &HashMap::new()).await.unwrap();
+        expect_variant!(output, ProviderOutput::Stream(mut stream) => {
+            let mut encoded = String::new();
+            while let Some(item) = stream.next().await {
+                encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+            }
+            // The malformed chunk was skipped; the valid event still
+            // produced its MessageStart.
+            assert!(encoded.contains("event: message_start"));
+        });
+    }
 }
