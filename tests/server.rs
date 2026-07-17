@@ -118,6 +118,7 @@ fn build_app(
         api_key: "unused".to_string(),
         api_base: "http://unused".to_string(),
         model_rewrite: HashMap::new(),
+        use_proxy: false,
     }];
     let fallback_chain = if let Some(backup) = backup {
         providers.insert("backup".to_string(), backup);
@@ -126,6 +127,7 @@ fn build_app(
             api_key: "unused".to_string(),
             api_base: "http://unused".to_string(),
             model_rewrite: HashMap::new(),
+            use_proxy: false,
         });
         vec!["backup".to_string()]
     } else {

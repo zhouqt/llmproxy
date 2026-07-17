@@ -12,6 +12,9 @@ server:
 
 # Outgoing proxy for all provider requests. Supports http://, https://,
 # socks5://, socks5h://. Useful for routing around regional blocks.
+# Per-provider opt-in via `use_proxy: true` on each provider below —
+# any provider without it bypasses the global proxy and connects
+# directly. Defaults to false.
 # proxy:
 #   url: "socks5://127.0.0.1:1080"
 #   timeout_secs: 600
@@ -20,17 +23,23 @@ providers:
   # ─── GitHub Copilot ────────────────────────────────────────────────
   # First request will trigger the device flow and print a one-time code.
   # The token persists at ~/.local/share/llmproxy/github_token.json.
+  # `use_proxy: true` because GitHub's API is regionally blocked from
+  # the operator's network.
   - name: copilot
     type: github_copilot
     vscode_version: "1.95.0"
     account_type: individual   # individual | business | enterprise
+    use_proxy: true
 
   # ─── OpenRouter (Anthropic-compatible endpoint) ────────────────────
+  # OpenRouter is fronted by Cloudflare; on this network it works
+  # better through the proxy.
   - name: openrouter_anthropic
     type: openrouter
     api_key: "${OPENROUTER_API_KEY}"
     api_base: "https://openrouter.ai/api/v1"
     api_format: anthropic
+    use_proxy: true
 
   # ─── OpenRouter (OpenAI-compatible endpoint) ───────────────────────
   - name: openrouter_openai
@@ -38,6 +47,7 @@ providers:
     api_key: "${OPENROUTER_API_KEY}"
     api_base: "https://openrouter.ai/api/v1"
     api_format: openai
+    use_proxy: true
 
   # ─── DeepSeek (OpenAI-compatible) ──────────────────────────────────
   - name: deepseek
