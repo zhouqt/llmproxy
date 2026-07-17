@@ -71,6 +71,13 @@ pub enum ProviderConfig {
         vscode_version: String,
         #[serde(default = "default_account_type")]
         account_type: String,
+        /// Whether this provider should route its outbound requests
+        /// through the global SOCKS/HTTP proxy. Defaults to `false`
+        /// because most providers in the example config work fine
+        /// without it; enable per-provider when the upstream is
+        /// regionally blocked.
+        #[serde(default)]
+        use_proxy: bool,
     },
     Openrouter {
         name: String,
@@ -78,6 +85,8 @@ pub enum ProviderConfig {
         #[serde(default = "default_api_base_openrouter")]
         api_base: String,
         api_format: ApiFormat,
+        #[serde(default)]
+        use_proxy: bool,
     },
     #[serde(rename = "openai_compat")]
     OpenaiCompat {
@@ -86,6 +95,8 @@ pub enum ProviderConfig {
         api_base: String,
         #[serde(default)]
         model_rewrite: HashMap<String, String>,
+        #[serde(default)]
+        use_proxy: bool,
     },
 }
 
@@ -107,6 +118,16 @@ impl ProviderConfig {
             ProviderConfig::GithubCopilot { name, .. } => name,
             ProviderConfig::Openrouter { name, .. } => name,
             ProviderConfig::OpenaiCompat { name, .. } => name,
+        }
+    }
+
+    /// Whether this provider should route its outbound requests through
+    /// the global proxy. See the field doc-comment on each variant.
+    pub fn use_proxy(&self) -> bool {
+        match self {
+            ProviderConfig::GithubCopilot { use_proxy, .. }
+            | ProviderConfig::Openrouter { use_proxy, .. }
+            | ProviderConfig::OpenaiCompat { use_proxy, .. } => *use_proxy,
         }
     }
 }
@@ -337,6 +358,7 @@ models:
                 name: "copilot".to_string(),
                 vscode_version: default_vscode_version(),
                 account_type: default_account_type(),
+                use_proxy: false,
             }],
             ..Config::default()
         }
@@ -352,6 +374,7 @@ models:
                 name: "copilot".to_string(),
                 vscode_version: default_vscode_version(),
                 account_type: default_account_type(),
+                use_proxy: false,
             }],
             models: vec![ModelConfig {
                 name: "model".to_string(),

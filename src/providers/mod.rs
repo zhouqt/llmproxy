@@ -66,7 +66,7 @@ pub fn build(
     http: reqwest::Client,
 ) -> Result<SharedProvider> {
     match cfg {
-        ProviderConfig::GithubCopilot { name, vscode_version, account_type } => {
+        ProviderConfig::GithubCopilot { name, vscode_version, account_type, .. } => {
             let inner = copilot::CopilotProvider::new(
                 name.clone(),
                 vscode_version.clone(),
@@ -75,7 +75,7 @@ pub fn build(
             )?;
             Ok(Arc::new(inner))
         }
-        ProviderConfig::Openrouter { name, api_key, api_base, api_format } => {
+        ProviderConfig::Openrouter { name, api_key, api_base, api_format, .. } => {
             let inner = openrouter::OpenRouterProvider::new(
                 name.clone(),
                 api_key.clone(),
@@ -85,7 +85,7 @@ pub fn build(
             )?;
             Ok(Arc::new(inner))
         }
-        ProviderConfig::OpenaiCompat { name, api_key, api_base, model_rewrite } => {
+        ProviderConfig::OpenaiCompat { name, api_key, api_base, model_rewrite, .. } => {
             let inner = openai_compat::OpenAiCompatProvider::new(
                 name.clone(),
                 api_base.clone(),
@@ -111,6 +111,7 @@ mod tests {
                 api_key: "key".to_string(),
                 api_base: "https://example.test/v1".to_string(),
                 model_rewrite: HashMap::new(),
+                use_proxy: false,
             },
             reqwest::Client::new(),
         )
@@ -125,6 +126,7 @@ mod tests {
                 api_key: "key".to_string(),
                 api_base: "https://openrouter.ai/api/v1".to_string(),
                 api_format: ApiFormat::Anthropic,
+                use_proxy: false,
             },
             reqwest::Client::new(),
         )
@@ -145,6 +147,7 @@ mod tests {
                 name: "copilot".to_string(),
                 vscode_version: "1.95.0".to_string(),
                 account_type: "individual".to_string(),
+                use_proxy: false,
             },
             reqwest::Client::new(),
         )

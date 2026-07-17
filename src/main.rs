@@ -45,9 +45,11 @@ async fn async_main() -> anyhow::Result<()> {
         .with_context(|| format!("loading config from {}", config_path.display()))?;
 
     let listen = resolve_listen_addr(&args, &cfg);
-    let http = proxy_client::build_client(&cfg.proxy)?;
+    let proxied_http = proxy_client::build_client(&cfg.proxy)?;
+    let direct_http = proxy_client::build_direct_client(&cfg.proxy)?;
 
-    let (state, bg_handles) = build_state(cfg, http).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (state, bg_handles) =
+        build_state(cfg, proxied_http, direct_http).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let app = server::build_router(state);
 
@@ -79,7 +81,8 @@ fn resolve_listen_addr(args: &Args, cfg: &Config) -> String {
 /// Extracted so it can be exercised in tests without binding a TCP listener.
 fn build_state(
     cfg: Config,
-    http: reqwest::Client,
+    proxied_http: reqwest::Client,
+    direct_http: reqwest::Client,
 ) -> Result<(AppState, Vec<tokio::task::JoinHandle<()>>), llmproxy::error::ProxyError> {
     let mut provider_map: HashMap<String, SharedProvider> = HashMap::new();
     let mut bg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -91,7 +94,12 @@ fn build_state(
     let mut copilot: Option<Arc<llmproxy::providers::copilot::CopilotProvider>> = None;
     for p in &cfg.providers {
         let name = p.name().to_string();
-        let built = providers::build(p, http.clone())
+        let client = if p.use_proxy() {
+            proxied_http.clone()
+        } else {
+            direct_http.clone()
+        };
+        let built = providers::build(p, client)
             .map_err(|e| llmproxy::error::ProxyError::Other(anyhow::anyhow!("building provider '{name}': {e}")))?;
         if let Some(h) = built.clone().spawn_background() {
             bg_handles.push(h);
@@ -113,7 +121,12 @@ fn build_state(
         config: Arc::new(cfg),
         router,
         cooldown,
-        http,
+        // AppState.http is currently vestigial — CopilotProvider owns
+        // its own self.http used by OAuth + per-call paths. Keep the
+        // field set to the direct client as a placeholder so any future
+        // admin endpoint that wants a default http client has one
+        // without re-resolving the proxy decision.
+        http: direct_http,
         copilot,
     };
     Ok((state, bg_handles))
@@ -262,7 +275,7 @@ models:
     async fn build_state_wires_providers_router_and_cooldown() {
         let cfg = fixture_config();
         let (state, bg_handles) =
-            build_state(cfg.clone(), reqwest::Client::new()).expect("build_state succeeds");
+            build_state(cfg.clone(), reqwest::Client::new(), reqwest::Client::new()).expect("build_state succeeds");
 
         // Router can find the model and primary provider.
         let model = state
@@ -302,7 +315,7 @@ models:
 "#;
         let cfg = Config::parse(yaml).unwrap();
         let (state, bg_handles) =
-            build_state(cfg.clone(), reqwest::Client::new()).expect("build_state succeeds");
+            build_state(cfg.clone(), reqwest::Client::new(), reqwest::Client::new()).expect("build_state succeeds");
 
         assert!(!bg_handles.is_empty(), "copilot should spawn a refresh task");
         for handle in &bg_handles {
