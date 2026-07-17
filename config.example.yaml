@@ -58,6 +58,13 @@ providers:
   #   $XDG_DATA_HOME/llmproxy/github_token.json
   # (defaults to ~/.local/share/llmproxy/github_token.json)
   #
+  # Routing: the proxy auto-routes by model name. Any incoming model
+  # starting with "gpt-5" is dispatched to Copilot's /v1/responses
+  # endpoint (Responses API), since Copilot rejects /v1/chat/completions
+  # for GPT-5.x with `unsupported_api_for_model`. All other model names
+  # go to /v1/chat/completions as before. No configuration flag is
+  # needed — the dispatch happens per-request.
+  #
   # Fields:
   #   name           — internal key referenced by `models:`
   #   vscode_version — User-Agent string sent to GitHub. Some Copilot
@@ -162,6 +169,55 @@ providers:
       "claude-sonnet-4.6": "deepseek-v4-flash-free"
       "claude-opus-4.6": "deepseek-v4-flash-free"
 
+  # OpenRouter Chat-Completions side. Pairs with the `anthropic`
+  # openrouter_anthropic provider above for fallback.
+  - name: openrouter_openai
+    type: openai_compat
+    api_key: "${OPENROUTER_API_KEY}"
+    api_base: "https://openrouter.ai/api/v1"
+    model_rewrite:
+      "gpt-4o":            "openai/gpt-4o"
+      "claude-haiku-4.6":  "anthropic/claude-haiku-4.5"
+      "claude-sonnet-4.6": "anthropic/claude-sonnet-4.5"
+      "claude-opus-4.6":   "anthropic/claude-opus-4.7"
+
+  # ─── openai_responses ────────────────────────────────────────────────
+  # Any backend exposing OpenAI's Responses API (POST /v1/responses).
+  # Used for direct OpenAI GPT-5.x access (which requires /v1/responses
+  # rather than /v1/chat/completions) and any reverse proxy that exposes
+  # the same endpoint.
+  #
+  # Conversion is Anthropic Messages ↔ Responses API: system →
+  # instructions, messages[] → flat input[] (with tool_use/result folded
+  # into function_call / function_call_output items), thinking.budget_tokens
+  # → reasoning.effort. Streaming is translated event-by-event
+  # (response.output_text.delta → content_block_delta,
+  # response.function_call_arguments.delta → input_json_delta, etc.).
+  #
+  # Fields:
+  #   name          — internal key
+  #   api_key       — Bearer token (supports ${ENV_VAR})
+  #   api_base      — base URL up to but not including /responses,
+  #                   e.g. https://api.openai.com/v1
+  #   model_rewrite — optional map: incoming-model-name → upstream-model-name.
+  #                   Empty (default) accepts any model name verbatim;
+  #                   a non-empty table is an explicit allow-list.
+  #   use_proxy     — see proxy section. Default: false.
+  #
+  # NOTE: GitHub Copilot also speaks Responses API but routes automatically
+  # by model name — see the github_copilot section above. Any incoming
+  # model starting with "gpt-5" is dispatched to /v1/responses; all other
+  # names go to /v1/chat/completions. No configuration flag needed.
+  - name: openai_direct
+    type: openai_responses
+    api_key: "${OPENAI_API_KEY}"
+    api_base: "https://api.openai.com/v1"
+    model_rewrite:
+      "gpt-5":      "gpt-5"
+      "gpt-5-mini": "gpt-5-mini"
+      "gpt-5.5":    "gpt-5.5"
+    use_proxy: false
+
 # ───────────────────────────────────────────────────────────────────────
 # models: client-facing model names mapped to a routing chain
 # ───────────────────────────────────────────────────────────────────────
@@ -215,6 +271,23 @@ models:
   - name: gpt-4o
     primary: openrouter_openai
     fallback_chain: [copilot, deepseek]
+
+  # GPT-5.x routes through `/v1/responses` automatically. Both providers
+  # below speak the Responses endpoint:
+  #   - openai_direct hits api.openai.com/v1/responses directly
+  #   - copilot's auto-routing sends gpt-5 to api.githubcopilot.com/responses
+  - name: gpt-5
+    primary: openai_direct
+    fallback_chain:
+      - copilot
+
+  - name: gpt-5-mini
+    primary: openai_direct
+
+  - name: gpt-5.5
+    primary: openai_direct
+    fallback_chain:
+      - copilot
 
   - name: deepseek-v4-flash-free
     primary: opencode_zen

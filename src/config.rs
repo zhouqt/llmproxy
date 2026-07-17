@@ -114,6 +114,22 @@ pub enum ProviderConfig {
         #[serde(default)]
         use_proxy: bool,
     },
+    /// OpenAI Responses API passthrough provider. Sends an
+    /// Anthropic-converted request to `{api_base}/responses` and
+    /// translates the response back. Use for upstreams that expose
+    /// `/v1/responses` (OpenAI GPT-5.x, direct OpenAI reverse proxies,
+    /// etc.). For Chat-Completions-style backends use
+    /// `openai_compat` instead.
+    #[serde(rename = "openai_responses")]
+    OpenaiResponses {
+        name: String,
+        api_key: String,
+        api_base: String,
+        #[serde(default)]
+        model_rewrite: HashMap<String, String>,
+        #[serde(default)]
+        use_proxy: bool,
+    },
 }
 
 fn default_vscode_version() -> String {
@@ -134,6 +150,7 @@ impl ProviderConfig {
             ProviderConfig::GithubCopilot { name, .. } => name,
             ProviderConfig::Anthropic { name, .. } => name,
             ProviderConfig::OpenaiCompat { name, .. } => name,
+            ProviderConfig::OpenaiResponses { name, .. } => name,
         }
     }
 
@@ -143,7 +160,8 @@ impl ProviderConfig {
         match self {
             ProviderConfig::GithubCopilot { use_proxy, .. }
             | ProviderConfig::Anthropic { use_proxy, .. }
-            | ProviderConfig::OpenaiCompat { use_proxy, .. } => *use_proxy,
+            | ProviderConfig::OpenaiCompat { use_proxy, .. }
+            | ProviderConfig::OpenaiResponses { use_proxy, .. } => *use_proxy,
         }
     }
 }

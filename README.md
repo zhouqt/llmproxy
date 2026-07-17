@@ -8,13 +8,18 @@ automatic fallback when a provider hits its rate limit.
 
 - **Anthropic-format in, mixed-format out**: accepts `/v1/messages` requests
   in Anthropic format, forwards to providers in their native format
-  (OpenAI Chat Completions or Anthropic), translates responses back.
+  (OpenAI Chat Completions, OpenAI Responses, or Anthropic Messages),
+  translates responses back.
 - **Multi-provider fallback**: configure a primary plus a fallback chain per
   model. On 429 / 5xx / 401, the failing provider is cooled down
   (configurable TTL, default 5 min) and the next provider in the chain is
   tried automatically.
 - **GitHub Copilot**: full OAuth device flow with token persistence and
-  background refresh — no manual token copying.
+  background refresh — no manual token copying. Auto-routes GPT-5.x
+  requests to Copilot's `/v1/responses` endpoint (Copilot rejects
+  `/v1/chat/completions` for GPT-5.x with `unsupported_api_for_model`).
+- **OpenAI Responses API passthrough** via `type: openai_responses` for
+  upstreams that expose `/v1/responses` (direct OpenAI GPT-5.x, etc.).
 - **OpenRouter, MiniMax, DeepSeek, OpenCode Zen, and any other
   OpenAI-compatible endpoint** supported out of the box.
 - **Per-provider proxy opt-in**: each provider declares whether it should
@@ -283,25 +288,35 @@ a fresh install prints a one-time code (`POST /admin/copilot/auth` does
 this on demand). Token persists at
 `$XDG_DATA_HOME/llmproxy/github_token.json`.
 
+**GPT-5 routing**: Copilot rejects `/v1/chat/completions` for GPT-5.x
+models with `unsupported_api_for_model`. The proxy auto-routes any
+incoming model name starting with `gpt-5` to Copilot's `/v1/responses`
+endpoint (Responses API). All other names go to `/v1/chat/completions`
+as before. No configuration flag is needed — the dispatch happens
+per-request.
+
 | Field           | Default      | Notes                                                |
 |-----------------|--------------|------------------------------------------------------|
 | `name`          | (required)   | Internal key referenced by `models:`                 |
 | `vscode_version`| `"1.95.0"`   | User-Agent string. Some Copilot endpoints gate by client version. |
 | `account_type`  | `"individual"` | `individual` / `business` / `enterprise`. Determines Copilot SKU. |
+| `model_rewrite` | `{}`         | Map of `incoming-model-name → upstream-model-name`   |
 | `use_proxy`     | `false`      | Route through the global proxy                       |
 
-### `openrouter`
+### `anthropic`
 
-OpenRouter serves both an Anthropic-compatible and an OpenAI-compatible
-endpoint on the same base URL.
+Native Anthropic Messages passthrough. Forwards `/v1/messages` requests
+verbatim to `{api_base}/messages` and streams the response unchanged.
+Used for OpenRouter's `/api/v1/messages` endpoint and any other gateway
+that speaks Anthropic Messages without translation.
 
-| Field         | Default                              | Notes                          |
-|---------------|--------------------------------------|--------------------------------|
-| `name`        | (required)                           | Internal key                   |
-| `api_key`     | (required)                           | OpenRouter API key             |
-| `api_base`    | `https://openrouter.ai/api/v1`       | Base URL                       |
-| `api_format`  | (required)                           | `anthropic` or `openai`. Tells the proxy which translation to use; the response to the client is always Anthropic Messages shape. |
-| `use_proxy`   | `false`                              |                                |
+| Field           | Default                          | Notes                                                |
+|-----------------|----------------------------------|------------------------------------------------------|
+| `name`          | (required)                       | Internal key                                         |
+| `api_key`       | (required)                       | Bearer token                                         |
+| `api_base`      | `https://openrouter.ai/api/v1`   | Base URL up to but not including `/messages`         |
+| `model_rewrite` | `{}`                             | Map of `incoming-model-name → upstream-model-name`   |
+| `use_proxy`     | `false`                          |                                                      |
 
 ### `openai_compat`
 
@@ -313,6 +328,28 @@ OpenCode Zen, etc.).
 | `name`          | (required)| Internal key                                         |
 | `api_key`       | (required)| Bearer token                                         |
 | `api_base`      | (required)| Base URL up to but not including `/chat/completions` |
+| `model_rewrite` | `{}`      | Map of `incoming-model-name → upstream-model-name`    |
+| `use_proxy`     | `false`   |                                                      |
+
+### `openai_responses`
+
+Any backend exposing OpenAI's Responses API (`POST /v1/responses`).
+Used for direct OpenAI GPT-5.x access (which requires `/v1/responses`
+rather than `/v1/chat/completions`) and any reverse proxy that exposes
+the same endpoint.
+
+Conversion is Anthropic Messages ↔ Responses API: `system` →
+`instructions`, `messages[]` → flat `input[]` (with `tool_use`/`tool_result`
+folded into `function_call` / `function_call_output` items),
+`thinking.budget_tokens` → `reasoning.effort`. Streaming is translated
+event-by-event (`response.output_text.delta` → `content_block_delta`,
+`response.function_call_arguments.delta` → `input_json_delta`, etc.).
+
+| Field           | Default   | Notes                                                |
+|-----------------|-----------|------------------------------------------------------|
+| `name`          | (required)| Internal key                                         |
+| `api_key`       | (required)| Bearer token                                         |
+| `api_base`      | (required)| Base URL up to but not including `/responses`, e.g. `https://api.openai.com/v1` |
 | `model_rewrite` | `{}`      | Map of `incoming-model-name → upstream-model-name`    |
 | `use_proxy`     | `false`   |                                                      |
 
