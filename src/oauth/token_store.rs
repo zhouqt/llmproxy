@@ -231,7 +231,6 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expect_variant;
 
     fn fresh_store() -> (tempfile::TempDir, TokenStore) {
         let dir = tempfile::tempdir().unwrap();
