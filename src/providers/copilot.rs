@@ -1043,6 +1043,155 @@ mod tests {
         });
     }
 
+    #[tokio::test]
+    async fn complete_responses_preserves_upstream_error() {
+        // Copilot's /responses endpoint can also 5xx; the error body
+        // must surface to the caller unchanged so the router can
+        // decide whether to fall back. Mirrors the chat-completions
+        // path's error preservation.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("bad gateway"))
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+        let mut gpt5_req = request(false);
+        gpt5_req.model = "gpt-5".to_string();
+
+        let error = provider
+            .complete(&gpt5_req, &HashMap::new())
+            .await
+            .err()
+            .expect("upstream 502 should fail");
+
+        assert!(matches!(
+            error,
+            ProxyError::Upstream { status: 502, ref body } if body == "bad gateway"
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_responses_preserves_upstream_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+        let mut gpt5_req = request(true);
+        gpt5_req.model = "gpt-5".to_string();
+
+        let error = provider
+            .stream(&gpt5_req, &HashMap::new())
+            .await
+            .err()
+            .expect("upstream 429 should fail");
+
+        assert!(matches!(
+            error,
+            ProxyError::Upstream { status: 429, ref body } if body == "rate limited"
+        ));
+    }
+
+    #[tokio::test]
+    async fn gpt5_request_never_touches_chat_completions_endpoint() {
+        // Regression guard: ensure GPT-5 dispatch is exclusive to
+        // /responses. We assert `expect(1)` on /responses AND `expect(0)`
+        // on /chat/completions via a mock that 404s if hit, so any
+        // accidental chat-side request would fail.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("should not be called"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_x",
+                "object": "response",
+                "created_at": 0,
+                "model": "gpt-5",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+        let mut gpt5_req = request(false);
+        gpt5_req.model = "gpt-5".to_string();
+
+        let output = provider
+            .complete(&gpt5_req, &HashMap::new())
+            .await
+            .unwrap();
+        expect_variant!(output, ProviderOutput::Json(body) => {
+            assert_eq!(body["content"][0]["text"], "ok");
+        });
+    }
+
+    #[tokio::test]
+    async fn non_gpt5_request_never_touches_responses_endpoint() {
+        // Mirror of the above: a non-GPT-5 model must NOT be routed to
+        // /responses even when the runtime model_rewrite maps it to a
+        // name that starts with "gpt-5". Dispatch reads req.model
+        // (the original incoming name), not the rewritten upstream
+        // name — so a rewrite `claude-sonnet-4.6 → gpt-5-mini` still
+        // goes to /chat/completions. Verify the upstream sees
+        // "gpt-5-mini" (the rewrite) but the mock on /responses is
+        // never hit.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("should not be called"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(json!({"model": "gpt-5-mini"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response("via-chat")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+        let mut req = request(false);
+        req.model = "claude-sonnet-4.6".to_string();
+        let mut rewrite = HashMap::new();
+        rewrite.insert("claude-sonnet-4.6".to_string(), "gpt-5-mini".to_string());
+
+        let output = provider
+            .complete(&req, &rewrite)
+            .await
+            .unwrap();
+        expect_variant!(output, ProviderOutput::Json(body) => {
+            assert_eq!(body["content"][0]["text"], "via-chat");
+        });
+    }
+
     #[test]
     fn endpoint_for_model_classifies_by_prefix() {
         assert_eq!(endpoint_for_model("gpt-5"), "responses");
@@ -1051,6 +1200,21 @@ mod tests {
         assert_eq!(endpoint_for_model("gpt-4"), "chat_completions");
         assert_eq!(endpoint_for_model("claude-sonnet-4.6"), "chat_completions");
         assert_eq!(endpoint_for_model(""), "chat_completions");
+    }
+
+    #[test]
+    fn endpoint_for_model_is_case_sensitive() {
+        // Routing is case-sensitive: only the exact lowercase prefix
+        // "gpt-5" hits /responses. Mixed-case model names fall through
+        // to /chat/completions, which is the safer default — we'd
+        // rather retry on the wrong endpoint than silently mis-route
+        // an unknown model.
+        assert_eq!(endpoint_for_model("GPT-5"), "chat_completions");
+        assert_eq!(endpoint_for_model("Gpt-5-mini"), "chat_completions");
+        assert_eq!(endpoint_for_model("GPT5"), "chat_completions");
+        // Real-world GPT-5 variants: all lowercase prefix matches.
+        assert_eq!(endpoint_for_model("gpt-5.5-mini"), "responses");
+        assert_eq!(endpoint_for_model("gpt-5-2025-08-07"), "responses");
     }
 
     #[tokio::test]
