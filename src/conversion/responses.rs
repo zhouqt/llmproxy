@@ -353,6 +353,7 @@ pub fn make_message_id() -> String {
 mod tests {
     use super::*;
     use crate::anthropic::{ContentBlock, Message};
+    use std::collections::HashMap;
 
     fn req_with_text() -> MessagesRequest {
         serde_json::from_value(json!({
@@ -608,5 +609,289 @@ mod tests {
             },
             _ => panic!("expected message"),
         }
+    }
+
+    #[test]
+    fn request_maps_image_blocks_to_input_image_parts() {
+        // Multimodal user turn: text + image. Anthropic Image source
+        // carries raw base64 data; Responses expects a data URL.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 256,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+                ]
+            }]
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert_eq!(out.input.len(), 1);
+        match &out.input[0] {
+            ResponseInputItem::Message { role, content } => {
+                assert_eq!(role, "user");
+                match content {
+                    ResponseInputContent::Parts(parts) => {
+                        assert_eq!(parts.len(), 2);
+                        match &parts[1] {
+                            ResponseInputPart::InputImage { image_url, .. } => {
+                                assert_eq!(image_url, "data:image/png;base64,AAAA");
+                            }
+                            _ => panic!("expected input_image"),
+                        }
+                    }
+                    _ => panic!("expected parts content"),
+                }
+            }
+            _ => panic!("expected message"),
+        }
+    }
+
+    #[test]
+    fn request_maps_system_blocks_to_instructions() {
+        // System prompt as `Blocks` (not just `Text`) — Anthropic
+        // supports per-block cache_control; we join their text with
+        // blank-line separators.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "hi"}],
+            "system": [
+                {"type": "text", "text": "first half"},
+                {"type": "text", "text": "second half"}
+            ]
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert_eq!(out.instructions.as_deref(), Some("first half\n\nsecond half"));
+    }
+
+    #[test]
+    fn request_omits_instructions_when_system_is_empty() {
+        // Empty/whitespace system must not produce a noisy
+        // `instructions: ""` field on the wire.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "hi"}],
+            "system": ""
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert!(out.instructions.is_none());
+    }
+
+    #[test]
+    fn request_maps_tool_choice_specific_tool_to_function_form() {
+        // `tool_choice: { type: tool, name: get_weather }` must become
+        // Responses' `{type:"function", name:"get_weather"}` shape.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "tool", "name": "get_weather"}
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert_eq!(
+            out.tool_choice.as_ref().unwrap(),
+            &json!({"type": "function", "name": "get_weather"})
+        );
+    }
+
+    #[test]
+    fn request_maps_tool_choice_none_to_none() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": {"type": "none"}
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert_eq!(out.tool_choice.as_ref().unwrap(), &json!("none"));
+    }
+
+    #[test]
+    fn request_passes_temperature_top_p_and_stream_through() {
+        // Anthropic sampling parameters must land on the Responses
+        // request unchanged so client-side tuning survives translation.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "stream": true
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert_eq!(out.temperature, Some(0.7));
+        assert_eq!(out.top_p, Some(0.9));
+        assert!(out.stream);
+    }
+
+    #[test]
+    fn request_applies_model_rewrite_to_upstream_name() {
+        // The runtime rewrite must change the wire model field; the
+        // input[] items must remain intact.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4.6",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let mut rewrite = HashMap::new();
+        rewrite.insert("claude-sonnet-4.6".to_string(), "gpt-5-mini".to_string());
+        let out = anthropic_to_responses_request(&req, &rewrite);
+        assert_eq!(out.model, "gpt-5-mini");
+        assert_eq!(out.input.len(), 1);
+    }
+
+    #[test]
+    fn request_with_empty_messages_emits_no_input_items() {
+        // Defensive: an empty messages array must serialize cleanly
+        // (Responses permits it for stateless prompts).
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 256,
+            "messages": []
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert!(out.input.is_empty());
+    }
+
+    #[test]
+    fn response_with_empty_output_returns_empty_content() {
+        // A Responses API response with zero output items must still
+        // produce a valid Anthropic message shape (id, model, usage)
+        // with an empty content array — the SSE adapter needs the
+        // message_id and usage to round-trip even when no text was
+        // emitted (e.g. a refusal with no body).
+        let raw = json!({
+            "id": "resp_empty",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [],
+            "usage": {"input_tokens": 3, "output_tokens": 0, "total_tokens": 3}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_x").unwrap();
+        assert_eq!(out.id, "msg_x");
+        assert!(out.content.is_empty());
+        assert_eq!(out.usage.input_tokens, 3);
+        assert_eq!(out.stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[test]
+    fn response_with_multiple_function_calls_keeps_all_and_sets_tool_use() {
+        // A response that emits N parallel function calls must
+        // surface all of them in content[], and stop_reason must be
+        // tool_use (not end_turn) regardless of call count.
+        let raw = json!({
+            "id": "resp_p",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [
+                {"type": "function_call", "id": "fc_1", "call_id": "c_1",
+                 "name": "get_weather", "arguments": "{\"city\":\"SF\"}", "status": "completed"},
+                {"type": "function_call", "id": "fc_2", "call_id": "c_2",
+                 "name": "get_time", "arguments": "{\"tz\":\"PST\"}", "status": "completed"},
+                {"type": "function_call", "id": "fc_3", "call_id": "c_3",
+                 "name": "lookup_user", "arguments": "{\"id\":42}", "status": "completed"}
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_p").unwrap();
+        assert_eq!(out.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(out.content.len(), 3);
+        let names: Vec<&str> = out
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                crate::anthropic::ResponseBlock::ToolUse { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["get_weather", "get_time", "lookup_user"]);
+    }
+
+    #[test]
+    fn response_failed_status_maps_to_end_turn() {
+        // A failed Responses API response (status="failed") still has
+        // a valid Anthropic-side stop_reason; we surface end_turn so
+        // the client doesn't loop on max_tokens or tool_use.
+        let raw = json!({
+            "id": "resp_f",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "failed",
+            "output": [{
+                "type": "message", "id": "m", "role": "assistant", "status": "completed",
+                "content": [{"type": "output_text", "text": "partial"}]
+            }],
+            "usage": {"input_tokens": 5, "output_tokens": 1, "total_tokens": 6}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_f").unwrap();
+        assert_eq!(out.stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[test]
+    fn response_omits_cache_read_tokens_when_cached_count_is_zero() {
+        // cached_tokens == 0 must NOT produce a cache_read_input_tokens
+        // field (Some(0) would be a different shape than absent — see
+        // Anthropic's Usage struct where None means "not provided").
+        let raw = json!({
+            "id": "resp_z",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [{"type": "message", "id": "m", "role": "assistant", "status": "completed",
+                        "content": [{"type": "output_text", "text": "ok"}]}],
+            "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12,
+                      "input_tokens_details": {"cached_tokens": 0}}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_z").unwrap();
+        assert!(out.usage.cache_read_input_tokens.is_none());
+    }
+
+    #[test]
+    fn response_text_then_function_call_yields_tool_use_stop_reason() {
+        // The presence of ANY function_call in output[] wins over
+        // text: stop_reason must be tool_use, not end_turn, even if
+        // text precedes it. Order in output[] is the OpenAI-defined
+        // execution order, but the Anthropic stop_reason only reflects
+        // whether the assistant wants tools called next.
+        let raw = json!({
+            "id": "resp_m",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [
+                {"type": "message", "id": "m", "role": "assistant", "status": "completed",
+                 "content": [{"type": "output_text", "text": "let me check"}]},
+                {"type": "function_call", "id": "fc_1", "call_id": "c_1",
+                 "name": "lookup", "arguments": "{}", "status": "completed"}
+            ],
+            "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_m").unwrap();
+        assert_eq!(out.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(out.content.len(), 2);
     }
 }
