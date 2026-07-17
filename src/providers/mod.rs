@@ -5,9 +5,9 @@
 //! the Anthropic-format request into whatever format the provider expects,
 //! sends it, and returns either an Anthropic-format response or an SSE stream.
 
+pub mod anthropic;
 pub mod copilot;
 pub mod openai_compat;
-pub mod openrouter;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -15,7 +15,7 @@ use futures_util::Stream;
 use std::sync::Arc;
 
 use crate::anthropic::MessagesRequest;
-use crate::config::{ApiFormat, ProviderConfig};
+use crate::config::ProviderConfig;
 use crate::error::Result;
 
 /// Output of a Provider call. Either a complete JSON response body or a
@@ -28,7 +28,6 @@ pub enum ProviderOutput {
 #[async_trait]
 pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
-    fn api_format(&self) -> ApiFormat;
     async fn complete(&self, req: &MessagesRequest, model_rewrite: &std::collections::HashMap<String, String>) -> Result<ProviderOutput>;
     async fn stream(&self, req: &MessagesRequest, model_rewrite: &std::collections::HashMap<String, String>) -> Result<ProviderOutput>;
     /// Whether this provider can serve `model` without the proxy sending an
@@ -75,12 +74,18 @@ pub fn build(
             )?;
             Ok(Arc::new(inner))
         }
-        ProviderConfig::Openrouter { name, api_key, api_base, api_format, .. } => {
-            let inner = openrouter::OpenRouterProvider::new(
+        ProviderConfig::Anthropic {
+            name,
+            api_key,
+            api_base,
+            model_rewrite,
+            ..
+        } => {
+            let inner = anthropic::AnthropicProvider::new(
                 name.clone(),
                 api_key.clone(),
                 api_base.clone(),
-                *api_format,
+                model_rewrite.clone(),
                 http,
             )?;
             Ok(Arc::new(inner))
@@ -104,7 +109,7 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn builds_openai_compat_and_openrouter_providers() {
+    fn builds_openai_compat_and_anthropic_providers() {
         let compat = build(
             &ProviderConfig::OpenaiCompat {
                 name: "compat".to_string(),
@@ -117,22 +122,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(compat.name(), "compat");
-        assert_eq!(compat.api_format(), ApiFormat::Openai);
         assert!(compat.clone().spawn_background().is_none());
 
         let router = build(
-            &ProviderConfig::Openrouter {
+            &ProviderConfig::Anthropic {
                 name: "router".to_string(),
                 api_key: "key".to_string(),
                 api_base: "https://openrouter.ai/api/v1".to_string(),
-                api_format: ApiFormat::Anthropic,
+                model_rewrite: HashMap::new(),
                 use_proxy: false,
             },
             reqwest::Client::new(),
         )
         .unwrap();
         assert_eq!(router.name(), "router");
-        assert_eq!(router.api_format(), ApiFormat::Anthropic);
         assert!(router.clone().spawn_background().is_none());
     }
 
@@ -160,7 +163,6 @@ mod tests {
         }
 
         assert_eq!(copilot.name(), "copilot");
-        assert_eq!(copilot.api_format(), ApiFormat::Openai);
         let handle = copilot
             .clone()
             .spawn_background()

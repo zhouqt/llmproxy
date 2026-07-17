@@ -370,7 +370,7 @@ impl Router {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use crate::config::{ApiFormat, ModelConfig, ProviderConfig};
+    use crate::config::{ModelConfig, ProviderConfig};
     use crate::providers::Provider;
     use async_trait::async_trait;
     use futures_util::stream;
@@ -389,9 +389,6 @@ mod tests {
     impl Provider for MockProvider {
         fn name(&self) -> &str {
             &self.name
-        }
-        fn api_format(&self) -> ApiFormat {
-            ApiFormat::Openai
         }
         async fn complete(
             &self,
@@ -441,9 +438,6 @@ mod tests {
             &self.name
         }
 
-        fn api_format(&self) -> ApiFormat {
-            ApiFormat::Openai
-        }
 
         async fn complete(
             &self,
@@ -616,9 +610,6 @@ mod tests {
     impl Provider for CountingMockProvider {
         fn name(&self) -> &str {
             &self.name
-        }
-        fn api_format(&self) -> ApiFormat {
-            ApiFormat::Openai
         }
         async fn complete(
             &self,
@@ -1172,28 +1163,6 @@ mod tests {
         )
     }
 
-    #[test]
-    fn mock_providers_expose_name_and_api_format() {
-        // The MockProvider and NonCooldownProvider impls in this module only
-        // exist to support the router tests above. Their `name` and
-        // `api_format` methods are otherwise dead code unless something
-        // invokes them directly — exercise both impls so the coverage tool
-        // records the bodies.
-        let mock = MockProvider {
-            name: "mock".into(),
-            fail_status: 0,
-            fail_count: 0,
-            call_count: AtomicU32::new(0),
-        };
-        assert_eq!(mock.name(), "mock");
-        assert_eq!(mock.api_format(), ApiFormat::Openai);
-
-        let non_cd = NonCooldownProvider {
-            name: "non-cd".into(),
-        };
-        assert_eq!(non_cd.name(), "non-cd");
-        assert_eq!(non_cd.api_format(), ApiFormat::Openai);
-    }
 
     /// A provider that accepts a fixed allow-list of model names; every
     /// other model is rejected at dispatch time via `can_serve_model`.
@@ -1208,9 +1177,6 @@ mod tests {
     impl Provider for RestrictedMockProvider {
         fn name(&self) -> &str {
             &self.name
-        }
-        fn api_format(&self) -> ApiFormat {
-            ApiFormat::Openai
         }
         fn can_serve_model(&self, model: &str) -> bool {
             // Empty allow-list means "no restriction" (matches the
@@ -1383,9 +1349,6 @@ mod tests {
             fn name(&self) -> &str {
                 &self.name
             }
-            fn api_format(&self) -> ApiFormat {
-                ApiFormat::Openai
-            }
             fn can_serve_model(&self, model: &str) -> bool {
                 self.allowed.is_empty() || self.allowed.iter().any(|m| m == model)
             }
@@ -1546,9 +1509,6 @@ mod tests {
     impl Provider for ModelUnsupportedProvider {
         fn name(&self) -> &str {
             &self.name
-        }
-        fn api_format(&self) -> ApiFormat {
-            ApiFormat::Openai
         }
         async fn complete(
             &self,
