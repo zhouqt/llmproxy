@@ -40,6 +40,19 @@ pub struct ResponsesRequest {
     pub parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// OpenAI Responses-API prompt-cache namespace. Set by the
+    /// request translator when the Anthropic client sent any
+    /// `cache_control` block AND provided `metadata.user_id`; otherwise
+    /// `None` so the field is absent from the wire. See
+    /// `conversion::cache_hint`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    /// OpenAI Responses-API prompt-cache TTL. `"in_memory"` (~5–10 min)
+    /// maps to Anthropic's `ephemeral` / `ephemeral_5m`; `"24h"` maps to
+    /// Anthropic's `ephemeral_1h`. `None` when the request had no
+    /// `cache_control` markers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_retention: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ReasoningConfig>,
     /// Anything we don't model explicitly passes through. Defaults to {}.
@@ -300,6 +313,8 @@ mod tests {
             tool_choice: None,
             parallel_tool_calls: None,
             user: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
             reasoning: None,
             extra: json!({}),
         };

@@ -22,6 +22,7 @@ use crate::anthropic::{
     ContentBlock, MessageContent, MessagesRequest, MessagesResponse, ResponseBlock, SystemPrompt,
     ToolChoice, Usage,
 };
+use crate::conversion::derive_cache_hints;
 use crate::error::Result;
 use crate::responses::{
     OutputContentPart, OutputItem, ReasoningConfig, ResponseInputContent, ResponseInputItem,
@@ -80,6 +81,8 @@ pub fn anthropic_to_responses_request(
             .collect()
     });
 
+    let hints = derive_cache_hints(req);
+
     ResponsesRequest {
         model,
         input,
@@ -92,6 +95,8 @@ pub fn anthropic_to_responses_request(
         tool_choice: req.tool_choice.as_ref().and_then(convert_tool_choice),
         parallel_tool_calls: None,
         user: req.metadata.as_ref().and_then(|m| m.user_id.clone()),
+        prompt_cache_key: hints.prompt_cache_key,
+        prompt_cache_retention: hints.prompt_cache_retention,
         reasoning: req.thinking.as_ref().and_then(convert_thinking),
         extra: json!({}),
     }
