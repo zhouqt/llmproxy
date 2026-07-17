@@ -1,7 +1,10 @@
-//! Generic OpenAI-compatible provider.
+//! Generic OpenAI Chat Completions provider.
 //!
-//! Used by OpenRouter (when api_format=openai), DeepSeek, MiniMax, and any
-//! other provider that exposes an OpenAI-style /chat/completions endpoint.
+//! Used by DeepSeek, MiniMax, OpenCode Zen, and any other backend that
+//! exposes an OpenAI-style /chat/completions endpoint. The provider
+//! always converts Anthropic requests to OpenAI Chat Completions and
+//! converts the response back; for native Anthropic passthrough use the
+//! `anthropic` provider type instead.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -14,7 +17,6 @@ use futures_util::Stream;
 use serde_json::Value;
 
 use crate::anthropic::{MessagesRequest, StreamEvent};
-use crate::config::ApiFormat;
 use crate::conversion::{anthropic_to_openai_request, openai_to_anthropic_response};
 use crate::error::{ProxyError, Result};
 use crate::openai::looks_like_error_envelope;
@@ -61,10 +63,6 @@ impl OpenAiCompatProvider {
 impl Provider for OpenAiCompatProvider {
     fn name(&self) -> &str {
         &self.name
-    }
-
-    fn api_format(&self) -> ApiFormat {
-        ApiFormat::Openai
     }
 
     fn can_serve_model(&self, model: &str) -> bool {
@@ -370,7 +368,6 @@ mod tests {
         let output = provider.complete(&request(false), &runtime_rewrite).await.unwrap();
 
         assert_eq!(provider.name(), "test");
-        assert_eq!(provider.api_format(), ApiFormat::Openai);
         expect_variant!(output, ProviderOutput::Json(body) => {
             assert_eq!(body["type"], "message");
             assert_eq!(body["model"], "claude-sonnet-4-20250514");

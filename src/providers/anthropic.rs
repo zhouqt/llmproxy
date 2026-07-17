@@ -1,9 +1,14 @@
-//! OpenRouter provider.
+//! Generic native-Anthropic-Messages provider.
 //!
-//! OpenRouter supports both OpenAI- and Anthropic-style endpoints.
-//! When `api_format=anthropic` we forward the Anthropic request body as-is
-//! (with a model rewrite) and stream the response. When `api_format=openai`
-//! we delegate to the same conversion logic as the generic OpenAI provider.
+//! Sends the Anthropic request body verbatim to `{api_base}/messages`
+//! with the `anthropic-version: 2023-06-01` header and streams the
+//! response unchanged (or returns the JSON response verbatim for the
+//! non-streaming path). No request/response translation occurs.
+//!
+//! Used for OpenRouter's native `/v1/messages` endpoint and any other
+//! gateway that exposes the Anthropic Messages API without conversion.
+//! For OpenAI Chat Completions-style upstreams use the `openai_compat`
+//! provider type instead.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -14,64 +19,57 @@ use bytes::Bytes;
 use futures_util::stream::Stream;
 use serde_json::{json, Value};
 
-use crate::anthropic::{MessagesRequest, StreamEvent};
-use crate::config::ApiFormat;
+use crate::anthropic::MessagesRequest;
 use crate::error::{ProxyError, Result};
-use crate::providers::{openai_compat, Provider, ProviderOutput};
+use crate::providers::{Provider, ProviderOutput};
 
-pub struct OpenRouterProvider {
+pub struct AnthropicProvider {
     name: String,
     api_key: String,
     api_base: String,
-    api_format: ApiFormat,
+    model_rewrite: HashMap<String, String>,
     http: reqwest::Client,
-    /// Inner provider used for the OpenAI-format path.
-    inner_openai: openai_compat::OpenAiCompatProvider,
 }
 
-impl OpenRouterProvider {
+impl AnthropicProvider {
     pub fn new(
         name: String,
         api_key: String,
         api_base: String,
-        api_format: ApiFormat,
+        model_rewrite: HashMap<String, String>,
         http: reqwest::Client,
     ) -> Result<Self> {
         let api_base = api_base.trim_end_matches('/').to_string();
-        let inner_openai = openai_compat::OpenAiCompatProvider::new(
-            format!("{name}_inner"),
-            api_base.clone(),
-            api_key.clone(),
-            HashMap::new(),
-            http.clone(),
-        )?;
         Ok(Self {
             name,
             api_key,
             api_base,
-            api_format,
+            model_rewrite,
             http,
-            inner_openai,
         })
     }
 
-    fn anthropic_url(&self) -> String {
-        // OpenRouter's Anthropic-compatible endpoint is at /api/v1/messages
-        // under the same api_base root.
-        // Strip any trailing "/v1" from api_base, then append /v1/messages.
+    fn messages_url(&self) -> String {
+        // api_base defaults to e.g. https://openrouter.ai/api/v1.
+        // Strip the trailing /v1 and POST to /v1/messages.
         let stripped = self.api_base.trim_end_matches("/v1");
         format!("{}/v1/messages", stripped)
+    }
+
+    fn merged_rewrite<'a>(
+        &'a self,
+        runtime: &'a HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        let mut merged = self.model_rewrite.clone();
+        merged.extend(runtime.iter().map(|(k, v)| (k.clone(), v.clone())));
+        merged
     }
 }
 
 #[async_trait]
-impl Provider for OpenRouterProvider {
+impl Provider for AnthropicProvider {
     fn name(&self) -> &str {
         &self.name
-    }
-
-    fn api_format(&self) -> ApiFormat {
-        self.api_format
     }
 
     async fn complete(
@@ -79,10 +77,26 @@ impl Provider for OpenRouterProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
-        match self.api_format {
-            ApiFormat::Openai => self.inner_openai.complete(req, model_rewrite).await,
-            ApiFormat::Anthropic => forward_anthropic_complete(&self.http, &self.api_key, &self.anthropic_url(), req, model_rewrite).await,
+        let body = build_body(req, &self.merged_rewrite(model_rewrite), false)?;
+        let resp = self
+            .http
+            .post(self.messages_url())
+            .bearer_auth(&self.api_key)
+            .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            return Err(ProxyError::Upstream {
+                status: status.as_u16(),
+                body: text,
+            });
         }
+        let val: Value = serde_json::from_str(&text)?;
+        Ok(ProviderOutput::Json(val))
     }
 
     async fn stream(
@@ -90,53 +104,13 @@ impl Provider for OpenRouterProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
-        match self.api_format {
-            ApiFormat::Openai => self.inner_openai.stream(req, model_rewrite).await,
-            ApiFormat::Anthropic => forward_anthropic_stream(&self.http, &self.api_key, &self.anthropic_url(), req, model_rewrite).await,
-        }
-    }
-}
-
-async fn forward_anthropic_complete(
-    http: &reqwest::Client,
-    api_key: &str,
-    url: &str,
-    req: &MessagesRequest,
-    model_rewrite: &HashMap<String, String>,
-) -> Result<ProviderOutput> {
-    let body = build_anthropic_body(req, model_rewrite, false)?;
-    let resp = http
-        .post(url)
-        .bearer_auth(api_key)
-        .header("content-type", "application/json")
-        .header("anthropic-version", "2023-06-01")
-        .json(&body)
-        .send()
-        .await?;
-    let status = resp.status();
-    let text = resp.text().await?;
-    if !status.is_success() {
-        return Err(ProxyError::Upstream {
-            status: status.as_u16(),
-            body: text,
-        });
-    }
-    let val: Value = serde_json::from_str(&text)?;
-    Ok(ProviderOutput::Json(val))
-}
-
-fn forward_anthropic_stream<'a>(
-    http: &'a reqwest::Client,
-    api_key: &'a str,
-    url: &'a str,
-    req: &'a MessagesRequest,
-    model_rewrite: &'a HashMap<String, String>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ProviderOutput>> + Send + 'a>> {
-    Box::pin(async move {
-        let body = build_anthropic_body(req, model_rewrite, true)?;
-        let resp = http
-            .post(url)
-            .bearer_auth(api_key)
+        let url = self.messages_url();
+        let api_key = self.api_key.clone();
+        let body = build_body(req, &self.merged_rewrite(model_rewrite), true)?;
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&api_key)
             .header("content-type", "application/json")
             .header("anthropic-version", "2023-06-01")
             .header("accept", "text/event-stream")
@@ -153,16 +127,16 @@ fn forward_anthropic_stream<'a>(
         }
         let stream = resp.bytes_stream();
         Ok(ProviderOutput::Stream(Box::new(PassthroughSse { inner: stream })))
-    })
+    }
 }
 
-fn build_anthropic_body(
+fn build_body(
     req: &MessagesRequest,
-    model_rewrite: &HashMap<String, String>,
+    merged_rewrite: &HashMap<String, String>,
     stream: bool,
 ) -> Result<Value> {
     let mut body = serde_json::to_value(req)?;
-    let model = model_rewrite
+    let model = merged_rewrite
         .get(&req.model)
         .cloned()
         .unwrap_or_else(|| req.model.clone());
@@ -192,10 +166,6 @@ where
     }
 }
 
-// Allow unused import to be useful for downstream expansion.
-#[allow(dead_code)]
-fn _event_marker(_e: &StreamEvent) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,20 +185,56 @@ mod tests {
         .unwrap()
     }
 
+    fn empty_rewrite() -> HashMap<String, String> {
+        HashMap::new()
+    }
+
     #[test]
-    fn builds_anthropic_body_with_rewrite_and_stream_flag() {
+    fn build_body_rewrites_model_and_sets_stream_flag() {
         let mut rewrite = HashMap::new();
         rewrite.insert("claude-model".to_string(), "upstream-model".to_string());
 
-        let body = build_anthropic_body(&request(false), &rewrite, true).unwrap();
+        let body = build_body(&request(false), &rewrite, true).unwrap();
 
         assert_eq!(body["model"], "upstream-model");
         assert_eq!(body["stream"], true);
         assert_eq!(body["messages"][0]["content"], "hello");
     }
 
+    #[test]
+    fn build_body_falls_back_to_original_model_when_unmapped() {
+        let body = build_body(&request(false), &empty_rewrite(), false).unwrap();
+
+        assert_eq!(body["model"], "claude-model");
+        assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn merged_rewrite_combines_provider_and_runtime_maps() {
+        // Constructor rewrite table takes effect even when runtime map
+        // names a different model — both layers compose.
+        let mut configured = HashMap::new();
+        configured.insert("claude-model".to_string(), "configured-model".to_string());
+
+        let provider = AnthropicProvider::new(
+            "r".to_string(),
+            "k".to_string(),
+            "https://example.test/v1".to_string(),
+            configured,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let mut runtime = HashMap::new();
+        runtime.insert("claude-model".to_string(), "runtime-model".to_string());
+
+        let merged = provider.merged_rewrite(&runtime);
+        // Runtime overrides the configured entry.
+        assert_eq!(merged.get("claude-model").unwrap(), "runtime-model");
+    }
+
     #[tokio::test]
-    async fn anthropic_complete_forwards_request_and_response() {
+    async fn complete_forwards_request_and_response() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/messages"))
@@ -246,21 +252,20 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let provider = OpenRouterProvider::new(
+        let mut rewrite = HashMap::new();
+        rewrite.insert("claude-model".to_string(), "rewritten-model".to_string());
+        let provider = AnthropicProvider::new(
             "router".to_string(),
             "router-key".to_string(),
             format!("{}/api/v1/", server.uri()),
-            ApiFormat::Anthropic,
+            rewrite,
             reqwest::Client::new(),
         )
         .unwrap();
-        let mut rewrite = HashMap::new();
-        rewrite.insert("claude-model".to_string(), "rewritten-model".to_string());
 
-        let output = provider.complete(&request(false), &rewrite).await.unwrap();
+        let output = provider.complete(&request(false), &empty_rewrite()).await.unwrap();
 
         assert_eq!(provider.name(), "router");
-        assert_eq!(provider.api_format(), ApiFormat::Anthropic);
         expect_variant!(output, ProviderOutput::Json(body) => {
             assert_eq!(body["id"], "msg_upstream");
             assert_eq!(body["content"][0]["text"], "world");
@@ -268,7 +273,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anthropic_stream_passes_sse_through() {
+    async fn stream_passes_sse_through() {
         let server = MockServer::start().await;
         let sse = "event: message_start\ndata: {\"type\":\"message_start\"}\n\n";
         Mock::given(method("POST"))
@@ -279,19 +284,16 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let provider = OpenRouterProvider::new(
+        let provider = AnthropicProvider::new(
             "router".to_string(),
             "key".to_string(),
             format!("{}/v1", server.uri()),
-            ApiFormat::Anthropic,
+            empty_rewrite(),
             reqwest::Client::new(),
         )
         .unwrap();
 
-        let output = provider
-            .stream(&request(true), &HashMap::new())
-            .await
-            .unwrap();
+        let output = provider.stream(&request(true), &empty_rewrite()).await.unwrap();
         expect_variant!(output, ProviderOutput::Stream(mut output) => {
             let mut bytes = Vec::new();
             while let Some(item) = output.next().await {
@@ -302,7 +304,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anthropic_paths_preserve_upstream_errors() {
+    async fn preserve_upstream_errors_on_complete_and_stream() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
@@ -310,22 +312,22 @@ mod tests {
             .expect(2)
             .mount(&server)
             .await;
-        let provider = OpenRouterProvider::new(
+        let provider = AnthropicProvider::new(
             "router".to_string(),
             "key".to_string(),
             format!("{}/v1", server.uri()),
-            ApiFormat::Anthropic,
+            empty_rewrite(),
             reqwest::Client::new(),
         )
         .unwrap();
 
         let complete = provider
-            .complete(&request(false), &HashMap::new())
+            .complete(&request(false), &empty_rewrite())
             .await
             .err()
             .expect("complete should fail");
         let stream = provider
-            .stream(&request(true), &HashMap::new())
+            .stream(&request(true), &empty_rewrite())
             .await
             .err()
             .expect("stream should fail");
@@ -342,8 +344,6 @@ mod tests {
 
     #[tokio::test]
     async fn passthrough_sse_surfaces_inner_errors() {
-        // Connect to a port that's almost certainly closed; the connect
-        // failure surfaces as a reqwest::Error we can feed into the SSE.
         let err = reqwest::Client::new()
             .get("http://127.0.0.1:1")
             .timeout(std::time::Duration::from_millis(50))
@@ -359,7 +359,6 @@ mod tests {
 
     #[tokio::test]
     async fn passthrough_sse_returns_none_when_inner_ends() {
-        // An empty inner stream should produce no items, then end.
         use futures_util::stream;
         let mut sse = PassthroughSse {
             inner: stream::empty::<reqwest::Result<Bytes>>(),
@@ -369,16 +368,10 @@ mod tests {
 
     #[tokio::test]
     async fn passthrough_sse_propagates_pending_from_inner() {
-        // When the inner stream returns `Poll::Pending`, the wrapper must
-        // propagate it (instead of fabricating a Ready). Cover the
-        // `Poll::Pending => Poll::Pending` arm of the match.
         use futures_util::stream;
         let mut sse = PassthroughSse {
             inner: stream::pending::<reqwest::Result<Bytes>>(),
         };
-        // poll_next must not deadlock; using tokio's noop waker it should
-        // return Pending. We assert via std::task::Poll directly to avoid
-        // the auto-waker logic in `next().await`.
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
         let poll = std::pin::Pin::new(&mut sse).poll_next(&mut cx);
@@ -386,45 +379,5 @@ mod tests {
             matches!(poll, std::task::Poll::Pending),
             "PassthroughSse should propagate Poll::Pending"
         );
-    }
-
-    #[tokio::test]
-    async fn openai_format_delegates_to_compat_provider() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .and(body_partial_json(json!({"stream": false})))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "chatcmpl-1",
-                "object": "chat.completion",
-                "created": 1,
-                "model": "m",
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "delegated"},
-                    "finish_reason": "stop"
-                }],
-                "usage": null
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let provider = OpenRouterProvider::new(
-            "router".to_string(),
-            "key".to_string(),
-            server.uri(),
-            ApiFormat::Openai,
-            reqwest::Client::new(),
-        )
-        .unwrap();
-
-        let output = provider
-            .complete(&request(false), &HashMap::new())
-            .await
-            .unwrap();
-
-        expect_variant!(output, ProviderOutput::Json(body) => {
-            assert_eq!(body["content"][0]["text"], "delegated");
-        });
     }
 }

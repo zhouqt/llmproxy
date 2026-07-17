@@ -16,7 +16,6 @@ use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::anthropic::MessagesRequest;
-use crate::config::ApiFormat;
 use crate::error::{ProxyError, Result};
 use crate::oauth::device_flow::{request_device_code, DeviceCodeResponse};
 use crate::oauth::token_store::{StoredTokens, TokenStore};
@@ -472,10 +471,6 @@ impl Provider for CopilotProvider {
         &self.name
     }
 
-    fn api_format(&self) -> ApiFormat {
-        ApiFormat::Openai
-    }
-
     async fn complete(
         &self,
         req: &MessagesRequest,
@@ -844,7 +839,6 @@ mod tests {
         let output = provider.complete(&request(false), &rewrite).await.unwrap();
 
         assert_eq!(provider.name(), "copilot");
-        assert_eq!(provider.api_format(), ApiFormat::Openai);
         expect_variant!(output, ProviderOutput::Json(body) => {
             assert_eq!(body["content"][0]["text"], "world");
             assert_eq!(body["usage"]["input_tokens"], 4);

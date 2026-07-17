@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use llmproxy::anthropic::MessagesRequest;
-use llmproxy::config::{ApiFormat, Config, ModelConfig, ProviderConfig, ServerConfig};
+use llmproxy::config::{Config, ModelConfig, ProviderConfig, ServerConfig};
 use llmproxy::cooldown::CooldownCache;
 use llmproxy::error::{ProxyError, Result};
 use llmproxy::providers::{Provider, ProviderOutput, SharedProvider};
@@ -41,10 +41,6 @@ struct TestProvider {
 impl Provider for TestProvider {
     fn name(&self) -> &str {
         &self.name
-    }
-
-    fn api_format(&self) -> ApiFormat {
-        ApiFormat::Anthropic
     }
 
     async fn complete(
