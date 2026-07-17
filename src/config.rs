@@ -71,6 +71,14 @@ pub enum ProviderConfig {
         vscode_version: String,
         #[serde(default = "default_account_type")]
         account_type: String,
+        /// Optional map: incoming-model-name → upstream-model-name.
+        /// Empty (default) accepts any model name verbatim (the proxy
+        /// forwards the Anthropic `model` value as-is to Copilot); a
+        /// non-empty table is an explicit allow-list (the router skips
+        /// this provider for unmapped names), with the upstream name
+        /// used when the request is dispatched.
+        #[serde(default)]
+        model_rewrite: HashMap<String, String>,
         /// Whether this provider should route its outbound requests
         /// through the global SOCKS/HTTP proxy. Defaults to `false`
         /// because most providers in the example config work fine
@@ -359,6 +367,7 @@ models:
                 name: "copilot".to_string(),
                 vscode_version: default_vscode_version(),
                 account_type: default_account_type(),
+                model_rewrite: HashMap::new(),
                 use_proxy: false,
             }],
             ..Config::default()
@@ -375,6 +384,7 @@ models:
                 name: "copilot".to_string(),
                 vscode_version: default_vscode_version(),
                 account_type: default_account_type(),
+                model_rewrite: HashMap::new(),
                 use_proxy: false,
             }],
             models: vec![ModelConfig {
