@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use crate::anthropic::{
     ContentBlock, Message, MessageContent, MessagesRequest, SystemPrompt, ToolChoice,
 };
+use crate::conversion::derive_cache_hints;
 use crate::openai::{
     ChatMessage, ChatRequest, ChatTool, ContentPart, FunctionDef, UserContent,
 };
@@ -50,6 +51,8 @@ pub fn anthropic_to_openai_request(
         None
     };
 
+    let hints = derive_cache_hints(req);
+
     ChatRequest {
         model,
         messages,
@@ -74,6 +77,8 @@ pub fn anthropic_to_openai_request(
         tool_choice: req.tool_choice.as_ref().map(convert_tool_choice),
         user: req.metadata.as_ref().and_then(|m| m.user_id.clone()),
         reasoning_effort: extract_reasoning_effort(req),
+        prompt_cache_key: hints.prompt_cache_key,
+        prompt_cache_retention: hints.prompt_cache_retention,
         extra: json!({}),
     }
 }

@@ -282,7 +282,43 @@ mod tests {
     use serde_json::json;
     use serde_json::Value;
     use wiremock::matchers::{body_partial_json, header, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
+
+    /// Wire-level "field X must NOT be present in the JSON request
+    /// body" matcher. wiremock's `body_partial_json` only checks
+    /// presence; we need this complement to verify that the proxy
+    /// doesn't pollute requests with `prompt_cache_key` /
+    /// `prompt_cache_retention` when the Anthropic client didn't ask
+    /// for caching.
+    struct JsonFieldAbsent(&'static str);
+
+    impl Match for JsonFieldAbsent {
+        fn matches(&self, request: &Request) -> bool {
+            let body: serde_json::Value = match serde_json::from_slice(&request.body) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            body.get(self.0).is_none()
+        }
+    }
+
+    fn cache_request_with(cache_type: &str, user_id: Option<&str>) -> MessagesRequest {
+        let mut v = json!({
+            "model": "claude-sonnet-4.6",
+            "max_tokens": 64,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "long prefix", "cache_control": {"type": cache_type}},
+                    {"type": "text", "text": "actual question"}
+                ]
+            }]
+        });
+        if let Some(uid) = user_id {
+            v["metadata"] = json!({"user_id": uid});
+        }
+        serde_json::from_value(v).unwrap()
+    }
 
     fn request(streaming: bool) -> MessagesRequest {
         serde_json::from_value(json!({
@@ -723,5 +759,140 @@ mod tests {
             // produced its MessageStart.
             assert!(encoded.contains("event: message_start"));
         });
+    }
+
+    #[tokio::test]
+    async fn complete_emits_prompt_cache_key_and_in_memory_when_cache_control_ephemeral() {
+        // Anthropic cache_control.ephemeral + metadata.user_id → wire
+        // must carry prompt_cache_key=user_id and
+        // prompt_cache_retention=in_memory. The whole point: the
+        // client-side cache hint has to reach the upstream so the
+        // upstream actually treats the tokens as cached (and bills
+        // them at the discounted rate).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(header("authorization", "Bearer key"))
+            .and(body_partial_json(json!({
+                "prompt_cache_key": "u-42",
+                "prompt_cache_retention": "in_memory"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(responses_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenaiResponsesProvider::new(
+            "p".to_string(),
+            format!("{}/v1/", server.uri()),
+            "key".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let _ = provider
+            .complete(&cache_request_with("ephemeral", Some("u-42")), &HashMap::new())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn complete_emits_24h_retention_when_cache_control_ephemeral_1h() {
+        // Anthropic cache_control.ephemeral_1h → retention=24h on the
+        // wire. This is the longest tier both APIs offer (Anthropic
+        // bills 1h tier; OpenAI's nearest equivalent is 24h).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(body_partial_json(json!({
+                "prompt_cache_key": "u-9",
+                "prompt_cache_retention": "24h"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(responses_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenaiResponsesProvider::new(
+            "p".to_string(),
+            format!("{}/v1/", server.uri()),
+            "key".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let _ = provider
+            .complete(&cache_request_with("ephemeral_1h", Some("u-9")), &HashMap::new())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn complete_omits_prompt_cache_key_when_cache_control_without_user_id() {
+        // cache_control present + no metadata.user_id → wire must
+        // emit retention (client wants caching) but NOT
+        // prompt_cache_key (we have no namespace to scope to; emitting
+        // an empty key would lump unrelated requests into one cache
+        // bucket).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(body_partial_json(json!({
+                "prompt_cache_retention": "in_memory"
+            })))
+            .and(JsonFieldAbsent("prompt_cache_key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(responses_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenaiResponsesProvider::new(
+            "p".to_string(),
+            format!("{}/v1/", server.uri()),
+            "key".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let _ = provider
+            .complete(&cache_request_with("ephemeral", None), &HashMap::new())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn complete_omits_cache_fields_when_request_has_no_cache_control() {
+        // Default Anthropic request (no cache_control, but
+        // metadata.user_id may or may not be present) → wire body
+        // must NOT carry prompt_cache_key / prompt_cache_retention.
+        // The proxy must not pollute requests with cache hints when
+        // the client didn't ask — that would change billing semantics
+        // (caching is opt-in on the client side).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(JsonFieldAbsent("prompt_cache_key"))
+            .and(JsonFieldAbsent("prompt_cache_retention"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(responses_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenaiResponsesProvider::new(
+            "p".to_string(),
+            format!("{}/v1/", server.uri()),
+            "key".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let _ = provider
+            .complete(&request(false), &HashMap::new())
+            .await
+            .unwrap();
     }
 }
