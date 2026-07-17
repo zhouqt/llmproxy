@@ -65,11 +65,18 @@ pub fn build(
     http: reqwest::Client,
 ) -> Result<SharedProvider> {
     match cfg {
-        ProviderConfig::GithubCopilot { name, vscode_version, account_type, .. } => {
+        ProviderConfig::GithubCopilot {
+            name,
+            vscode_version,
+            account_type,
+            model_rewrite,
+            ..
+        } => {
             let inner = copilot::CopilotProvider::new(
                 name.clone(),
                 vscode_version.clone(),
                 account_type.clone(),
+                model_rewrite.clone(),
                 http,
             )?;
             Ok(Arc::new(inner))
@@ -150,6 +157,7 @@ mod tests {
                 name: "copilot".to_string(),
                 vscode_version: "1.95.0".to_string(),
                 account_type: "individual".to_string(),
+                model_rewrite: HashMap::new(),
                 use_proxy: false,
             },
             reqwest::Client::new(),

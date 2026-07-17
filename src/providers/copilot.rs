@@ -32,6 +32,7 @@ pub struct CopilotProvider {
     name: String,
     vscode_version: String,
     account_type: String,
+    model_rewrite: HashMap<String, String>,
     http: reqwest::Client,
     state: Arc<CopilotState>,
     #[cfg(test)]
@@ -79,6 +80,7 @@ impl CopilotProvider {
         name: String,
         vscode_version: String,
         account_type: String,
+        model_rewrite: HashMap<String, String>,
         http: reqwest::Client,
     ) -> Result<Self> {
         let store = TokenStore::new()?;
@@ -100,6 +102,7 @@ impl CopilotProvider {
             name,
             vscode_version,
             account_type,
+            model_rewrite,
             http,
             state,
             #[cfg(test)]
@@ -465,10 +468,29 @@ impl CopilotProvider {
     }
 }
 
+/// Combine the configured provider-level rewrite table with the
+/// runtime per-call map. Runtime entries override configured ones
+/// when keys collide (mirrors `OpenAiCompatProvider`).
+fn merge_rewrites(
+    configured: &HashMap<String, String>,
+    runtime: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut merged = configured.clone();
+    merged.extend(runtime.iter().map(|(k, v)| (k.clone(), v.clone())));
+    merged
+}
+
 #[async_trait]
 impl Provider for CopilotProvider {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn can_serve_model(&self, model: &str) -> bool {
+        // Mirrors OpenAiCompatProvider: empty rewrite table accepts any
+        // model verbatim (Copilot exposes its own catalog); a non-empty
+        // table is an explicit allow-list — see fix-R11.
+        self.model_rewrite.is_empty() || self.model_rewrite.contains_key(model)
     }
 
     async fn complete(
@@ -476,8 +498,9 @@ impl Provider for CopilotProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
+        let merged = merge_rewrites(&self.model_rewrite, model_rewrite);
         let mut openai_req =
-            crate::conversion::anthropic_to_openai_request(req, model_rewrite);
+            crate::conversion::anthropic_to_openai_request(req, &merged);
         openai_req.stream = false;
         openai_req.stream_options = None;
         let body = serde_json::to_value(openai_req)?;
@@ -514,8 +537,9 @@ impl Provider for CopilotProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
+        let merged = merge_rewrites(&self.model_rewrite, model_rewrite);
         let mut openai_req =
-            crate::conversion::anthropic_to_openai_request(req, model_rewrite);
+            crate::conversion::anthropic_to_openai_request(req, &merged);
         openai_req.stream = true;
         openai_req.stream_options = Some(crate::openai::StreamOptions {
             include_usage: true,
@@ -588,6 +612,7 @@ mod tests {
             name: "copilot".to_string(),
             vscode_version: "1.95.0".to_string(),
             account_type: "individual".to_string(),
+            model_rewrite: HashMap::new(),
             http: reqwest::Client::new(),
             state,
             api_base_override: server.map(MockServer::uri),
@@ -771,6 +796,7 @@ mod tests {
             name: "copilot".to_string(),
             vscode_version: "1.95.0".to_string(),
             account_type: "individual".to_string(),
+            model_rewrite: HashMap::new(),
             http: reqwest::Client::new(),
             state,
             api_base_override: Some(server.uri()),
@@ -1099,6 +1125,7 @@ mod tests {
             name: "copilot".to_string(),
             vscode_version: "1.95.0".to_string(),
             account_type: "individual".to_string(),
+            model_rewrite: HashMap::new(),
             http: reqwest::Client::new(),
             state,
             api_base_override: Some(server.uri()),
@@ -1159,6 +1186,7 @@ mod tests {
             name: "copilot".to_string(),
             vscode_version: "1.95.0".to_string(),
             account_type: "individual".to_string(),
+            model_rewrite: HashMap::new(),
             http: reqwest::Client::new(),
             state,
             api_base_override: Some(server.uri()),
@@ -1222,6 +1250,7 @@ mod tests {
             name: "copilot".to_string(),
             vscode_version: "1.95.0".to_string(),
             account_type: "individual".to_string(),
+            model_rewrite: HashMap::new(),
             http: reqwest::Client::new(),
             state,
             api_base_override: Some(server.uri()),
@@ -1297,6 +1326,7 @@ mod tests {
             name: "copilot".to_string(),
             vscode_version: "1.95.0".to_string(),
             account_type: "individual".to_string(),
+            model_rewrite: HashMap::new(),
             http: reqwest::Client::new(),
             state,
             api_base_override: Some(server.uri()),
@@ -1389,6 +1419,7 @@ mod tests {
             name: "copilot".to_string(),
             vscode_version: "1.95.0".to_string(),
             account_type: "individual".to_string(),
+            model_rewrite: HashMap::new(),
             http: reqwest::Client::new(),
             state,
             api_base_override: Some(server.uri()),
@@ -1475,6 +1506,7 @@ mod tests {
             name: "copilot".to_string(),
             vscode_version: "1.95.0".to_string(),
             account_type: "individual".to_string(),
+            model_rewrite: HashMap::new(),
             http: reqwest::Client::new(),
             state,
             api_base_override: Some(server.uri()),
@@ -1535,6 +1567,7 @@ mod tests {
             name: "copilot".to_string(),
             vscode_version: "1.95.0".to_string(),
             account_type: "individual".to_string(),
+            model_rewrite: HashMap::new(),
             http: reqwest::Client::new(),
             state,
             api_base_override: Some(server.uri()),
