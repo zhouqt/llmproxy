@@ -8,6 +8,7 @@
 pub mod anthropic;
 pub mod copilot;
 pub mod openai_compat;
+pub mod openai_responses;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -107,6 +108,16 @@ pub fn build(
             )?;
             Ok(Arc::new(inner))
         }
+        ProviderConfig::OpenaiResponses { name, api_key, api_base, model_rewrite, .. } => {
+            let inner = openai_responses::OpenaiResponsesProvider::new(
+                name.clone(),
+                api_base.clone(),
+                api_key.clone(),
+                model_rewrite.clone(),
+                http,
+            )?;
+            Ok(Arc::new(inner))
+        }
     }
 }
 
@@ -144,6 +155,22 @@ mod tests {
         .unwrap();
         assert_eq!(router.name(), "router");
         assert!(router.clone().spawn_background().is_none());
+    }
+
+    #[test]
+    fn builds_openai_responses_provider() {
+        let responses = build(
+            &ProviderConfig::OpenaiResponses {
+                name: "responses".to_string(),
+                api_key: "key".to_string(),
+                api_base: "https://example.test/v1".to_string(),
+                model_rewrite: HashMap::new(),
+                use_proxy: false,
+            },
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        assert_eq!(responses.name(), "responses");
     }
 
     #[tokio::test]

@@ -28,6 +28,19 @@ const GITHUB_API_VERSION: &str = "2025-04-01";
 const COPILOT_INTERNAL_TOKEN_URL: &str =
     "https://api.github.com/copilot_internal/v2/token";
 
+/// Copilot rejects `/chat/completions` for GPT-5.x with
+/// `unsupported_api_for_model` — those models must hit `/responses`
+/// instead. Reference: copilot-api-py `endpoint_router.py`. Pure
+/// function so we can call it from both `complete` and `stream`
+/// without sharing provider state.
+fn endpoint_for_model(model: &str) -> &'static str {
+    if model.starts_with("gpt-5") {
+        "responses"
+    } else {
+        "chat_completions"
+    }
+}
+
 pub struct CopilotProvider {
     name: String,
     vscode_version: String,
@@ -125,6 +138,10 @@ impl CopilotProvider {
 
     fn chat_url(&self) -> String {
         format!("{}/chat/completions", self.base_url())
+    }
+
+    fn responses_url(&self) -> String {
+        format!("{}/responses", self.base_url())
     }
 
     fn token_url(&self) -> &str {
@@ -440,12 +457,13 @@ impl CopilotProvider {
 
     async fn send_with_token(
         &self,
+        url: &str,
         body: &Value,
     ) -> Result<reqwest::Response> {
         let token = self.ensure_token().await?;
         let resp = self
             .http
-            .post(self.chat_url())
+            .post(url)
             .headers(self.headers(&token))
             .header("content-type", "application/json")
             .json(body)
@@ -456,7 +474,7 @@ impl CopilotProvider {
             let token = self.ensure_token().await?;
             let resp2 = self
                 .http
-                .post(self.chat_url())
+                .post(url)
                 .headers(self.headers(&token))
                 .header("content-type", "application/json")
                 .json(body)
@@ -465,6 +483,69 @@ impl CopilotProvider {
             return Ok(resp2);
         }
         Ok(resp)
+    }
+
+    /// Complete path for GPT-5.x models — Copilot rejects
+    /// `/chat/completions` for those (`unsupported_api_for_model`), so
+    /// we route them to `/responses` instead. See
+    /// `endpoint_for_model`.
+    async fn complete_responses(
+        &self,
+        req: &MessagesRequest,
+        model_rewrite: &HashMap<String, String>,
+    ) -> Result<ProviderOutput> {
+        let merged = merge_rewrites(&self.model_rewrite, model_rewrite);
+        let mut responses_req =
+            crate::conversion::anthropic_to_responses_request(req, &merged);
+        responses_req.stream = false;
+        let body = serde_json::to_value(responses_req)?;
+
+        let resp = self.send_with_token(&self.responses_url(), &body).await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            return Err(ProxyError::Upstream {
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        let parsed: crate::responses::ResponsesResponse = serde_json::from_str(&text)?;
+        let msg_id = crate::conversion::make_message_id();
+        let anthropic = crate::conversion::responses_to_anthropic_response(
+            &parsed,
+            &req.model,
+            &msg_id,
+        )?;
+        Ok(ProviderOutput::Json(serde_json::to_value(anthropic)?))
+    }
+
+    /// Streaming twin of `complete_responses`.
+    async fn stream_responses(
+        &self,
+        req: &MessagesRequest,
+        model_rewrite: &HashMap<String, String>,
+    ) -> Result<ProviderOutput> {
+        let merged = merge_rewrites(&self.model_rewrite, model_rewrite);
+        let mut responses_req =
+            crate::conversion::anthropic_to_responses_request(req, &merged);
+        responses_req.stream = true;
+        let body = serde_json::to_value(responses_req)?;
+
+        let resp = self.send_with_token(&self.responses_url(), &body).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await?;
+            return Err(ProxyError::Upstream {
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        let stream = resp.bytes_stream();
+        let sse = crate::providers::openai_responses::ResponsesSseToAnthropic::new(
+            stream,
+            &req.model,
+        );
+        Ok(ProviderOutput::Stream(Box::new(sse)))
     }
 }
 
@@ -498,6 +579,11 @@ impl Provider for CopilotProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
+        let endpoint = endpoint_for_model(&req.model);
+        if endpoint == "responses" {
+            return self.complete_responses(req, model_rewrite).await;
+        }
+
         let merged = merge_rewrites(&self.model_rewrite, model_rewrite);
         let mut openai_req =
             crate::conversion::anthropic_to_openai_request(req, &merged);
@@ -505,7 +591,7 @@ impl Provider for CopilotProvider {
         openai_req.stream_options = None;
         let body = serde_json::to_value(openai_req)?;
 
-        let resp = self.send_with_token(&body).await?;
+        let resp = self.send_with_token(&self.chat_url(), &body).await?;
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
@@ -537,6 +623,11 @@ impl Provider for CopilotProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
+        let endpoint = endpoint_for_model(&req.model);
+        if endpoint == "responses" {
+            return self.stream_responses(req, model_rewrite).await;
+        }
+
         let merged = merge_rewrites(&self.model_rewrite, model_rewrite);
         let mut openai_req =
             crate::conversion::anthropic_to_openai_request(req, &merged);
@@ -546,7 +637,7 @@ impl Provider for CopilotProvider {
         });
         let body = serde_json::to_value(openai_req)?;
 
-        let resp = self.send_with_token(&body).await?;
+        let resp = self.send_with_token(&self.chat_url(), &body).await?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await?;
@@ -869,6 +960,97 @@ mod tests {
             assert_eq!(body["content"][0]["text"], "world");
             assert_eq!(body["usage"]["input_tokens"], 4);
         });
+    }
+
+    #[tokio::test]
+    async fn complete_routes_gpt5_to_responses_endpoint() {
+        // GPT-5.x models must hit /responses, not /chat/completions —
+        // Copilot rejects the latter with unsupported_api_for_model.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("authorization", "Bearer copilot-token"))
+            .and(body_partial_json(json!({
+                "model": "gpt-5",
+                "stream": false
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_1",
+                "object": "response",
+                "created_at": 0,
+                "model": "gpt-5",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "hello-from-responses"}]
+                }],
+                "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+        let mut gpt5_req = request(false);
+        gpt5_req.model = "gpt-5".to_string();
+
+        let output = provider.complete(&gpt5_req, &HashMap::new()).await.unwrap();
+
+        expect_variant!(output, ProviderOutput::Json(body) => {
+            assert_eq!(body["content"][0]["text"], "hello-from-responses");
+            assert_eq!(body["stop_reason"], "end_turn");
+            assert_eq!(body["usage"]["input_tokens"], 5);
+        });
+    }
+
+    #[tokio::test]
+    async fn stream_routes_gpt5_to_responses_endpoint() {
+        let server = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"object\":\"response\",\"created_at\":0,\"model\":\"gpt-5\",\"status\":\"in_progress\",\"output\":[],\"usage\":{}}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[{\"type\":\"output_text\",\"text\":\"\"}]}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"streamed\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"object\":\"response\",\"created_at\":0,\"model\":\"gpt-5\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+        let mut gpt5_req = request(true);
+        gpt5_req.model = "gpt-5".to_string();
+
+        let output = provider.stream(&gpt5_req, &HashMap::new()).await.unwrap();
+        expect_variant!(output, ProviderOutput::Stream(mut stream) => {
+            let mut encoded = String::new();
+            while let Some(item) = stream.next().await {
+                encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+            }
+            assert!(encoded.contains("event: message_start"));
+            assert!(encoded.contains("\"text\":\"streamed\""));
+            assert!(encoded.contains("event: message_stop"));
+        });
+    }
+
+    #[test]
+    fn endpoint_for_model_classifies_by_prefix() {
+        assert_eq!(endpoint_for_model("gpt-5"), "responses");
+        assert_eq!(endpoint_for_model("gpt-5-mini"), "responses");
+        assert_eq!(endpoint_for_model("gpt-5.5"), "responses");
+        assert_eq!(endpoint_for_model("gpt-4"), "chat_completions");
+        assert_eq!(endpoint_for_model("claude-sonnet-4.6"), "chat_completions");
+        assert_eq!(endpoint_for_model(""), "chat_completions");
     }
 
     #[tokio::test]
