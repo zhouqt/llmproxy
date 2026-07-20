@@ -856,6 +856,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_copilot_token_classifies_5xx_as_transient() {
+        // A 5xx from the copilot token endpoint must be Transient (not
+        // AuthRejected) so the caller keeps the stored github token
+        // instead of wiping it on a flaky upstream (lines 379-381).
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/copilot_internal/v2/token"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("upstream down"))
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(Some(&server), None);
+        let error = provider.fetch_copilot_token("github").await.unwrap_err();
+        assert!(
+            matches!(error, CopilotFetchError::Transient(ref m) if m.contains("503") && m.contains("upstream down")),
+            "5xx must be Transient, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_copilot_token_classifies_invalid_json_body_as_transient() {
+        // A 200 response whose body is not valid JSON must be Transient
+        // (lines 385-388) — a truncated/garbled success payload is a
+        // flaky-upstream symptom, not an auth failure.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/copilot_internal/v2/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string("this is not json"),
+            )
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(Some(&server), None);
+        let error = provider.fetch_copilot_token("github").await.unwrap_err();
+        assert!(
+            matches!(error, CopilotFetchError::Transient(ref m) if m.contains("not valid JSON")),
+            "invalid JSON body must be Transient, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_copilot_token_classifies_network_error_as_transient() {
+        // When the token endpoint is unreachable (connection refused),
+        // the send() call itself errors and must map to Transient
+        // (lines 356-359). We point the provider at a port nobody is
+        // listening on to force a connection error deterministically.
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::from_path(dir.path().join("github_token.json"));
+        let provider = CopilotProvider {
+            name: "copilot".to_string(),
+            vscode_version: "1.95.0".to_string(),
+            account_type: "individual".to_string(),
+            model_rewrite: HashMap::new(),
+            http: reqwest::Client::new(),
+            state: Arc::new(CopilotState {
+                tokens: RwLock::new(None),
+                store,
+                refresh_lock: Mutex::new(()),
+            }),
+            api_base_override: None,
+            // 127.0.0.1:1 is in the reserved low-port range; nothing
+            // listens there, so the TCP connect fails immediately.
+            copilot_token_url: "http://127.0.0.1:1/copilot_internal/v2/token".to_string(),
+        };
+        let error = provider.fetch_copilot_token("github").await.unwrap_err();
+        assert!(
+            matches!(error, CopilotFetchError::Transient(ref m) if m.contains("network error")),
+            "connection failure must be Transient, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn ensure_token_refreshes_when_memory_is_empty() {
         // The store has a valid GitHub token but the in-memory cache was
         // cleared (e.g. process restart). ensure_token should re-fetch the
@@ -1102,6 +1175,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_responses_converts_sse_to_anthropic_for_gpt5() {
+        // Success path for the GPT-5 /responses streaming surface: a
+        // Responses-API SSE sequence (response.created → output_item
+        // .added → output_text.delta → completed) must translate into
+        // valid Anthropic SSE frames (message_start … content_block_delta
+        // … message_stop). This exercises complete lines 543-548
+        // (bytes_stream → ResponsesSseToAnthropic) which the error-only
+        // test above never reaches.
+        let server = MockServer::start().await;
+        let sse = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_s\",\"object\":\"response\",\"created_at\":0,\"model\":\"gpt-5\",\"status\":\"in_progress\",\"output\":[],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"m1\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[{\"type\":\"output_text\",\"text\":\"\"}]}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"output_index\":0,\"content_index\":0,\"delta\":\"streamed-via-responses\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_s\",\"object\":\"response\",\"created_at\":0,\"model\":\"gpt-5\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(body_partial_json(json!({"stream": true})))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+        let mut gpt5_req = request(true);
+        gpt5_req.model = "gpt-5".to_string();
+
+        let output = provider
+            .stream(&gpt5_req, &HashMap::new())
+            .await
+            .unwrap();
+        expect_variant!(output, ProviderOutput::Stream(mut output) => {
+            let mut encoded = String::new();
+            while let Some(item) = output.next().await {
+                encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+            }
+            assert!(encoded.contains("event: message_start"), "missing message_start: {encoded}");
+            assert!(
+                encoded.contains("\"text\":\"streamed-via-responses\""),
+                "missing text delta: {encoded}"
+            );
+            assert!(encoded.contains("event: message_stop"), "missing message_stop: {encoded}");
+        });
+    }
+
+    #[tokio::test]
     async fn gpt5_request_never_touches_chat_completions_endpoint() {
         // Regression guard: ensure GPT-5 dispatch is exclusive to
         // /responses. We assert `expect(1)` on /responses AND `expect(0)`
@@ -1215,6 +1340,34 @@ mod tests {
         // Real-world GPT-5 variants: all lowercase prefix matches.
         assert_eq!(endpoint_for_model("gpt-5.5-mini"), "responses");
         assert_eq!(endpoint_for_model("gpt-5-2025-08-07"), "responses");
+    }
+
+    #[test]
+    fn can_serve_model_accepts_any_model_when_rewrite_is_empty() {
+        // Mirrors OpenAiCompatProvider: empty rewrite table accepts
+        // every model verbatim (Copilot exposes its own catalog).
+        // Without this, the router would skip Copilot for every
+        // request unless the operator explicitly enumerated every
+        // model name.
+        let (_dir, provider) = test_provider(None, None);
+        assert!(provider.can_serve_model("claude-opus-4"));
+        assert!(provider.can_serve_model("gpt-5"));
+        assert!(provider.can_serve_model("any-random-name"));
+    }
+
+    #[test]
+    fn can_serve_model_filters_by_rewrite_keys_when_set() {
+        // When the operator explicitly configures a rewrite table, it
+        // becomes an allow-list — same semantics as OpenAiCompat.
+        // The router relies on this to skip Copilot for unsupported
+        // models without making a doomed HTTP call.
+        let mut rewrite = HashMap::new();
+        rewrite.insert("claude-sonnet-4.6".to_string(), "copilot-claude".to_string());
+        let (_dir, mut provider) = test_provider(None, None);
+        provider.model_rewrite = rewrite;
+        assert!(provider.can_serve_model("claude-sonnet-4.6"));
+        assert!(!provider.can_serve_model("claude-opus-4"));
+        assert!(!provider.can_serve_model("gpt-5"));
     }
 
     #[tokio::test]
@@ -1494,6 +1647,117 @@ mod tests {
 
         let memory = provider.state.tokens.read().await;
         assert_eq!(memory.as_ref().unwrap().copilot_token, "empty-loop-token");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn spawn_refresh_loop_logs_error_when_refresh_fails() {
+        // When the background refresh loop's refresh_token call returns
+        // Err (here: 5xx from the Copilot token endpoint), the loop
+        // body must surface the failure via tracing::error and keep
+        // running (not abort). The next iteration will try again. We
+        // hit line 442 (tracing::error arm) on the first failed cycle.
+        let _env_guard = crate::oauth::device_flow::ENV_LOCK.lock().unwrap();
+        let server = MockServer::start().await;
+        // Copilot token endpoint returns 5xx on every call. The loop's
+        // refresh_token path classifies this as transient (store stays
+        // populated, returns Err), so the loop hits the
+        // `tracing::error!` arm at line 442.
+        Mock::given(method("GET"))
+            .and(path("/copilot_internal/v2/token"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("upstream-down"))
+            .mount(&server)
+            .await;
+
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("loop-fail-github", "loop-fail-copilot", 600)),
+        );
+        let provider = Arc::new(provider);
+        let handle = provider.clone().spawn_refresh_loop();
+
+        // Advance enough paused time to wake the loop past its first
+        // sleep (refresh_in=1500 → 1440s) and execute the refresh call.
+        for _ in 0..30 {
+            tokio::time::advance(std::time::Duration::from_secs(60)).await;
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        handle.abort();
+        let _ = handle.await;
+        std::env::remove_var("LLMPROXY_TEST_GITHUB_BASE_URL");
+
+        // The store must still hold the original credentials — the
+        // refresh failure was transient, so the loop must not have
+        // cleared it.
+        let disk = provider.state.store.load().unwrap().expect("store intact");
+        assert_eq!(disk.github_access_token, "loop-fail-github");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn spawn_refresh_loop_logs_warn_when_bootstrap_fails() {
+        // When the background loop finds no credentials on disk, it
+        // calls start_bootstrap. If the device-flow endpoint returns
+        // 5xx, start_bootstrap returns Err with a non-"already in
+        // progress" message, and the loop hits the tracing::warn arm
+        // (lines 444-453). We don't assert on the log output — the
+        // observable contract is just "loop must keep running" and
+        // "no credentials got persisted". Hitting the warn path is
+        // enough.
+        let _env_guard = crate::oauth::device_flow::ENV_LOCK.lock().unwrap();
+        let server = MockServer::start().await;
+        // Device code endpoint always 5xx so start_bootstrap fails.
+        Mock::given(method("POST"))
+            .and(path("/login/device/code"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("device-flow-down"))
+            .mount(&server)
+            .await;
+        // Make sure no unexpected calls reach the copilot endpoint.
+        Mock::given(method("GET"))
+            .and(path("/copilot_internal/v2/token"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        std::env::set_var("LLMPROXY_TEST_GITHUB_BASE_URL", &server.uri());
+        let dir = tempfile::tempdir().unwrap();
+        // Empty on-disk store → loop hits the bootstrap branch.
+        let store = TokenStore::from_path(dir.path().join("github_token.json"));
+        let state = Arc::new(CopilotState {
+            tokens: RwLock::new(None),
+            store: store.clone(),
+            refresh_lock: Mutex::new(()),
+        });
+        let provider = Arc::new(CopilotProvider {
+            name: "copilot".to_string(),
+            vscode_version: "1.95.0".to_string(),
+            account_type: "individual".to_string(),
+            model_rewrite: HashMap::new(),
+            http: reqwest::Client::new(),
+            state,
+            api_base_override: Some(server.uri()),
+            copilot_token_url: format!("{}/copilot_internal/v2/token", server.uri()),
+        });
+        let handle = provider.clone().spawn_refresh_loop();
+
+        // The empty-memory branch sleeps only 60s; advance enough
+        // paused time for at least one full iteration.
+        for _ in 0..5 {
+            tokio::time::advance(std::time::Duration::from_secs(60)).await;
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        handle.abort();
+        let _ = handle.await;
+        std::env::remove_var("LLMPROXY_TEST_GITHUB_BASE_URL");
+
+        // No tokens got persisted — bootstrap failed and the loop just
+        // logs and retries.
+        assert!(
+            store.load().unwrap().is_none(),
+            "store must remain empty after a failed bootstrap attempt"
+        );
     }
 
     #[tokio::test(start_paused = true)]

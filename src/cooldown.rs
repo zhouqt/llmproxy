@@ -12,7 +12,6 @@ use tokio::sync::RwLock;
 struct CooldownEntry {
     until: Instant,
     status: u16,
-    reason: String,
 }
 
 /// Tracks per-provider cooldown windows.
@@ -21,8 +20,11 @@ pub struct CooldownCache {
     inner: Arc<RwLock<HashMap<String, CooldownEntry>>>,
 }
 
-/// Maximum characters of `reason` we emit in a single `tracing::warn!`.
-/// CooldownEntry still stores the full body for debug snapshots.
+/// Maximum characters of upstream body we emit in a single
+/// `tracing::warn!`. The body itself is NOT stored — it is only
+/// truncated for the warn log so operator can see *why* a provider
+/// was cooled down without flooding the log or holding onto KB-sized
+/// upstream payloads.
 const LOG_REASON_MAX_CHARS: usize = 200;
 
 /// Truncate `s` to `max_chars` characters, appending an ellipsis marker
@@ -64,15 +66,13 @@ impl CooldownCache {
             CooldownEntry {
                 until: Instant::now() + duration,
                 status,
-                reason: reason.to_string(),
             },
         );
         // Some upstreams (e.g. DeepSeek on auth failure) return bodies
-        // longer than a kilobyte. Emitting the full body in every
-        // `provider marked cooldown` warn floods the log and breaks
-        // log-line parsers that assume one event per line. Keep the
-        // full body in CooldownEntry (for debug snapshots) but truncate
-        // what hits the log.
+        // longer than a kilobyte. Emit the body in the cooldown warn
+        // (truncated) so operator can see *why* a provider was cooled,
+        // but do NOT keep the full body in the cache — there is no
+        // reader for it. See issue #1.
         tracing::warn!(
             provider = provider,
             status = status,
@@ -98,22 +98,6 @@ impl CooldownCache {
             .filter_map(|(k, v)| {
                 if v.until > now {
                     Some((k.clone(), v.status, v.until - now))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    /// Same as `active()` but also includes the cached reason string.
-    pub async fn active_with_reason(&self) -> Vec<(String, u16, Duration, String)> {
-        let now = Instant::now();
-        let guard = self.inner.read().await;
-        guard
-            .iter()
-            .filter_map(|(k, v)| {
-                if v.until > now {
-                    Some((k.clone(), v.status, v.until - now, v.reason.clone()))
                 } else {
                     None
                 }
@@ -163,25 +147,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_with_reason_returns_reason_string() {
-        let c = CooldownCache::new();
-        c.mark_cooldown("copilot", Duration::from_secs(60), 429, "rate limited")
-            .await;
-
-        let snapshot = c.active_with_reason().await;
-
-        assert_eq!(snapshot.len(), 1);
-        assert_eq!(snapshot[0].0, "copilot");
-        assert_eq!(snapshot[0].1, 429);
-        assert_eq!(snapshot[0].3, "rate limited");
-        assert!(c.active().await.iter().all(|entry| entry.0 == "copilot"));
-    }
-
-    #[tokio::test]
     async fn active_returns_empty_when_no_entries() {
         let c = CooldownCache::new();
         assert!(c.active().await.is_empty());
-        assert!(c.active_with_reason().await.is_empty());
     }
 
     #[tokio::test]
@@ -196,14 +164,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_with_reason_skips_expired_entries() {
-        // When every entry has expired, active_with_reason should return an
-        // empty vec (the None branch of the filter_map closure runs).
+    async fn active_skips_expired_entries() {
+        // When every entry has expired, active() should return an empty
+        // vec (the None branch of the filter_map closure runs).
         let c = CooldownCache::new();
         c.mark_cooldown("expired", Duration::from_millis(5), 429, "x")
             .await;
         tokio::time::sleep(Duration::from_millis(15)).await;
-        assert!(c.active_with_reason().await.is_empty());
         assert!(c.active().await.is_empty());
     }
 
@@ -229,13 +196,13 @@ mod tests {
         }
 
         assert!(c.is_cooling_down("shared").await);
-        let snapshot = c.active_with_reason().await;
+        // The reason string is no longer cached — only one entry remains
+        // after 32 concurrent writes. The reason is still consumed by
+        // the warn log but is not stored in the cooldown entry itself.
+        let snapshot = c.active().await;
         assert_eq!(snapshot.len(), 1);
-        assert!(
-            snapshot[0].3.starts_with("attempt-"),
-            "reason should come from one of the writers: {}",
-            snapshot[0].3
-        );
+        assert_eq!(snapshot[0].0, "shared");
+        assert_eq!(snapshot[0].1, 429);
     }
 
     #[test]
@@ -287,23 +254,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_cooldown_keeps_full_reason_in_entry_but_logs_truncated() {
-        // CooldownEntry stores the full reason for debug snapshots, but
-        // the tracing::warn! macro receives a truncated version. We can't
-        // easily intercept tracing::warn! here without a subscriber; what
-        // we can check directly is that active_with_reason() still
-        // returns the un-truncated reason — i.e. truncation is purely
-        // a logging concern.
+    async fn mark_cooldown_does_not_cache_reason_body() {
+        // After deleting the `reason` field on `CooldownEntry`, the cache
+        // no longer holds the upstream body — but `truncate_for_log` is
+        // still applied to the warn log. We can't easily intercept
+        // `tracing::warn!` here without a subscriber; what we *can*
+        // assert is that `active()` (the only remaining snapshot
+        // interface) returns just (name, status, ttl) and never a body.
         let c = CooldownCache::new();
-        let long_reason = "y".repeat(2000);
-        c.mark_cooldown("p", Duration::from_secs(5), 503, &long_reason)
+        c.mark_cooldown("p", Duration::from_secs(5), 503, "any body")
             .await;
-        let snapshot = c.active_with_reason().await;
+        let snapshot = c.active().await;
         assert_eq!(snapshot.len(), 1);
-        assert_eq!(
-            snapshot[0].3.len(),
-            2000,
-            "snapshot must keep the full reason for debug"
-        );
+        assert_eq!(snapshot[0].0, "p");
+        assert_eq!(snapshot[0].1, 503);
+        // Snapshot is a 3-tuple — no 4th element to leak body into.
+        // (Type system enforces this; the comment is for readers.)
     }
 }

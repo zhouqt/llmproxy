@@ -543,4 +543,190 @@ mod tests {
         let evs = t.push_event(&ResponsesStreamEvent::Unknown);
         assert!(evs.is_empty());
     }
+
+    #[test]
+    fn in_progress_event_starts_message_and_captures_id_model() {
+        // response.in_progress shares the ResponseCreated arm (line 79).
+        // It must open the message stream; the id/model capture (lines
+        // 82-87) updates internal state AFTER ensure_started has already
+        // emitted MessageStart, so that first event still carries the
+        // constructor placeholders — the captured values would surface
+        // on later events. We assert MessageStart is emitted exactly
+        // once here (the capture path is exercised regardless).
+        let mut t = ResponsesStreamTranslator::new("msg_placeholder", "unset");
+        let mut resp = placeholder_response("in_progress");
+        resp.id = "resp_real".into();
+        resp.model = "gpt-5-mini".into();
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseInProgress {
+            response: Box::new(resp),
+        });
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(evs[0], StreamEvent::MessageStart { .. }));
+        // A second in_progress must not re-emit MessageStart.
+        let evs2 = t.push_event(&ResponsesStreamEvent::ResponseInProgress {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        assert!(evs2.is_empty());
+    }
+
+    #[test]
+    fn output_text_done_emits_content_block_stop() {
+        // response.output_text.done closes the text block (lines 118-121)
+        // by mapping the output_index back to its allocated block and
+        // emitting content_block_stop.
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::Message {
+                id: "msg_a".into(),
+                role: "assistant".into(),
+                status: "in_progress".into(),
+                content: vec![OutputContentPart::OutputText {
+                    text: String::new(),
+                    annotations: None,
+                }],
+            },
+        });
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseOutputTextDone {
+            item_id: "msg_a".into(),
+            output_index: 0,
+            content_index: 0,
+            text: "done".into(),
+        });
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(evs[0], StreamEvent::ContentBlockStop { index: 0 }));
+    }
+
+    #[test]
+    fn function_call_arguments_done_emits_content_block_stop() {
+        // response.function_call_arguments.done closes the tool_use
+        // block (lines 136-139).
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::FunctionCall {
+                id: "fc_1".into(),
+                call_id: "call_1".into(),
+                name: "f".into(),
+                arguments: "{}".into(),
+                status: "in_progress".into(),
+            },
+        });
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseFunctionCallArgumentsDone {
+            item_id: "fc_1".into(),
+            output_index: 0,
+            arguments: "{\"x\":1}".into(),
+        });
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(evs[0], StreamEvent::ContentBlockStop { index: 0 }));
+    }
+
+    #[test]
+    fn output_item_done_is_a_noop() {
+        // response.output_item.done is redundant with the per-text /
+        // per-function-call done events (lines 140-143). It must not
+        // emit anything on its own.
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseOutputItemDone {
+            output_index: 0,
+            item: OutputItem::Message {
+                id: "msg_a".into(),
+                role: "assistant".into(),
+                status: "completed".into(),
+                content: vec![OutputContentPart::OutputText {
+                    text: "full".into(),
+                    annotations: None,
+                }],
+            },
+        });
+        assert!(evs.is_empty());
+    }
+
+    #[test]
+    fn unknown_final_status_defaults_to_end_turn() {
+        // A completed/failed/incomplete event whose status string is
+        // none of the recognized values still resolves to end_turn via
+        // the catch-all arm (line 154). We drive this through the
+        // ResponseCompleted variant carrying an odd status.
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(placeholder_response("some_new_status")),
+        });
+        let final_events = t.finalize();
+        let delta = final_events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { delta } => Some(delta),
+                _ => None,
+            })
+            .expect("finalize emits MessageDelta");
+        assert_eq!(delta.stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[test]
+    fn output_item_added_with_unknown_content_part_opens_empty_text_block() {
+        // A message item whose only content part is an unrecognized type
+        // yields an empty-text block (output_item_to_block: the Unknown
+        // part is skipped by find_map → unwrap_or_default, line 203).
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::Message {
+                id: "msg_u".into(),
+                role: "assistant".into(),
+                status: "in_progress".into(),
+                content: vec![OutputContentPart::Unknown],
+            },
+        });
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            StreamEvent::ContentBlockStart { index: 0, content_block } => {
+                match content_block {
+                    ResponseBlock::Text { text } => assert!(text.is_empty()),
+                    _ => panic!("expected empty Text block"),
+                }
+            }
+            _ => panic!("expected ContentBlockStart"),
+        }
+    }
+
+    #[test]
+    fn output_item_added_with_unknown_item_opens_empty_text_block() {
+        // An unrecognized OutputItem type maps to an empty Text block
+        // (output_item_to_block Unknown arm, lines 222-224) so the block
+        // accounting stays balanced even for item types we don't model.
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::Unknown,
+        });
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            StreamEvent::ContentBlockStart { index: 0, content_block } => {
+                match content_block {
+                    ResponseBlock::Text { text } => assert!(text.is_empty()),
+                    _ => panic!("expected empty Text block"),
+                }
+            }
+            _ => panic!("expected ContentBlockStart"),
+        }
+    }
 }

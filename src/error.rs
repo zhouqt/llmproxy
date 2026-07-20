@@ -375,4 +375,22 @@ mod tests {
             "primary:500,backup:502"
         );
     }
+
+    /// Non-`AllProvidersFailed` errors must not produce the failed-providers
+    /// header. The `_ => None` arm of `failed_providers_header()` is the
+    /// gate; without this test it stays uncovered.
+    #[test]
+    fn failed_providers_header_is_none_for_non_all_failed_variants() {
+        let err = ProxyError::Upstream {
+            status: 502,
+            body: "bad gateway".into(),
+        };
+        assert!(err.failed_providers_header().is_none());
+
+        let err = ProxyError::BadRequest("nope".into());
+        assert!(err.failed_providers_header().is_none());
+
+        let err = ProxyError::ProviderNotFound("m".into());
+        assert!(err.failed_providers_header().is_none());
+    }
 }

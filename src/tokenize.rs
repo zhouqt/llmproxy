@@ -143,4 +143,19 @@ mod tests {
         let tokens = estimate_request_tokens(&serde_json::json!({}));
         assert!(tokens >= 1);
     }
+
+    /// The `walk` recursion falls through a `_ => {}` arm for non-recursive
+    /// JSON shapes (Null, Bool, Number). Mix those in to exercise the arm.
+    #[test]
+    fn walk_handles_non_recursive_leaves() {
+        let v = serde_json::json!({
+            "n": 42,
+            "b": true,
+            "z": null,
+        });
+        let tokens = estimate_request_tokens(&v);
+        // Non-recursive leaves contribute 0 text tokens, but the wrapper
+        // object still floors at 1.
+        assert!(tokens >= 1);
+    }
 }

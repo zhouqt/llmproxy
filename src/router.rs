@@ -582,7 +582,7 @@ mod tests {
             }],
             logging: Default::default(),
         };
-        let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
+        let router = Router::new(Arc::new(cfg), providers.clone(), CooldownCache::new());
         let model = router.find_model("m").unwrap();
 
         let (out, attempts) = router.complete(model, &dummy_request()).await.unwrap();
@@ -594,6 +594,11 @@ mod tests {
         for a in &attempts {
             assert_eq!(a.provider, "primary");
             assert_eq!(a.status, 429);
+        }
+        // Touch `.name()` on each mock provider so the trait impl method
+        // is not just compiled but actually exercised in this test.
+        for (label, expected) in [("primary", "primary"), ("backup", "backup")] {
+            assert_eq!(providers.get(label).unwrap().name(), expected);
         }
     }
 
@@ -775,6 +780,10 @@ mod tests {
         );
         let model = router.find_model("m").unwrap();
 
+        // Touch the NonCooldownProvider's name() method so the trait
+        // impl is covered by this test, not just compiled.
+        assert_eq!(router.providers.get("primary").unwrap().name(), "primary");
+
         let complete = router
             .complete(model, &dummy_request())
             .await
@@ -943,10 +952,10 @@ mod tests {
         assert_eq!(
             router
                 .cooldown()
-                .active_with_reason()
+                .active()
                 .await
                 .iter()
-                .filter(|(n, _, _, _)| n == "primary" || n == "backup")
+                .filter(|(n, _, _)| n == "primary" || n == "backup")
                 .count(),
             2
         );
@@ -1279,6 +1288,12 @@ mod tests {
         let model = router.find_model("m").unwrap();
         let req = dummy_request();
 
+        // Touch the RestrictedMockProvider's name() method on each side
+        // so the trait impl is covered by this test (and the helper
+        // doesn't remain a compiled-but-never-called shell).
+        assert_eq!(router.providers.get("primary").unwrap().name(), "primary");
+        assert_eq!(router.providers.get("backup").unwrap().name(), "backup");
+
         let (out, attempts) = router.complete(model, &req).await.unwrap();
         assert!(matches!(out, ProviderOutput::Json(_)));
         assert_eq!(primary_count.load(Ordering::SeqCst), 0, "primary must be skipped, not called");
@@ -1585,6 +1600,11 @@ mod tests {
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
 
+        // Touch the ModelUnsupportedProvider's name() method so the trait
+        // impl is covered by this test (it would otherwise only exist as
+        // a compiled-but-never-called method on the mock helper).
+        assert_eq!(primary.name(), "primary");
+
         let (out, attempts) = router.complete(model, &dummy_request()).await.unwrap();
         assert!(matches!(out, ProviderOutput::Json(_)));
         // Primary was tried once (returned the 400), backup took over.
@@ -1595,6 +1615,76 @@ mod tests {
         assert_eq!(attempts[0].provider, "primary");
         assert_eq!(attempts[0].status, 400);
         assert!(attempts[0].body.contains("model_not_supported"));
+    }
+
+    #[tokio::test]
+    async fn stream_skips_provider_returning_runtime_model_unsupported() {
+        // Streaming twin of the complete() model-unsupported skip: the
+        // primary answers the stream() call with 400 + model_not_supported;
+        // the router must record the attempt, cool the primary down, and
+        // fall back to the backup's stream. Covers router.rs stream()
+        // is_model_unsupported branch (the 400 skip on the streaming path)
+        // AND ModelUnsupportedProvider::stream. — see fix-R11.
+        let primary = Arc::new(ModelUnsupportedProvider {
+            name: "primary".into(),
+            body: r#"{"error":{"code":"model_not_supported","message":"The requested model is not supported.","param":"model","type":"invalid_request_error"}}"#.into(),
+            call_count: AtomicU32::new(0),
+        });
+        let backup = Arc::new(MockProvider {
+            name: "backup".into(),
+            fail_status: 0,
+            fail_count: 0, // stream succeeds with an empty stream
+            call_count: AtomicU32::new(0),
+        });
+        let mut providers: HashMap<String, SharedProvider> = HashMap::new();
+        providers.insert("primary".to_string(), primary.clone() as SharedProvider);
+        providers.insert("backup".to_string(), backup as SharedProvider);
+
+        let cfg = Config {
+            server: Default::default(),
+            proxy: Default::default(),
+            providers: vec![
+                ProviderConfig::OpenaiCompat {
+                    name: "primary".into(),
+                    api_key: "k".into(),
+                    api_base: "http://x".into(),
+                    model_rewrite: Default::default(),
+                    use_proxy: false,
+                },
+                ProviderConfig::OpenaiCompat {
+                    name: "backup".into(),
+                    api_key: "k".into(),
+                    api_base: "http://x".into(),
+                    model_rewrite: Default::default(),
+                    use_proxy: false,
+                },
+            ],
+            models: vec![ModelConfig {
+                name: "m".into(),
+                primary: "primary".into(),
+                fallback_chain: vec!["backup".into()],
+                cooldown_seconds: 60,
+                max_retries_per_provider: 1,
+                max_retries_total: 3,
+            }],
+            logging: Default::default(),
+        };
+        let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
+        let model = router.find_model("m").unwrap();
+
+        let (provider, _out, attempts) =
+            router.stream(model, &dummy_request()).await.unwrap();
+        // Backup served the stream after primary was skipped.
+        assert_eq!(provider.name(), "backup");
+        assert_eq!(primary.call_count.load(Ordering::SeqCst), 1);
+        // The skipped primary must appear in attempts with its 400 body.
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].provider, "primary");
+        assert_eq!(attempts[0].status, 400);
+        assert!(attempts[0].body.contains("model_not_supported"));
+        // A model-unsupported skip cools the provider down (60s) so the
+        // next request bypasses it entirely.
+        assert!(router.cooldown().is_cooling_down("primary").await);
     }
 
     #[tokio::test]

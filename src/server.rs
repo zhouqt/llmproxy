@@ -421,4 +421,307 @@ mod tests {
         let s = fresh_mapped();
         assert!(!s.done);
     }
+
+    // ──────────────────────────────────────────────────────────────────
+    // admin_copilot_auth: 200 OK / 409 Conflict paths.
+    //
+    // The 404 arm is covered in tests/server.rs. These unit tests
+    // exercise the success arm (device code returned) and the conflict
+    // arm (concurrent bootstrap fails fast with the structured 409
+    // envelope). They construct a real `CopilotProvider` against a
+    // wiremock github device-flow endpoint and exercise the handler
+    // through `axum::Router::oneshot`.
+    //
+    // Note: CopilotState is private to providers/copilot.rs, so we use
+    // `CopilotProvider::new` which builds the state from the standard
+    // TokenStore path (XDG_DATA_HOME). To redirect the device-flow URL
+    // at the wiremock we use the crate-private
+    // `LLMPROXY_TEST_GITHUB_BASE_URL` env var; the existing
+    // `device_flow::ENV_LOCK` serializes this against parallel tests.
+    // ──────────────────────────────────────────────────────────────────
+    mod admin_copilot {
+        use crate::config::{Config, ModelConfig, ProviderConfig, ServerConfig};
+        use crate::cooldown::CooldownCache;
+        use crate::providers::Provider;
+        use crate::providers::copilot::CopilotProvider;
+        use crate::router::Router;
+        use crate::state::AppState;
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+        use http_body_util::BodyExt;
+        use serde_json::{json, Value};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tower::util::ServiceExt;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn build_app_with_copilot(provider: Arc<CopilotProvider>) -> axum::Router {
+            let cfg = Config {
+                server: ServerConfig {
+                    listen: "127.0.0.1:0".to_string(),
+                    api_key: None,
+                },
+                proxy: Default::default(),
+                providers: vec![ProviderConfig::GithubCopilot {
+                    name: "copilot".to_string(),
+                    vscode_version: "1.95.0".to_string(),
+                    account_type: "individual".to_string(),
+                    model_rewrite: HashMap::new(),
+                    use_proxy: false,
+                }],
+                models: vec![ModelConfig {
+                    name: "m".to_string(),
+                    primary: "copilot".to_string(),
+                    fallback_chain: vec![],
+                    cooldown_seconds: 60,
+                    max_retries_per_provider: 1,
+                    max_retries_total: 1,
+                }],
+                logging: Default::default(),
+            };
+            let cfg = Arc::new(cfg);
+            let cooldown = CooldownCache::new();
+            let mut providers = HashMap::new();
+            providers.insert("copilot".to_string(), provider.clone() as Arc<dyn Provider>);
+            let router = Arc::new(Router::new(cfg.clone(), providers, cooldown.clone()));
+            let state = AppState {
+                config: cfg,
+                router,
+                cooldown,
+                http: reqwest::Client::new(),
+                copilot: Some(provider),
+            };
+            crate::server::build_router(state)
+        }
+
+        /// Build a real `CopilotProvider` whose token store lives in a
+        /// private tempdir. The caller is responsible for setting the
+        /// github-base-URL env var under `ENV_LOCK`.
+        fn new_copilot() -> Arc<CopilotProvider> {
+            let dir = tempfile::tempdir().expect("tempdir");
+            // XDG_DATA_HOME must be set BEFORE `CopilotProvider::new`
+            // is called — `TokenStore::new` reads it.
+            std::env::set_var("XDG_DATA_HOME", dir.path());
+            Arc::new(
+                CopilotProvider::new(
+                    "copilot".to_string(),
+                    "1.95.0".to_string(),
+                    "individual".to_string(),
+                    HashMap::new(),
+                    reqwest::Client::new(),
+                )
+                .expect("copilot provider builds"),
+            )
+        }
+
+        #[tokio::test]
+        async fn admin_copilot_auth_returns_200_with_device_code_when_bootstrap_starts() {
+            // Hold the github-base-URL env lock and point it at the
+            // wiremock for this test only.
+            let _env_guard = crate::oauth::device_flow::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+
+            let server = MockServer::start().await;
+            std::env::set_var("LLMPROXY_TEST_GITHUB_BASE_URL", &server.uri());
+
+            Mock::given(method("POST"))
+                .and(path("/login/device/code"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "device_code": "code-200",
+                    "user_code": "USER-200",
+                    "verification_uri": "https://example.test/device",
+                    "expires_in": 600,
+                    "interval": 5,
+                })))
+                .mount(&server)
+                .await;
+
+            let provider = new_copilot();
+            let app = build_app_with_copilot(provider);
+
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/admin/copilot/auth")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            // Drop the env override immediately so the rest of the
+            // suite isn't affected by a stale value.
+            std::env::remove_var("LLMPROXY_TEST_GITHUB_BASE_URL");
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["status"], "ok");
+            assert!(
+                body["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("complete the device flow"),
+                "message should describe the bootstrap step, got: {body}"
+            );
+            assert_eq!(body["device_code"], "code-200");
+            assert_eq!(body["user_code"], "USER-200");
+            assert_eq!(body["verification_uri"], "https://example.test/device");
+            assert_eq!(body["expires_in"], 600);
+            assert_eq!(body["interval"], 5);
+        }
+
+        #[tokio::test]
+        async fn admin_copilot_auth_returns_409_when_bootstrap_already_in_progress() {
+            // The two requests must be SEQUENCED, not raced. Rationale:
+            // `start_bootstrap`'s `try_lock` fast-path guard is dropped
+            // immediately after the check — the refresh_lock is only
+            // truly *held* by the spawned background task, which acquires
+            // it AFTER `request_device_code` returns and then blocks in
+            // the poll loop (which sleeps `interval.max(5)+1` ≈ 6s before
+            // its first HTTP poll). So the reliable ordering is:
+            //   1. request 1 returns 200 (device code issued),
+            //   2. its spawned task acquires refresh_lock and parks in
+            //      the ~6s poll sleep,
+            //   3. request 2 hits try_lock while the lock is held →
+            //      "already in progress" → structured 409 Conflict.
+            // The device-code mock is instant; the second request must
+            // arrive during the spawned task's poll sleep, which is why
+            // we await request 1 fully and then poll for the 409 with a
+            // short retry budget (well under the ~6s hold window).
+            let _env_guard = crate::oauth::device_flow::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+
+            let server = MockServer::start().await;
+            std::env::set_var("LLMPROXY_TEST_GITHUB_BASE_URL", &server.uri());
+
+            Mock::given(method("POST"))
+                .and(path("/login/device/code"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "device_code": "code-slow",
+                    "user_code": "SLOW",
+                    "verification_uri": "https://example.test/device",
+                    "expires_in": 600,
+                    "interval": 5,
+                })))
+                .mount(&server)
+                .await;
+            // The poll loop will fire one access_token request after its
+            // first sleep; answer with authorization_pending so it keeps
+            // holding the lock (never completes) for the test's lifetime.
+            Mock::given(method("POST"))
+                .and(path("/login/oauth/access_token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "error": "authorization_pending"
+                })))
+                .mount(&server)
+                .await;
+
+            let provider = new_copilot();
+            let app = build_app_with_copilot(provider);
+
+            let mk_req = || {
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/copilot/auth")
+                    .body(Body::empty())
+                    .unwrap()
+            };
+
+            // Request 1: expect 200 and a device code.
+            let first_resp = app.clone().oneshot(mk_req()).await.unwrap();
+            assert_eq!(
+                first_resp.status(),
+                StatusCode::OK,
+                "first bootstrap must succeed"
+            );
+
+            // The spawned task acquires refresh_lock asynchronously after
+            // request 1 returns. Poll request 2 until it observes the
+            // held lock (409). Budget stays well under the ~6s hold.
+            let mut conflict_resp = None;
+            for _ in 0..50 {
+                let resp = app.clone().oneshot(mk_req()).await.unwrap();
+                if resp.status() == StatusCode::CONFLICT {
+                    conflict_resp = Some(resp);
+                    break;
+                }
+                // 200 means the spawned task hasn't grabbed the lock yet
+                // (or already released it — impossible here since the
+                // poll loop never completes). Give it a moment.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            std::env::remove_var("LLMPROXY_TEST_GITHUB_BASE_URL");
+
+            let conflict_resp =
+                conflict_resp.expect("a concurrent bootstrap must eventually return 409 Conflict");
+
+            // Inspect the 409 body: structured conflict envelope with
+            // an "already in progress" message.
+            let bytes = conflict_resp.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["type"], "error");
+            assert_eq!(body["error"]["type"], "conflict");
+            let msg = body["error"]["message"].as_str().unwrap();
+            assert!(
+                msg.contains("already in progress"),
+                "409 message must mention 'already in progress', got: {msg}"
+            );
+        }
+
+        /// Triggers the `Err(e) => { ... else { e.into_response() } }`
+        /// branch of `admin_copilot_auth_handler` — i.e. start_bootstrap
+        /// fails for a reason that is *not* "already in progress"
+        /// (e.g. GitHub returned 500). The handler must surface it as a
+        /// normal internal error response, not a 409.
+        #[tokio::test]
+        async fn admin_copilot_auth_returns_internal_error_when_bootstrap_fails_for_other_reason() {
+            let _env_guard = crate::oauth::device_flow::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+
+            let server = MockServer::start().await;
+            std::env::set_var("LLMPROXY_TEST_GITHUB_BASE_URL", &server.uri());
+
+            // GitHub returns 500 on the device-code endpoint. The error
+            // message will not contain "already in progress", so the
+            // handler takes the `else { e.into_response() }` path.
+            Mock::given(method("POST"))
+                .and(path("/login/device/code"))
+                .respond_with(ResponseTemplate::new(500).set_body_string("upstream error"))
+                .mount(&server)
+                .await;
+
+            let provider = new_copilot();
+            let app = build_app_with_copilot(provider);
+
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/admin/copilot/auth")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            std::env::remove_var("LLMPROXY_TEST_GITHUB_BASE_URL");
+
+            // 500 from the upstream device-code endpoint is propagated
+            // through `ProxyError::into_response`, not 409 (which is the
+            // "already in progress" branch).
+            assert_eq!(
+                resp.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "non-conflict bootstrap failure must surface as 5xx, not 409"
+            );
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["type"], "error");
+        }
+    }
 }
