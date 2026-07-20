@@ -402,3 +402,37 @@ pub struct ApiErrorBody {
     #[serde(default)]
     pub code: Option<Value>,
 }
+
+#[cfg(test)]
+mod looks_like_error_envelope_tests {
+    use super::*;
+
+    /// `looks_like_error_envelope` short-circuits to false for any
+    /// top-level value that is not a JSON object. Without a guard test,
+    /// the `Value::Object` early-return is never exercised.
+    #[test]
+    fn looks_like_error_envelope_rejects_non_object_values() {
+        assert!(!looks_like_error_envelope(&serde_json::json!("a string")));
+        assert!(!looks_like_error_envelope(&serde_json::json!(42)));
+        assert!(!looks_like_error_envelope(&serde_json::json!(null)));
+        assert!(!looks_like_error_envelope(&serde_json::json!([1, 2, 3])));
+    }
+
+    /// An object with an `error` field whose value is not itself an
+    /// object (e.g. a string) is not an OpenAI error envelope — that
+    /// shape is reserved for assistant-message payloads that happen to
+    /// mention the word "error".
+    #[test]
+    fn looks_like_error_envelope_rejects_non_object_error_field() {
+        let body = serde_json::json!({"error": "rate limited"});
+        assert!(!looks_like_error_envelope(&body));
+    }
+
+    #[test]
+    fn looks_like_error_envelope_accepts_object_error_field() {
+        let body = serde_json::json!({
+            "error": {"message": "rate limited", "type": "rate_limit"}
+        });
+        assert!(looks_like_error_envelope(&body));
+    }
+}
