@@ -56,15 +56,19 @@ pub fn anthropic_to_responses_request(
     let instructions = req.system.as_ref().and_then(|s| match s {
         SystemPrompt::Text(s) if !s.is_empty() => Some(s.clone()),
         SystemPrompt::Blocks(blocks) => {
-            let text = blocks
+            // Drop empty-text blocks before joining so we don't emit
+            // `instructions: "\n\n"` (or any whitespace-only string)
+            // when every block is empty. An all-empty `Blocks` array
+            // must behave the same as `Text("")` → `None`. See issue #2.
+            let non_empty: Vec<&str> = blocks
                 .iter()
                 .map(|b| b.text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            if text.is_empty() {
+                .filter(|t| !t.is_empty())
+                .collect();
+            if non_empty.is_empty() {
                 None
             } else {
-                Some(text)
+                Some(non_empty.join("\n\n"))
             }
         }
         _ => None,
@@ -898,5 +902,303 @@ mod tests {
         let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_m").unwrap();
         assert_eq!(out.stop_reason.as_deref(), Some("tool_use"));
         assert_eq!(out.content.len(), 2);
+    }
+
+    #[test]
+    fn request_omits_instructions_when_system_blocks_are_empty_array() {
+        // System supplied as an EMPTY `Blocks` array: the joined
+        // instruction string is empty, so `instructions` must be absent.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "system": []
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert!(out.instructions.is_none());
+    }
+
+    #[test]
+    fn request_omits_instructions_when_system_blocks_are_all_empty_text() {
+        // N>=1 blocks each with empty text: drop them all before joining
+        // and return None. The fix for issue #2 makes this consistent
+        // with `Text("")` and the empty-array case above — a client
+        // that sends all-empty system prompts must NOT cause
+        // `instructions: "\n\n"` to leak into the upstream request.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "system": [
+                {"type": "text", "text": ""},
+                {"type": "text", "text": ""}
+            ]
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert!(
+            out.instructions.is_none(),
+            "all-empty-text system blocks must yield None, got {:?}",
+            out.instructions
+        );
+    }
+
+    #[test]
+    fn request_keeps_non_empty_blocks_when_mixed_with_empty() {
+        // When some blocks are empty and some are non-empty, only the
+        // non-empty blocks contribute to the joined string. The empty
+        // blocks are filtered (not joined as "" → "\n\n" padding).
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "system": [
+                {"type": "text", "text": ""},
+                {"type": "text", "text": "first real instruction"},
+                {"type": "text", "text": ""},
+                {"type": "text", "text": "second real instruction"}
+            ]
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert_eq!(
+            out.instructions.as_deref(),
+            Some("first real instruction\n\nsecond real instruction"),
+            "empty blocks must be filtered, not joined as padding"
+        );
+    }
+
+    #[test]
+    fn user_turn_with_single_image_uses_parts_content() {
+        // A user turn whose ONLY block is an image yields a single-part
+        // list — but a single non-text part must still serialize as
+        // `Parts` (not `Text`), covering the else-branch at line 164.
+        let msg = Message {
+            role: "user".into(),
+            content: MessageContent::Blocks(vec![ContentBlock::Image {
+                source: crate::anthropic::ImageSource {
+                    kind: "base64".into(),
+                    media_type: "image/png".into(),
+                    data: "AAAA".into(),
+                },
+            }]),
+        };
+        let out = convert_message(&msg);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ResponseInputItem::Message { content, .. } => match content {
+                ResponseInputContent::Parts(parts) => {
+                    assert_eq!(parts.len(), 1);
+                    assert!(matches!(parts[0], ResponseInputPart::InputImage { .. }));
+                }
+                _ => panic!("single image must serialize as Parts, not Text"),
+            },
+            _ => panic!("expected message"),
+        }
+    }
+
+    #[test]
+    fn assistant_turn_with_multiple_text_blocks_joins_with_newline() {
+        // Two assistant Text blocks accumulate into one message body
+        // separated by '\n' (line 183-184: the non-empty push guard).
+        let msg = Message {
+            role: "assistant".into(),
+            content: MessageContent::Blocks(vec![
+                ContentBlock::Text { text: "line one".into(), cache_control: None },
+                ContentBlock::Text { text: "line two".into(), cache_control: None },
+            ]),
+        };
+        let out = convert_message(&msg);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ResponseInputItem::Message { content, .. } => match content {
+                ResponseInputContent::Text(t) => assert_eq!(t, "line one\nline two"),
+                _ => panic!("expected joined text"),
+            },
+            _ => panic!("expected message"),
+        }
+    }
+
+    #[test]
+    fn assistant_turn_skips_image_and_tool_result_blocks() {
+        // Image / ToolResult / Unknown blocks are invalid in an
+        // assistant turn and must be dropped (line 199-201), leaving
+        // only the text body.
+        let msg = Message {
+            role: "assistant".into(),
+            content: MessageContent::Blocks(vec![
+                ContentBlock::Text { text: "keep me".into(), cache_control: None },
+                ContentBlock::Image {
+                    source: crate::anthropic::ImageSource {
+                        kind: "base64".into(),
+                        media_type: "image/png".into(),
+                        data: "AAAA".into(),
+                    },
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: crate::anthropic::ToolResultContent::Text("ignored".into()),
+                    is_error: None,
+                },
+                ContentBlock::Unknown,
+            ]),
+        };
+        let out = convert_message(&msg);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ResponseInputItem::Message { content, .. } => match content {
+                ResponseInputContent::Text(t) => assert_eq!(t, "keep me"),
+                _ => panic!("expected text"),
+            },
+            _ => panic!("expected message"),
+        }
+    }
+
+    #[test]
+    fn unknown_role_produces_no_input_items() {
+        // A role other than user/assistant (e.g. a client-injected
+        // "tool" role) falls through the `_ => {}` arm at line 218 and
+        // yields nothing.
+        let out = convert_blocks(
+            "tool",
+            &[ContentBlock::Text { text: "orphan".into(), cache_control: None }],
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn tool_result_with_block_content_joins_text_fields() {
+        // A tool_result whose content is an array of blocks (not a bare
+        // string) must have its `text` fields extracted and joined
+        // (tool_result_to_string Blocks arm, lines 227-231).
+        let msg = Message {
+            role: "user".into(),
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "t9".into(),
+                content: crate::anthropic::ToolResultContent::Blocks(vec![
+                    json!({"type": "text", "text": "first"}),
+                    json!({"type": "text", "text": "second"}),
+                    json!({"type": "image", "source": {}}), // no text → skipped
+                ]),
+                is_error: None,
+            }]),
+        };
+        let out = convert_message(&msg);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ResponseInputItem::FunctionCallOutput { call_id, output } => {
+                assert_eq!(call_id, "t9");
+                assert_eq!(output, "first\nsecond");
+            }
+            _ => panic!("expected function_call_output"),
+        }
+    }
+
+    #[test]
+    fn tool_choice_auto_maps_to_auto_string() {
+        // `tool_choice: {type: auto}` → Responses `"auto"` (line 237).
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "f", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "auto"}
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert_eq!(out.tool_choice.as_ref().unwrap(), &json!("auto"));
+    }
+
+    #[test]
+    fn thinking_high_and_low_budget_map_to_effort_levels() {
+        // budget >= 8000 → "high" (line 253); budget < 2000 → "low"
+        // (line 257). The medium band is already covered elsewhere.
+        for (budget, expected) in [(8000u32, "high"), (1000u32, "low")] {
+            let req: MessagesRequest = serde_json::from_value(json!({
+                "model": "gpt-5",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"type": "enabled", "budget_tokens": budget}
+            }))
+            .unwrap();
+            let out = anthropic_to_responses_request(&req, &Default::default());
+            match out.reasoning.as_ref().unwrap() {
+                ReasoningConfig::Enabled { effort } => {
+                    assert_eq!(effort.as_deref(), Some(expected), "budget {budget}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn response_with_unknown_output_content_part_is_ignored() {
+        // An output message containing an unrecognized content part
+        // type must be skipped without panicking (OutputContentPart
+        // ::Unknown arm, line 293). The known text part still lands.
+        let raw = json!({
+            "id": "resp_u",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [{
+                "type": "message", "id": "m", "role": "assistant", "status": "completed",
+                "content": [
+                    {"type": "output_text", "text": "visible"},
+                    {"type": "some_future_part", "blob": 1}
+                ]
+            }],
+            "usage": {"input_tokens": 4, "output_tokens": 1, "total_tokens": 5}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_u").unwrap();
+        assert_eq!(out.content.len(), 1);
+        assert!(matches!(out.content[0], ResponseBlock::Text { .. }));
+    }
+
+    #[test]
+    fn response_with_unknown_output_item_is_ignored() {
+        // An unrecognized top-level output item type (e.g. a hosted
+        // tool call we don't model) must be skipped (OutputItem::Unknown
+        // arm, line 312) while known items still convert.
+        let raw = json!({
+            "id": "resp_ui",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [
+                {"type": "web_search_call", "id": "ws_1", "status": "completed"},
+                {"type": "message", "id": "m", "role": "assistant", "status": "completed",
+                 "content": [{"type": "output_text", "text": "answer"}]}
+            ],
+            "usage": {"input_tokens": 4, "output_tokens": 1, "total_tokens": 5}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_ui").unwrap();
+        assert_eq!(out.content.len(), 1);
+        assert!(matches!(out.content[0], ResponseBlock::Text { .. }));
+    }
+
+    #[test]
+    fn response_unknown_status_yields_no_stop_reason() {
+        // A status the translator doesn't recognize (and no tool calls)
+        // leaves stop_reason as None (line 323, the `_ => None` arm).
+        let raw = json!({
+            "id": "resp_s",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "in_progress",
+            "output": [{
+                "type": "message", "id": "m", "role": "assistant", "status": "in_progress",
+                "content": [{"type": "output_text", "text": "streaming..."}]
+            }],
+            "usage": {"input_tokens": 4, "output_tokens": 1, "total_tokens": 5}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_s").unwrap();
+        assert!(out.stop_reason.is_none());
     }
 }

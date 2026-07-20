@@ -895,4 +895,162 @@ mod tests {
             .await
             .unwrap();
     }
+
+    #[tokio::test]
+    async fn adapter_emits_clean_message_start_and_stop_on_minimal_sse() {
+        // End-to-end shape of a minimal successful Responses SSE
+        // exchange: created → text delta → completed → [DONE]. The
+        // adapter must emit message_start, at least one content
+        // delta, and message_stop with no other framing noise.
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"object\":\"response\",\"created_at\":0,\"model\":\"m\",\"status\":\"in_progress\",\"output\":[],\"usage\":{}}}\n\n\
+              data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[{\"type\":\"output_text\",\"text\":\"\"}]}}\n\n\
+              data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg\",\"output_index\":0,\"content_index\":0,\"delta\":\"hi\"}\n\n\
+              data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"object\":\"response\",\"created_at\":0,\"model\":\"m\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n\
+              data: [DONE]\n\n",
+        ))];
+        let mut adapter = ResponsesSseToAnthropic::new(stream::iter(chunks), "m");
+        let mut encoded = String::new();
+        while let Some(item) = adapter.next().await {
+            encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+        }
+        // Order: message_start must come before content_block_delta,
+        // which must come before message_stop.
+        let pos_start = encoded.find("event: message_start").expect("message_start");
+        let pos_delta = encoded.find("event: content_block_delta").expect("content_block_delta");
+        let pos_stop = encoded.find("event: message_stop").expect("message_stop");
+        assert!(pos_start < pos_delta);
+        assert!(pos_delta < pos_stop);
+        assert!(encoded.contains("\"text\":\"hi\""));
+    }
+
+    #[tokio::test]
+    async fn adapter_skips_empty_data_lines_without_dropping_subsequent_events() {
+        // OpenAI SSE often has trailing `data:` lines (empty payload)
+        // interleaved with valid events. The adapter must skip them
+        // silently rather than crashing on the empty payload or
+        // dropping the next event. See openai_responses.rs:188.
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data:\n\n\
+              data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"object\":\"response\",\"created_at\":0,\"model\":\"m\",\"status\":\"in_progress\",\"output\":[],\"usage\":{}}}\n\n\
+              data:   \n\n\
+              data: [DONE]\n\n",
+        ))];
+        let mut adapter = ResponsesSseToAnthropic::new(stream::iter(chunks), "m");
+        let mut encoded = String::new();
+        while let Some(item) = adapter.next().await {
+            encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+        }
+        // Empty lines were skipped; the one real event still came
+        // through.
+        assert!(encoded.contains("event: message_start"));
+        assert!(encoded.contains("event: message_stop"));
+    }
+
+    #[tokio::test]
+    async fn adapter_emits_finalized_message_stop_when_done_marker_seen_after_completed() {
+        // When the upstream sends [DONE] after response.completed, the
+        // adapter's process_lines() takes the [DONE] branch and calls
+        // translator.finalize() — but at that point the completed event
+        // already added message_stop to the buffer. We verify that the
+        // [DONE] branch doesn't emit a *second* message_stop and that
+        // the stream terminates cleanly. See openai_responses.rs:190-198.
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"object\":\"response\",\"created_at\":0,\"model\":\"m\",\"status\":\"in_progress\",\"output\":[],\"usage\":{}}}\n\n\
+              data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"object\":\"response\",\"created_at\":0,\"model\":\"m\",\"status\":\"completed\",\"output\":[],\"usage\":{}}}\n\n\
+              data: [DONE]\n\n",
+        ))];
+        let mut adapter = ResponsesSseToAnthropic::new(stream::iter(chunks), "m");
+        let mut encoded = String::new();
+        while let Some(item) = adapter.next().await {
+            encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+        }
+        let stop_count = encoded.matches("event: message_stop").count();
+        assert_eq!(stop_count, 1, "exactly one message_stop expected, got {stop_count}: {encoded}");
+    }
+
+    #[tokio::test]
+    async fn adapter_emits_error_event_on_inner_stream_failure() {
+        // If the upstream HTTP body stream returns Err mid-stream
+        // (connection drop, etc.), the adapter must surface it as a
+        // ProxyError so the server layer can wrap it in the
+        // `event: error` envelope (see server::MappedStream). The
+        // outer Stream::poll_next drives the adapter — we feed a
+        // stream that yields one chunk then an Err. See
+        // openai_responses.rs:242-244.
+        let s = stream::iter(vec![
+            Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"object\":\"response\",\"created_at\":0,\"model\":\"m\",\"status\":\"in_progress\",\"output\":[],\"usage\":{}}}\n\n",
+            )),
+            Err(reqwest::Error::from(
+                reqwest::Client::new()
+                    .get("http://[invalid")
+                    .build()
+                    .unwrap_err(),
+            )),
+        ]);
+        let mut adapter = ResponsesSseToAnthropic::new(s, "m");
+        let mut items: Vec<Result<Bytes>> = Vec::new();
+        while let Some(item) = adapter.next().await {
+            items.push(item);
+        }
+        // The first item should be the message_start chunk; the
+        // second should be the propagated error.
+        assert!(items.len() >= 2, "expected >=2 items, got {}", items.len());
+        assert!(items[0].is_ok(), "first chunk should be the message_start bytes");
+        assert!(items[1].is_err(), "second item should be the propagated Http error, got Ok");
+        match &items[1] {
+            Err(crate::error::ProxyError::Http(_)) => {}
+            other => panic!("expected ProxyError::Http, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn adapter_finalizes_on_eof_after_chunk_with_no_done_marker() {
+        // End-of-stream without a [DONE] marker. The poll_next
+        // Poll::Ready(None) branch (lines 246-251) must call
+        // translator.finalize() so the client still sees
+        // message_stop — otherwise the body just truncates. We feed
+        // one valid event then a chunk that ends the stream.
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"object\":\"response\",\"created_at\":0,\"model\":\"m\",\"status\":\"in_progress\",\"output\":[],\"usage\":{}}}\n\n",
+        ))];
+        let mut adapter = ResponsesSseToAnthropic::new(stream::iter(chunks), "m");
+        let mut encoded = String::new();
+        while let Some(item) = adapter.next().await {
+            encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+        }
+        assert!(encoded.contains("event: message_start"));
+        assert!(
+            encoded.contains("event: message_stop"),
+            "EOF must finalize the translator and emit message_stop, got: {encoded}"
+        );
+    }
+
+    #[test]
+    fn event_name_emits_ping_for_ping_variant() {
+        // The Responses translator never emits a Ping, but the
+        // event_name() match must still handle it for completeness
+        // (if a future Responses variant maps to an Anthropic
+        // Ping, this arm is the one that takes it). Locking the
+        // encoding here so a future rename of the wire-format name
+        // is caught.
+        assert_eq!(event_name(&StreamEvent::Ping), "ping");
+    }
+
+    #[test]
+    fn event_name_emits_error_for_error_variant() {
+        // Same rationale as ping: future-proofing the
+        // event_name() match for the Error variant. The Responses
+        // translator surfaces upstream errors via the chunk's HTTP
+        // status (handled before SSE starts), so this arm is
+        // currently only reachable when an Error event is injected
+        // by the translator itself — but the wire-name contract is
+        // still part of the public surface.
+        use crate::anthropic::StreamEvent;
+        let ev = StreamEvent::Error {
+            error: serde_json::json!({"type": "upstream_error", "message": "boom"}),
+        };
+        assert_eq!(event_name(&ev), "error");
+    }
 }
