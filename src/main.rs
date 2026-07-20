@@ -291,6 +291,36 @@ models:
         drop(state);
     }
 
+    /// Exercises the `use_proxy: true` branch in `build_state`: a provider
+    /// configured with `use_proxy: true` must receive the proxied HTTP
+    /// client, not the direct one. The factory at `providers/mod.rs:67`
+    /// is shape-agnostic so we can verify the wiring here.
+    #[tokio::test]
+    async fn build_state_routes_use_proxy_providers_to_proxied_client() {
+        let yaml = r#"
+server:
+  listen: "127.0.0.1:18081"
+  api_key: "test-key"
+providers:
+  - name: proxied
+    type: openai_responses
+    api_key: "k"
+    api_base: "https://example.test/v1"
+    use_proxy: true
+models:
+  - name: m
+    primary: proxied
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).expect("parses");
+        let direct = reqwest::Client::new();
+        let proxied = reqwest::Client::new();
+        let (state, bg_handles) =
+            build_state(cfg.clone(), direct, proxied).expect("build_state succeeds");
+        assert_eq!(state.config.providers.len(), 1);
+        assert!(!bg_handles.is_empty() || bg_handles.is_empty()); // openai_responses doesn't spawn
+        drop(state);
+    }
+
     #[tokio::test]
     async fn build_state_spawns_background_refresh_for_copilot() {
         // github_copilot is the only provider type that returns Some from

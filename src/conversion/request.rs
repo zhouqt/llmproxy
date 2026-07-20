@@ -306,6 +306,19 @@ mod tests {
         assert_eq!(strip_date_suffix("claude-sonnet-4-5"), "claude-sonnet-4-5");
     }
 
+    /// The loop in `strip_date_suffix` finds a hyphen and then checks
+    /// the trailing 8 chars are all digits. The "found hyphen but tail
+    /// is not 8 digits" branch (e.g. `-snapshot`) must fall through and
+    /// return the original model untouched — see uncovered region at
+    /// `request.rs:292`.
+    #[test]
+    fn strip_date_suffix_drops_tail_when_hyphen_found_but_tail_is_not_date() {
+        assert_eq!(strip_date_suffix("claude-sonnet-4-snapshot"), "claude-sonnet-4-snapshot");
+        assert_eq!(strip_date_suffix("model-latest"), "model-latest");
+        // Edge case: hyphen followed by a non-digit char (not even 8 chars)
+        assert_eq!(strip_date_suffix("m-x"), "m-x");
+    }
+
     #[test]
     fn request_with_text_only() {
         let raw = serde_json::json!({

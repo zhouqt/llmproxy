@@ -101,5 +101,12 @@ mod tests {
             "application/x-www-form-urlencoded".parse().unwrap(),
         );
         assert!(!is_json_content_type(&h));
+        // Non-ASCII bytes make HeaderValue::to_str() fail. The function
+        // should treat that as "not JSON" rather than panic.
+        h.insert(
+            header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_bytes(b"application/json\xff").unwrap(),
+        );
+        assert!(!is_json_content_type(&h));
     }
 }
