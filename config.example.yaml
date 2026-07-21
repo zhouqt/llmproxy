@@ -4,8 +4,10 @@
 #   cargo run --release -- --config config.yaml
 #
 # Environment variable expansion: any `${VAR}` or `$VAR` reference is
-# expanded from the process environment at startup. This is how API keys
-# are typically injected.
+# expanded from the process environment at startup. Bash-style
+# `${VAR:-default}` is also supported — the literal `default` is used
+# (with outer single/double quotes stripped) when VAR is unset or empty.
+# This is how API keys are typically injected.
 
 # ───────────────────────────────────────────────────────────────────────
 # server: incoming HTTP listener
