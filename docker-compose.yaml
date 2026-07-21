@@ -6,12 +6,15 @@ services:
     volumes:
       - ./config.yaml:/etc/llmproxy/config.yaml:ro
       - llmproxy-data:/root/.local/share/llmproxy
+    # Secrets and per-host config come from .env (gitignored). Copy
+    # .env.example -> .env and fill in real values before `docker
+    # compose up`. `env_file` lets us keep this YAML free of any
+    # host-specific data so the file can be pushed without conflicts.
+    env_file:
+      - .env
     environment:
-      - LLMPROXY_API_KEY=${LLMPROXY_API_KEY:-sk-llmproxy-1234}
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
-      - MINIMAX_API_KEY=${MINIMAX_API_KEY:-}
-      - OPENCODE_API_KEY=${OPENCODE_API_KEY:-}
+      # Non-secret defaults only. Override per-host via .env if needed.
+      - RUST_LOG=${RUST_LOG:-info}
     restart: unless-stopped
 
 volumes:
