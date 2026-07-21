@@ -197,7 +197,7 @@ fn convert_blocks(role: &str, blocks: &[ContentBlock]) -> Vec<ChatMessage> {
                         }
                         text_acc.push_str(text);
                     }
-                    ContentBlock::Thinking { thinking } => {
+                    ContentBlock::Thinking { thinking, .. } => {
                         reasoning_acc.push_str(thinking);
                     }
                     ContentBlock::ToolUse { id, name, input } => {
