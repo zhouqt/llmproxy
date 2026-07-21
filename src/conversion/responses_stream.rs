@@ -55,7 +55,10 @@ impl ResponsesStreamTranslator {
                 model: self.model.clone(),
                 stop_reason: None,
                 stop_sequence: None,
+                stop_details: None,
+                container: None,
                 usage: Usage::default(),
+                extra: std::collections::HashMap::new(),
             };
             out.push(StreamEvent::MessageStart { message: placeholder });
         }
@@ -178,11 +181,18 @@ impl ResponsesStreamTranslator {
                 .as_ref()
                 .filter(|d| d.cached_tokens > 0)
                 .map(|d| d.cached_tokens),
+            cache_creation: None,
+            server_tool_use: None,
+            output_tokens_details: None,
+            service_tier: None,
+            inference_geo: None,
         });
         out.push(StreamEvent::MessageDelta {
             delta: MessageDeltaPayload {
                 stop_reason,
                 stop_sequence: None,
+                stop_details: None,
+                container: None,
                 usage,
             },
         });
@@ -203,7 +213,7 @@ fn output_item_to_block(item: &OutputItem) -> ResponseBlock {
                     OutputContentPart::Unknown => None,
                 })
                 .unwrap_or_default();
-            ResponseBlock::Text { text }
+            ResponseBlock::Text { text, citations: None }
         }
         OutputItem::FunctionCall {
             call_id,
@@ -217,10 +227,12 @@ fn output_item_to_block(item: &OutputItem) -> ResponseBlock {
                 id: call_id.clone(),
                 name: name.clone(),
                 input,
+                caller: None,
             }
         }
         OutputItem::Unknown => ResponseBlock::Text {
             text: String::new(),
+            citations: None,
         },
     }
 }
@@ -697,7 +709,7 @@ mod tests {
         match &evs[0] {
             StreamEvent::ContentBlockStart { index: 0, content_block } => {
                 match content_block {
-                    ResponseBlock::Text { text } => assert!(text.is_empty()),
+                    ResponseBlock::Text { text, .. } => assert!(text.is_empty()),
                     _ => panic!("expected empty Text block"),
                 }
             }
@@ -722,7 +734,7 @@ mod tests {
         match &evs[0] {
             StreamEvent::ContentBlockStart { index: 0, content_block } => {
                 match content_block {
-                    ResponseBlock::Text { text } => assert!(text.is_empty()),
+                    ResponseBlock::Text { text, .. } => assert!(text.is_empty()),
                     _ => panic!("expected empty Text block"),
                 }
             }

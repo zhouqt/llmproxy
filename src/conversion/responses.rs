@@ -15,6 +15,8 @@
 //!   `ResponseBlock::Thinking` if the model emitted reasoning), and
 //!   `OutputItem::FunctionCall` into `ResponseBlock::ToolUse`.
 
+use std::collections::HashMap;
+
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -133,7 +135,7 @@ fn convert_blocks(role: &str, blocks: &[ContentBlock]) -> Vec<ResponseInputItem>
                             text: text.clone(),
                         });
                     }
-                    ContentBlock::Image { source } => {
+                    ContentBlock::Image { source, .. } => {
                         let url = format!(
                             "data:{};base64,{}",
                             source.media_type, source.data
@@ -154,7 +156,20 @@ fn convert_blocks(role: &str, blocks: &[ContentBlock]) -> Vec<ResponseInputItem>
                             output: tool_result_to_string(content),
                         });
                     }
-                    ContentBlock::ToolUse { .. } | ContentBlock::Thinking { .. } => {
+                    ContentBlock::ToolUse { .. }
+                    | ContentBlock::Thinking { .. }
+                    | ContentBlock::RedactedThinking { .. }
+                    | ContentBlock::Document { .. }
+                    | ContentBlock::SearchResult { .. }
+                    | ContentBlock::ServerToolUse { .. }
+                    | ContentBlock::WebSearchToolResult { .. }
+                    | ContentBlock::WebFetchToolResult { .. }
+                    | ContentBlock::CodeExecutionToolResult { .. }
+                    | ContentBlock::BashCodeExecutionToolResult { .. }
+                    | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+                    | ContentBlock::ToolSearchToolResult { .. }
+                    | ContentBlock::ContainerUpload { .. }
+                    | ContentBlock::MidConversationSystem { .. } => {
                         // Skip — only valid in assistant turns.
                     }
                     ContentBlock::Unknown => {}
@@ -193,7 +208,7 @@ fn convert_blocks(role: &str, blocks: &[ContentBlock]) -> Vec<ResponseInputItem>
                         // Reasoning isn't replayed in subsequent turns via
                         // the Responses input[] — drop it.
                     }
-                    ContentBlock::ToolUse { id, name, input } => {
+                    ContentBlock::ToolUse { id, name, input, .. } => {
                         tool_calls.push((
                             id.clone(),
                             name.clone(),
@@ -202,6 +217,18 @@ fn convert_blocks(role: &str, blocks: &[ContentBlock]) -> Vec<ResponseInputItem>
                     }
                     ContentBlock::Image { .. }
                     | ContentBlock::ToolResult { .. }
+                    | ContentBlock::RedactedThinking { .. }
+                    | ContentBlock::Document { .. }
+                    | ContentBlock::SearchResult { .. }
+                    | ContentBlock::ServerToolUse { .. }
+                    | ContentBlock::WebSearchToolResult { .. }
+                    | ContentBlock::WebFetchToolResult { .. }
+                    | ContentBlock::CodeExecutionToolResult { .. }
+                    | ContentBlock::BashCodeExecutionToolResult { .. }
+                    | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+                    | ContentBlock::ToolSearchToolResult { .. }
+                    | ContentBlock::ContainerUpload { .. }
+                    | ContentBlock::MidConversationSystem { .. }
                     | ContentBlock::Unknown => {}
                 }
             }
@@ -291,7 +318,7 @@ pub fn responses_to_anthropic_response(
                     match part {
                         OutputContentPart::OutputText { text, .. } => {
                             if !text.is_empty() {
-                                content.push(ResponseBlock::Text { text: text.clone() });
+                                content.push(ResponseBlock::Text { text: text.clone(), citations: None });
                             }
                         }
                         OutputContentPart::Unknown => {}
@@ -310,6 +337,7 @@ pub fn responses_to_anthropic_response(
                     id: call_id.clone(),
                     name: name.clone(),
                     input,
+                    caller: None,
                 });
                 has_tool_calls = true;
             }
@@ -343,12 +371,20 @@ pub fn responses_to_anthropic_response(
         model: model.to_string(),
         stop_reason,
         stop_sequence: None,
+        stop_details: None,
+        container: None,
         usage: Usage {
             input_tokens: resp.usage.input_tokens,
             output_tokens: resp.usage.output_tokens,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: if cached > 0 { Some(cached) } else { None },
+            cache_creation: None,
+            server_tool_use: None,
+            output_tokens_details: None,
+            service_tier: None,
+            inference_geo: None,
         },
+        extra: HashMap::new(),
     })
 }
 
@@ -578,11 +614,13 @@ mod tests {
         let msg = Message {
             role: "user".into(),
             content: MessageContent::Blocks(vec![
-                ContentBlock::Text { text: "before".into(), cache_control: None },
+                ContentBlock::Text { text: "before".into(), cache_control: None, citations: None },
                 ContentBlock::ToolUse {
                     id: "t1".into(),
                     name: "f".into(),
                     input: json!({}),
+                    cache_control: None,
+                    caller: None,
                 },
                 ContentBlock::Unknown,
             ]),
@@ -607,7 +645,7 @@ mod tests {
                     thinking: "internal".into(),
                     signature: None,
                 },
-                ContentBlock::Text { text: "final".into(), cache_control: None },
+                ContentBlock::Text { text: "final".into(), cache_control: None, citations: None },
             ]),
         };
         let out = convert_message(&msg);
@@ -983,6 +1021,7 @@ mod tests {
                     media_type: "image/png".into(),
                     data: "AAAA".into(),
                 },
+                cache_control: None,
             }]),
         };
         let out = convert_message(&msg);
@@ -1006,8 +1045,8 @@ mod tests {
         let msg = Message {
             role: "assistant".into(),
             content: MessageContent::Blocks(vec![
-                ContentBlock::Text { text: "line one".into(), cache_control: None },
-                ContentBlock::Text { text: "line two".into(), cache_control: None },
+                ContentBlock::Text { text: "line one".into(), cache_control: None, citations: None },
+                ContentBlock::Text { text: "line two".into(), cache_control: None, citations: None },
             ]),
         };
         let out = convert_message(&msg);
@@ -1029,17 +1068,19 @@ mod tests {
         let msg = Message {
             role: "assistant".into(),
             content: MessageContent::Blocks(vec![
-                ContentBlock::Text { text: "keep me".into(), cache_control: None },
+                ContentBlock::Text { text: "keep me".into(), cache_control: None, citations: None },
                 ContentBlock::Image {
                     source: crate::anthropic::ImageSource {
                         kind: "base64".into(),
                         media_type: "image/png".into(),
                         data: "AAAA".into(),
                     },
+                    cache_control: None,
                 },
                 ContentBlock::ToolResult {
                     tool_use_id: "t1".into(),
                     content: crate::anthropic::ToolResultContent::Text("ignored".into()),
+                    cache_control: None,
                     is_error: None,
                 },
                 ContentBlock::Unknown,
@@ -1063,7 +1104,7 @@ mod tests {
         // yields nothing.
         let out = convert_blocks(
             "tool",
-            &[ContentBlock::Text { text: "orphan".into(), cache_control: None }],
+            &[ContentBlock::Text { text: "orphan".into(), cache_control: None, citations: None }],
         );
         assert!(out.is_empty());
     }
@@ -1082,6 +1123,7 @@ mod tests {
                     json!({"type": "text", "text": "second"}),
                     json!({"type": "image", "source": {}}), // no text → skipped
                 ]),
+                cache_control: None,
                 is_error: None,
             }]),
         };
