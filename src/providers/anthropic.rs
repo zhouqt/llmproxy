@@ -274,6 +274,198 @@ mod tests {
         assert!(!has_thinking_error(""));
     }
 
+    #[tokio::test]
+    async fn complete_passes_through_every_field_unmodified() {
+        // Regression guard: every documented request field — thinking
+        // blocks with signatures, cache_control on text/tools/images,
+        // redacted_thinking blocks, server tool blocks, document blocks,
+        // top-level output_config/service_tier/container/inference_geo/
+        // user_profile_id — must reach upstream byte-identical except
+        // for `model` (which `build_body` rewrites) and `stream`.
+        //
+        // wiremock's `body_partial_json` matcher asserts the body is a
+        // superset of the expected JSON, so any field dropped by the
+        // proxy would cause the mock to NOT match.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("authorization", "Bearer router-key"))
+            .and(header("anthropic-version", "2023-06-01"))
+            .and(body_partial_json(json!({
+                "model": "rewritten-model",
+                "stream": false,
+                "max_tokens": 1024,
+                "system": [
+                    {"type": "text", "text": "you are claude",
+                     "cache_control": {"type": "ephemeral", "ttl": "5m"}}
+                ],
+                "temperature": 0.5,
+                "top_p": 1.0,
+                "top_k": 40,
+                "stop_sequences": ["STOP"],
+                "tools": [
+                    {"name": "get_weather", "description": "weather",
+                     "input_schema": {"type": "object"}}
+                ],
+                "tool_choice": {"type": "tool", "name": "get_weather"},
+                "metadata": {"user_id": "u-1"},
+                "thinking": {"type": "enabled", "budget_tokens": 4000, "display": "summarized"},
+                "cache_control": {"type": "ephemeral", "ttl": "5m"},
+                "container": "container_x",
+                "inference_geo": "us",
+                "service_tier": "auto",
+                "output_config": {"effort": "high"},
+                "user_profile_id": "profile-1",
+                "messages": [
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "hello",
+                         "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                        {"type": "image",
+                         "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+                         "cache_control": {"type": "ephemeral"}}
+                    ]},
+                    {"role": "assistant", "content": [
+                        {"type": "thinking", "thinking": "thinking…", "signature": "sig-1"},
+                        {"type": "redacted_thinking", "data": "encrypted-blob"},
+                        {"type": "tool_use", "id": "t1", "name": "f", "input": {"x": 1},
+                         "cache_control": {"type": "ephemeral"}}
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "t1", "content": "ok",
+                         "is_error": false}
+                    ]}
+                ],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_upstream",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "world"}],
+                "model": "rewritten-model",
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 5,
+                    "output_tokens": 3,
+                    "cache_creation_input_tokens": null,
+                    "cache_read_input_tokens": null
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut rewrite = HashMap::new();
+        rewrite.insert("claude-model".to_string(), "rewritten-model".to_string());
+        let provider = AnthropicProvider::new(
+            "router".to_string(),
+            "router-key".to_string(),
+            format!("{}/", server.uri()),
+            rewrite,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        // Build a fully-populated request that exercises every field
+        // path through serde → build_body → wiremock.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 1024,
+            "system": [
+                {"type": "text", "text": "you are claude",
+                 "cache_control": {"type": "ephemeral", "ttl": "5m"}}
+            ],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "hello",
+                     "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                    {"type": "image",
+                     "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+                     "cache_control": {"type": "ephemeral"}}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "thinking…", "signature": "sig-1"},
+                    {"type": "redacted_thinking", "data": "encrypted-blob"},
+                    {"type": "tool_use", "id": "t1", "name": "f", "input": {"x": 1},
+                     "cache_control": {"type": "ephemeral"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok",
+                     "is_error": false}
+                ]}
+            ],
+            "temperature": 0.5,
+            "top_p": 1.0,
+            "top_k": 40,
+            "stop_sequences": ["STOP"],
+            "stream": false,
+            "tools": [
+                {"name": "get_weather", "description": "weather",
+                 "input_schema": {"type": "object"}}
+            ],
+            "tool_choice": {"type": "tool", "name": "get_weather"},
+            "metadata": {"user_id": "u-1"},
+            "thinking": {"type": "enabled", "budget_tokens": 4000, "display": "summarized"},
+            "cache_control": {"type": "ephemeral", "ttl": "5m"},
+            "container": "container_x",
+            "inference_geo": "us",
+            "service_tier": "auto",
+            "output_config": {"effort": "high"},
+            "user_profile_id": "profile-1"
+        }))
+        .unwrap();
+
+        let output = provider.complete(&req, &empty_rewrite()).await.unwrap();
+        expect_variant!(output, ProviderOutput::Json(body) => {
+            // upstream body forwarded verbatim — no transformation.
+            assert_eq!(body["id"], "msg_upstream");
+            assert_eq!(body["content"][0]["text"], "world");
+        });
+    }
+
+    #[tokio::test]
+    async fn complete_preserves_thinking_signature_in_response() {
+        // Regression guard for the original bug: Anthropic-format
+        // responses must include `signature` on thinking blocks so the
+        // client can echo them back next turn without the upstream
+        // returning "content[].thinking in the thinking mode must be
+        // passed back to the API".
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_x",
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "reasoning",
+                     "signature": "sig-should-survive"},
+                    {"type": "text", "text": "answer"}
+                ],
+                "model": "rewritten-model",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+        let mut rewrite = HashMap::new();
+        rewrite.insert("claude-model".to_string(), "rewritten-model".to_string());
+        let provider = AnthropicProvider::new(
+            "router".to_string(),
+            "router-key".to_string(),
+            format!("{}/", server.uri()),
+            rewrite,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let output = provider.complete(&request(false), &empty_rewrite()).await.unwrap();
+        expect_variant!(output, ProviderOutput::Json(body) => {
+            let thinking = body["content"].as_array().unwrap().iter()
+                .find(|b| b["type"] == "thinking")
+                .expect("thinking block");
+            assert_eq!(thinking["signature"], "sig-should-survive",
+                "thinking.signature must roundtrip from upstream response to client");
+        });
+    }
+
     #[test]
     fn build_body_rewrites_model_and_sets_stream_flag() {
         let mut rewrite = HashMap::new();
