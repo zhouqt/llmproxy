@@ -168,6 +168,7 @@ impl StreamTranslator {
                 index: idx,
                 content_block: ResponseBlock::Thinking {
                     thinking: String::new(),
+                    signature: None,
                 },
             });
         }
