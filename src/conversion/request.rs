@@ -138,7 +138,7 @@ fn convert_blocks(role: &str, blocks: &[ContentBlock]) -> Vec<ChatMessage> {
                     ContentBlock::Text { text, .. } => {
                         text_parts.push(ContentPart::Text { text: text.clone() });
                     }
-                    ContentBlock::Image { source } => {
+                    ContentBlock::Image { source, .. } => {
                         let url = format!(
                             "data:{};base64,{}",
                             source.media_type, source.data
@@ -161,7 +161,20 @@ fn convert_blocks(role: &str, blocks: &[ContentBlock]) -> Vec<ChatMessage> {
                             tool_call_id: tool_use_id.clone(),
                         });
                     }
-                    ContentBlock::ToolUse { .. } | ContentBlock::Thinking { .. } => {
+                    ContentBlock::ToolUse { .. }
+                    | ContentBlock::Thinking { .. }
+                    | ContentBlock::RedactedThinking { .. }
+                    | ContentBlock::Document { .. }
+                    | ContentBlock::SearchResult { .. }
+                    | ContentBlock::ServerToolUse { .. }
+                    | ContentBlock::WebSearchToolResult { .. }
+                    | ContentBlock::WebFetchToolResult { .. }
+                    | ContentBlock::CodeExecutionToolResult { .. }
+                    | ContentBlock::BashCodeExecutionToolResult { .. }
+                    | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+                    | ContentBlock::ToolSearchToolResult { .. }
+                    | ContentBlock::ContainerUpload { .. }
+                    | ContentBlock::MidConversationSystem { .. } => {
                         // Skip — these only make sense in assistant turns.
                     }
                     ContentBlock::Unknown => {}
@@ -200,7 +213,7 @@ fn convert_blocks(role: &str, blocks: &[ContentBlock]) -> Vec<ChatMessage> {
                     ContentBlock::Thinking { thinking, .. } => {
                         reasoning_acc.push_str(thinking);
                     }
-                    ContentBlock::ToolUse { id, name, input } => {
+                    ContentBlock::ToolUse { id, name, input, .. } => {
                         tool_calls.push(crate::openai::ToolCall {
                             id: id.clone(),
                             kind: "function".to_string(),
@@ -213,6 +226,18 @@ fn convert_blocks(role: &str, blocks: &[ContentBlock]) -> Vec<ChatMessage> {
                     }
                     ContentBlock::Image { .. }
                     | ContentBlock::ToolResult { .. }
+                    | ContentBlock::RedactedThinking { .. }
+                    | ContentBlock::Document { .. }
+                    | ContentBlock::SearchResult { .. }
+                    | ContentBlock::ServerToolUse { .. }
+                    | ContentBlock::WebSearchToolResult { .. }
+                    | ContentBlock::WebFetchToolResult { .. }
+                    | ContentBlock::CodeExecutionToolResult { .. }
+                    | ContentBlock::BashCodeExecutionToolResult { .. }
+                    | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+                    | ContentBlock::ToolSearchToolResult { .. }
+                    | ContentBlock::ContainerUpload { .. }
+                    | ContentBlock::MidConversationSystem { .. }
                     | ContentBlock::Unknown => {}
                 }
             }

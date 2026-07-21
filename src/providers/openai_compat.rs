@@ -661,7 +661,10 @@ mod tests {
             model: "model".to_string(),
             stop_reason: None,
             stop_sequence: None,
+            stop_details: None,
+            container: None,
             usage: Default::default(),
+            extra: Default::default(),
         };
         let events = [
             StreamEvent::MessageStart { message },
@@ -669,6 +672,7 @@ mod tests {
                 index: 0,
                 content_block: crate::anthropic::ResponseBlock::Text {
                     text: String::new(),
+                    citations: None,
                 },
             },
             StreamEvent::Ping,
@@ -683,6 +687,8 @@ mod tests {
                 delta: crate::anthropic::MessageDeltaPayload {
                     stop_reason: None,
                     stop_sequence: None,
+                    stop_details: None,
+                    container: None,
                     usage: None,
                 },
             },

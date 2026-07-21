@@ -2,6 +2,8 @@
 //!
 //! Reference: copilot-api-py/src/routes/messages/non_stream_translation.py:293-378
 
+use std::collections::HashMap;
+
 use serde_json::{json, Value};
 
 use crate::anthropic::{MessagesResponse, ResponseBlock, Usage};
@@ -34,7 +36,10 @@ pub fn openai_to_anthropic_response(
 
     if let Some(text) = &choice.message.content {
         if !text.is_empty() {
-            content.push(ResponseBlock::Text { text: text.clone() });
+            content.push(ResponseBlock::Text {
+                text: text.clone(),
+                citations: None,
+            });
         }
     }
 
@@ -46,6 +51,7 @@ pub fn openai_to_anthropic_response(
                 id: tc.id.clone(),
                 name: tc.function.name.clone(),
                 input,
+                caller: None,
             });
         }
     }
@@ -64,6 +70,11 @@ pub fn openai_to_anthropic_response(
                 output_tokens: u.completion_tokens,
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: if cached > 0 { Some(cached) } else { None },
+                cache_creation: None,
+                server_tool_use: None,
+                output_tokens_details: None,
+                service_tier: None,
+                inference_geo: None,
             }
         })
         .unwrap_or_default();
@@ -108,7 +119,10 @@ pub fn openai_to_anthropic_response(
             .transpose()?
             .flatten(),
         stop_sequence: None,
+        stop_details: None,
+        container: None,
         usage,
+        extra: HashMap::new(),
     })
 }
 
@@ -212,7 +226,7 @@ mod tests {
         let out = openai_to_anthropic_response(&resp, "model", "msg_1").unwrap();
         assert_eq!(out.content.len(), 2);
         assert!(matches!(out.content[0], ResponseBlock::Thinking { ref thinking, .. } if thinking == "because"));
-        assert!(matches!(out.content[1], ResponseBlock::Text { ref text } if text == "final"));
+        assert!(matches!(out.content[1], ResponseBlock::Text { ref text, .. } if text == "final"));
         assert_eq!(out.usage.input_tokens, 0);
         assert_eq!(out.usage.output_tokens, 0);
         assert!(out.usage.cache_read_input_tokens.is_none());

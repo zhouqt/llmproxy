@@ -7,9 +7,7 @@
 //! "Option::is_none"`) emit nothing extra on the wire when the client
 //! didn't ask for caching.
 
-use serde_json::Value;
-
-use crate::anthropic::{ContentBlock, MessageContent, MessagesRequest, SystemPrompt};
+use crate::anthropic::{CacheControlEphemeral, ContentBlock, MessageContent, MessagesRequest, SystemPrompt};
 
 /// Cache hints derived from an Anthropic `MessagesRequest`. Either
 /// field is `None` when the request carries no `cache_control`
@@ -38,7 +36,7 @@ pub fn derive_cache_hints(req: &MessagesRequest) -> CacheHints {
 
     if let Some(SystemPrompt::Blocks(blocks)) = &req.system {
         for b in blocks {
-            if let Some(cc) = b.cache_control.as_ref() {
+            if let Some(cc) = &b.cache_control {
                 any_marker = true;
                 if !needs_24h && cc_is_24h(cc) {
                     needs_24h = true;
@@ -49,12 +47,10 @@ pub fn derive_cache_hints(req: &MessagesRequest) -> CacheHints {
     for m in &req.messages {
         if let MessageContent::Blocks(blocks) = &m.content {
             for b in blocks {
-                if let ContentBlock::Text { cache_control, .. } = b {
-                    if let Some(cc) = cache_control.as_ref() {
-                        any_marker = true;
-                        if !needs_24h && cc_is_24h(cc) {
-                            needs_24h = true;
-                        }
+                if let ContentBlock::Text { cache_control: Some(cc), .. } = b {
+                    any_marker = true;
+                    if !needs_24h && cc_is_24h(cc) {
+                        needs_24h = true;
                     }
                 }
             }
@@ -70,21 +66,19 @@ pub fn derive_cache_hints(req: &MessagesRequest) -> CacheHints {
     }
 }
 
-/// `cache_control.type == "ephemeral_1h"` is the only Anthropic value
-/// that maps to OpenAI's `24h` retention tier; everything else (incl.
-/// `ephemeral`, `ephemeral_5m`, missing `type`, future unknown
-/// values) is the default in-memory tier.
-fn cc_is_24h(cc: &Value) -> bool {
-    cc.get("type")
-        .and_then(|v| v.as_str())
-        .map(|t| t == "ephemeral_1h")
-        .unwrap_or(false)
+/// `cache_control.type == "ephemeral_1h"` (or `"1h"` TTL) is the only
+/// Anthropic value that maps to OpenAI's `24h` retention tier;
+/// everything else (incl. `ephemeral`, `ephemeral_5m`/`5m`, missing
+/// `type`, future unknown values) is the default in-memory tier.
+fn cc_is_24h(cc: &CacheControlEphemeral) -> bool {
+    cc.ttl.as_deref() == Some("1h")
+        || cc.kind == "ephemeral_1h"
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     fn req(blocks: Value, user_id: Option<&str>) -> MessagesRequest {
         let mut v = json!({
