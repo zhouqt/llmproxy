@@ -198,8 +198,7 @@ impl Provider for AnthropicProvider {
 }
 
 /// Check if the upstream response body indicates thinking-mode is not supported.
-/// Anthropic-compatible endpoints that reject thinking (e.g. MiniMax) return
-/// a 400 with a message like:
+/// Some Anthropic-compatible endpoints return a 400 with a message like:
 ///   `The content[].thinking in the thinking mode must be passed back to the API.`
 fn has_thinking_error(body: &str) -> bool {
     body.contains("content[].thinking") && body.contains("must be passed back")
