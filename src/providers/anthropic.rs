@@ -64,6 +64,57 @@ impl AnthropicProvider {
         merged.extend(runtime.iter().map(|(k, v)| (k.clone(), v.clone())));
         merged
     }
+
+    /// Build a friendly Anthropic-shaped error body when an upstream rejects
+    /// the request because it doesn't support thinking/reasoning mode. The
+    /// proxy does NOT silently strip thinking and retry — the user has
+    /// explicitly requested thinking, and any fallback in the chain must
+    /// also support it. Surface the mismatch as an actionable error so the
+    /// operator knows to reconfigure the fallback chain rather than seeing
+    /// silently degraded responses.
+    ///
+    /// `client_model` is the model name the proxy received from the client
+    /// (the incoming request's `model` field); `upstream_model` is the
+    /// model name that was actually sent upstream after the provider's
+    /// `model_rewrite` map was applied. Reporting the upstream model lets
+    /// the operator see exactly which catalog entry the upstream rejected,
+    /// which is what they need to look up in their upstream dashboard.
+    fn thinking_not_supported_error(
+        &self,
+        client_model: &str,
+        upstream_model: &str,
+        upstream_body: &str,
+    ) -> ProxyError {
+        // Truncate upstream body for the human-readable message so the
+        // envelope stays compact; the full body is preserved in
+        // `upstream_body` for debugging.
+        let snippet: String = upstream_body.chars().take(200).collect();
+        let friendly = json!({
+            "type": "error",
+            "error": {
+                "type": "thinking_not_supported",
+                "message": format!(
+                    "Provider '{}' does not support thinking/reasoning mode for model '{}'. \
+                     The primary model in this fallback chain uses thinking; \
+                     all fallbacks must support it too. \
+                     Reconfigure the fallback chain in config.yaml: either \
+                     remove this provider from chains whose primary uses \
+                     thinking, or replace it with a thinking-capable provider \
+                     (or a model variant that supports thinking on this upstream). \
+                     Upstream response: {}",
+                    self.name, upstream_model, snippet
+                ),
+                "provider": self.name,
+                "client_model": client_model,
+                "upstream_model": upstream_model,
+                "upstream_body": upstream_body,
+            }
+        });
+        ProxyError::Upstream {
+            status: 400,
+            body: friendly.to_string(),
+        }
+    }
 }
 
 #[async_trait]
@@ -77,7 +128,8 @@ impl Provider for AnthropicProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
-        let body = build_body(req, &self.merged_rewrite(model_rewrite), false)?;
+        let merged = self.merged_rewrite(model_rewrite);
+        let body = build_body(req, &merged, false)?;
         let resp = self
             .http
             .post(self.messages_url())
@@ -90,6 +142,13 @@ impl Provider for AnthropicProvider {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
+            if status.as_u16() == 400 && has_thinking_error(&text) {
+                return Err(self.thinking_not_supported_error(
+                    &req.model,
+                    &merged.get(&req.model).cloned().unwrap_or_else(|| req.model.clone()),
+                    &text,
+                ));
+            }
             return Err(ProxyError::Upstream {
                 status: status.as_u16(),
                 body: text,
@@ -106,7 +165,8 @@ impl Provider for AnthropicProvider {
     ) -> Result<ProviderOutput> {
         let url = self.messages_url();
         let api_key = self.api_key.clone();
-        let body = build_body(req, &self.merged_rewrite(model_rewrite), true)?;
+        let merged = self.merged_rewrite(model_rewrite);
+        let body = build_body(req, &merged, true)?;
         let resp = self
             .http
             .post(&url)
@@ -120,6 +180,13 @@ impl Provider for AnthropicProvider {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await?;
+            if status.as_u16() == 400 && has_thinking_error(&text) {
+                return Err(self.thinking_not_supported_error(
+                    &req.model,
+                    &merged.get(&req.model).cloned().unwrap_or_else(|| req.model.clone()),
+                    &text,
+                ));
+            }
             return Err(ProxyError::Upstream {
                 status: status.as_u16(),
                 body: text,
@@ -128,6 +195,14 @@ impl Provider for AnthropicProvider {
         let stream = resp.bytes_stream();
         Ok(ProviderOutput::Stream(Box::new(PassthroughSse { inner: stream })))
     }
+}
+
+/// Check if the upstream response body indicates thinking-mode is not supported.
+/// Anthropic-compatible endpoints that reject thinking (e.g. MiniMax) return
+/// a 400 with a message like:
+///   `The content[].thinking in the thinking mode must be passed back to the API.`
+fn has_thinking_error(body: &str) -> bool {
+    body.contains("content[].thinking") && body.contains("must be passed back")
 }
 
 fn build_body(
@@ -187,6 +262,17 @@ mod tests {
 
     fn empty_rewrite() -> HashMap<String, String> {
         HashMap::new()
+    }
+
+    #[test]
+    fn has_thinking_error_matches_anthropic_error_message() {
+        assert!(has_thinking_error(
+            r#"{"error":{"message":"The `content[].thinking` in the thinking mode must be passed back to the API."}}"#
+        ));
+        // Non-thinking errors must NOT match.
+        assert!(!has_thinking_error(r#"{"error":{"message":"model not found"}}"#));
+        assert!(!has_thinking_error("rate limited"));
+        assert!(!has_thinking_error(""));
     }
 
     #[test]
@@ -379,5 +465,262 @@ mod tests {
             matches!(poll, std::task::Poll::Pending),
             "PassthroughSse should propagate Poll::Pending"
         );
+    }
+
+    /// Build a request with thinking enabled, mimicking a client that asks
+    /// for extended reasoning. The fallback chain problem only manifests
+    /// when the upstream can't honour this request.
+    fn thinking_request(stream: bool) -> MessagesRequest {
+        serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 64,
+            "stream": stream,
+            "thinking": {"type": "enabled", "budget_tokens": 2000},
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn complete_returns_friendly_error_on_thinking_mismatch() {
+        // The upstream rejects with the canonical Anthropic thinking
+        // error. The proxy must NOT silently strip thinking and retry —
+        // it must surface a clear, actionable message telling the
+        // operator to reconfigure the fallback chain. The message must
+        // include both the provider name and the model name (preferring
+        // the upstream-rewritten name so the operator can match it to
+        // their upstream dashboard).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "The `content[].thinking` in the thinking mode must be passed back to the API."
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut rewrite = HashMap::new();
+        // Operator maps `claude-model` to `upstream-variant` for this provider.
+        rewrite.insert("claude-model".to_string(), "upstream-variant".to_string());
+        let provider = AnthropicProvider::new(
+            "minimax".to_string(),
+            "key".to_string(),
+            format!("{}/v1", server.uri()),
+            rewrite,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let err = provider
+            .complete(&thinking_request(false), &empty_rewrite())
+            .await
+            .err()
+            .expect("thinking-mismatch must surface as Err");
+
+        let (status, body) = match err {
+            ProxyError::Upstream { status, body } => (status, body),
+            other => panic!("expected Upstream error, got: {other:?}"),
+        };
+        assert_eq!(status, 400);
+
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["type"], "error");
+        assert_eq!(parsed["error"]["type"], "thinking_not_supported");
+
+        // Structured fields for programmatic inspection.
+        assert_eq!(parsed["error"]["provider"], "minimax");
+        assert_eq!(parsed["error"]["client_model"], "claude-model");
+        assert_eq!(
+            parsed["error"]["upstream_model"], "upstream-variant",
+            "upstream_model must reflect the rewrite, not the original"
+        );
+
+        let message = parsed["error"]["message"].as_str().unwrap();
+        // Provider name appears in the message.
+        assert!(
+            message.contains("minimax"),
+            "message must name the offending provider: {message}"
+        );
+        // Upstream (rewritten) model name appears — not the client model.
+        assert!(
+            message.contains("upstream-variant"),
+            "message must name the upstream model after rewrite: {message}"
+        );
+        // Thinking-not-supported phrasing and a reconfigure hint.
+        assert!(
+            message.contains("does not support thinking"),
+            "message must explain the mismatch: {message}"
+        );
+        assert!(
+            message.contains("Reconfigure"),
+            "message must tell the operator what to do: {message}"
+        );
+        // Original upstream body is preserved for debugging.
+        assert!(parsed["error"]["upstream_body"].as_str().unwrap().contains("thinking"));
+    }
+
+    #[tokio::test]
+    async fn complete_friendly_error_uses_client_model_when_no_rewrite() {
+        // When there's no model_rewrite mapping, upstream_model should
+        // fall back to the original client model name (no fabricated
+        // upstream name).
+        let server = MockServer::start().await;
+        // Plain-text 400 body that still triggers has_thinking_error
+        // via the `content[].thinking` and `must be passed back` markers.
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                "The `content[].thinking` in the thinking mode must be passed back to the API.",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new(
+            "no-rewrite".to_string(),
+            "key".to_string(),
+            format!("{}/v1", server.uri()),
+            empty_rewrite(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let err = provider
+            .complete(&thinking_request(false), &empty_rewrite())
+            .await
+            .err()
+            .expect("should fail");
+
+        let body = match err {
+            ProxyError::Upstream { body, .. } => body,
+            other => panic!("expected Upstream, got: {other:?}"),
+        };
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["error"]["client_model"], "claude-model");
+        assert_eq!(
+            parsed["error"]["upstream_model"], "claude-model",
+            "upstream_model must equal client_model when no rewrite applies"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_passes_through_unrelated_400_not_thinking() {
+        // A 400 that does NOT mention thinking must surface to the caller
+        // unchanged — the friendly-error path must not fire for unrelated
+        // request-shape errors.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "model not found"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new(
+            "no-retry".to_string(),
+            "key".to_string(),
+            format!("{}/v1", server.uri()),
+            empty_rewrite(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let err = provider
+            .complete(&thinking_request(false), &empty_rewrite())
+            .await
+            .err()
+            .expect("should fail");
+
+        assert!(matches!(
+            err,
+            ProxyError::Upstream { status: 400, ref body } if body.contains("model not found")
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_returns_friendly_error_on_thinking_mismatch() {
+        // Streaming twin of complete_returns_friendly_error_on_thinking_mismatch.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "The `content[].thinking` in the thinking mode must be passed back to the API."}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut rewrite = HashMap::new();
+        rewrite.insert("claude-model".to_string(), "rewritten-claude".to_string());
+        let provider = AnthropicProvider::new(
+            "minimax".to_string(),
+            "key".to_string(),
+            format!("{}/v1", server.uri()),
+            rewrite,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let err = provider
+            .stream(&thinking_request(true), &empty_rewrite())
+            .await
+            .err()
+            .expect("thinking-mismatch must surface as Err");
+
+        match err {
+            ProxyError::Upstream { status, body } => {
+                assert_eq!(status, 400);
+                let parsed: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(parsed["error"]["type"], "thinking_not_supported");
+                assert_eq!(parsed["error"]["provider"], "minimax");
+                assert_eq!(parsed["error"]["client_model"], "claude-model");
+                assert_eq!(parsed["error"]["upstream_model"], "rewritten-claude");
+                let message = parsed["error"]["message"].as_str().unwrap();
+                assert!(message.contains("minimax"));
+                assert!(message.contains("rewritten-claude"));
+            }
+            other => panic!("expected Upstream error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn thinking_mismatch_does_not_retry_when_thinking_absent() {
+        // Even when the incoming request has no thinking field, an
+        // Anthropic-shaped 400 from the upstream is treated as a config
+        // mismatch only when the body explicitly mentions thinking.
+        // A bare 400 with a different shape passes through.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("plain text error"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new(
+            "p".to_string(),
+            "key".to_string(),
+            format!("{}/v1", server.uri()),
+            empty_rewrite(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let err = provider
+            .complete(&thinking_request(false), &empty_rewrite())
+            .await
+            .err()
+            .expect("should fail");
+        assert!(matches!(
+            err,
+            ProxyError::Upstream { status: 400, ref body } if body == "plain text error"
+        ));
     }
 }
