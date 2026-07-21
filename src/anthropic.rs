@@ -93,6 +93,8 @@ pub enum ContentBlock {
     },
     Thinking {
         thinking: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
     /// Catch-all for unknown future block types.
     #[serde(other)]
@@ -168,7 +170,11 @@ pub struct MessagesResponse {
 pub enum ResponseBlock {
     Text { text: String },
     ToolUse { id: String, name: String, input: Value },
-    Thinking { thinking: String },
+    Thinking {
+        thinking: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

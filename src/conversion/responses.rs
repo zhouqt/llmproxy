@@ -605,6 +605,7 @@ mod tests {
             content: MessageContent::Blocks(vec![
                 ContentBlock::Thinking {
                     thinking: "internal".into(),
+                    signature: None,
                 },
                 ContentBlock::Text { text: "final".into(), cache_control: None },
             ]),

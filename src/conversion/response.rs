@@ -27,6 +27,7 @@ pub fn openai_to_anthropic_response(
         if !reasoning.is_empty() {
             content.push(ResponseBlock::Thinking {
                 thinking: reasoning.clone(),
+                signature: None,
             });
         }
     }
@@ -210,7 +211,7 @@ mod tests {
 
         let out = openai_to_anthropic_response(&resp, "model", "msg_1").unwrap();
         assert_eq!(out.content.len(), 2);
-        assert!(matches!(out.content[0], ResponseBlock::Thinking { ref thinking } if thinking == "because"));
+        assert!(matches!(out.content[0], ResponseBlock::Thinking { ref thinking, .. } if thinking == "because"));
         assert!(matches!(out.content[1], ResponseBlock::Text { ref text } if text == "final"));
         assert_eq!(out.usage.input_tokens, 0);
         assert_eq!(out.usage.output_tokens, 0);
