@@ -275,6 +275,12 @@ impl Config {
 }
 
 /// Expand ${VAR} / $VAR references in a string using process environment.
+///
+/// Supports bash-style `${VAR:-default}` for fallback values: when VAR is
+/// unset or empty, the literal `default` is emitted (no `env var ... not set`
+/// warning is logged). `default` may be wrapped in matching single or double
+/// quotes (`${VAR:-"hello world"}`, `${VAR:-'hello world'}`); the wrapping
+/// characters are stripped. Unmatched quotes are kept verbatim.
 fn expand_env_vars(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let bytes = input.as_bytes();
@@ -283,11 +289,35 @@ fn expand_env_vars(input: &str) -> String {
         if bytes[i] == b'$' && i + 1 < bytes.len() {
             if bytes[i + 1] == b'{' {
                 if let Some(end) = input[i + 2..].find('}') {
-                    let var = &input[i + 2..i + 2 + end];
-                    if let Ok(val) = std::env::var(var) {
-                        out.push_str(&val);
-                    } else {
-                        tracing::warn!("env var {} not set", var);
+                    let inner = &input[i + 2..i + 2 + end];
+                    // Bash-style ${VAR:-default} falls back when VAR is
+                    // unset OR empty; ${VAR-default} only when unset.
+                    // We support the colon-prefixed form because that is
+                    // what template literals and .env style configs reach
+                    // for.
+                    let (var_name, default) = match inner.split_once(":-") {
+                        Some((v, d)) => (v, Some(strip_outer_quotes(d))),
+                        None => (inner, None),
+                    };
+
+                    match std::env::var(var_name) {
+                        Ok(val) if !val.is_empty() => {
+                            out.push_str(&val);
+                        }
+                        Ok(_) => {
+                            // Set but empty. Treat as unset for the
+                            // purposes of `:-`. With no default, the
+                            // original code emitted empty silently.
+                            if let Some(d) = default {
+                                out.push_str(d);
+                            }
+                        }
+                        Err(_) => match default {
+                            Some(d) => out.push_str(d),
+                            None => {
+                                tracing::warn!("env var {} not set", var_name);
+                            }
+                        },
                     }
                     i += 3 + end;
                     continue;
@@ -315,6 +345,23 @@ fn expand_env_vars(input: &str) -> String {
         i += ch.len_utf8();
     }
     out
+}
+
+/// Strip matching outer single or double quotes from `s`. Unmatched
+/// quotes are preserved verbatim. Intended for the `default` half of
+/// `${VAR:-default}` so users can write `${VAR:-"hello world"}` and
+/// get `hello world`, mirroring shell behaviour.
+fn strip_outer_quotes(s: &str) -> &str {
+    let trimmed = s.trim();
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &trimmed[1..trimmed.len() - 1];
+        }
+    }
+    trimmed
 }
 
 #[cfg(test)]
@@ -373,6 +420,61 @@ models:
 
         assert_eq!(expanded, "前缀-值-后缀");
         assert_eq!(expand_env_vars("literal-$9-${UNCLOSED"), "literal-$9-${UNCLOSED");
+    }
+
+    #[test]
+    fn env_expansion_bash_default_unset_var_uses_default() {
+        std::env::remove_var("LLMPROXY_DEFINITELY_NOT_SET");
+        let expanded =
+            expand_env_vars("key=${LLMPROXY_DEFINITELY_NOT_SET:-fallback}-end");
+        assert_eq!(expanded, "key=fallback-end");
+    }
+
+    #[test]
+    fn env_expansion_bash_default_set_var_wins_over_default() {
+        std::env::set_var("LLMPROXY_BASH_DEFAULT_SET", "actual");
+        let expanded = expand_env_vars("key=${LLMPROXY_BASH_DEFAULT_SET:-fallback}");
+        assert_eq!(expanded, "key=actual");
+    }
+
+    #[test]
+    fn env_expansion_bash_default_empty_var_uses_default() {
+        // Bash `:-` treats empty as null. Match that behaviour.
+        std::env::set_var("LLMPROXY_BASH_DEFAULT_EMPTY", "");
+        let expanded = expand_env_vars("key=${LLMPROXY_BASH_DEFAULT_EMPTY:-fallback}");
+        assert_eq!(expanded, "key=fallback");
+        std::env::remove_var("LLMPROXY_BASH_DEFAULT_EMPTY");
+    }
+
+    #[test]
+    fn env_expansion_bash_default_strips_double_quotes() {
+        std::env::remove_var("LLMPROXY_BASH_DEFAULT_QUOTED");
+        let expanded =
+            expand_env_vars("k=${LLMPROXY_BASH_DEFAULT_QUOTED:-\"hello world\"}-e");
+        assert_eq!(expanded, "k=hello world-e");
+    }
+
+    #[test]
+    fn env_expansion_bash_default_strips_single_quotes() {
+        std::env::remove_var("LLMPROXY_BASH_DEFAULT_SQUOTED");
+        let expanded =
+            expand_env_vars("k=${LLMPROXY_BASH_DEFAULT_SQUOTED:-'hello world'}-e");
+        assert_eq!(expanded, "k=hello world-e");
+    }
+
+    #[test]
+    fn env_expansion_bash_default_unmatched_quote_passes_through() {
+        std::env::remove_var("LLMPROXY_BASH_DEFAULT_UNMATCHED");
+        // Bare brace without quotes — default is literal.
+        let expanded = expand_env_vars("k=${LLMPROXY_BASH_DEFAULT_UNMATCHED:-hello}");
+        assert_eq!(expanded, "k=hello");
+    }
+
+    #[test]
+    fn env_expansion_bash_default_empty_default_substitutes_empty() {
+        std::env::remove_var("LLMPROXY_BASH_DEFAULT_EMPTY_D");
+        let expanded = expand_env_vars("k=${LLMPROXY_BASH_DEFAULT_EMPTY_D:-}-e");
+        assert_eq!(expanded, "k=-e");
     }
 
     #[test]
