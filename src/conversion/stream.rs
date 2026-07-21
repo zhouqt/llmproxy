@@ -63,7 +63,10 @@ impl StreamTranslator {
                 model: self.model.clone(),
                 stop_reason: None,
                 stop_sequence: None,
+                stop_details: None,
+                container: None,
                 usage: Usage::default(),
+                extra: std::collections::HashMap::new(),
             };
             out.push(StreamEvent::MessageStart { message: placeholder });
         }
@@ -118,12 +121,19 @@ impl StreamTranslator {
                 .as_ref()
                 .and_then(|d| d.cached_tokens)
                 .filter(|&n| n > 0),
+            cache_creation: None,
+            server_tool_use: None,
+            output_tokens_details: None,
+            service_tier: None,
+            inference_geo: None,
         });
 
         out.push(StreamEvent::MessageDelta {
             delta: MessageDeltaPayload {
                 stop_reason: Some(stop_reason),
                 stop_sequence: None,
+                stop_details: None,
+                container: None,
                 usage,
             },
         });
@@ -147,7 +157,7 @@ impl StreamTranslator {
             self.block_has_text[idx as usize] = true;
             out.push(StreamEvent::ContentBlockStart {
                 index: idx,
-                content_block: ResponseBlock::Text { text: String::new() },
+                content_block: ResponseBlock::Text { text: String::new(), citations: None },
             });
         }
 
@@ -221,6 +231,7 @@ impl StreamTranslator {
                     id,
                     name,
                     input: json!({}),
+                    caller: None,
                 },
             });
         }
