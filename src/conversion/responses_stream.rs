@@ -149,7 +149,7 @@ impl ResponsesStreamTranslator {
             | ResponsesStreamEvent::ResponseFailed { response }
             | ResponsesStreamEvent::ResponseIncomplete { response } => {
                 self.ensure_started(&mut out);
-                self.final_usage = Some(response.usage.clone());
+                self.final_usage = response.usage.clone();
                 self.final_stop_reason = Some(match response.status.as_str() {
                     "incomplete" => "max_tokens".to_string(),
                     "completed" => "end_turn".to_string(),
@@ -254,7 +254,7 @@ mod tests {
             status: status.into(),
             output: vec![],
             incomplete_details: None,
-            usage: ResponsesUsage::default(),
+            usage: Some(ResponsesUsage::default()),
             extra: json!({}),
         }
     }
@@ -350,13 +350,13 @@ mod tests {
         });
 
         let mut resp = placeholder_response("completed");
-        resp.usage = ResponsesUsage {
+        resp.usage = Some(ResponsesUsage {
             input_tokens: 10,
             output_tokens: 5,
             total_tokens: 15,
             input_tokens_details: None,
             output_tokens_details: None,
-        };
+        });
         let evs = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
             response: Box::new(resp),
         });

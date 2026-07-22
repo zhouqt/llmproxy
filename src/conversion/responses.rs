@@ -372,8 +372,8 @@ pub fn responses_to_anthropic_response(
         }
     };
 
-    let cached = resp
-        .usage
+    let usage = resp.usage.clone().unwrap_or_default();
+    let cached = usage
         .input_tokens_details
         .as_ref()
         .map(|d| d.cached_tokens)
@@ -390,8 +390,8 @@ pub fn responses_to_anthropic_response(
         stop_details: None,
         container: None,
         usage: Usage {
-            input_tokens: resp.usage.input_tokens,
-            output_tokens: resp.usage.output_tokens,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: if cached > 0 { Some(cached) } else { None },
             cache_creation: None,
