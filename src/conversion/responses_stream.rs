@@ -171,6 +171,20 @@ impl ResponsesStreamTranslator {
         out
     }
 
+    /// Returns true iff `event` is a terminal response event that
+    /// closes the upstream stream (`response.completed`, `failed`,
+    /// or `incomplete`). The transport calls `finish()` on these so
+    /// the message delta + stop get emitted even when the upstream
+    /// omits the `[DONE]` sentinel.
+    pub fn is_terminal(event: &ResponsesStreamEvent) -> bool {
+        matches!(
+            event,
+            ResponsesStreamEvent::ResponseCompleted { .. }
+                | ResponsesStreamEvent::ResponseFailed { .. }
+                | ResponsesStreamEvent::ResponseIncomplete { .. }
+        )
+    }
+
     pub fn finalize(&mut self) -> Vec<StreamEvent> {
         let mut out = Vec::new();
         if !self.started {

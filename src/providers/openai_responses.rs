@@ -203,6 +203,20 @@ where
                             self.output_buffer.push_back(Self::encode(&out));
                         }
                     }
+                    // Copilot often omits the SSE `[DONE]` sentinel —
+                    // the terminal response event is the only signal
+                    // the upstream gives that the stream is over.
+                    // Without this, finalize() never runs and the
+                    // client hangs waiting for message_stop.
+                    if ResponsesStreamTranslator::is_terminal(&ev) {
+                        if let Some(mut t) = self.translator.take() {
+                            for ev in t.finalize() {
+                                self.output_buffer.push_back(Self::encode(&ev));
+                            }
+                        }
+                        self.finished = true;
+                        return;
+                    }
                 }
                 Err(e) => {
                     tracing::debug!("skipping malformed Responses SSE line: {} ({e})", payload);
@@ -470,6 +484,54 @@ mod tests {
             assert!(encoded.contains("\"text\":\"hello\""));
             assert!(encoded.contains("\"input_tokens\":4"));
             assert!(encoded.contains("event: message_stop"));
+        });
+    }
+
+    #[tokio::test]
+    async fn stream_terminal_event_without_done_sentinel_still_finalizes() {
+        // Copilot often omits the SSE `[DONE]` sentinel — the terminal
+        // `response.completed` event is the only signal the stream is
+        // over. Without auto-finalize on the terminal event, finalize()
+        // never runs and the client hangs waiting for message_stop.
+        let server = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"object\":\"response\",\"created_at\":0,\"model\":\"m\",\"status\":\"in_progress\",\"output\":[],\"usage\":{}}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"response.output_text.done\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"text\":\"hello\"}\n\n",
+            // NO [DONE] sentinel — the stream ends with a partial chunk
+            // boundary right after the terminal response.completed event.
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"object\":\"response\",\"created_at\":0,\"model\":\"m\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":4,\"output_tokens\":1,\"total_tokens\":5}}}\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&server)
+            .await;
+        let provider = OpenaiResponsesProvider::new(
+            "test".to_string(),
+            server.uri(),
+            "key".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let mut rewrite = HashMap::new();
+        rewrite.insert(
+            "claude-sonnet-4-20250514".to_string(),
+            "stream-model".to_string(),
+        );
+
+        let output = provider.stream(&request(true), &rewrite).await.unwrap();
+        expect_variant!(output, ProviderOutput::Stream(mut output) => {
+            let mut encoded = String::new();
+            while let Some(item) = output.next().await {
+                encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+            }
+
+            assert!(encoded.contains("event: message_start"), "got: {encoded}");
+            assert!(encoded.contains("\"text\":\"hello\""), "got: {encoded}");
+            assert!(encoded.contains("event: message_stop"), "missing message_stop — stream hung: {encoded}");
         });
     }
 
