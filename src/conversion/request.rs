@@ -57,6 +57,7 @@ pub fn anthropic_to_openai_request(
         model,
         messages,
         max_tokens: Some(req.max_tokens),
+        max_completion_tokens: Some(req.max_tokens),
         temperature: req.temperature,
         top_p: req.top_p,
         stop: req.stop_sequences.clone(),
@@ -75,7 +76,11 @@ pub fn anthropic_to_openai_request(
                 .collect()
         }),
         tool_choice: req.tool_choice.as_ref().map(convert_tool_choice),
-        user: req.metadata.as_ref().and_then(|m| m.user_id.clone()),
+        user: req
+            .metadata
+            .as_ref()
+            .and_then(|m| m.user_id.as_deref())
+            .map(|u| crate::conversion::responses::truncate_user(u)),
         reasoning_effort: extract_reasoning_effort(req),
         prompt_cache_key: hints.prompt_cache_key,
         prompt_cache_retention: hints.prompt_cache_retention,
