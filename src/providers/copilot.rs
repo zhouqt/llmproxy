@@ -28,6 +28,17 @@ const GITHUB_API_VERSION: &str = "2025-04-01";
 const COPILOT_INTERNAL_TOKEN_URL: &str =
     "https://api.github.com/copilot_internal/v2/token";
 
+/// A Copilot-discovered model stripped to the fields `/v1/models` needs.
+/// Policy state and capabilities from the upstream response are discarded
+/// — the cache only keeps entries whose `policy.state == "enabled"`, so
+/// disabled/preview models are never advertised.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CopilotModel {
+    pub id: String,
+    pub name: String,
+    pub vendor: String,
+}
+
 /// Copilot rejects `/chat/completions` for GPT-5.x with
 /// `unsupported_api_for_model` — those models must hit `/responses`
 /// instead. Reference: copilot-api-py `endpoint_router.py`. Pure
@@ -58,7 +69,7 @@ struct CopilotState {
     tokens: RwLock<Option<StoredTokens>>,
     store: TokenStore,
     refresh_lock: Mutex<()>,
-    cached_models: RwLock<Option<Value>>,
+    cached_models: RwLock<Option<Vec<CopilotModel>>>,
 }
 
 /// Distinguishes credential failures (must clear store + re-authenticate)
@@ -342,11 +353,13 @@ impl CopilotProvider {
                 "copilot token fetch after device flow failed: {e}"
             ))
         })?;
+        let copilot_token = new_tokens.copilot_token.clone();
         self.state.store.save(&new_tokens)?;
         *self.state.tokens.write().await = Some(new_tokens);
 
-        // Token is fresh — populate the model list immediately.
-        self.cache_models().await;
+        // Token is fresh — populate the model list immediately without
+        // calling ensure_token (which would re-enter refresh_lock).
+        self.cache_models_with_token(&copilot_token).await;
 
         Ok(())
     }
@@ -425,6 +438,25 @@ impl CopilotProvider {
     /// Spawn a background refresh loop. Returns a join handle for shutdown.
     pub fn spawn_refresh_loop(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            // Populate the model cache immediately if a valid token is
+            // already in memory (closes the cold-start gap — without this,
+            // /v1/models returns zero Copilot models until the first
+            // scheduled refresh fires).
+            {
+                let guard = self.state.tokens.read().await;
+                if let Some(t) = guard.as_ref() {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    if t.copilot_expires_at > now {
+                        let token = t.copilot_token.clone();
+                        drop(guard);
+                        self.cache_models_with_token(&token).await;
+                    }
+                }
+            }
+
             loop {
                 let sleep_secs = {
                     let guard = self.state.tokens.read().await;
@@ -470,24 +502,39 @@ impl CopilotProvider {
     }
 
     /// Return a clone of the cached Copilot model list, if available.
-    pub async fn cached_models(&self) -> Option<Value> {
+    pub async fn cached_models(&self) -> Option<Vec<CopilotModel>> {
         self.state.cached_models.read().await.clone()
     }
 
     /// Fetch models from the Copilot API and update the cache.
     ///
-    /// Best-effort: logs a warning on failure but does not propagate the
-    /// error — a stale cache (or no cache) is better than blocking the
-    /// caller on a transient `/models` failure.
+    /// Best-effort: obtains a token via `ensure_token`, then delegates to
+    /// `cache_models_with_token`. Logs a warning on failure but does not
+    /// propagate the error — a stale cache (or no cache) is better than
+    /// blocking the caller on a transient `/models` failure.
     pub async fn cache_models(&self) {
-        match self.fetch_models().await {
+        match self.ensure_token().await {
+            Ok(t) => self.cache_models_with_token(&t).await,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to get copilot token for model refresh; keeping stale cache"
+                );
+            }
+        }
+    }
+
+    /// Fetch models using the given token and store them directly.
+    ///
+    /// Does not call `ensure_token` — the caller is responsible for
+    /// providing a valid token. This avoids re-entering `refresh_lock`
+    /// when the caller already holds a fresh token (e.g. after bootstrap
+    /// or at startup in the refresh loop).
+    pub async fn cache_models_with_token(&self, token: &str) {
+        match self.fetch_models(token).await {
             Ok(models) => {
                 tracing::info!(
-                    model_count = models
-                        .get("data")
-                        .and_then(|d| d.as_array())
-                        .map(|a| a.len())
-                        .unwrap_or(0),
+                    model_count = models.len(),
                     "copilot models cached"
                 );
                 *self.state.cached_models.write().await = Some(models);
@@ -498,15 +545,15 @@ impl CopilotProvider {
         }
     }
 
-    async fn fetch_models(&self) -> std::result::Result<Value, CopilotFetchError> {
-        let token = self.ensure_token().await.map_err(|e| {
-            CopilotFetchError::Transient(format!("no copilot token: {e}"))
-        })?;
+    async fn fetch_models(
+        &self,
+        token: &str,
+    ) -> std::result::Result<Vec<CopilotModel>, CopilotFetchError> {
         let url = self.models_url();
         let resp = match self
             .http
             .get(&url)
-            .headers(self.headers(&token))
+            .headers(self.headers(token))
             .header("accept", "application/json")
             .send()
             .await
@@ -530,7 +577,28 @@ impl CopilotProvider {
                 "copilot models response not valid JSON: {e}"
             ))
         })?;
-        Ok(body)
+        let data = body
+            .get("data")
+            .and_then(|d| d.as_array())
+            .ok_or_else(|| {
+                CopilotFetchError::Transient(
+                    "copilot models response missing 'data' array".to_string(),
+                )
+            })?;
+        let enabled: Vec<CopilotModel> = data
+            .iter()
+            .filter(|entry| {
+                entry
+                    .get("policy")
+                    .and_then(|p| p.get("state"))
+                    .and_then(|s| s.as_str())
+                    == Some("enabled")
+            })
+            .filter_map(|entry| {
+                serde_json::from_value::<CopilotModel>(entry.clone()).ok()
+            })
+            .collect();
+        Ok(enabled)
     }
 
     async fn send_with_token(
@@ -2324,11 +2392,13 @@ mod tests {
             refresh_in: 3600,
         };
         let (_dir, p) = test_provider(Some(&server), Some(initial));
-        let result = p.fetch_models().await.expect("fetch_models should succeed");
-        let data = result["data"].as_array().unwrap();
-        assert_eq!(data.len(), 2);
-        assert_eq!(data[0]["id"], "gpt-5");
-        assert_eq!(data[1]["vendor"], "Anthropic");
+        let result = p
+            .fetch_models("test-token")
+            .await
+            .expect("fetch_models should succeed");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].id, "gpt-5");
+        assert_eq!(result[1].vendor, "Anthropic");
     }
 
     #[tokio::test]
@@ -2338,7 +2408,7 @@ mod tests {
             .and(path("/models"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "object": "list",
-                "data": [{"id": "m1", "name": "Model 1", "vendor": "v"}]
+                "data": [{"id": "m1", "name": "Model 1", "vendor": "v", "policy": {"state": "enabled"}}]
             })))
             .expect(1)
             .mount(&server)
@@ -2351,10 +2421,189 @@ mod tests {
             refresh_in: 3600,
         };
         let (_dir, p) = test_provider(Some(&server), Some(initial));
-        assert!(p.cached_models().await.is_none(), "cache should be empty before fetch");
+        assert!(
+            p.cached_models().await.is_none(),
+            "cache should be empty before fetch"
+        );
         p.cache_models().await;
-        let cached = p.cached_models().await.expect("cached_models should be Some after cache_models");
-        assert_eq!(cached["data"].as_array().unwrap().len(), 1);
+        let cached = p
+            .cached_models()
+            .await
+            .expect("cached_models should be Some after cache_models");
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].id, "m1");
+    }
+
+    #[tokio::test]
+    async fn fetch_models_filters_disabled_policy() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [
+                    {"id": "enabled-model", "name": "E", "vendor": "v", "policy": {"state": "enabled"}},
+                    {"id": "disabled-model", "name": "D", "vendor": "v", "policy": {"state": "disabled"}}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_dir, p) = test_provider(Some(&server), None);
+        let result = p.fetch_models("test-token").await.expect("fetch should succeed");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, "enabled-model");
+    }
+
+    #[tokio::test]
+    async fn fetch_models_drops_missing_policy() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [
+                    {"id": "has-policy", "name": "A", "vendor": "v", "policy": {"state": "enabled"}},
+                    {"id": "no-policy", "name": "B", "vendor": "v"}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_dir, p) = test_provider(Some(&server), None);
+        let result = p.fetch_models("test-token").await.expect("fetch should succeed");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, "has-policy");
+    }
+
+    #[tokio::test]
+    async fn cache_models_with_token_does_not_call_ensure_token_when_token_unexpired() {
+        let server = MockServer::start().await;
+        // /models endpoint returns valid data.
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("authorization", "Bearer my-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [{"id": "m1", "name": "M", "vendor": "v", "policy": {"state": "enabled"}}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Token refresh endpoint must NOT be called.
+        Mock::given(method("GET"))
+            .and(path("/copilot_internal/v2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"token": "unused"})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let initial = StoredTokens {
+            github_access_token: "gh".into(),
+            copilot_token: "my-token".into(),
+            copilot_expires_at: 9999999999,
+            refresh_in: 3600,
+        };
+        let (_dir, p) = test_provider(Some(&server), Some(initial));
+        p.cache_models_with_token("my-token").await;
+        let cached = p.cached_models().await.expect("cache should be populated");
+        assert_eq!(cached.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cache_models_keeps_stale_cache_on_failure() {
+        let server = MockServer::start().await;
+        // /models returns 503 (transient failure).
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let initial = StoredTokens {
+            github_access_token: "gh".into(),
+            copilot_token: "test-token".into(),
+            copilot_expires_at: 9999999999,
+            refresh_in: 3600,
+        };
+        let (_dir, p) = test_provider(Some(&server), Some(initial));
+
+        // Pre-populate the cache with a known entry.
+        *p.state.cached_models.write().await = Some(vec![CopilotModel {
+            id: "cached-m1".to_string(),
+            name: "Cached Model".to_string(),
+            vendor: "v".to_string(),
+        }]);
+
+        // cache_models() will call ensure_token (succeeds, token unexpired),
+        // then fetch_models which fails with 503. The cache must survive.
+        p.cache_models().await;
+
+        let cached = p
+            .cached_models()
+            .await
+            .expect("stale cache should survive transient failure");
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].id, "cached-m1");
+    }
+
+    #[tokio::test]
+    async fn spawn_refresh_loop_caches_models_on_first_iteration_with_unexpired_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("authorization", "Bearer loop-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [{"id": "loop-model", "name": "Loop Model", "vendor": "v", "policy": {"state": "enabled"}}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let initial = StoredTokens {
+            github_access_token: "gh".into(),
+            copilot_token: "loop-token".into(),
+            copilot_expires_at: now() + 3600,
+            refresh_in: 1500,
+        };
+        let (_dir, p) = test_provider(Some(&server), Some(initial));
+        let provider = Arc::new(p);
+        let handle = provider.clone().spawn_refresh_loop();
+
+        // Poll until the pre-sleep cache_models_with_token call completes
+        // (the spawned task makes a real HTTP request to wiremock, which
+        // needs actual wall-clock time — not just paused-time advances).
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async {
+                loop {
+                    if provider.cached_models().await.is_some() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            },
+        )
+        .await;
+
+        handle.abort();
+        let _ = handle.await;
+
+        assert!(
+            result.is_ok(),
+            "pre-sleep cache_models_with_token did not populate cache within 5s"
+        );
+        let cached = provider
+            .cached_models()
+            .await
+            .expect("pre-sleep caching should populate models");
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].id, "loop-model");
     }
 
     /// Spawn a background task that advances paused tokio time every 7
