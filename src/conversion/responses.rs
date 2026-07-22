@@ -31,6 +31,18 @@ use crate::responses::{
     ResponseInputPart, ResponsesRequest, ResponsesResponse, ResponsesTool,
 };
 
+/// Truncate the `user` identifier to the 64-character limit enforced by
+/// Copilot's Responses API. The Anthropic `metadata.user_id` has no
+/// length constraint in the spec, so clients routinely send longer
+/// values that Copilot rejects.
+pub(crate) fn truncate_user(user: &str) -> String {
+    if user.len() <= 64 {
+        user.to_string()
+    } else {
+        user[..64].to_string()
+    }
+}
+
 /// Convert an Anthropic MessagesRequest into an OpenAI ResponsesRequest.
 pub fn anthropic_to_responses_request(
     req: &MessagesRequest,
@@ -100,7 +112,11 @@ pub fn anthropic_to_responses_request(
         tools,
         tool_choice: req.tool_choice.as_ref().and_then(convert_tool_choice),
         parallel_tool_calls: None,
-        user: req.metadata.as_ref().and_then(|m| m.user_id.clone()),
+        user: req
+            .metadata
+            .as_ref()
+            .and_then(|m| m.user_id.as_deref())
+            .map(|u| truncate_user(u)),
         prompt_cache_key: hints.prompt_cache_key,
         prompt_cache_retention: hints.prompt_cache_retention,
         reasoning: req.thinking.as_ref().and_then(convert_thinking),
@@ -1243,5 +1259,17 @@ mod tests {
         let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
         let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_s").unwrap();
         assert!(out.stop_reason.is_none());
+    }
+
+    #[test]
+    fn truncate_user_truncates_long_strings() {
+        assert_eq!(truncate_user("short"), "short");
+        assert_eq!(truncate_user(""), "");
+        let long = "a".repeat(150);
+        assert_eq!(truncate_user(&long).len(), 64);
+        assert_eq!(truncate_user(&long), long[..64]);
+        // exactly 64 — no truncation needed
+        let exact = "b".repeat(64);
+        assert_eq!(truncate_user(&exact), exact);
     }
 }
