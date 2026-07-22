@@ -34,7 +34,7 @@ const COPILOT_INTERNAL_TOKEN_URL: &str =
 /// function so we can call it from both `complete` and `stream`
 /// without sharing provider state.
 fn endpoint_for_model(model: &str) -> &'static str {
-    if model.starts_with("gpt-5") {
+    if crate::util::gpt5_family(model) {
         "responses"
     } else {
         "chat_completions"

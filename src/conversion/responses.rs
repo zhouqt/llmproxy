@@ -107,7 +107,7 @@ pub fn anthropic_to_responses_request(
     // that intent by escalating the short tier to `24h` for these models
     // rather than letting the request 400.
     let prompt_cache_retention = hints.prompt_cache_retention.map(|r| {
-        if r == "in_memory" && model.starts_with("gpt-5") {
+        if r == "in_memory" && crate::util::gpt5_family(&model) {
             "24h".to_string()
         } else {
             r
@@ -875,7 +875,7 @@ mod tests {
         // A non-gpt-5 Responses model (e.g. rewritten to something else)
         // must keep the client-requested short tier untouched.
         let req: MessagesRequest = serde_json::from_value(json!({
-            "model": "o4-mini",
+            "model": "deepseek-chat",
             "max_tokens": 64,
             "messages": [{
                 "role": "user",
