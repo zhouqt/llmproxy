@@ -461,6 +461,13 @@ impl CopilotProvider {
         body: &Value,
     ) -> Result<reqwest::Response> {
         let token = self.ensure_token().await?;
+        tracing::debug!(
+            provider = "copilot",
+            url = url,
+            model = body.get("model").and_then(|v| v.as_str()).unwrap_or(""),
+            stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false),
+            "sending copilot request"
+        );
         let resp = self
             .http
             .post(url)
@@ -469,6 +476,12 @@ impl CopilotProvider {
             .json(body)
             .send()
             .await?;
+        tracing::debug!(
+            provider = "copilot",
+            url = url,
+            status = resp.status().as_u16(),
+            "copilot response status"
+        );
         if resp.status().as_u16() == 401 {
             self.refresh_token().await?;
             let token = self.ensure_token().await?;

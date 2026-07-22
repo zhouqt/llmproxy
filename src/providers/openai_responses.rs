@@ -198,8 +198,19 @@ where
             }
             match serde_json::from_str::<crate::responses::ResponsesStreamEvent>(payload) {
                 Ok(ev) => {
+                    tracing::debug!(
+                        provider = "copilot",
+                        event = event_name_for_debug(&ev),
+                        terminal = ResponsesStreamTranslator::is_terminal(&ev),
+                        "responses SSE event"
+                    );
                     if let Some(t) = self.translator.as_mut() {
                         for out in t.push_event(&ev) {
+                            tracing::debug!(
+                                provider = "copilot",
+                                event = event_name_for_debug_out(&out),
+                                "emitting anthropic event"
+                            );
                             self.output_buffer.push_back(Self::encode(&out));
                         }
                     }
@@ -209,8 +220,17 @@ where
                     // Without this, finalize() never runs and the
                     // client hangs waiting for message_stop.
                     if ResponsesStreamTranslator::is_terminal(&ev) {
+                        tracing::debug!(
+                            provider = "copilot",
+                            "terminal response event — flushing finalize()"
+                        );
                         if let Some(mut t) = self.translator.take() {
                             for ev in t.finalize() {
+                                tracing::debug!(
+                                    provider = "copilot",
+                                    event = event_name_for_debug_out(&ev),
+                                    "emitting anthropic event (from finalize)"
+                                );
                                 self.output_buffer.push_back(Self::encode(&ev));
                             }
                         }
@@ -223,6 +243,47 @@ where
                 }
             }
         }
+    }
+}
+
+/// Short debug label for a Responses stream event — used by the
+/// transport-level debug traces to make logs scannable.
+fn event_name_for_debug(ev: &crate::responses::ResponsesStreamEvent) -> &'static str {
+    use crate::responses::ResponsesStreamEvent as E;
+    match ev {
+        E::ResponseCreated { .. } => "response.created",
+        E::ResponseInProgress { .. } => "response.in_progress",
+        E::ResponseCompleted { .. } => "response.completed",
+        E::ResponseFailed { .. } => "response.failed",
+        E::ResponseIncomplete { .. } => "response.incomplete",
+        E::ResponseOutputItemAdded { .. } => "response.output_item.added",
+        E::ResponseOutputItemDone { .. } => "response.output_item.done",
+        E::ResponseContentPartAdded { .. } => "response.content_part.added",
+        E::ResponseContentPartDone { .. } => "response.content_part.done",
+        E::ResponseOutputTextDelta { .. } => "response.output_text.delta",
+        E::ResponseOutputTextDone { .. } => "response.output_text.done",
+        E::ResponseFunctionCallArgumentsDelta { .. } => {
+            "response.function_call_arguments.delta"
+        }
+        E::ResponseFunctionCallArgumentsDone { .. } => {
+            "response.function_call_arguments.done"
+        }
+        E::Unknown => "unknown",
+    }
+}
+
+/// Short debug label for an Anthropic `StreamEvent` — emitted alongside
+/// each event the translator pushes to the client.
+fn event_name_for_debug_out(ev: &StreamEvent) -> &'static str {
+    match ev {
+        StreamEvent::MessageStart { .. } => "message_start",
+        StreamEvent::ContentBlockStart { .. } => "content_block_start",
+        StreamEvent::ContentBlockDelta { .. } => "content_block_delta",
+        StreamEvent::ContentBlockStop { .. } => "content_block_stop",
+        StreamEvent::MessageDelta { .. } => "message_delta",
+        StreamEvent::MessageStop => "message_stop",
+        StreamEvent::Ping { .. } => "ping",
+        StreamEvent::Error { .. } => "error",
     }
 }
 
