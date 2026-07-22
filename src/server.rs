@@ -239,11 +239,16 @@ async fn list_models_handler(State(state): State<AppState>) -> impl IntoResponse
         .models
         .iter()
         .map(|m| {
+            // display_name uses the model id as a placeholder — static
+            // config has no separate display-name field, and using id
+            // keeps the response shape identical to Copilot-discovered
+            // entries (which carry the upstream `name` field).
             serde_json::json!({
                 "id": m.name,
                 "object": "model",
                 "created": 0,
                 "owned_by": "llmproxy",
+                "display_name": m.name,
             })
         })
         .collect();
@@ -556,6 +561,30 @@ mod tests {
         // First wins.
         assert_eq!(result[0]["owned_by"], "v1");
         assert_eq!(result[0]["display_name"], "First");
+    }
+
+    #[test]
+    fn merge_copilot_models_includes_display_name_on_every_entry() {
+        // Static entries carry display_name from list_models_handler;
+        // Copilot entries get it from the upstream name field.
+        // Every entry in the merged result must have the key.
+        let static_entries = vec![serde_json::json!({
+            "id": "local-1",
+            "display_name": "local-1",
+        })];
+        let copilot = vec![CopilotModel {
+            id: "gpt-4".to_string(),
+            name: "GPT-4".to_string(),
+            vendor: "OpenAI".to_string(),
+        }];
+        let result = merge_copilot_models(static_entries, &copilot);
+        assert_eq!(result.len(), 2);
+        for entry in &result {
+            assert!(
+                entry.get("display_name").is_some(),
+                "every entry must have a display_name key; missing in {entry}"
+            );
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────
