@@ -44,6 +44,12 @@ pub struct ResponsesStreamTranslator {
     /// with. By routing through this map we land on the correct block
     /// instead of creating a phantom block for the mismatched index.
     fc_item_index: std::collections::HashMap<String, u32>,
+    /// Set of Anthropic block indices that have received at least one
+    /// `output_text.delta`. Used to detect text blocks that only carry
+    /// content on the `output_text.done` event (snapshot-only, no deltas
+    /// arrived). When no delta was seen, the done event's `text` is emitted
+    /// as a fallback text delta so the client does not see an empty block.
+    deltas_seen: std::collections::HashSet<u32>,
 }
 
 /// Returns `true` for SSE events that signal the upstream response is
@@ -74,6 +80,7 @@ impl ResponsesStreamTranslator {
             final_usage: None,
             has_tool_calls: false,
             fc_item_index: std::collections::HashMap::new(),
+            deltas_seen: std::collections::HashSet::new(),
         }
     }
 
@@ -150,13 +157,24 @@ impl ResponsesStreamTranslator {
             } => {
                 self.ensure_started(&mut out);
                 let block_idx = self.allocate_block(*output_index);
+                self.deltas_seen.insert(block_idx);
                 out.push(StreamEvent::ContentBlockDelta {
                     index: block_idx,
                     delta: BlockDelta::TextDelta { text: delta.clone() },
                 });
             }
-            ResponsesStreamEvent::ResponseOutputTextDone { output_index, .. } => {
+            ResponsesStreamEvent::ResponseOutputTextDone { output_index, text, .. } => {
                 let block_idx = self.allocate_block(*output_index);
+                // If this text block never received any delta, emit the
+                // done event's full text as a fallback delta. This handles
+                // the case where the upstream sends the complete reply only
+                // on the done event (snapshot-only, no incremental deltas).
+                if !self.deltas_seen.contains(&block_idx) {
+                    out.push(StreamEvent::ContentBlockDelta {
+                        index: block_idx,
+                        delta: BlockDelta::TextDelta { text: text.clone() },
+                    });
+                }
                 if self.closed_blocks.insert(block_idx) {
                     out.push(StreamEvent::ContentBlockStop { index: block_idx });
                 }
@@ -773,8 +791,14 @@ mod tests {
             content_index: 0,
             text: "done".into(),
         });
-        assert_eq!(evs.len(), 1);
-        assert!(matches!(evs[0], StreamEvent::ContentBlockStop { index: 0 }));
+        // No deltas were sent, so the done text is emitted as a fallback
+        // delta before the stop (P1-1: snapshot-only text blocks).
+        assert_eq!(evs.len(), 2);
+        assert!(matches!(
+            evs[0],
+            StreamEvent::ContentBlockDelta { index: 0, delta: BlockDelta::TextDelta { .. } }
+        ));
+        assert!(matches!(evs[1], StreamEvent::ContentBlockStop { index: 0 }));
     }
 
     #[test]
@@ -1083,4 +1107,57 @@ mod tests {
         assert_eq!(usage.input_tokens, 0);
         assert_eq!(usage.output_tokens, 0);
     }
+
+    /// T6: P1-1 regression — text blocks that only carry content on the
+    /// `output_text.done` event (no `output_text.delta` in between) must
+    /// emit the done text as a fallback delta. Without this fix the client
+    /// sees an empty content block because the start block was intentionally
+    /// seeded empty (db0e67b) and no delta ever arrived.
+    #[test]
+    fn text_block_without_deltas_emits_done_text_as_fallback_delta() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        // Open a text output item with a snapshot (seeded empty).
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::Message {
+                id: "msg_x".into(),
+                role: "assistant".into(),
+                status: "in_progress".into(),
+                content: vec![OutputContentPart::OutputText {
+                    text: "snapshot".into(),
+                    annotations: None,
+                }],
+            },
+        });
+        // NO deltas — only the done event carrying the full text.
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseOutputTextDone {
+            item_id: "msg_x".into(),
+            output_index: 0,
+            content_index: 0,
+            text: "Hello from done".into(),
+        });
+        // Must emit a fallback text delta before the stop.
+        assert_eq!(evs.len(), 2);
+        match &evs[0] {
+            StreamEvent::ContentBlockDelta { index: 0, delta: BlockDelta::TextDelta { text } } => {
+                assert_eq!(text, "Hello from done");
+            }
+            other => panic!("expected fallback text delta on block 0, got {other:?}"),
+        }
+        match &evs[1] {
+            StreamEvent::ContentBlockStop { index: 0 } => {}
+            other => panic!("expected stop on block 0, got {other:?}"),
+        }
+        // Finalize must not emit an extra delta or stop for this block.
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(placeholder_response("completed")),
+        });
+        let tail = t.finalize();
+        assert!(!tail.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { .. })));
+        assert!(!tail.iter().any(|e| matches!(e, StreamEvent::ContentBlockDelta { .. })));
+    }
 }
+
