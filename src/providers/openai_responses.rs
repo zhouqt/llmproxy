@@ -212,6 +212,8 @@ where
                                 self.output_buffer.push_back(Self::encode(&ev));
                             }
                         }
+                        self.finished = true;
+                        return;
                     }
                 }
                 Err(e) => {
@@ -1145,15 +1147,19 @@ mod tests {
 
         let mut encoded = String::new();
         // Collect events with a 500ms timeout — the adapter should emit
-        // message_stop from the inline finalize on response.completed,
-        // even though the inner stream never terminates.
-        let _result = timeout(Duration::from_millis(500), async {
+        // message_stop from the inline finalize on response.completed
+        // and then terminate immediately (not hang).
+        let result = timeout(Duration::from_millis(500), async {
             while let Some(item) = adapter.next().await {
                 encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
             }
         })
         .await;
 
+        assert!(
+            result.is_ok(),
+            "adapter must terminate within 500ms after terminal event, not hang until timeout; got: {encoded}"
+        );
         assert!(
             encoded.contains("event: message_stop"),
             "expected message_stop within timeout (inner stream never ends), got: {encoded}"
@@ -1165,6 +1171,53 @@ mod tests {
         assert!(
             encoded.contains("\"text\":\"hi\""),
             "expected content delta text, got: {encoded}"
+        );
+
+        // Subsequent poll must return None immediately (not hang).
+        let after_none = timeout(Duration::from_millis(200), adapter.next())
+            .await
+            .expect("subsequent poll after stream end must not hang");
+        assert!(after_none.is_none(), "expected None after stream ended");
+    }
+
+    /// T7: P0-A regression — after a terminal event (response.completed)
+    /// without [DONE], the adapter must terminate immediately instead of
+    /// hanging on the inner stream, which is chained with stream::pending()
+    /// so it would never return on its own.
+    #[tokio::test]
+    async fn adapter_terminates_immediately_after_terminal_event_no_hang() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"object\":\"response\",\"created_at\":0,\"model\":\"m\",\"status\":\"in_progress\",\"output\":[],\"usage\":{}}}\n\n\
+              data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"object\":\"response\",\"created_at\":0,\"model\":\"m\",\"status\":\"completed\",\"output\":[],\"usage\":{}}}\n\n",
+        ))];
+        let inner = stream::iter(chunks).chain(stream::pending());
+        let mut adapter = ResponsesSseToAnthropic::new(inner, "m");
+
+        let result = timeout(Duration::from_secs(1), async {
+            let mut encoded = String::new();
+            while let Some(item) = adapter.next().await {
+                encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+            }
+            encoded
+        })
+        .await;
+
+        let encoded =
+            result.expect("adapter must return None within 1s after terminal event, not hang");
+        assert!(
+            encoded.contains("event: message_start"),
+            "expected message_start, got: {encoded}"
+        );
+        assert!(
+            encoded.contains("event: message_stop"),
+            "expected message_stop, got: {encoded}"
+        );
+        assert!(
+            encoded.contains("event: message_delta"),
+            "expected message_delta, got: {encoded}"
         );
     }
 
