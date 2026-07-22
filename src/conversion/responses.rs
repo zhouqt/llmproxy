@@ -36,10 +36,10 @@ use crate::responses::{
 /// length constraint in the spec, so clients routinely send longer
 /// values that Copilot rejects.
 pub(crate) fn truncate_user(user: &str) -> String {
-    if user.len() <= 64 {
+    if user.chars().count() <= 64 {
         user.to_string()
     } else {
-        user[..64].to_string()
+        user.chars().take(64).collect()
     }
 }
 
@@ -385,8 +385,8 @@ pub fn responses_to_anthropic_response(
         }
     };
 
-    let cached = resp
-        .usage
+    let usage = resp.usage.clone().unwrap_or_default();
+    let cached = usage
         .input_tokens_details
         .as_ref()
         .map(|d| d.cached_tokens)
@@ -403,8 +403,8 @@ pub fn responses_to_anthropic_response(
         stop_details: None,
         container: None,
         usage: Usage {
-            input_tokens: resp.usage.input_tokens,
-            output_tokens: resp.usage.output_tokens,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: if cached > 0 { Some(cached) } else { None },
             cache_creation: None,
@@ -1357,9 +1357,24 @@ mod tests {
         assert_eq!(truncate_user(""), "");
         let long = "a".repeat(150);
         assert_eq!(truncate_user(&long).len(), 64);
-        assert_eq!(truncate_user(&long), long[..64]);
+        assert_eq!(truncate_user(&long).chars().count(), 64);
         // exactly 64 — no truncation needed
         let exact = "b".repeat(64);
         assert_eq!(truncate_user(&exact), exact);
+    }
+
+    /// T4: P0-4 regression — multibyte user_id must not panic from byte-
+    /// slicing across a character boundary.
+    #[test]
+    fn truncate_user_handles_multibyte_user_id_without_panic() {
+        let user = "\u{7528}".repeat(30); // 90 bytes, 30 chars
+        let truncated = truncate_user(&user);
+        assert_eq!(truncated.chars().count(), 30);
+        assert!(truncated.is_char_boundary(truncated.len()));
+        // A very long multibyte string that exceeds 64 characters
+        let long_mb = "\u{7528}".repeat(100); // 300 bytes, 100 chars
+        let truncated_long = truncate_user(&long_mb);
+        assert_eq!(truncated_long.chars().count(), 64);
+        assert!(truncated_long.is_char_boundary(truncated_long.len()));
     }
 }

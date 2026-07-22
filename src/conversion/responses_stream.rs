@@ -208,7 +208,7 @@ impl ResponsesStreamTranslator {
             | ResponsesStreamEvent::ResponseFailed { response }
             | ResponsesStreamEvent::ResponseIncomplete { response } => {
                 self.ensure_started(&mut out);
-                self.final_usage = Some(response.usage.clone());
+                self.final_usage = response.usage.clone();
                 self.final_stop_reason = Some(match response.status.as_str() {
                     "incomplete" => "max_tokens".to_string(),
                     "completed" => "end_turn".to_string(),
@@ -250,11 +250,12 @@ impl ResponsesStreamTranslator {
         } else {
             stop_reason
         };
-        let usage = self.final_usage.take().map(|u| Usage {
-            input_tokens: u.input_tokens,
-            output_tokens: u.output_tokens,
+        let raw = self.final_usage.take().unwrap_or_default();
+        let usage = Some(Usage {
+            input_tokens: raw.input_tokens,
+            output_tokens: raw.output_tokens,
             cache_creation_input_tokens: None,
-            cache_read_input_tokens: u
+            cache_read_input_tokens: raw
                 .input_tokens_details
                 .as_ref()
                 .filter(|d| d.cached_tokens > 0)
@@ -328,7 +329,7 @@ mod tests {
             status: status.into(),
             output: vec![],
             incomplete_details: None,
-            usage: ResponsesUsage::default(),
+            usage: Some(ResponsesUsage::default()),
             extra: json!({}),
         }
     }
@@ -514,13 +515,13 @@ mod tests {
         });
 
         let mut resp = placeholder_response("completed");
-        resp.usage = ResponsesUsage {
+        resp.usage = Some(ResponsesUsage {
             input_tokens: 10,
             output_tokens: 5,
             total_tokens: 15,
             input_tokens_details: None,
             output_tokens_details: None,
-        };
+        });
         let evs = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
             response: Box::new(resp),
         });
@@ -1009,5 +1010,77 @@ mod tests {
             .filter(|e| matches!(e, StreamEvent::ContentBlockStop { .. }))
             .collect();
         assert!(stops.is_empty(), "no extra stops after finalize: {stops:?}");
+    }
+
+    /// T5 (responses_stream.rs): P0-5 regression — `response.created` with
+    /// `"usage": null` must not prevent finalization. The translator
+    /// should produce default-zero usage rather than erroring.
+    #[test]
+    fn response_created_with_null_usage_decodes_and_finalizes_cleanly() {
+        // Build a response.created event with None usage (simulates the
+        // JSON `"usage": null` case which deserializes to Option::None).
+        let resp = ResponsesResponse {
+            id: "resp_n".into(),
+            object: "response".into(),
+            created_at: 0,
+            model: "gpt-5".into(),
+            status: "in_progress".into(),
+            output: vec![],
+            incomplete_details: None,
+            usage: None,
+            extra: json!({}),
+        };
+        let mut t = ResponsesStreamTranslator::new("msg_n", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(resp),
+        });
+        // A text block so finalize has something to emit.
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::Message {
+                id: "msg_x".into(),
+                role: "assistant".into(),
+                status: "in_progress".into(),
+                content: vec![OutputContentPart::OutputText {
+                    text: String::new(),
+                    annotations: None,
+                }],
+            },
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputTextDelta {
+            item_id: "msg_x".into(),
+            output_index: 0,
+            content_index: 0,
+            delta: "hello".into(),
+        });
+        // Complete with a response that ALSO has None usage.
+        let complete_resp = ResponsesResponse {
+            id: "resp_n".into(),
+            object: "response".into(),
+            created_at: 0,
+            model: "gpt-5".into(),
+            status: "completed".into(),
+            output: vec![],
+            incomplete_details: None,
+            usage: None,
+            extra: json!({}),
+        };
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(complete_resp),
+        });
+        let tail = t.finalize();
+        let message_delta = tail
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { delta, usage } => Some((delta, usage)),
+                _ => None,
+            })
+            .expect("finalize should emit MessageDelta");
+        // stop_reason defaults to "end_turn" for completed status
+        assert_eq!(message_delta.0.stop_reason.as_deref(), Some("end_turn"));
+        // usage should be Some with default values when upstream usage is None
+        let usage = message_delta.1.as_ref().expect("usage should be Some, not None");
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
     }
 }
