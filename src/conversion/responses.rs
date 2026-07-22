@@ -101,6 +101,19 @@ pub fn anthropic_to_responses_request(
 
     let hints = derive_cache_hints(req);
 
+    // GPT-5.x models on the Responses API reject the short `in_memory`
+    // retention tier: "This model is compatible only with 24h extended
+    // prompt caching". When the client asked for caching at all, honor
+    // that intent by escalating the short tier to `24h` for these models
+    // rather than letting the request 400.
+    let prompt_cache_retention = hints.prompt_cache_retention.map(|r| {
+        if r == "in_memory" && model.starts_with("gpt-5") {
+            "24h".to_string()
+        } else {
+            r
+        }
+    });
+
     ResponsesRequest {
         model,
         input,
@@ -118,7 +131,7 @@ pub fn anthropic_to_responses_request(
             .and_then(|m| m.user_id.as_deref())
             .map(|u| truncate_user(u)),
         prompt_cache_key: hints.prompt_cache_key,
-        prompt_cache_retention: hints.prompt_cache_retention,
+        prompt_cache_retention,
         reasoning: req.thinking.as_ref().and_then(convert_thinking),
         extra: json!({}),
     }
@@ -813,6 +826,83 @@ mod tests {
         let out = anthropic_to_responses_request(&req, &rewrite);
         assert_eq!(out.model, "gpt-5-mini");
         assert_eq!(out.input.len(), 1);
+    }
+
+    #[test]
+    fn gpt5_escalates_in_memory_retention_to_24h() {
+        // GPT-5.x rejects `in_memory`: "This model is compatible only
+        // with 24h extended prompt caching". A short-tier cache_control
+        // marker must be escalated to 24h for these models.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "hi",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }],
+            "metadata": {"user_id": "u-1"}
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert_eq!(out.prompt_cache_retention.as_deref(), Some("24h"));
+    }
+
+    #[test]
+    fn gpt5_leaves_24h_retention_unchanged() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "hi",
+                    "cache_control": {"type": "ephemeral_1h"}
+                }]
+            }]
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert_eq!(out.prompt_cache_retention.as_deref(), Some("24h"));
+    }
+
+    #[test]
+    fn non_gpt5_keeps_in_memory_retention() {
+        // A non-gpt-5 Responses model (e.g. rewritten to something else)
+        // must keep the client-requested short tier untouched.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "o4-mini",
+            "max_tokens": 64,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "hi",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }]
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert_eq!(out.prompt_cache_retention.as_deref(), Some("in_memory"));
+    }
+
+    #[test]
+    fn no_cache_control_emits_no_retention_even_for_gpt5() {
+        // Without any cache_control marker the field stays absent — the
+        // escalation must not conjure a retention value out of nothing.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert_eq!(out.prompt_cache_retention, None);
     }
 
     #[test]
