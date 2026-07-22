@@ -33,6 +33,11 @@ pub struct ResponsesStreamTranslator {
     closed_blocks: std::collections::HashSet<u32>,
     final_stop_reason: Option<String>,
     final_usage: Option<crate::responses::ResponsesUsage>,
+    /// Set to true when the stream contains at least one function_call
+    /// output item. Forces the final stop_reason to `tool_use` so Claude
+    /// Code does not interpret `end_turn` as "model finished speaking"
+    /// and drop the tool call.
+    has_tool_calls: bool,
 }
 
 impl ResponsesStreamTranslator {
@@ -46,6 +51,7 @@ impl ResponsesStreamTranslator {
             closed_blocks: std::collections::HashSet::new(),
             final_stop_reason: None,
             final_usage: None,
+            has_tool_calls: false,
         }
     }
 
@@ -96,6 +102,9 @@ impl ResponsesStreamTranslator {
             }
             ResponsesStreamEvent::ResponseOutputItemAdded { output_index, item } => {
                 self.ensure_started(&mut out);
+                if matches!(item, OutputItem::FunctionCall { .. }) {
+                    self.has_tool_calls = true;
+                }
                 let block_idx = self.allocate_block(*output_index);
                 let block = output_item_to_block(item);
                 out.push(StreamEvent::ContentBlockStart {
@@ -190,6 +199,26 @@ impl ResponsesStreamTranslator {
             out.push(StreamEvent::ContentBlockStop { index: block_idx });
         }
         let stop_reason = self.final_stop_reason.take();
+        // If the stream produced function_call items, the stop reason
+        // must be "tool_use" regardless of response.status. Claude Code
+        // uses stop_reason to decide whether to execute tools; an
+        // "end_turn" when tools are present causes the client to discard
+        // the tool_use blocks.
+        let stop_reason = if self.has_tool_calls {
+            Some("tool_use".to_string())
+        } else {
+            stop_reason
+        };
+        // If the stream produced function_call items, the stop reason
+        // must be "tool_use" regardless of response.status. Claude Code
+        // uses stop_reason to decide whether to execute tools; an
+        // "end_turn" when tools are present causes the client to discard
+        // the tool_use blocks.
+        let stop_reason = if self.has_tool_calls {
+            Some("tool_use".to_string())
+        } else {
+            stop_reason
+        };
         let usage = self.final_usage.take().map(|u| Usage {
             input_tokens: u.input_tokens,
             output_tokens: u.output_tokens,
@@ -844,5 +873,52 @@ mod tests {
             }
             _ => panic!("expected ContentBlockStart"),
         }
+    }
+
+    /// T1: P0-1 regression — a stream containing a function_call output
+    /// item must produce `stop_reason: "tool_use"` in the final
+    /// MessageDelta, even when response.status says "completed". Without
+    /// this fix, the translator falls through to the status-based mapping
+    /// and emits `end_turn`, causing Claude Code to discard the tool call.
+    #[test]
+    fn streaming_function_call_response_reports_tool_use_stop_reason() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        // Add a function_call output item — no text deltas.
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::FunctionCall {
+                id: "fc_1".into(),
+                call_id: "call_1".into(),
+                name: "f".into(),
+                arguments: "{}".into(),
+                status: "in_progress".into(),
+            },
+        });
+        // Push an arguments delta so the block gets a delta event.
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseFunctionCallArgumentsDelta {
+            item_id: "fc_1".into(),
+            output_index: 0,
+            delta: "{\"x\":1}".into(),
+        });
+        // Stream completes with status "completed".
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(placeholder_response("completed")),
+        });
+        let tail = t.finalize();
+        let message_delta = tail
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { delta, .. } => Some(delta),
+                _ => None,
+            })
+            .expect("finalize should emit MessageDelta");
+        assert_eq!(
+            message_delta.stop_reason.as_deref(),
+            Some("tool_use"),
+            "function_call stream must report tool_use, not end_turn"
+        );
     }
 }
