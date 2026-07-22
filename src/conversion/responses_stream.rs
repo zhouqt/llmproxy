@@ -54,6 +54,12 @@ pub struct ResponsesStreamTranslator {
     /// Signals to the adapter that it should stop processing the stream
     /// immediately and avoid calling `finalize()` on EOF.
     pub(crate) finalized: bool,
+    /// When an upstream `error` SSE event is received, this holds the
+    /// raw Anthropic error SSE envelope to emit directly. Bypasses
+    /// `StreamEvent::Error` serialization because the enum uses
+    /// `#[serde(tag = "type")]` which renders `"type": "Error"`, but
+    /// the Anthropic wire protocol requires `"type": "error"`.
+    pub(crate) raw_error_event: Option<String>,
 }
 
 /// Returns `true` for SSE events that signal the upstream response is
@@ -86,6 +92,7 @@ impl ResponsesStreamTranslator {
             fc_item_index: std::collections::HashMap::new(),
             deltas_seen: std::collections::HashSet::new(),
             finalized: false,
+            raw_error_event: None,
         }
     }
 
@@ -247,12 +254,18 @@ impl ResponsesStreamTranslator {
             }
             ResponsesStreamEvent::Error { code, message, .. } => {
                 self.ensure_started(&mut out);
-                let error = serde_json::json!({
-                    "type_": "upstream_error",
+                let mut error_body = serde_json::json!({
+                    "type": "upstream_error",
                     "message": message,
-                    "code": code,
                 });
-                out.push(StreamEvent::Error { error });
+                if let Some(ref code) = code {
+                    error_body["code"] = serde_json::Value::String(code.clone());
+                }
+                let payload = serde_json::json!({
+                    "type": "error",
+                    "error": error_body,
+                });
+                self.raw_error_event = Some(format!("event: error\ndata: {}\n\n", payload));
                 // Clear final_stop_reason so EOF finalize does not emit
                 // message_delta after the error event.
                 self.final_stop_reason = None;
@@ -274,6 +287,13 @@ impl ResponsesStreamTranslator {
             ResponsesStreamEvent::Unknown => {}
         }
         out
+    }
+
+    /// Consume the raw error payload (if any) that was stored by the
+    /// Error event handler. The adapter layer emits this directly as
+    /// SSE bytes, bypassing `StreamEvent::Error` serialization.
+    pub(crate) fn take_raw_error(&mut self) -> Option<String> {
+        self.raw_error_event.take()
     }
 
     pub fn finalize(&mut self) -> Vec<StreamEvent> {
