@@ -17,7 +17,7 @@
 use crate::anthropic::{
     BlockDelta, MessageDeltaPayload, MessagesResponse, ResponseBlock, StreamEvent, Usage,
 };
-use crate::responses::{OutputContentPart, OutputItem, ResponsesStreamEvent};
+use crate::responses::{OutputItem, ResponsesStreamEvent};
 
 pub struct ResponsesStreamTranslator {
     message_id: String,
@@ -27,6 +27,10 @@ pub struct ResponsesStreamTranslator {
     /// Map Responses `output_index` → Anthropic content_block index.
     /// Each Responses output item maps to one Anthropic content block.
     block_map: std::collections::HashMap<u32, u32>,
+    /// Anthropic block indices already closed by an explicit `*.done`
+    /// event, so `finalize` doesn't emit a second `content_block_stop`
+    /// for them.
+    closed_blocks: std::collections::HashSet<u32>,
     final_stop_reason: Option<String>,
     final_usage: Option<crate::responses::ResponsesUsage>,
 }
@@ -39,6 +43,7 @@ impl ResponsesStreamTranslator {
             started: false,
             block_index: 0,
             block_map: std::collections::HashMap::new(),
+            closed_blocks: std::collections::HashSet::new(),
             final_stop_reason: None,
             final_usage: None,
         }
@@ -120,7 +125,9 @@ impl ResponsesStreamTranslator {
             }
             ResponsesStreamEvent::ResponseOutputTextDone { output_index, .. } => {
                 let block_idx = self.allocate_block(*output_index);
-                out.push(StreamEvent::ContentBlockStop { index: block_idx });
+                if self.closed_blocks.insert(block_idx) {
+                    out.push(StreamEvent::ContentBlockStop { index: block_idx });
+                }
             }
             ResponsesStreamEvent::ResponseFunctionCallArgumentsDelta {
                 output_index,
@@ -138,7 +145,9 @@ impl ResponsesStreamTranslator {
             }
             ResponsesStreamEvent::ResponseFunctionCallArgumentsDone { output_index, .. } => {
                 let block_idx = self.allocate_block(*output_index);
-                out.push(StreamEvent::ContentBlockStop { index: block_idx });
+                if self.closed_blocks.insert(block_idx) {
+                    out.push(StreamEvent::ContentBlockStop { index: block_idx });
+                }
             }
             ResponsesStreamEvent::ResponseOutputItemDone { .. } => {
                 // Closing a whole output item — already covered by the
@@ -167,8 +176,17 @@ impl ResponsesStreamTranslator {
         if !self.started {
             return out;
         }
-        // Close any blocks that weren't explicitly closed.
-        for &block_idx in self.block_map.values() {
+        // Close any blocks that weren't already closed by an explicit
+        // `*.done` event. Emit in ascending index order so the client
+        // sees a deterministic sequence.
+        let mut open: Vec<u32> = self
+            .block_map
+            .values()
+            .copied()
+            .filter(|idx| !self.closed_blocks.contains(idx))
+            .collect();
+        open.sort_unstable();
+        for block_idx in open {
             out.push(StreamEvent::ContentBlockStop { index: block_idx });
         }
         let stop_reason = self.final_stop_reason.take();
@@ -203,30 +221,26 @@ impl ResponsesStreamTranslator {
 
 fn output_item_to_block(item: &OutputItem) -> ResponseBlock {
     match item {
-        OutputItem::Message { content, .. } => {
-            // Use the first output_text part as the initial content.
-            // Subsequent parts will be appended via deltas.
-            let text = content
-                .iter()
-                .find_map(|p| match p {
-                    OutputContentPart::OutputText { text, .. } => Some(text.clone()),
-                    OutputContentPart::Unknown => None,
-                })
-                .unwrap_or_default();
-            ResponseBlock::Text { text, citations: None }
-        }
-        OutputItem::FunctionCall {
-            call_id,
-            name,
-            arguments,
-            ..
-        } => {
-            let input: serde_json::Value = serde_json::from_str(arguments)
-                .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+        // `content_block_start` must open an *empty* block. The text
+        // arrives via `response.output_text.delta` events. Seeding the
+        // block from the item's content would emit the reply twice when
+        // the upstream includes a text snapshot on `output_item.added`
+        // (Copilot's gpt-5.x does this): once here and again through the
+        // deltas, which the client concatenates into a duplicated reply.
+        OutputItem::Message { .. } => ResponseBlock::Text {
+            text: String::new(),
+            citations: None,
+        },
+        OutputItem::FunctionCall { call_id, name, .. } => {
+            // Arguments arrive via `response.function_call_arguments.delta`
+            // and the Anthropic client builds tool input purely from the
+            // concatenated `input_json_delta` fragments. Open with empty
+            // input so a snapshot on `output_item.added` can't collide
+            // with the streamed fragments.
             ResponseBlock::ToolUse {
                 id: call_id.clone(),
                 name: name.clone(),
-                input,
+                input: serde_json::Value::Object(Default::default()),
                 caller: None,
             }
         }
@@ -241,7 +255,7 @@ fn output_item_to_block(item: &OutputItem) -> ResponseBlock {
 mod tests {
     use super::*;
     use crate::responses::{
-        ResponsesResponse, ResponsesUsage,
+        OutputContentPart, ResponsesResponse, ResponsesUsage,
     };
     use serde_json::json;
 
@@ -273,6 +287,96 @@ mod tests {
             response: Box::new(placeholder_response("in_progress")),
         });
         assert!(events2.is_empty());
+    }
+
+    #[test]
+    fn output_item_added_with_text_snapshot_does_not_duplicate_reply() {
+        // Copilot's gpt-5.x includes the accumulated text in the item on
+        // `output_item.added`. The content_block_start must still open
+        // EMPTY — otherwise the reply is emitted twice (once in the start
+        // block, once via the deltas) and the client renders it twice.
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let start = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::Message {
+                id: "msg_x".into(),
+                role: "assistant".into(),
+                status: "in_progress".into(),
+                content: vec![OutputContentPart::OutputText {
+                    text: "Hello world".into(),
+                    annotations: None,
+                }],
+            },
+        });
+        match &start[0] {
+            StreamEvent::ContentBlockStart { content_block: ResponseBlock::Text { text, .. }, .. } => {
+                assert!(text.is_empty(), "start block must be empty, got {text:?}");
+            }
+            _ => panic!("expected empty Text ContentBlockStart"),
+        }
+
+        // The whole reply now arrives via deltas — exactly once.
+        let d1 = t.push_event(&ResponsesStreamEvent::ResponseOutputTextDelta {
+            item_id: "msg_x".into(),
+            output_index: 0,
+            content_index: 0,
+            delta: "Hello world".into(),
+        });
+        let accumulated: String = std::iter::once(&start[0])
+            .chain(d1.iter())
+            .filter_map(|e| match e {
+                StreamEvent::ContentBlockDelta { delta: BlockDelta::TextDelta { text }, .. } => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(accumulated, "Hello world");
+    }
+
+    #[test]
+    fn output_text_done_then_finalize_emits_single_content_block_stop() {
+        // `output_text.done` closes the block; finalize must NOT emit a
+        // second content_block_stop for the same index.
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::Message {
+                id: "msg_x".into(),
+                role: "assistant".into(),
+                status: "in_progress".into(),
+                content: vec![],
+            },
+        });
+        let done = t.push_event(&ResponsesStreamEvent::ResponseOutputTextDone {
+            item_id: "msg_x".into(),
+            output_index: 0,
+            content_index: 0,
+            text: "hi".into(),
+        });
+        assert_eq!(
+            done.iter()
+                .filter(|e| matches!(e, StreamEvent::ContentBlockStop { index: 0 }))
+                .count(),
+            1
+        );
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(placeholder_response("completed")),
+        });
+        let tail = t.finalize();
+        assert_eq!(
+            tail.iter()
+                .filter(|e| matches!(e, StreamEvent::ContentBlockStop { .. }))
+                .count(),
+            0,
+            "finalize must not re-close a block already closed by output_text.done"
+        );
     }
 
     #[test]
