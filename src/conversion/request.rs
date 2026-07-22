@@ -64,11 +64,17 @@ pub fn anthropic_to_openai_request(
         }
     });
 
+    let (max_tokens, max_completion_tokens) = if crate::util::gpt5_family(&model) {
+        (None, Some(req.max_tokens))
+    } else {
+        (Some(req.max_tokens), None)
+    };
+
     ChatRequest {
         model,
         messages,
-        max_tokens: Some(req.max_tokens),
-        max_completion_tokens: Some(req.max_tokens),
+        max_tokens,
+        max_completion_tokens,
         temperature: req.temperature,
         top_p: req.top_p,
         stop: req.stop_sequences.clone(),
@@ -772,6 +778,61 @@ mod tests {
             converted4.prompt_cache_retention.as_deref(),
             Some("in_memory"),
             "non-gpt-5 must keep in_memory"
+        );
+    }
+
+    /// T11: Chat Completions for a gpt-5 family model emits only
+    /// `max_completion_tokens` (not `max_tokens`).
+    #[test]
+    fn chat_completions_emits_only_max_completion_tokens_for_gpt5() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 200,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        let mut rewrite = std::collections::HashMap::new();
+        rewrite.insert("claude-sonnet-4-5".to_string(), "gpt-5".to_string());
+        let converted = anthropic_to_openai_request(&req, &rewrite);
+        assert_eq!(converted.max_tokens, None, "gpt-5 must not emit max_tokens");
+        assert_eq!(
+            converted.max_completion_tokens,
+            Some(200),
+            "gpt-5 must emit max_completion_tokens"
+        );
+
+        // o3-mini also uses max_completion_tokens
+        let mut rewrite2 = std::collections::HashMap::new();
+        rewrite2.insert("claude-sonnet-4-5".to_string(), "o3-mini".to_string());
+        let converted2 = anthropic_to_openai_request(&req, &rewrite2);
+        assert_eq!(converted2.max_tokens, None, "o3-mini must not emit max_tokens");
+        assert_eq!(
+            converted2.max_completion_tokens,
+            Some(200),
+            "o3-mini must emit max_completion_tokens"
+        );
+    }
+
+    /// T12: Chat Completions for a non-gpt-5 model emits only
+    /// `max_tokens` (not `max_completion_tokens`).
+    #[test]
+    fn chat_completions_emits_only_max_tokens_for_non_gpt5() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        let converted = anthropic_to_openai_request(&req, &Default::default());
+        assert_eq!(
+            converted.max_tokens,
+            Some(100),
+            "non-gpt-5 must emit max_tokens"
+        );
+        assert_eq!(
+            converted.max_completion_tokens,
+            None,
+            "non-gpt-5 must not emit max_completion_tokens"
         );
     }
 }
