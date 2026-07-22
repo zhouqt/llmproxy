@@ -192,7 +192,7 @@ async fn count_tokens_handler(
 }
 
 async fn list_models_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let models: Vec<_> = state
+    let mut models: Vec<_> = state
         .config
         .models
         .iter()
@@ -205,6 +205,42 @@ async fn list_models_handler(State(state): State<AppState>) -> impl IntoResponse
             })
         })
         .collect();
+
+    // If Copilot is configured and has a cached model list, merge it in.
+    // Copilot-discovered entries take precedence over static config entries
+    // with the same id. Static entries for non-Copilot providers are kept.
+    if let Some(cp) = &state.copilot {
+        if let Some(raw) = cp.cached_models().await {
+            if let Some(data) = raw.get("data").and_then(|d| d.as_array()) {
+                // Build a set of Copilot model ids for dedup.
+                let copilot_ids: std::collections::HashSet<&str> = data
+                    .iter()
+                    .filter_map(|m| m.get("id").and_then(|v| v.as_str()))
+                    .collect();
+
+                // Remove static entries that Copilot also reports (Copilot wins).
+                models.retain(|m| {
+                    let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    !copilot_ids.contains(id)
+                });
+
+                // Append Copilot-discovered models in OpenAI format.
+                for m in data {
+                    let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let vendor = m.get("vendor").and_then(|v| v.as_str()).unwrap_or("");
+                    let display_name = m.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    models.push(serde_json::json!({
+                        "id": id,
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": vendor,
+                        "display_name": display_name,
+                    }));
+                }
+            }
+        }
+    }
+
     Json(serde_json::json!({
         "object": "list",
         "data": models,
