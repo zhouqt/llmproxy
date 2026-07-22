@@ -287,6 +287,17 @@ pub enum ResponsesStreamEvent {
         output_index: u32,
         arguments: String,
     },
+    /// Upstream SSE error event. OpenAI send these inline during a
+    /// stream when something goes wrong mid-response (e.g. model
+    /// overload, internal error).
+    #[serde(rename = "error")]
+    Error {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        param: Option<String>,
+    },
     #[serde(other)]
     Unknown,
 }
