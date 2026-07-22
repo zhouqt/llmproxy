@@ -38,6 +38,12 @@ pub struct ResponsesStreamTranslator {
     /// Code does not interpret `end_turn` as "model finished speaking"
     /// and drop the tool call.
     has_tool_calls: bool,
+    /// Maps `function_call` item IDs to their `output_index`, recorded on
+    /// `output_item.added`. Copilot sometimes sends function-call argument
+    /// deltas with a *different* `output_index` than the item was created
+    /// with. By routing through this map we land on the correct block
+    /// instead of creating a phantom block for the mismatched index.
+    fc_item_index: std::collections::HashMap<String, u32>,
 }
 
 /// Returns `true` for SSE events that signal the upstream response is
@@ -67,6 +73,7 @@ impl ResponsesStreamTranslator {
             final_stop_reason: None,
             final_usage: None,
             has_tool_calls: false,
+            fc_item_index: std::collections::HashMap::new(),
         }
     }
 
@@ -117,8 +124,9 @@ impl ResponsesStreamTranslator {
             }
             ResponsesStreamEvent::ResponseOutputItemAdded { output_index, item } => {
                 self.ensure_started(&mut out);
-                if matches!(item, OutputItem::FunctionCall { .. }) {
+                if let OutputItem::FunctionCall { id, .. } = item {
                     self.has_tool_calls = true;
+                    self.fc_item_index.insert(id.clone(), *output_index);
                 }
                 let block_idx = self.allocate_block(*output_index);
                 let block = output_item_to_block(item);
@@ -156,10 +164,19 @@ impl ResponsesStreamTranslator {
             ResponsesStreamEvent::ResponseFunctionCallArgumentsDelta {
                 output_index,
                 delta,
+                item_id,
                 ..
             } => {
                 self.ensure_started(&mut out);
-                let block_idx = self.allocate_block(*output_index);
+                // Route by item_id when available — Copilot sometimes
+                // sends deltas with a different output_index than the
+                // item was created with.
+                let fc_index = self
+                    .fc_item_index
+                    .get(item_id)
+                    .copied()
+                    .unwrap_or(*output_index);
+                let block_idx = self.allocate_block(fc_index);
                 out.push(StreamEvent::ContentBlockDelta {
                     index: block_idx,
                     delta: BlockDelta::InputJsonDelta {
@@ -167,8 +184,17 @@ impl ResponsesStreamTranslator {
                     },
                 });
             }
-            ResponsesStreamEvent::ResponseFunctionCallArgumentsDone { output_index, .. } => {
-                let block_idx = self.allocate_block(*output_index);
+            ResponsesStreamEvent::ResponseFunctionCallArgumentsDone {
+                output_index,
+                item_id,
+                ..
+            } => {
+                let fc_index = self
+                    .fc_item_index
+                    .get(item_id)
+                    .copied()
+                    .unwrap_or(*output_index);
+                let block_idx = self.allocate_block(fc_index);
                 if self.closed_blocks.insert(block_idx) {
                     out.push(StreamEvent::ContentBlockStop { index: block_idx });
                 }
@@ -214,16 +240,6 @@ impl ResponsesStreamTranslator {
             out.push(StreamEvent::ContentBlockStop { index: block_idx });
         }
         let stop_reason = self.final_stop_reason.take();
-        // If the stream produced function_call items, the stop reason
-        // must be "tool_use" regardless of response.status. Claude Code
-        // uses stop_reason to decide whether to execute tools; an
-        // "end_turn" when tools are present causes the client to discard
-        // the tool_use blocks.
-        let stop_reason = if self.has_tool_calls {
-            Some("tool_use".to_string())
-        } else {
-            stop_reason
-        };
         // If the stream produced function_call items, the stop reason
         // must be "tool_use" regardless of response.status. Claude Code
         // uses stop_reason to decide whether to execute tools; an
@@ -935,5 +951,63 @@ mod tests {
             Some("tool_use"),
             "function_call stream must report tool_use, not end_turn"
         );
+    }
+
+    /// T3: P0-3 regression — Copilot sometimes sends
+    /// `function_call_arguments.delta` / `.done` with a *different*
+    /// `output_index` than the `output_item.added` used. The translator
+    /// must route by `item_id` via `fc_item_index`, not by the raw
+    /// `output_index` on the delta/done event.
+    #[test]
+    fn function_call_args_with_mismatched_output_index_routes_by_item_id() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        // Add a function_call with output_index=0, item_id="fc_1".
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::FunctionCall {
+                id: "fc_1".into(),
+                call_id: "call_1".into(),
+                name: "f".into(),
+                arguments: "{}".into(),
+                status: "in_progress".into(),
+            },
+        });
+        // Delta arrives with output_index=1 (mismatched!) but correct
+        // item_id. Must route to block 0, not create a phantom block 1.
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseFunctionCallArgumentsDelta {
+            item_id: "fc_1".into(),
+            output_index: 1,
+            delta: "{\"x\":1}".into(),
+        });
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            StreamEvent::ContentBlockDelta { index: 0, delta: BlockDelta::InputJsonDelta { .. } } => {}
+            other => panic!("expected delta on block 0, got {other:?}"),
+        }
+        // Done also arrives with mismatched output_index=1.
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseFunctionCallArgumentsDone {
+            item_id: "fc_1".into(),
+            output_index: 1,
+            arguments: "{\"x\":1}".into(),
+        });
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            StreamEvent::ContentBlockStop { index: 0 } => {}
+            other => panic!("expected stop on block 0, got {other:?}"),
+        }
+        // Finalize should not emit any extra content_block_stop (block 0
+        // already closed, and no phantom block 1 exists).
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(placeholder_response("completed")),
+        });
+        let tail = t.finalize();
+        let stops: Vec<&StreamEvent> = tail
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::ContentBlockStop { .. }))
+            .collect();
+        assert!(stops.is_empty(), "no extra stops after finalize: {stops:?}");
     }
 }
