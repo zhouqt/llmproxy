@@ -130,7 +130,7 @@ pub struct ResponsesResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incomplete_details: Option<IncompleteDetails>,
     #[serde(default)]
-    pub usage: ResponsesUsage,
+    pub usage: Option<ResponsesUsage>,
     /// Forward-compat for fields we don't model.
     #[serde(default, flatten)]
     pub extra: Value,
