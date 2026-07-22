@@ -203,6 +203,16 @@ where
                             self.output_buffer.push_back(Self::encode(&out));
                         }
                     }
+                    // Copilot often omits [DONE] after response.completed.
+                    // Finalize inline on terminal events so the client
+                    // always gets message_delta + message_stop.
+                    if crate::conversion::responses_stream::is_terminal_event(&ev) {
+                        if let Some(mut t) = self.translator.take() {
+                            for ev in t.finalize() {
+                                self.output_buffer.push_back(Self::encode(&ev));
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::debug!("skipping malformed Responses SSE line: {} ({e})", summarize_for_log(payload));
@@ -1111,8 +1121,55 @@ mod tests {
         );
     }
 
-    #[test]
-    fn event_name_emits_ping_for_ping_variant() {
+    /// T2: P0-2 regression — when the upstream emits
+    /// `response.completed` but never sends `[DONE]` and keeps the TCP
+    /// connection open, the adapter must still finalize and emit
+    /// `message_stop`. Without this fix, the adapter would wait forever
+    /// (or until EOF) for the sentinel, and the client would hang.
+    #[tokio::test]
+    async fn stream_finalizes_on_response_completed_without_done_sentinel() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        // Feed a complete SSE sequence ending with response.completed,
+        // then hang the inner stream (stream::pending) to simulate a
+        // Copilot upstream that never sends [DONE] after completion.
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"object\":\"response\",\"created_at\":0,\"model\":\"m\",\"status\":\"in_progress\",\"output\":[],\"usage\":{}}}\n\n\
+              data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[{\"type\":\"output_text\",\"text\":\"\"}]}}\n\n\
+              data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg\",\"output_index\":0,\"content_index\":0,\"delta\":\"hi\"}\n\n\
+              data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"object\":\"response\",\"created_at\":0,\"model\":\"m\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+        ))];
+        let inner = stream::iter(chunks).chain(stream::pending());
+        let mut adapter = ResponsesSseToAnthropic::new(inner, "m");
+
+        let mut encoded = String::new();
+        // Collect events with a 500ms timeout — the adapter should emit
+        // message_stop from the inline finalize on response.completed,
+        // even though the inner stream never terminates.
+        let _result = timeout(Duration::from_millis(500), async {
+            while let Some(item) = adapter.next().await {
+                encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+            }
+        })
+        .await;
+
+        assert!(
+            encoded.contains("event: message_stop"),
+            "expected message_stop within timeout (inner stream never ends), got: {encoded}"
+        );
+        assert!(
+            encoded.contains("event: message_delta"),
+            "expected message_delta, got: {encoded}"
+        );
+        assert!(
+            encoded.contains("\"text\":\"hi\""),
+            "expected content delta text, got: {encoded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn event_name_emits_ping_for_ping_variant() {
         // The Responses translator never emits a Ping, but the
         // event_name() match must still handle it for completeness
         // (if a future Responses variant maps to an Anthropic
