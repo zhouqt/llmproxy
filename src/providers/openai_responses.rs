@@ -205,12 +205,96 @@ where
                     }
                 }
                 Err(e) => {
-                    tracing::debug!("skipping malformed Responses SSE line: {} ({e})", payload);
+                    tracing::debug!("skipping malformed Responses SSE line: {} ({e})", summarize_for_log(payload));
                 }
             }
         }
     }
 }
+
+/// Reduce a payload string to a short, log-friendly hint.
+///
+/// The malformed-SSE debug log used to dump the full payload, which
+/// for a Copilot 502 HTML error page meant dumping a full HTML
+/// document with stylesheets, image refs, and links. Strip tags,
+/// URLs, image refs, scripts, and styles, then take the first ~200
+/// chars of substantive text.
+fn summarize_for_log(payload: &str) -> String {
+    // Reuse the same shape as copilot's summarize_http_body — inline
+    // it here so we don't grow a cross-module dep just for one log
+    // site. If the truncation rules ever need to evolve, hoist into a
+    // shared util.
+    let mut s = payload.to_string();
+    for tag in ["script", "style"] {
+        let open = format!("<{tag}");
+        let close = format!("</{tag}>");
+        while let Some(start) = s.find(&open) {
+            let Some(end_rel) = s[start..].find(&close) else {
+                s.truncate(start);
+                break;
+            };
+            let end = start + end_rel + close.len();
+            s.replace_range(start..end, " ");
+        }
+    }
+    while let Some(start) = s.find("<!--") {
+        let Some(end_rel) = s[start..].find("-->") else {
+            s.truncate(start);
+            break;
+        };
+        s.replace_range(start..start + end_rel + 3, " ");
+    }
+    let url_chars = |c: char| c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-' | '_' | '?' | '&' | '=' | '%' | '#' | '+' | '~');
+    let strip_token = |s: &mut String, token: &str| {
+        let mut idx = 0;
+        while let Some(rel) = s[idx..].find(token) {
+            let start = idx + rel;
+            let after = start + token.len();
+            let mut end = after;
+            while end < s.len() && url_chars(s.as_bytes()[end] as char) {
+                end += 1;
+            }
+            s.replace_range(start..end, " ");
+            idx = start + 1;
+        }
+    };
+    for prefix in ["https://", "http://", "ftp://"] {
+        strip_token(&mut s, prefix);
+    }
+    for token in ["src=\"", "src='", "url(", "href=\"", "href='"] {
+        strip_token(&mut s, token);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    let mut line = String::new();
+    for c in out.chars() {
+        if c.is_whitespace() {
+            if !line.ends_with(' ') && !line.is_empty() {
+                line.push(' ');
+            }
+        } else {
+            line.push(c);
+        }
+        if line.len() > 200 {
+            break;
+        }
+    }
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        "<empty payload>".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 
 impl<S> Stream for ResponsesSseToAnthropic<S>
 where
