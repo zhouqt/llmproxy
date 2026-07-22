@@ -579,12 +579,16 @@ impl Provider for CopilotProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
-        let endpoint = endpoint_for_model(&req.model);
+        let merged = merge_rewrites(&self.model_rewrite, model_rewrite);
+        let upstream_model = merged
+            .get(&req.model)
+            .map(String::as_str)
+            .unwrap_or(&req.model);
+        let endpoint = endpoint_for_model(upstream_model);
         if endpoint == "responses" {
-            return self.complete_responses(req, model_rewrite).await;
+            return self.complete_responses(req, &merged).await;
         }
 
-        let merged = merge_rewrites(&self.model_rewrite, model_rewrite);
         let mut openai_req =
             crate::conversion::anthropic_to_openai_request(req, &merged);
         openai_req.stream = false;
@@ -623,12 +627,16 @@ impl Provider for CopilotProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
-        let endpoint = endpoint_for_model(&req.model);
+        let merged = merge_rewrites(&self.model_rewrite, model_rewrite);
+        let upstream_model = merged
+            .get(&req.model)
+            .map(String::as_str)
+            .unwrap_or(&req.model);
+        let endpoint = endpoint_for_model(upstream_model);
         if endpoint == "responses" {
-            return self.stream_responses(req, model_rewrite).await;
+            return self.stream_responses(req, &merged).await;
         }
 
-        let merged = merge_rewrites(&self.model_rewrite, model_rewrite);
         let mut openai_req =
             crate::conversion::anthropic_to_openai_request(req, &merged);
         openai_req.stream = true;
@@ -741,6 +749,24 @@ mod tests {
                 "completion_tokens": 2,
                 "total_tokens": 6
             }
+        })
+    }
+
+    fn responses_response_json(content: &str) -> Value {
+        json!({
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5.5",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": content}]
+            }],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
         })
     }
 
@@ -1277,14 +1303,10 @@ mod tests {
 
     #[tokio::test]
     async fn non_gpt5_request_never_touches_responses_endpoint() {
-        // Mirror of the above: a non-GPT-5 model must NOT be routed to
-        // /responses even when the runtime model_rewrite maps it to a
-        // name that starts with "gpt-5". Dispatch reads req.model
-        // (the original incoming name), not the rewritten upstream
-        // name — so a rewrite `claude-sonnet-4.6 → gpt-5-mini` still
-        // goes to /chat/completions. Verify the upstream sees
-        // "gpt-5-mini" (the rewrite) but the mock on /responses is
-        // never hit.
+        // A non-GPT-5 source model with no rewrite resolving to a GPT-5
+        // upstream name must NOT be routed to /responses. The mock on
+        // /responses asserts it is never hit; the chat-completions mock
+        // is what serves the request.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/responses"))
@@ -1294,7 +1316,7 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(body_partial_json(json!({"model": "gpt-5-mini"})))
+            .and(body_partial_json(json!({"model": "claude-sonnet-4.6"})))
             .respond_with(ResponseTemplate::new(200).set_body_json(completion_response("via-chat")))
             .expect(1)
             .mount(&server)
@@ -1305,8 +1327,9 @@ mod tests {
         );
         let mut req = request(false);
         req.model = "claude-sonnet-4.6".to_string();
-        let mut rewrite = HashMap::new();
-        rewrite.insert("claude-sonnet-4.6".to_string(), "gpt-5-mini".to_string());
+        // No rewrite: upstream_model == req.model, classified as
+        // chat_completions.
+        let rewrite = HashMap::new();
 
         let output = provider
             .complete(&req, &rewrite)
@@ -1314,6 +1337,93 @@ mod tests {
             .unwrap();
         expect_variant!(output, ProviderOutput::Json(body) => {
             assert_eq!(body["content"][0]["text"], "via-chat");
+        });
+    }
+
+    #[tokio::test]
+    async fn rewritten_to_gpt5_routes_to_responses_endpoint() {
+        // The user's `work-high → gpt-5.5` mapping must dispatch to
+        // /responses, not /chat/completions. Previously dispatch keyed
+        // off the original `req.model` and missed the rewrite.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(body_partial_json(json!({"model": "gpt-5.5"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                responses_response_json("via-responses"),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("should not be called"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+        let mut req = request(false);
+        req.model = "work-high".to_string();
+        let mut rewrite = HashMap::new();
+        rewrite.insert("work-high".to_string(), "gpt-5.5".to_string());
+
+        let output = provider
+            .complete(&req, &rewrite)
+            .await
+            .unwrap();
+        expect_variant!(output, ProviderOutput::Json(body) => {
+            assert_eq!(body["content"][0]["text"], "via-responses");
+        });
+    }
+
+    #[tokio::test]
+    async fn streaming_rewritten_to_gpt5_routes_to_responses_endpoint() {
+        // Same routing must apply on the streaming path: a rewrite
+        // `work-high → gpt-5.5` must dispatch to /responses and the
+        // response.stream event text must reach the client.
+        let server = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"object\":\"response\",\"created_at\":0,\"model\":\"gpt-5.5\",\"status\":\"in_progress\",\"output\":[],\"usage\":{}}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"m1\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"output_index\":0,\"content_index\":0,\"delta\":\"via-stream\"}\n\n",
+            "data: {\"type\":\"response.output_text.done\",\"item_id\":\"m1\",\"output_index\":0,\"content_index\":0,\"text\":\"via-stream\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"object\":\"response\",\"created_at\":0,\"model\":\"gpt-5.5\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(body_partial_json(json!({"model": "gpt-5.5"})))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sse))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("should not be called"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+        let mut req = request(true);
+        req.model = "work-high".to_string();
+        let mut rewrite = HashMap::new();
+        rewrite.insert("work-high".to_string(), "gpt-5.5".to_string());
+
+        let output = provider.stream(&req, &rewrite).await.unwrap();
+        expect_variant!(output, ProviderOutput::Stream(mut output) => {
+            let mut encoded = String::new();
+            while let Some(item) = output.next().await {
+                encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+            }
+            assert!(
+                encoded.contains("\"text\":\"via-stream\""),
+                "expected text delta in stream, got: {encoded}"
+            );
         });
     }
 
