@@ -32,8 +32,9 @@ pub struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     /// GPT-5.x and newer models require `max_completion_tokens` and
-    /// reject the legacy `max_tokens`. We emit both so the upstream
-    /// picks whichever it recognizes.
+    /// reject the legacy `max_tokens`. The conversion logic emits
+    /// exactly one of the two (XOR): `max_completion_tokens` for GPT-5
+    /// models, `max_tokens` for everything else.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
