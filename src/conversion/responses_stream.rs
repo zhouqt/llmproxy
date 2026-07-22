@@ -31,6 +31,21 @@ pub struct ResponsesStreamTranslator {
     /// event, so `finalize` doesn't emit a second `content_block_stop`
     /// for them.
     closed_blocks: std::collections::HashSet<u32>,
+    /// Map Responses function-call `id` → the `output_index` of the
+    /// `output_item.added` event that opened its block.
+    ///
+    /// The Copilot Responses stream sometimes uses a different
+    /// `output_index` for the function call's `output_item.added` event
+    /// (e.g. 1) than for its `function_call_arguments.delta/done`
+    /// events (e.g. 0). Routing purely by `output_index` would then
+    /// allocate two separate Anthropic block indices for the same
+    /// tool call — `output_item.added` opens block 1, the args
+    /// `delta`s go to block 0, the args `done` closes block 0, and
+    /// `finalize()` re-closes block 1. Claude Code sees the duplicate
+    /// `content_block_stop` and drops the tool call. Use the
+    /// `item_id` carried on the args events to look up the correct
+    /// block instead.
+    fc_item_index: std::collections::HashMap<String, u32>,
     /// Set when an `output_item.added` of type FunctionCall arrives.
     /// Drives the terminal `stop_reason`: `"tool_use"` if any function
     /// call was emitted (so the client executes the tool and continues
@@ -53,6 +68,7 @@ impl ResponsesStreamTranslator {
             block_index: 0,
             block_map: std::collections::HashMap::new(),
             closed_blocks: std::collections::HashSet::new(),
+            fc_item_index: std::collections::HashMap::new(),
             has_tool_calls: false,
             final_stop_reason: None,
             final_usage: None,
@@ -107,8 +123,14 @@ impl ResponsesStreamTranslator {
             ResponsesStreamEvent::ResponseOutputItemAdded { output_index, item } => {
                 self.ensure_started(&mut out);
                 let block_idx = self.allocate_block(*output_index);
-                if matches!(item, OutputItem::FunctionCall { .. }) {
+                if let OutputItem::FunctionCall { id, .. } = item {
                     self.has_tool_calls = true;
+                    // Remember which `output_index` opened this
+                    // function-call block. Subsequent args events
+                    // carry `item_id`; we'll use it to route their
+                    // deltas to the same block even if the upstream
+                    // reports a different `output_index`.
+                    self.fc_item_index.insert(id.clone(), *output_index);
                 }
                 let block = output_item_to_block(item);
                 out.push(StreamEvent::ContentBlockStart {
@@ -143,12 +165,24 @@ impl ResponsesStreamTranslator {
                 }
             }
             ResponsesStreamEvent::ResponseFunctionCallArgumentsDelta {
+                item_id,
                 output_index,
                 delta,
                 ..
             } => {
                 self.ensure_started(&mut out);
-                let block_idx = self.allocate_block(*output_index);
+                // Route the delta to the block opened by
+                // `output_item.added`, not to whatever `output_index`
+                // the upstream put on this event — see `fc_item_index`
+                // doc. Fall back to the event's own `output_index` if
+                // we somehow never saw the item.added (shouldn't
+                // happen on a well-formed stream).
+                let block_output_index = self
+                    .fc_item_index
+                    .get(item_id)
+                    .copied()
+                    .unwrap_or(*output_index);
+                let block_idx = self.allocate_block(block_output_index);
                 out.push(StreamEvent::ContentBlockDelta {
                     index: block_idx,
                     delta: BlockDelta::InputJsonDelta {
@@ -156,11 +190,26 @@ impl ResponsesStreamTranslator {
                     },
                 });
             }
-            ResponsesStreamEvent::ResponseFunctionCallArgumentsDone { output_index, .. } => {
-                let block_idx = self.allocate_block(*output_index);
+            ResponsesStreamEvent::ResponseFunctionCallArgumentsDone {
+                item_id,
+                output_index,
+                ..
+            } => {
+                let block_output_index = self
+                    .fc_item_index
+                    .get(item_id)
+                    .copied()
+                    .unwrap_or(*output_index);
+                let block_idx = self.allocate_block(block_output_index);
+                // Also close the block that was opened for the
+                // event's own `output_index`, in case any stray delta
+                // got routed there before this fix landed (or in case
+                // the upstream mixes indices for unrelated reasons).
+                let stray_block_idx = self.allocate_block(*output_index);
                 if self.closed_blocks.insert(block_idx) {
                     out.push(StreamEvent::ContentBlockStop { index: block_idx });
                 }
+                self.closed_blocks.insert(stray_block_idx);
             }
             ResponsesStreamEvent::ResponseOutputItemDone { .. } => {
                 // Closing a whole output item — already covered by the
@@ -939,6 +988,295 @@ mod tests {
             }
             _ => panic!("expected ContentBlockStart"),
         }
+    }
+
+    #[test]
+    fn text_then_function_call_no_duplicate_block_stop_on_finalize() {
+        // Regression for the live trace: when a response carries a
+        // text message followed by a function_call item, finalize()
+        // must NOT re-emit content_block_stop for the function_call
+        // block (which was already closed by
+        // response.function_call_arguments.done).
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        // Text message item at output_index=0.
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::Message {
+                id: "msg_a".into(),
+                role: "assistant".into(),
+                status: "in_progress".into(),
+                content: vec![OutputContentPart::OutputText {
+                    text: String::new(),
+                    annotations: None,
+                }],
+            },
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputTextDelta {
+            item_id: "msg_a".into(),
+            output_index: 0,
+            content_index: 0,
+            delta: "Hello".into(),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputTextDone {
+            item_id: "msg_a".into(),
+            output_index: 0,
+            content_index: 0,
+            text: "Hello".into(),
+        });
+        // Function-call item at output_index=1.
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 1,
+            item: OutputItem::FunctionCall {
+                id: "fc_1".into(),
+                call_id: "call_1".into(),
+                name: "lookup".into(),
+                arguments: "{}".into(),
+                status: "in_progress".into(),
+            },
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseFunctionCallArgumentsDelta {
+            item_id: "fc_1".into(),
+            output_index: 1,
+            delta: "{\"x\":1}".into(),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseFunctionCallArgumentsDone {
+            item_id: "fc_1".into(),
+            output_index: 1,
+            arguments: "{\"x\":1}".into(),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemDone {
+            output_index: 1,
+            item: OutputItem::FunctionCall {
+                id: "fc_1".into(),
+                call_id: "call_1".into(),
+                name: "lookup".into(),
+                arguments: "{\"x\":1}".into(),
+                status: "completed".into(),
+            },
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(placeholder_response("completed")),
+        });
+
+        let tail = t.finalize();
+        let stops: Vec<u32> = tail
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ContentBlockStop { index } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            stops.is_empty(),
+            "finalize must not re-close the function_call block (already \
+             closed by function_call_arguments.done), got content_block_stop \
+             indices: {stops:?}"
+        );
+    }
+
+    #[test]
+    fn function_call_args_with_mismatched_output_index_does_not_leak_block() {
+        // The Copilot Responses stream sometimes uses different
+        // `output_index` values for the `output_item.added` event of a
+        // function call and the subsequent `function_call_arguments.*`
+        // events. If we naively trust `output_index` everywhere,
+        // allocate_block() creates two different internal block
+        // indices for the same item, and `finalize()` ends up
+        // emitting `content_block_stop` for a block that was already
+        // closed by `function_call_arguments.done` — which causes
+        // Claude Code to hang / drop the tool call.
+        //
+        // The trace we saw was:
+        //   response.output_item.added           output_index=1 (function call)
+        //   response.function_call_arguments.delta  output_index=0
+        //   response.function_call_arguments.done   output_index=0
+        //   response.output_item.done            output_index=1
+        // `finalize()` then emitted a `content_block_stop` for block 1.
+        //
+        // Until upstream is fixed, the translator must heal the
+        // mismatch by closing the function-call block when its
+        // `arguments.done` arrives even if the index differs from
+        // `output_item.added`.
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        // Text message at output_index=0 (closes cleanly).
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::Message {
+                id: "msg_a".into(),
+                role: "assistant".into(),
+                status: "in_progress".into(),
+                content: vec![OutputContentPart::OutputText {
+                    text: String::new(),
+                    annotations: None,
+                }],
+            },
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputTextDone {
+            item_id: "msg_a".into(),
+            output_index: 0,
+            content_index: 0,
+            text: "Hello".into(),
+        });
+        // Function call item opens at output_index=1.
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 1,
+            item: OutputItem::FunctionCall {
+                id: "fc_1".into(),
+                call_id: "call_1".into(),
+                name: "lookup".into(),
+                arguments: "{}".into(),
+                status: "in_progress".into(),
+            },
+        });
+        // But its args events report output_index=0 (mismatch).
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseFunctionCallArgumentsDelta {
+            item_id: "fc_1".into(),
+            output_index: 0,
+            delta: "{\"x\":1}".into(),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseFunctionCallArgumentsDone {
+            item_id: "fc_1".into(),
+            output_index: 0,
+            arguments: "{\"x\":1}".into(),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemDone {
+            output_index: 1,
+            item: OutputItem::FunctionCall {
+                id: "fc_1".into(),
+                call_id: "call_1".into(),
+                name: "lookup".into(),
+                arguments: "{\"x\":1}".into(),
+                status: "completed".into(),
+            },
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(placeholder_response("completed")),
+        });
+
+        let tail = t.finalize();
+        let stops: Vec<u32> = tail
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ContentBlockStop { index } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            stops.is_empty(),
+            "finalize must not re-emit content_block_stop for the function \
+             call block even when its arguments events used a different \
+             output_index than the item.added event; got stops at {stops:?}"
+        );
+    }
+
+    #[test]
+    fn text_then_function_call_no_duplicate_block_stop_total() {
+        // Stronger version of the previous test: count ALL
+        // content_block_stop events emitted across the whole
+        // translator lifecycle (push_event + finalize). There must
+        // be exactly one stop per opened block, not two.
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        // Text message item at output_index=0.
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::Message {
+                id: "msg_a".into(),
+                role: "assistant".into(),
+                status: "in_progress".into(),
+                content: vec![OutputContentPart::OutputText {
+                    text: String::new(),
+                    annotations: None,
+                }],
+            },
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputTextDelta {
+            item_id: "msg_a".into(),
+            output_index: 0,
+            content_index: 0,
+            delta: "Hello".into(),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputTextDone {
+            item_id: "msg_a".into(),
+            output_index: 0,
+            content_index: 0,
+            text: "Hello".into(),
+        });
+        // Function-call item at output_index=1.
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 1,
+            item: OutputItem::FunctionCall {
+                id: "fc_1".into(),
+                call_id: "call_1".into(),
+                name: "lookup".into(),
+                arguments: "{}".into(),
+                status: "in_progress".into(),
+            },
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseFunctionCallArgumentsDelta {
+            item_id: "fc_1".into(),
+            output_index: 1,
+            delta: "{\"x\":1}".into(),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseFunctionCallArgumentsDone {
+            item_id: "fc_1".into(),
+            output_index: 1,
+            arguments: "{\"x\":1}".into(),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemDone {
+            output_index: 1,
+            item: OutputItem::FunctionCall {
+                id: "fc_1".into(),
+                call_id: "call_1".into(),
+                name: "lookup".into(),
+                arguments: "{\"x\":1}".into(),
+                status: "completed".into(),
+            },
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(placeholder_response("completed")),
+        });
+        let tail = t.finalize();
+
+        let mut all_events = Vec::new();
+        for ev in tail {
+            all_events.push(ev);
+        }
+        let mut all_stops: Vec<u32> = Vec::new();
+        let mut content_block_starts = 0;
+        for ev in &all_events {
+            match ev {
+                StreamEvent::ContentBlockStart { .. } => content_block_starts += 1,
+                StreamEvent::ContentBlockStop { index } => all_stops.push(*index),
+                _ => {}
+            }
+        }
+        // Two opens (text + function call), so exactly two stops, one per
+        // block, no duplicates. (The finalize-only count is checked in
+        // the companion test.)
+        let mut sorted = all_stops.clone();
+        sorted.sort_unstable();
+        let mut deduped = sorted.clone();
+        deduped.dedup();
+        assert_eq!(
+            sorted.len(),
+            content_block_starts,
+            "exactly one content_block_stop per opened block; \
+             got {content_block_starts} starts but stops at {sorted:?}"
+        );
+        assert_eq!(
+            sorted,
+            deduped,
+            "no duplicate content_block_stop indices: {sorted:?}"
+        );
     }
 
     #[test]
