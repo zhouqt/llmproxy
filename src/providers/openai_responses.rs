@@ -202,6 +202,9 @@ where
                         for out in t.push_event(&ev) {
                             self.output_buffer.push_back(Self::encode(&out));
                         }
+                        if let Some(raw) = t.take_raw_error() {
+                            self.output_buffer.push_back(Bytes::from(raw));
+                        }
                         if t.finalized {
                             self.finished = true;
                             return;
@@ -1266,16 +1269,59 @@ mod tests {
             !encoded.contains("event: message_stop"),
             "must NOT emit message_stop after error event, got: {encoded}"
         );
-        // Must contain the upstream_error type_ marker.
+        // Must contain the upstream_error marker with correct Anthropic shape.
         assert!(
-            encoded.contains("\"type_\":"),
-            "expected upstream_error marker, got: {encoded}"
+            encoded.contains("\"type\":\"error\""),
+            "expected 'type: error' in envelope, got: {encoded}"
+        );
+        assert!(
+            encoded.contains("\"type\":\"upstream_error\""),
+            "expected upstream_error subtype, got: {encoded}"
         );
         // Must contain the error message text.
         assert!(
             encoded.contains("upstream is overloaded"),
             "expected error message, got: {encoded}"
         );
+    }
+
+    /// T14: P1-E regression — the error SSE envelope must use `"type"`
+    /// not `"type_"`, and match the Anthropic error wire shape exactly.
+    #[test]
+    fn error_event_envelope_uses_type_not_type_under_score() {
+        use crate::conversion::responses_stream::ResponsesStreamTranslator;
+        use crate::responses::ResponsesStreamEvent;
+
+        let mut t = ResponsesStreamTranslator::new("test_id", "test_model");
+        let ev = ResponsesStreamEvent::Error {
+            code: Some("server_error".into()),
+            message: "upstream is overloaded".into(),
+            param: None,
+        };
+        let _ = t.push_event(&ev);
+        let raw = t.take_raw_error().expect("should have raw error payload");
+
+        assert!(
+            raw.starts_with("event: error"),
+            "SSE event type must be 'error': {raw}"
+        );
+        assert!(
+            raw.contains("\"type\":\"error\""),
+            "wire envelope must use 'type' not 'type_': {raw}"
+        );
+        assert!(
+            raw.contains("\"type\":\"upstream_error\""),
+            "error subtype must be 'upstream_error': {raw}"
+        );
+        // Verify the payload is valid JSON matching Anthropic's error shape.
+        let data_part = raw
+            .strip_prefix("event: error\ndata: ")
+            .and_then(|s| s.strip_suffix("\n\n"))
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(data_part).unwrap();
+        assert_eq!(parsed["type"], "error");
+        assert_eq!(parsed["error"]["type"], "upstream_error");
+        assert_eq!(parsed["error"]["message"], "upstream is overloaded");
     }
 
     #[tokio::test]
