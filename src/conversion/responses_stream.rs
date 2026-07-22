@@ -50,6 +50,10 @@ pub struct ResponsesStreamTranslator {
     /// arrived). When no delta was seen, the done event's `text` is emitted
     /// as a fallback text delta so the client does not see an empty block.
     deltas_seen: std::collections::HashSet<u32>,
+    /// Set to true when an upstream `error` SSE event was handled.
+    /// Signals to the adapter that it should stop processing the stream
+    /// immediately and avoid calling `finalize()` on EOF.
+    pub(crate) finalized: bool,
 }
 
 /// Returns `true` for SSE events that signal the upstream response is
@@ -81,6 +85,7 @@ impl ResponsesStreamTranslator {
             has_tool_calls: false,
             fc_item_index: std::collections::HashMap::new(),
             deltas_seen: std::collections::HashSet::new(),
+            finalized: false,
         }
     }
 
@@ -164,7 +169,10 @@ impl ResponsesStreamTranslator {
                 });
             }
             ResponsesStreamEvent::ResponseOutputTextDone { output_index, text, .. } => {
-                let block_idx = self.allocate_block(*output_index);
+                let Some(&block_idx) = self.block_map.get(output_index) else {
+                    tracing::warn!(?output_index, "text.done for unseen block; ignoring");
+                    return out;
+                };
                 // If this text block never received any delta, emit the
                 // done event's full text as a fallback delta. This handles
                 // the case where the upstream sends the complete reply only
@@ -212,7 +220,10 @@ impl ResponsesStreamTranslator {
                     .get(item_id)
                     .copied()
                     .unwrap_or(*output_index);
-                let block_idx = self.allocate_block(fc_index);
+                let Some(&block_idx) = self.block_map.get(&fc_index) else {
+                    tracing::warn!(?fc_index, ?item_id, "fc_args.done for unseen block; ignoring");
+                    return out;
+                };
                 if self.closed_blocks.insert(block_idx) {
                     out.push(StreamEvent::ContentBlockStop { index: block_idx });
                 }
@@ -233,6 +244,32 @@ impl ResponsesStreamTranslator {
                     "failed" => "end_turn".to_string(),
                     _ => "end_turn".to_string(),
                 });
+            }
+            ResponsesStreamEvent::Error { code, message, .. } => {
+                self.ensure_started(&mut out);
+                let error = serde_json::json!({
+                    "type_": "upstream_error",
+                    "message": message,
+                    "code": code,
+                });
+                out.push(StreamEvent::Error { error });
+                // Clear final_stop_reason so EOF finalize does not emit
+                // message_delta after the error event.
+                self.final_stop_reason = None;
+                self.finalized = true;
+            }
+            ResponsesStreamEvent::Error { code, message, .. } => {
+                self.ensure_started(&mut out);
+                let error = serde_json::json!({
+                    "type_": "upstream_error",
+                    "message": message,
+                    "code": code,
+                });
+                out.push(StreamEvent::Error { error });
+                // Clear final_stop_reason so EOF finalize does not emit
+                // message_delta after the error event.
+                self.final_stop_reason = None;
+                self.finalized = true;
             }
             ResponsesStreamEvent::Unknown => {}
         }
@@ -1158,6 +1195,62 @@ mod tests {
         let tail = t.finalize();
         assert!(!tail.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { .. })));
         assert!(!tail.iter().any(|e| matches!(e, StreamEvent::ContentBlockDelta { .. })));
+    }
+
+    /// T8: P1-5 — a `text.done` event for an output_index that was never
+    /// opened by `output_item.added` must be silently ignored (not create
+    /// a phantom block via allocate_block).
+    #[test]
+    fn done_event_for_unseen_output_index_is_ignored() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        // Send text.done for index 0 without any prior output_item.added
+        // or text.delta — should not allocate a phantom block.
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseOutputTextDone {
+            item_id: "msg_x".into(),
+            output_index: 0,
+            content_index: 0,
+            text: "orphan text".into(),
+        });
+        assert!(
+            evs.is_empty(),
+            "must not emit events for unseen output_index"
+        );
+        // Complete and finalize: must not emit a stop for index 0 either.
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(placeholder_response("completed")),
+        });
+        let tail = t.finalize();
+        assert!(!tail.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { .. })));
+    }
+
+    /// T9: P1-5 — a `function_call_arguments.done` with an item_id that
+    /// was never registered (no prior `output_item.added` for that fc
+    /// item) must not allocate a phantom block via block_map.
+    #[test]
+    fn fc_args_done_with_unknown_item_id_does_not_allocate_phantom() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        // Send function_call_arguments.done for an item_id unseen.
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseFunctionCallArgumentsDone {
+            item_id: "unknown_fc".into(),
+            output_index: 0,
+            arguments: "{}".into(),
+        });
+        assert!(
+            evs.is_empty(),
+            "must not emit events for unknown fc item_id"
+        );
+        // Finalize: must not emit a stop for the phantom block.
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(placeholder_response("completed")),
+        });
+        let tail = t.finalize();
+        assert!(!tail.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { .. })));
     }
 }
 

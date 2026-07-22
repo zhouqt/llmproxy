@@ -202,6 +202,10 @@ where
                         for out in t.push_event(&ev) {
                             self.output_buffer.push_back(Self::encode(&out));
                         }
+                        if t.finalized {
+                            self.finished = true;
+                            return;
+                        }
                     }
                     // Copilot often omits [DONE] after response.completed.
                     // Finalize inline on terminal events so the client
@@ -1221,6 +1225,59 @@ mod tests {
         );
     }
 
+    /// T10: P1-B regression — an upstream `error` SSE event must
+    /// surface as `event: error` with `type_:"upstream_error"` and
+    /// immediately terminate the stream (no hang, no message_stop).
+    #[tokio::test]
+    async fn midstream_error_event_surfaces_as_anthropic_error_and_terminates() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"object\":\"response\",\"created_at\":0,\"model\":\"m\",\"status\":\"in_progress\",\"output\":[],\"usage\":{}}}\n\n\
+              data: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"upstream is overloaded\"}\n\n",
+        ))];
+        let inner = stream::iter(chunks).chain(stream::pending());
+        let mut adapter = ResponsesSseToAnthropic::new(inner, "m");
+
+        let result = timeout(Duration::from_secs(1), async {
+            let mut items = Vec::new();
+            while let Some(item) = adapter.next().await {
+                items.push(item.unwrap());
+            }
+            items
+        })
+        .await;
+
+        let items = result.expect("adapter must terminate within 1s after error event, not hang");
+
+        let encoded: String = items
+            .iter()
+            .map(|b| std::str::from_utf8(b).unwrap())
+            .collect();
+
+        // Must contain the error event.
+        assert!(
+            encoded.contains("event: error"),
+            "expected event: error, got: {encoded}"
+        );
+        // Must NOT contain message_stop (final_stop_reason was cleared).
+        assert!(
+            !encoded.contains("event: message_stop"),
+            "must NOT emit message_stop after error event, got: {encoded}"
+        );
+        // Must contain the upstream_error type_ marker.
+        assert!(
+            encoded.contains("\"type_\":"),
+            "expected upstream_error marker, got: {encoded}"
+        );
+        // Must contain the error message text.
+        assert!(
+            encoded.contains("upstream is overloaded"),
+            "expected error message, got: {encoded}"
+        );
+    }
+
     #[tokio::test]
     async fn event_name_emits_ping_for_ping_variant() {
         // The Responses translator never emits a Ping, but the
@@ -1248,3 +1305,4 @@ mod tests {
         assert_eq!(event_name(&ev), "error");
     }
 }
+
