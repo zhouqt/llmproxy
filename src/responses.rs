@@ -129,8 +129,12 @@ pub struct ResponsesResponse {
     pub output: Vec<OutputItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incomplete_details: Option<IncompleteDetails>,
-    #[serde(default)]
-    pub usage: ResponsesUsage,
+    /// `usage` is only populated on `response.completed` events; earlier
+    /// events (e.g. `response.created`) carry `usage: null`. Copilot's
+    /// Responses SSE stream sends a `response.created` event with
+    /// `status: in_progress` and no usage, so we accept null here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ResponsesUsage>,
     /// Forward-compat for fields we don't model.
     #[serde(default, flatten)]
     pub extra: Value,
@@ -384,6 +388,34 @@ mod tests {
                 assert_eq!(delta, "hi");
             }
             _ => panic!("expected text delta"),
+        }
+    }
+
+    #[test]
+    fn stream_event_response_created_with_null_usage_decodes() {
+        // Copilot's Responses stream sends `response.created` with
+        // `usage: null` (usage is only populated on `response.completed`).
+        // Treating `usage` as required made the whole SSE line get skipped
+        // as malformed. It must decode as None.
+        let raw = json!({
+            "type": "response.created",
+            "response": {
+                "id": "resp_1",
+                "object": "response",
+                "created_at": 0,
+                "model": "gpt-5",
+                "status": "in_progress",
+                "output": [],
+                "usage": null
+            }
+        });
+        let ev: ResponsesStreamEvent = serde_json::from_value(raw).unwrap();
+        match ev {
+            ResponsesStreamEvent::ResponseCreated { response } => {
+                assert_eq!(response.id, "resp_1");
+                assert!(response.usage.is_none());
+            }
+            _ => panic!("expected response.created"),
         }
     }
 
