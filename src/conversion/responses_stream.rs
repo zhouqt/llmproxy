@@ -68,6 +68,18 @@ pub struct ResponsesStreamTranslator {
 /// `[DONE]` sentinel (common in Copilot's gpt-5.x responses), the
 /// adapter layer should call `finalize()` immediately rather than waiting
 /// for `[DONE]` or EOF.
+///
+/// This is intentional: once a terminal event is received the adapter
+/// stops polling the upstream stream and calls `finalize()`, which
+/// causes any data that arrives after the terminal event to be
+/// discarded. The upstream is not expected to send further meaningful
+/// data past this point.
+///
+/// This is intentional: once a terminal event is received the adapter
+/// stops polling the upstream stream and calls `finalize()`, which
+/// causes any data that arrives after the terminal event to be
+/// discarded. The upstream is not expected to send further meaningful
+/// data past this point.
 pub fn is_terminal_event(event: &ResponsesStreamEvent) -> bool {
     matches!(
         event,
@@ -1310,6 +1322,93 @@ mod tests {
             second.is_empty(),
             "second finalize must be a no-op, got {} events",
             second.len()
+        );
+    }
+
+    /// T20: P1-1 — in a multi-part output item, once ANY part receives a
+    /// text delta (`deltas_seen` is keyed by `block_idx`, not
+    /// `content_index`), the done event for other parts must NOT emit a
+    /// fallback delta. This pins the current invariant — the translator
+    /// treats the entire output item as a single Anthropic content block
+    /// and does not track per-part delta state.
+    #[test]
+    fn multipart_item_snapshot_fallback_invariant() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        // Add a multi-part output item (2 text parts).
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::Message {
+                id: "msg_x".into(),
+                role: "assistant".into(),
+                status: "in_progress".into(),
+                content: vec![
+                    OutputContentPart::OutputText {
+                        text: String::new(),
+                        annotations: None,
+                    },
+                    OutputContentPart::OutputText {
+                        text: String::new(),
+                        annotations: None,
+                    },
+                ],
+            },
+        });
+        // Part 0 receives a delta — marks deltas_seen for the block.
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseOutputTextDelta {
+            item_id: "msg_x".into(),
+            output_index: 0,
+            content_index: 0,
+            delta: "delta from part 0".into(),
+        });
+        assert_eq!(evs.len(), 1);
+        assert!(
+            matches!(&evs[0], StreamEvent::ContentBlockDelta { index: 0, .. }),
+            "expected delta for block 0"
+        );
+
+        // Part 1's done event — since deltas_seen already contains the
+        // block index (set by part 0's delta), the done text must NOT
+        // emit a second fallback ContentBlockDelta.
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseOutputTextDone {
+            item_id: "msg_x".into(),
+            output_index: 0,
+            content_index: 1,
+            text: "done text from part 1".into(),
+        });
+        // Must NOT contain a delta; only the stop is allowed.
+        assert!(
+            !evs.iter().any(|e| matches!(e, StreamEvent::ContentBlockDelta { .. })),
+            "part 1 done must not emit a fallback delta when deltas_seen is set"
+        );
+        // Should emit ContentBlockStop (first close of the block).
+        assert!(
+            evs.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { index: 0 })),
+            "part 1 done should close block 0"
+        );
+
+        // Part 0's done event — block already closed, no output.
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseOutputTextDone {
+            item_id: "msg_x".into(),
+            output_index: 0,
+            content_index: 0,
+            text: "done text from part 0".into(),
+        });
+        assert!(
+            evs.is_empty(),
+            "part 0 done must not emit anything when block is already closed"
+        );
+
+        // Finalize produces MessageDelta + MessageStop (no extra stop).
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(placeholder_response("completed")),
+        });
+        let tail = t.finalize();
+        assert!(
+            !tail.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { .. })),
+            "finalize must not emit extra content_block_stop"
         );
     }
 }
