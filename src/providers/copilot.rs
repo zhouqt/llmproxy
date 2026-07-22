@@ -58,6 +58,7 @@ struct CopilotState {
     tokens: RwLock<Option<StoredTokens>>,
     store: TokenStore,
     refresh_lock: Mutex<()>,
+    cached_models: RwLock<Option<Value>>,
 }
 
 /// Distinguishes credential failures (must clear store + re-authenticate)
@@ -110,6 +111,7 @@ impl CopilotProvider {
             tokens: RwLock::new(initial),
             store,
             refresh_lock: Mutex::new(()),
+            cached_models: RwLock::new(None),
         });
         Ok(Self {
             name,
@@ -142,6 +144,10 @@ impl CopilotProvider {
 
     fn responses_url(&self) -> String {
         format!("{}/responses", self.base_url())
+    }
+
+    fn models_url(&self) -> String {
+        format!("{}/models", self.base_url())
     }
 
     fn token_url(&self) -> &str {
@@ -338,6 +344,10 @@ impl CopilotProvider {
         })?;
         self.state.store.save(&new_tokens)?;
         *self.state.tokens.write().await = Some(new_tokens);
+
+        // Token is fresh — populate the model list immediately.
+        self.cache_models().await;
+
         Ok(())
     }
 
@@ -440,6 +450,10 @@ impl CopilotProvider {
                 if has_credentials {
                     if let Err(e) = self.refresh_token().await {
                         tracing::error!("background copilot refresh failed: {e}");
+                    } else {
+                        // Refresh the model list in the background so
+                        // /v1/models stays current.
+                        self.cache_models().await;
                     }
                 } else if let Err(e) = self.clone().start_bootstrap().await {
                     // Common: "bootstrap already in progress" — quiet.
@@ -453,6 +467,70 @@ impl CopilotProvider {
                 }
             }
         })
+    }
+
+    /// Return a clone of the cached Copilot model list, if available.
+    pub async fn cached_models(&self) -> Option<Value> {
+        self.state.cached_models.read().await.clone()
+    }
+
+    /// Fetch models from the Copilot API and update the cache.
+    ///
+    /// Best-effort: logs a warning on failure but does not propagate the
+    /// error — a stale cache (or no cache) is better than blocking the
+    /// caller on a transient `/models` failure.
+    pub async fn cache_models(&self) {
+        match self.fetch_models().await {
+            Ok(models) => {
+                tracing::info!(
+                    model_count = models
+                        .get("data")
+                        .and_then(|d| d.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0),
+                    "copilot models cached"
+                );
+                *self.state.cached_models.write().await = Some(models);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to refresh copilot model list");
+            }
+        }
+    }
+
+    async fn fetch_models(&self) -> std::result::Result<Value, CopilotFetchError> {
+        let token = self.ensure_token().await.map_err(|e| {
+            CopilotFetchError::Transient(format!("no copilot token: {e}"))
+        })?;
+        let url = self.models_url();
+        let resp = match self
+            .http
+            .get(&url)
+            .headers(self.headers(&token))
+            .header("accept", "application/json")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(CopilotFetchError::Transient(format!(
+                    "network error fetching copilot models: {e}"
+                )));
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(CopilotFetchError::Transient(format!(
+                "copilot models endpoint returned {status}: {text}"
+            )));
+        }
+        let body: Value = resp.json().await.map_err(|e| {
+            CopilotFetchError::Transient(format!(
+                "copilot models response not valid JSON: {e}"
+            ))
+        })?;
+        Ok(body)
     }
 
     async fn send_with_token(
@@ -698,6 +776,7 @@ mod tests {
             tokens: RwLock::new(initial),
             store,
             refresh_lock: Mutex::new(()),
+            cached_models: RwLock::new(None),
         });
         let provider = CopilotProvider {
             name: "copilot".to_string(),
@@ -915,6 +994,7 @@ mod tests {
                 tokens: RwLock::new(None),
                 store,
                 refresh_lock: Mutex::new(()),
+            cached_models: RwLock::new(None),
             }),
             api_base_override: None,
             // 127.0.0.1:1 is in the reserved low-port range; nothing
@@ -955,6 +1035,7 @@ mod tests {
             tokens: RwLock::new(None),
             store,
             refresh_lock: Mutex::new(()),
+            cached_models: RwLock::new(None),
         });
         let provider = CopilotProvider {
             name: "copilot".to_string(),
@@ -1619,6 +1700,7 @@ mod tests {
             tokens: RwLock::new(None),
             store,
             refresh_lock: Mutex::new(()),
+            cached_models: RwLock::new(None),
         });
         let provider = Arc::new(CopilotProvider {
             name: "copilot".to_string(),
@@ -1727,6 +1809,7 @@ mod tests {
             tokens: RwLock::new(None),
             store: store.clone(),
             refresh_lock: Mutex::new(()),
+            cached_models: RwLock::new(None),
         });
         let provider = Arc::new(CopilotProvider {
             name: "copilot".to_string(),
@@ -1791,6 +1874,7 @@ mod tests {
             tokens: RwLock::new(None),
             store,
             refresh_lock: Mutex::new(()),
+            cached_models: RwLock::new(None),
         });
         let provider = CopilotProvider {
             name: "copilot".to_string(),
@@ -1855,6 +1939,7 @@ mod tests {
             tokens: RwLock::new(None),
             store,
             refresh_lock: Mutex::new(()),
+            cached_models: RwLock::new(None),
         });
         let provider = CopilotProvider {
             name: "copilot".to_string(),
@@ -1931,6 +2016,7 @@ mod tests {
             ))),
             store: store.clone(),
             refresh_lock: Mutex::new(()),
+            cached_models: RwLock::new(None),
         });
         let provider = CopilotProvider {
             name: "copilot".to_string(),
@@ -2024,6 +2110,7 @@ mod tests {
             tokens: RwLock::new(None),
             store: store.clone(),
             refresh_lock: Mutex::new(()),
+            cached_models: RwLock::new(None),
         });
         let provider = Arc::new(CopilotProvider {
             name: "copilot".to_string(),
@@ -2111,6 +2198,7 @@ mod tests {
             tokens: RwLock::new(None),
             store,
             refresh_lock: Mutex::new(()),
+            cached_models: RwLock::new(None),
         });
         let provider = Arc::new(CopilotProvider {
             name: "copilot".to_string(),
@@ -2172,6 +2260,7 @@ mod tests {
             tokens: RwLock::new(Some(pre_existing.clone())),
             store: store.clone(),
             refresh_lock: Mutex::new(()),
+            cached_models: RwLock::new(None),
         });
         let provider = CopilotProvider {
             name: "copilot".to_string(),
@@ -2197,6 +2286,75 @@ mod tests {
         let disk = store.load().unwrap().expect("store must still exist");
         assert_eq!(disk.github_access_token, "still-valid-github");
         assert_eq!(disk.copilot_token, "still-valid-copilot");
+    }
+
+    #[test]
+    fn models_url_returns_expected_path() {
+        let (dir, p) = test_provider(None, None);
+        drop(dir);
+        assert_eq!(
+            p.models_url(),
+            "https://api.githubcopilot.com/models"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_models_parses_valid_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [
+                    {"id": "gpt-5", "name": "GPT-5", "object": "model", "vendor": "OpenAI",
+                     "capabilities": {"supports_vision": true}, "policy": {"state": "enabled"}},
+                    {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6", "object": "model",
+                     "vendor": "Anthropic", "capabilities": {}, "policy": {"state": "enabled"}}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let initial = StoredTokens {
+            github_access_token: "gh".into(),
+            copilot_token: "test-token".into(),
+            copilot_expires_at: 9999999999,
+            refresh_in: 3600,
+        };
+        let (_dir, p) = test_provider(Some(&server), Some(initial));
+        let result = p.fetch_models().await.expect("fetch_models should succeed");
+        let data = result["data"].as_array().unwrap();
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0]["id"], "gpt-5");
+        assert_eq!(data[1]["vendor"], "Anthropic");
+    }
+
+    #[tokio::test]
+    async fn cache_models_populates_cached_models_accessor() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [{"id": "m1", "name": "Model 1", "vendor": "v"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let initial = StoredTokens {
+            github_access_token: "gh".into(),
+            copilot_token: "test-token".into(),
+            copilot_expires_at: 9999999999,
+            refresh_in: 3600,
+        };
+        let (_dir, p) = test_provider(Some(&server), Some(initial));
+        assert!(p.cached_models().await.is_none(), "cache should be empty before fetch");
+        p.cache_models().await;
+        let cached = p.cached_models().await.expect("cached_models should be Some after cache_models");
+        assert_eq!(cached["data"].as_array().unwrap().len(), 1);
     }
 
     /// Spawn a background task that advances paused tokio time every 7
