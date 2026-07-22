@@ -31,6 +31,15 @@ pub struct ResponsesStreamTranslator {
     /// event, so `finalize` doesn't emit a second `content_block_stop`
     /// for them.
     closed_blocks: std::collections::HashSet<u32>,
+    /// Set when an `output_item.added` of type FunctionCall arrives.
+    /// Drives the terminal `stop_reason`: `"tool_use"` if any function
+    /// call was emitted (so the client executes the tool and continues
+    /// the conversation), otherwise the upstream's status maps to
+    /// `end_turn` / `max_tokens`. Without this flag every Responses
+    /// stream would surface as `end_turn`, and clients (Claude Code)
+    /// would never invoke the tool — they'd just stop after the model
+    /// emitted the function call.
+    has_tool_calls: bool,
     final_stop_reason: Option<String>,
     final_usage: Option<crate::responses::ResponsesUsage>,
 }
@@ -44,6 +53,7 @@ impl ResponsesStreamTranslator {
             block_index: 0,
             block_map: std::collections::HashMap::new(),
             closed_blocks: std::collections::HashSet::new(),
+            has_tool_calls: false,
             final_stop_reason: None,
             final_usage: None,
         }
@@ -97,6 +107,9 @@ impl ResponsesStreamTranslator {
             ResponsesStreamEvent::ResponseOutputItemAdded { output_index, item } => {
                 self.ensure_started(&mut out);
                 let block_idx = self.allocate_block(*output_index);
+                if matches!(item, OutputItem::FunctionCall { .. }) {
+                    self.has_tool_calls = true;
+                }
                 let block = output_item_to_block(item);
                 out.push(StreamEvent::ContentBlockStart {
                     index: block_idx,
@@ -159,11 +172,20 @@ impl ResponsesStreamTranslator {
             | ResponsesStreamEvent::ResponseIncomplete { response } => {
                 self.ensure_started(&mut out);
                 self.final_usage = response.usage.clone();
-                self.final_stop_reason = Some(match response.status.as_str() {
-                    "incomplete" => "max_tokens".to_string(),
-                    "completed" => "end_turn".to_string(),
-                    "failed" => "end_turn".to_string(),
-                    _ => "end_turn".to_string(),
+                // Tool calls take precedence over the upstream status:
+                // an `incomplete` (length-capped) response with a tool
+                // call still surfaces as `tool_use` so the client runs
+                // the tool. Status-based reasons only apply when no
+                // tool was emitted.
+                self.final_stop_reason = Some(if self.has_tool_calls {
+                    "tool_use".to_string()
+                } else {
+                    match response.status.as_str() {
+                        "incomplete" => "max_tokens".to_string(),
+                        "completed" => "end_turn".to_string(),
+                        "failed" => "end_turn".to_string(),
+                        _ => "end_turn".to_string(),
+                    }
                 });
             }
             ResponsesStreamEvent::Unknown => {}
@@ -349,6 +371,90 @@ mod tests {
             })
             .collect();
         assert_eq!(accumulated, "Hello world");
+    }
+
+    #[test]
+    fn tool_call_response_emits_tool_use_stop_reason() {
+        // Regression: when the Responses stream contains a function_call
+        // item, finalize must emit message_delta with `stop_reason:
+        // "tool_use"` (not `end_turn`), so the client executes the tool
+        // and continues the conversation. Without this flag the proxy
+        // would emit `end_turn` and Claude Code would just stop after
+        // receiving the function call.
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::FunctionCall {
+                id: "fc_1".into(),
+                call_id: "call_1".into(),
+                name: "get_weather".into(),
+                arguments: "{}".into(),
+                status: "in_progress".into(),
+            },
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseFunctionCallArgumentsDelta {
+            item_id: "fc_1".into(),
+            output_index: 0,
+            delta: r#"{"city":"SF"}"#.into(),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseFunctionCallArgumentsDone {
+            item_id: "fc_1".into(),
+            output_index: 0,
+            arguments: r#"{"city":"SF"}"#.into(),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(placeholder_response("completed")),
+        });
+
+        let tail = t.finalize();
+        let delta = tail
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { delta } => Some(delta),
+                _ => None,
+            })
+            .expect("finalize must emit MessageDelta");
+        assert_eq!(
+            delta.stop_reason.as_deref(),
+            Some("tool_use"),
+            "tool-call response must surface stop_reason=tool_use, not end_turn"
+        );
+    }
+
+    #[test]
+    fn text_only_response_emits_end_turn_stop_reason() {
+        // Mirror case: a message-only stream must still emit end_turn
+        // when no function call happened — guarding against the
+        // has_tool_calls flag being set incorrectly.
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::Message {
+                id: "msg_x".into(),
+                role: "assistant".into(),
+                status: "in_progress".into(),
+                content: vec![],
+            },
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(placeholder_response("completed")),
+        });
+
+        let tail = t.finalize();
+        let delta = tail
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { delta } => Some(delta),
+                _ => None,
+            })
+            .expect("finalize must emit MessageDelta");
+        assert_eq!(delta.stop_reason.as_deref(), Some("end_turn"));
     }
 
     #[test]
