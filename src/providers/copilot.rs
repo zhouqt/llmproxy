@@ -41,6 +41,96 @@ fn endpoint_for_model(model: &str) -> &'static str {
     }
 }
 
+/// Reduce a raw HTTP error body to a short, log-friendly hint.
+///
+/// Strips HTML tags, `<script>` / `<style>` blocks, URLs, image refs
+/// (`<img src=...>`, `url(...)`), and collapses whitespace. The
+/// upstream often returns the GitHub "Unicorn!" 502 HTML page (a full
+/// document with inline stylesheet and image references) on a
+/// transient failure — without this filter that HTML would land
+/// verbatim in the operator's logs.
+///
+/// Returns at most ~200 chars of the first non-empty meaningful
+/// line, or `<empty body>` if the body had nothing readable.
+fn summarize_http_body(body: &str) -> String {
+    // Drop <script>...</script> and <style>...</style> blocks first —
+    // those contain CSS / JS that we never want in the hint.
+    let mut s = body.to_string();
+    for tag in ["script", "style"] {
+        let open = format!("<{tag}");
+        let close = format!("</{tag}>");
+        while let Some(start) = s.find(&open) {
+            let Some(end_rel) = s[start..].find(&close) else {
+                // Unterminated block: drop everything from <tag to end.
+                s.truncate(start);
+                break;
+            };
+            let end = start + end_rel + close.len();
+            s.replace_range(start..end, " ");
+        }
+    }
+    // Strip HTML comments.
+    while let Some(start) = s.find("<!--") {
+        let Some(end_rel) = s[start..].find("-->") else {
+            s.truncate(start);
+            break;
+        };
+        s.replace_range(start..start + end_rel + 3, " ");
+    }
+    // Strip URLs (http/https/ftp), image refs, and CSS url(...) calls.
+    let url_chars = |c: char| c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-' | '_' | '?' | '&' | '=' | '%' | '#' | '+' | '~');
+    let strip_token = |s: &mut String, token: &str| {
+        let mut idx = 0;
+        while let Some(rel) = s[idx..].find(token) {
+            let start = idx + rel;
+            let after = start + token.len();
+            let mut end = after;
+            while end < s.len() && url_chars(s.as_bytes()[end] as char) {
+                end += 1;
+            }
+            s.replace_range(start..end, " ");
+            idx = start + 1;
+        }
+    };
+    for prefix in ["https://", "http://", "ftp://"] {
+        strip_token(&mut s, prefix);
+    }
+    for token in ["src=\"", "src='", "url(", "href=\"", "href='"] {
+        strip_token(&mut s, token);
+    }
+    // Strip any remaining HTML tags.
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    // Collapse whitespace and take the first non-empty line.
+    let mut line = String::new();
+    for c in out.chars() {
+        if c.is_whitespace() {
+            if !line.ends_with(' ') && !line.is_empty() {
+                line.push(' ');
+            }
+        } else {
+            line.push(c);
+        }
+        if line.len() > 200 {
+            break;
+        }
+    }
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        "<empty body>".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 pub struct CopilotProvider {
     name: String,
     vscode_version: String,
@@ -366,6 +456,12 @@ impl CopilotProvider {
             // we don't want to fail at the parse step before we get a
             // chance to classify the status.
             let text = resp.text().await.unwrap_or_default();
+            // Sanitize the body so a 5xx HTML error page (e.g. the
+            // GitHub 502 with its inline stylesheet and image refs)
+            // doesn't pollute the logs. Keep only the first short,
+            // tag-free line as a hint; URLs / images / links / scripts
+            // are stripped entirely.
+            let hint = summarize_http_body(&text);
             // 401 / 403 / 404 mean the stored github token is invalid or
             // lost access — the operator must re-authenticate. Anything
             // else (5xx, 408, 429) is treated as transient so we don't
@@ -373,11 +469,11 @@ impl CopilotProvider {
             if matches!(status.as_u16(), 401 | 403 | 404) {
                 return Err(CopilotFetchError::AuthRejected {
                     status: status.as_u16(),
-                    body: text,
+                    body: hint,
                 });
             }
             return Err(CopilotFetchError::Transient(format!(
-                "copilot token fetch failed: {status} {text}"
+                "copilot token fetch failed: {status} {hint}"
             )));
         }
         let body: Value = match resp.json().await {
@@ -910,6 +1006,86 @@ mod tests {
         assert!(
             matches!(error, CopilotFetchError::Transient(ref m) if m.contains("503") && m.contains("upstream down")),
             "5xx must be Transient, got: {error:?}"
+        );
+    }
+
+    /// Regression for the operator-noise issue: GitHub's `/copilot_internal/v2/token`
+    /// endpoint returns a full HTML page (the "Unicorn!" 502) on transient
+    /// failures. Without `summarize_http_body`, that entire HTML document —
+    /// inline stylesheets, image refs, links — would land verbatim in the
+    /// warn log. The hint must drop everything but the first short,
+    /// meaningful line.
+    #[tokio::test]
+    async fn fetch_copilot_token_5xx_html_body_is_summarized() {
+        let github_502_html = "<!DOCTYPE html>\n\
+            <!--\nHello future GitHubber! I bet you're here to remove those nasty inline styles,\n\
+DRY up these templates and make 'em nice and re-usable, right?\n\
+Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
+<html>\n\
+  <head>\n\
+    <title>Unicorn! &middot; GitHub</title>\n\
+    <style type=\"text/css\" media=\"screen\">\n\
+      body { font-family: sans-serif; background: url(https://example.test/bg.png); }\n\
+    </style>\n\
+    <link rel=\"stylesheet\" href=\"https://example.test/main.css\">\n\
+  </head>\n\
+  <body>\n\
+    <a href=\"https://status.github.com\"><img src=\"https://example.test/unicorn.png\" alt=\"Unicorn!\"></a>\n\
+  </body>\n\
+</html>\n";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/copilot_internal/v2/token"))
+            .respond_with(ResponseTemplate::new(502).set_body_string(github_502_html))
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(Some(&server), None);
+        let err = provider.fetch_copilot_token("github").await.unwrap_err();
+        let msg = err.to_string();
+        // Status code preserved.
+        assert!(msg.contains("502"), "missing 502 in: {msg}");
+        // The "Unicorn!" page title is the only meaningful text.
+        assert!(msg.contains("Unicorn!"), "expected page title in: {msg}");
+        // None of the noise should leak through.
+        assert!(!msg.contains("font-family"), "CSS leaked: {msg}");
+        assert!(!msg.contains("example.test"), "URL leaked: {msg}");
+        assert!(!msg.contains("background:"), "CSS url() leaked: {msg}");
+        assert!(!msg.contains("github.com/styleguide"), "comment URL leaked: {msg}");
+        assert!(!msg.contains(".css"), "stylesheet URL leaked: {msg}");
+        assert!(!msg.contains(".png"), "image URL leaked: {msg}");
+        assert!(!msg.contains("<html"), "raw HTML leaked: {msg}");
+    }
+
+    #[test]
+    fn summarize_http_body_strips_html_scripts_and_urls() {
+        // A short body with the same shapes the GitHub 502 page has
+        // (HTML + inline style + URL + image + comment) must come
+        // out as a single readable hint, no markup, no URLs.
+        let html = "<style>body{color:red}</style>\n\
+                    <!-- internal note: see https://example.test/secret -->\n\
+                    <a href=\"https://example.test/x\">link</a>\n\
+                    <img src=\"https://example.test/y.png\">";
+        let hint = summarize_http_body(html);
+        assert!(!hint.contains("color:red"), "inline CSS leaked: {hint}");
+        assert!(!hint.contains("example.test"), "URL leaked: {hint}");
+        assert!(!hint.contains(".png"), "image leaked: {hint}");
+        assert!(!hint.contains("internal note"), "comment leaked: {hint}");
+        assert!(!hint.contains("<"), "raw markup leaked: {hint}");
+    }
+
+    #[test]
+    fn summarize_http_body_returns_placeholder_for_empty_body() {
+        assert_eq!(summarize_http_body(""), "<empty body>");
+        assert_eq!(summarize_http_body("   \n  \t "), "<empty body>");
+        assert_eq!(summarize_http_body("<html></html>"), "<empty body>");
+    }
+
+    #[test]
+    fn summarize_http_body_keeps_plain_text_unchanged() {
+        assert_eq!(summarize_http_body("rate limited"), "rate limited");
+        assert_eq!(
+            summarize_http_body("invalid grant: token expired"),
+            "invalid grant: token expired"
         );
     }
 
