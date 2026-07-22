@@ -40,6 +40,21 @@ pub struct ResponsesStreamTranslator {
     has_tool_calls: bool,
 }
 
+/// Returns `true` for SSE events that signal the upstream response is
+/// complete: `response.completed`, `response.failed`, or
+/// `response.incomplete`. When one of these arrives without a subsequent
+/// `[DONE]` sentinel (common in Copilot's gpt-5.x responses), the
+/// adapter layer should call `finalize()` immediately rather than waiting
+/// for `[DONE]` or EOF.
+pub fn is_terminal_event(event: &ResponsesStreamEvent) -> bool {
+    matches!(
+        event,
+        ResponsesStreamEvent::ResponseCompleted { .. }
+            | ResponsesStreamEvent::ResponseFailed { .. }
+            | ResponsesStreamEvent::ResponseIncomplete { .. }
+    )
+}
+
 impl ResponsesStreamTranslator {
     pub fn new(message_id: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
