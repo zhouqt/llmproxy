@@ -1577,6 +1577,54 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
     }
 
     #[tokio::test]
+    async fn unauthorized_responses_refreshes_and_retries_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("authorization", "Bearer old-token"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("expired"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/copilot_internal/v2/token"))
+            .and(header("authorization", "token github-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "token": "new-token",
+                "expires_at": now() + 900,
+                "refresh_in": 800
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("authorization", "Bearer new-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                responses_response_json("retried"),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "old-token", 600)),
+        );
+
+        let mut req = request(false);
+        req.model = "gpt-5".to_string();
+
+        let output = provider
+            .complete(&req, &HashMap::new())
+            .await
+            .unwrap();
+
+        expect_variant!(output, ProviderOutput::Json(body) => {
+            assert_eq!(body["content"][0]["text"], "retried");
+        });
+    }
+
+    #[tokio::test]
     async fn stream_converts_sse_and_background_task_can_be_aborted() {
         let server = MockServer::start().await;
         let sse = concat!(
