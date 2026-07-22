@@ -271,19 +271,6 @@ impl ResponsesStreamTranslator {
                 self.final_stop_reason = None;
                 self.finalized = true;
             }
-            ResponsesStreamEvent::Error { code, message, .. } => {
-                self.ensure_started(&mut out);
-                let error = serde_json::json!({
-                    "type_": "upstream_error",
-                    "message": message,
-                    "code": code,
-                });
-                out.push(StreamEvent::Error { error });
-                // Clear final_stop_reason so EOF finalize does not emit
-                // message_delta after the error event.
-                self.final_stop_reason = None;
-                self.finalized = true;
-            }
             ResponsesStreamEvent::Unknown => {}
         }
         out
@@ -297,6 +284,10 @@ impl ResponsesStreamTranslator {
     }
 
     pub fn finalize(&mut self) -> Vec<StreamEvent> {
+        if self.finalized {
+            return Vec::new();
+        }
+        self.finalized = true;
         let mut out = Vec::new();
         if !self.started {
             return out;
@@ -1271,6 +1262,55 @@ mod tests {
         });
         let tail = t.finalize();
         assert!(!tail.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { .. })));
+    }
+
+    /// T15: P1-G — calling finalize() after an Error event has already
+    /// set finalized=true must return an empty vec (no message_delta or
+    /// message_stop re-emitted).
+    #[test]
+    fn finalize_after_error_event_emits_nothing() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        // Push an Error event — this sets finalized=true and stores the
+        // raw error payload. The returned StreamEvents contain only
+        // whatever ensure_started emitted (message_start if first event).
+        let _ = t.push_event(&ResponsesStreamEvent::Error {
+            code: Some("server_error".into()),
+            message: "upstream is overloaded".into(),
+            param: None,
+        });
+        // finalize() should notice finalized=true and return empty.
+        let tail = t.finalize();
+        assert!(
+            tail.is_empty(),
+            "finalize after error must be a no-op, got {} events",
+            tail.len()
+        );
+    }
+
+    /// T16: P1-G — calling finalize() twice is idempotent; the second
+    /// call returns an empty vec.
+    #[test]
+    fn finalize_called_twice_emits_nothing_second_time() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        // Prime the translator with real events so the first finalize
+        // produces output.
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(placeholder_response("completed")),
+        });
+        let first = t.finalize();
+        assert!(
+            !first.is_empty(),
+            "first finalize must emit events"
+        );
+        let second = t.finalize();
+        assert!(
+            second.is_empty(),
+            "second finalize must be a no-op, got {} events",
+            second.len()
+        );
     }
 }
 
