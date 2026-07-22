@@ -296,8 +296,8 @@ impl ResponsesStreamTranslator {
                 stop_sequence: None,
                 stop_details: None,
                 container: None,
-                usage,
             },
+            usage,
         });
         out.push(StreamEvent::MessageStop);
         out
@@ -462,7 +462,7 @@ mod tests {
         let delta = tail
             .iter()
             .find_map(|e| match e {
-                StreamEvent::MessageDelta { delta } => Some(delta),
+                StreamEvent::MessageDelta { delta, .. } => Some(delta),
                 _ => None,
             })
             .expect("finalize must emit MessageDelta");
@@ -499,7 +499,7 @@ mod tests {
         let delta = tail
             .iter()
             .find_map(|e| match e {
-                StreamEvent::MessageDelta { delta } => Some(delta),
+                StreamEvent::MessageDelta { delta, .. } => Some(delta),
                 _ => None,
             })
             .expect("finalize must emit MessageDelta");
@@ -640,9 +640,9 @@ mod tests {
         assert_eq!(tail.len(), 2);
         assert!(matches!(tail[0], StreamEvent::MessageDelta { .. }));
         assert!(matches!(tail[1], StreamEvent::MessageStop));
-        if let StreamEvent::MessageDelta { delta } = &tail[0] {
+        if let StreamEvent::MessageDelta { delta, usage } = &tail[0] {
             assert_eq!(delta.stop_reason.as_deref(), Some("end_turn"));
-            let usage = delta.usage.as_ref().unwrap();
+            let usage = usage.as_ref().unwrap();
             assert_eq!(usage.input_tokens, 10);
             assert_eq!(usage.output_tokens, 5);
         }
@@ -671,7 +671,7 @@ mod tests {
         let message_delta = final_events
             .iter()
             .find_map(|e| match e {
-                StreamEvent::MessageDelta { delta } => Some(delta),
+                StreamEvent::MessageDelta { delta, .. } => Some(delta),
                 _ => None,
             })
             .expect("finalize should emit MessageDelta");
@@ -693,7 +693,7 @@ mod tests {
         let message_delta = final_events
             .iter()
             .find_map(|e| match e {
-                StreamEvent::MessageDelta { delta } => Some(delta),
+                StreamEvent::MessageDelta { delta, .. } => Some(delta),
                 _ => None,
             })
             .expect("finalize should emit MessageDelta");
@@ -953,7 +953,7 @@ mod tests {
         let delta = final_events
             .iter()
             .find_map(|e| match e {
-                StreamEvent::MessageDelta { delta } => Some(delta),
+                StreamEvent::MessageDelta { delta, .. } => Some(delta),
                 _ => None,
             })
             .expect("finalize emits MessageDelta");
