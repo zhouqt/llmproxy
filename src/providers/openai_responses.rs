@@ -201,6 +201,7 @@ where
                     tracing::debug!(
                         provider = "copilot",
                         event = event_name_for_debug(&ev),
+                        output_index = output_index_for_debug(&ev),
                         terminal = ResponsesStreamTranslator::is_terminal(&ev),
                         "responses SSE event"
                     );
@@ -243,6 +244,27 @@ where
                 }
             }
         }
+    }
+}
+
+/// Extract the `output_index` (when present) for debug logging. The
+/// index ties a `*.delta` or `*.done` event back to the item it
+/// belongs to; logging it makes cross-event mismatches easy to spot
+/// (e.g. when an item.added sits at index 1 but its deltas use index
+/// 0 — that mismatch is what makes `finalize` think an item is
+/// unclosed and re-emit `content_block_stop` for it).
+fn output_index_for_debug(ev: &crate::responses::ResponsesStreamEvent) -> Option<u32> {
+    use crate::responses::ResponsesStreamEvent as E;
+    match ev {
+        E::ResponseOutputItemAdded { output_index, .. }
+        | E::ResponseOutputItemDone { output_index, .. }
+        | E::ResponseContentPartAdded { output_index, .. }
+        | E::ResponseContentPartDone { output_index, .. }
+        | E::ResponseOutputTextDelta { output_index, .. }
+        | E::ResponseOutputTextDone { output_index, .. }
+        | E::ResponseFunctionCallArgumentsDelta { output_index, .. }
+        | E::ResponseFunctionCallArgumentsDone { output_index, .. } => Some(*output_index),
+        _ => None,
     }
 }
 
