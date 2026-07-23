@@ -180,7 +180,10 @@ impl ResponsesStreamTranslator {
                 ..
             } => {
                 self.ensure_started(&mut out);
-                let block_idx = self.allocate_block(*output_index);
+                let Some(&block_idx) = self.block_map.get(output_index) else {
+                    tracing::warn!(?output_index, "text delta for unseen block; ignoring");
+                    return out;
+                };
                 self.deltas_seen.insert(block_idx);
                 out.push(StreamEvent::ContentBlockDelta {
                     index: block_idx,
@@ -221,7 +224,10 @@ impl ResponsesStreamTranslator {
                     .get(item_id)
                     .copied()
                     .unwrap_or(*output_index);
-                let block_idx = self.allocate_block(fc_index);
+                let Some(&block_idx) = self.block_map.get(&fc_index) else {
+                    tracing::warn!(?output_index, ?item_id, ?fc_index, "fc args delta for unseen block; ignoring");
+                    return out;
+                };
                 out.push(StreamEvent::ContentBlockDelta {
                     index: block_idx,
                     delta: BlockDelta::InputJsonDelta {
