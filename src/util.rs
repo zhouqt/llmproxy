@@ -3,10 +3,15 @@
 /// Returns `true` when `model` belongs to the GPT-5.x family (including
 /// o-series reasoning models) that share specific API constraints:
 ///
-/// - `/responses` endpoint required (Copilot rejects `/chat/completions`)
 /// - `max_completion_tokens` instead of `max_tokens`
 /// - Only `"24h"` prompt-cache retention is accepted (`"in_memory"` causes
 ///   a 400 from the upstream)
+///
+/// **Not for endpoint routing.** Copilot `/responses` only serves gpt-5.x;
+/// o-series must route to `/chat/completions`. Use `model.starts_with("gpt-5")`
+/// in `endpoint_for_model` instead. The 3 other call sites in `request.rs`
+/// and `responses.rs` legitimately need o-series included for request
+/// shaping (max_completion_tokens, 24h retention).
 pub fn gpt5_family(model: &str) -> bool {
     model.starts_with("gpt-5")
         || model.starts_with("o1")
