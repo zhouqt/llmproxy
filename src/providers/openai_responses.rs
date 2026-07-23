@@ -1211,8 +1211,9 @@ mod tests {
         let mut t = ResponsesStreamTranslator::new("test_id", "test_model");
         let ev = ResponsesStreamEvent::Error {
             code: Some("server_error".into()),
-            message: "upstream is overloaded".into(),
+            message: Some("upstream is overloaded".into()),
             param: None,
+            extra: serde_json::Value::default(),
         };
         let _ = t.push_event(&ev);
         let raw = t.take_raw_error().expect("should have raw error payload");

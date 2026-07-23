@@ -294,9 +294,12 @@ pub enum ResponsesStreamEvent {
     Error {
         #[serde(skip_serializing_if = "Option::is_none")]
         code: Option<String>,
-        message: String,
+        #[serde(default)]
+        message: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         param: Option<String>,
+        #[serde(default, flatten)]
+        extra: Value,
     },
     #[serde(other)]
     Unknown,
