@@ -62,7 +62,7 @@ update (P3-1+P3-2).
 
 ## Commits by Round
 
-The branch contains 31 commits on top of the `main` baseline. Foundational
+The branch contains 33 commits on top of the `main` baseline. Foundational
 fixes (pre-Round 1) established the initial GPT-5 /responses path; rounds 1-5
 added tests, fixed regressions, and hardened edge cases.
 
