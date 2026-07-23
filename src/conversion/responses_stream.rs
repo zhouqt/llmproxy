@@ -54,12 +54,6 @@ pub struct ResponsesStreamTranslator {
     /// Signals to the adapter that it should stop processing the stream
     /// immediately and avoid calling `finalize()` on EOF.
     pub(crate) finalized: bool,
-    /// When an upstream `error` SSE event is received, this holds the
-    /// raw Anthropic error SSE envelope to emit directly. Bypasses
-    /// `StreamEvent::Error` serialization because the enum uses
-    /// `#[serde(tag = "type")]` which renders `"type": "Error"`, but
-    /// the Anthropic wire protocol requires `"type": "error"`.
-    pub(crate) raw_error_event: Option<String>,
 }
 
 /// Returns `true` for SSE events that signal the upstream response is
@@ -104,7 +98,6 @@ impl ResponsesStreamTranslator {
             fc_item_index: std::collections::HashMap::new(),
             deltas_seen: std::collections::HashSet::new(),
             finalized: false,
-            raw_error_event: None,
         }
     }
 
@@ -259,16 +252,40 @@ impl ResponsesStreamTranslator {
             }
             ResponsesStreamEvent::ResponseContentPartDone { .. } => {}
             ResponsesStreamEvent::ResponseCompleted { response }
-            | ResponsesStreamEvent::ResponseFailed { response }
             | ResponsesStreamEvent::ResponseIncomplete { response } => {
                 self.ensure_started(&mut out);
                 self.final_usage = response.usage.clone();
                 self.final_stop_reason = Some(match response.status.as_str() {
                     "incomplete" => "max_tokens".to_string(),
                     "completed" => "end_turn".to_string(),
-                    "failed" => "end_turn".to_string(),
                     _ => "end_turn".to_string(),
                 });
+            }
+            ResponsesStreamEvent::ResponseFailed { response } => {
+                self.ensure_started(&mut out);
+                let msg = response
+                    .extra
+                    .get("error")
+                    .and_then(|v| v.get("message"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_owned())
+                    .unwrap_or_else(|| "upstream error".to_string());
+                let code = response
+                    .extra
+                    .get("error")
+                    .and_then(|v| v.get("code"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_owned());
+                let mut error_body = serde_json::json!({
+                    "type": "upstream_error",
+                    "message": msg,
+                });
+                if let Some(ref c) = code {
+                    error_body["code"] = serde_json::Value::String(c.clone());
+                }
+                out.push(StreamEvent::Error { error: error_body });
+                self.final_stop_reason = None;
+                self.finalized = true;
             }
             ResponsesStreamEvent::Error {
                 code,
@@ -289,11 +306,7 @@ impl ResponsesStreamTranslator {
                 if let Some(ref code) = code {
                     error_body["code"] = serde_json::Value::String(code.clone());
                 }
-                let payload = serde_json::json!({
-                    "type": "error",
-                    "error": error_body,
-                });
-                self.raw_error_event = Some(format!("event: error\ndata: {}\n\n", payload));
+                out.push(StreamEvent::Error { error: error_body });
                 // Clear final_stop_reason so EOF finalize does not emit
                 // message_delta after the error event.
                 self.final_stop_reason = None;
@@ -302,13 +315,6 @@ impl ResponsesStreamTranslator {
             ResponsesStreamEvent::Unknown => {}
         }
         out
-    }
-
-    /// Consume the raw error payload (if any) that was stored by the
-    /// Error event handler. The adapter layer emits this directly as
-    /// SSE bytes, bypassing `StreamEvent::Error` serialization.
-    pub(crate) fn take_raw_error(&mut self) -> Option<String> {
-        self.raw_error_event.take()
     }
 
     pub fn finalize(&mut self) -> Vec<StreamEvent> {
@@ -641,10 +647,9 @@ mod tests {
     }
 
     #[test]
-    fn failed_status_maps_to_end_turn() {
-        // response.failed is treated like completed for stop_reason
-        // purposes — both surface as end_turn on the Anthropic side,
-        // so the client sees a normal terminal event.
+    fn failed_status_emits_error_and_finalizes() {
+        // response.failed now surfaces upstream error details instead of
+        // mapping silently to end_turn.
         let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
         let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
             response: Box::new(placeholder_response("in_progress")),
@@ -652,16 +657,19 @@ mod tests {
         let tail = t.push_event(&ResponsesStreamEvent::ResponseFailed {
             response: Box::new(placeholder_response("failed")),
         });
-        assert!(tail.is_empty(), "failed event alone must not emit immediately");
+        // Must emit an Error event immediately (no end_turn).
+        assert!(
+            tail.iter().any(|e| matches!(e, StreamEvent::Error { .. })),
+            "response.failed must emit Error event"
+        );
+        assert!(
+            !tail.iter().any(|e| matches!(e, StreamEvent::MessageDelta { .. })),
+            "response.failed must not emit MessageDelta"
+        );
+        assert!(t.finalized, "translator must be finalized after response.failed");
+        // finalize() should emit nothing.
         let final_events = t.finalize();
-        let message_delta = final_events
-            .iter()
-            .find_map(|e| match e {
-                StreamEvent::MessageDelta { delta, .. } => Some(delta),
-                _ => None,
-            })
-            .expect("finalize should emit MessageDelta");
-        assert_eq!(message_delta.stop_reason.as_deref(), Some("end_turn"));
+        assert!(final_events.is_empty(), "finalize after response.failed must be empty");
     }
 
     #[test]
@@ -1487,7 +1495,7 @@ mod tests {
             let out = t.push_event(&ev);
             // The translator should set finalized = true, clear
             // final_stop_reason so finalize emits nothing, and emit
-            // a raw_error_event.
+            // a StreamEvent::Error.
             assert!(t.finalized, "translator must be finalized after error event");
             assert!(t.final_stop_reason.is_none(), "final_stop_reason must be cleared");
             // finalize() should emit nothing.
@@ -1496,16 +1504,72 @@ mod tests {
                 tail.iter().all(|e| !matches!(e, StreamEvent::MessageDelta { .. })),
                 "finalize must not emit message_delta after error"
             );
-            // The SSE payload must contain "type":"error".
-            if let Some(raw) = &t.raw_error_event {
-                assert!(
-                    raw.contains(r#""type":"error""#),
-                    "raw_error_event must contain error-type envelope"
-                );
-            } else {
-                panic!("raw_error_event must be set after error event");
-            }
+            // The output must contain a StreamEvent::Error.
+            assert!(
+                out.iter().any(|e| matches!(e, StreamEvent::Error { .. })),
+                "output must contain error event"
+            );
         }
+    }
+
+    /// T24: response.failed event surfaces error details as an Error event
+    /// instead of being silently mapped to end_turn.
+    #[test]
+    fn response_failed_event_surfaces_error_details_not_end_turn() {
+        let mut t = ResponsesStreamTranslator::new("msg_t24", "gpt-4o");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+
+        // Build a failed response with error details in extra.
+        let mut failed_resp = placeholder_response("failed");
+        failed_resp.extra = json!({"error": {"code": "rate_limited", "message": "too fast"}});
+
+        let out = t.push_event(&ResponsesStreamEvent::ResponseFailed {
+            response: Box::new(failed_resp),
+        });
+
+        // Must emit an Error event (not end_turn).
+        assert!(
+            out.iter().any(|e| matches!(e, StreamEvent::Error { .. })),
+            "response.failed must emit an Error event"
+        );
+        // Must NOT emit end_turn semantics — no message_delta.
+        assert!(
+            !out.iter().any(|e| matches!(e, StreamEvent::MessageDelta { .. })),
+            "response.failed must not emit message_delta"
+        );
+        // Finalized flag must be set.
+        assert!(t.finalized, "translator must be finalized after response.failed");
+        // final_stop_reason must be cleared.
+        assert!(t.final_stop_reason.is_none(), "final_stop_reason must be cleared after response.failed");
+
+        // Verify the error payload.
+        let error_ev = out.iter().find(|e| matches!(e, StreamEvent::Error { .. })).unwrap();
+        let StreamEvent::Error { error } = error_ev else { unreachable!() };
+        assert_eq!(error["type"], "upstream_error");
+        assert_eq!(error["message"], "too fast");
+        assert_eq!(error["code"], "rate_limited");
+    }
+
+    /// T24b: response.failed without error details still emits an Error
+    /// event with a fallback message.
+    #[test]
+    fn response_failed_without_error_details_uses_fallback_message() {
+        let mut t = ResponsesStreamTranslator::new("msg_t24b", "gpt-4o");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+
+        let out = t.push_event(&ResponsesStreamEvent::ResponseFailed {
+            response: Box::new(placeholder_response("failed")),
+        });
+
+        assert!(
+            out.iter().any(|e| matches!(e, StreamEvent::Error { .. })),
+            "response.failed must emit Error event even without error details"
+        );
+        assert!(t.finalized, "translator must be finalized");
     }
 }
 

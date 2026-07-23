@@ -25,7 +25,7 @@ use crate::anthropic::{
     ToolChoice, Usage,
 };
 use crate::conversion::derive_cache_hints;
-use crate::error::Result;
+use crate::error::{ProxyError, Result};
 use crate::responses::{
     OutputContentPart, OutputItem, ReasoningConfig, ResponseInputContent, ResponseInputItem,
     ResponseInputPart, ResponsesRequest, ResponsesResponse, ResponsesTool,
@@ -380,7 +380,22 @@ pub fn responses_to_anthropic_response(
         match resp.status.as_str() {
             "incomplete" => Some("max_tokens".to_string()),
             "completed" => Some("end_turn".to_string()),
-            "failed" => Some("end_turn".to_string()),
+            "failed" => {
+                // If the response carries error details in extra, surface
+                // them as an upstream error rather than silently mapping
+                // to end_turn.
+                let err_msg = resp
+                    .extra
+                    .get("error")
+                    .and_then(|v| v.get("message"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_owned())
+                    .unwrap_or_else(|| "upstream error".to_string());
+                return Err(ProxyError::Upstream {
+                    status: 502,
+                    body: err_msg,
+                });
+            }
             _ => None,
         }
     };
@@ -980,10 +995,9 @@ mod tests {
     }
 
     #[test]
-    fn response_failed_status_maps_to_end_turn() {
-        // A failed Responses API response (status="failed") still has
-        // a valid Anthropic-side stop_reason; we surface end_turn so
-        // the client doesn't loop on max_tokens or tool_use.
+    fn response_failed_status_returns_upstream_error() {
+        // A failed Responses API response (status="failed") without error
+        // details returns a fallback upstream error.
         let raw = json!({
             "id": "resp_f",
             "object": "response",
@@ -997,8 +1011,36 @@ mod tests {
             "usage": {"input_tokens": 5, "output_tokens": 1, "total_tokens": 6}
         });
         let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
-        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_f").unwrap();
-        assert_eq!(out.stop_reason.as_deref(), Some("end_turn"));
+        let err = responses_to_anthropic_response(&resp, "gpt-5", "msg_f").unwrap_err();
+        assert!(
+            matches!(&err, ProxyError::Upstream { status: 502, .. }),
+            "expected Upstream(502), got: {err}"
+        );
+    }
+
+    #[test]
+    fn response_failed_with_error_details_surfaces_message() {
+        // A failed response with error details in extra should surface
+        // the upstream error message.
+        let raw = json!({
+            "id": "resp_f2",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "failed",
+            "output": [],
+            "usage": {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1},
+            "error": {"code": "rate_limited", "message": "too fast"}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let err = responses_to_anthropic_response(&resp, "gpt-5", "msg_f2").unwrap_err();
+        match &err {
+            ProxyError::Upstream { status, body } => {
+                assert_eq!(*status, 502);
+                assert!(body.contains("too fast"), "body: {body}");
+            }
+            _ => panic!("expected Upstream error, got: {err}"),
+        }
     }
 
     #[test]
