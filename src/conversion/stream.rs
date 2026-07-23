@@ -578,4 +578,30 @@ mod tests {
         assert!(empty_events.iter().all(|e| matches!(e, StreamEvent::MessageStart { .. })));
         assert!(role_events.is_empty());
     }
+
+    #[test]
+    fn empty_choices_and_no_usage_chunk_emits_nothing_after_start() {
+        let mut t = StreamTranslator::new("msg_1", "m");
+        let content: ChatChunk = serde_json::from_value(serde_json::json!({
+            "id": "c", "object": "chat.completion.chunk", "created": 0, "model": "m",
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "hello"},
+                "finish_reason": null
+            }]
+        })).unwrap();
+        let metadata: ChatChunk = serde_json::from_value(serde_json::json!({
+            "choices": [],
+            "x-opencode-type": "inference-cost"
+        })).unwrap();
+
+        let events = t.push_chunk(&content);
+        let second = t.push_chunk(&metadata);
+
+        // First push emits MessageStart + ContentBlockStart + ContentBlockDelta
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::MessageStart { .. })));
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::ContentBlockDelta { .. })));
+        // Second push (metadata with empty choices) emits nothing
+        assert!(second.is_empty());
+    }
 }
