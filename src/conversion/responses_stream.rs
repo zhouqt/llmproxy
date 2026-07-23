@@ -1565,5 +1565,44 @@ mod tests {
         );
         assert!(t.finalized, "translator must be finalized");
     }
+
+    /// T21: P2-2 — a text delta for an output_index that was never opened
+    /// (no prior output_item.added) must be silently ignored. Without this
+    /// guard, the translator would allocate a phantom block via block_map.
+    /// Note: ensure_started() still fires a MessageStart, so the output
+    /// may contain that; what matters is no block-level event.
+    #[test]
+    fn output_text_delta_with_unseen_output_index_emits_nothing() {
+        let mut t = ResponsesStreamTranslator::new("msg_x", "gpt-5");
+        // No output_item.added → block_map is empty.
+        let out = t.push_event(&ResponsesStreamEvent::ResponseOutputTextDelta {
+            item_id: "msg_1".into(),
+            output_index: 99,
+            content_index: 0,
+            delta: "orphan".into(),
+        });
+        assert!(
+            !out.iter().any(|e| matches!(e, StreamEvent::ContentBlockDelta { .. })),
+            "must not emit a content_block_delta for unseen output_index; got {out:?}"
+        );
+    }
+
+    /// T22: P2-2 — a function_call_arguments delta for an item_id that was
+    /// never registered (no prior output_item.added for that fc item) must
+    /// not allocate a phantom block via block_map.
+    #[test]
+    fn function_call_arguments_delta_with_unknown_item_id_emits_nothing() {
+        let mut t = ResponsesStreamTranslator::new("msg_x", "gpt-5");
+        // Both fc_item_index miss AND output_index miss.
+        let out = t.push_event(&ResponsesStreamEvent::ResponseFunctionCallArgumentsDelta {
+            item_id: "fc_unknown".into(),
+            output_index: 42,
+            delta: "{}".into(),
+        });
+        assert!(
+            !out.iter().any(|e| matches!(e, StreamEvent::ContentBlockDelta { .. })),
+            "must not emit a content_block_delta for unknown item_id; got {out:?}"
+        );
+    }
 }
 
