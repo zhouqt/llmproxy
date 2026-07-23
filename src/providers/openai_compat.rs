@@ -215,6 +215,12 @@ where
             }
             match serde_json::from_str::<crate::openai::ChatChunk>(payload) {
                 Ok(c) => {
+                    if c.extra.get("x-opencode-type").is_some() {
+                        tracing::trace!(
+                            extra = %c.extra,
+                            "absorbing upstream metadata line (not a ChatChunk)"
+                        );
+                    }
                     if let Some(t) = self.translator.as_mut() {
                         for ev in t.push_chunk(&c) {
                             self.output_buffer.push_back(Self::encode(&ev));
@@ -919,5 +925,63 @@ mod tests {
         // Also check the empty case returns the placeholder.
         let empty = crate::util::summarize_for_log("", "<empty payload>");
         assert_eq!(empty, "<empty payload>");
+    }
+
+    #[tokio::test]
+    async fn adapter_absorbs_opencode_metadata_without_events_or_logs() {
+        // SSE stream containing: 1 content chunk + metadata line + [DONE]
+        // Output should contain normal events but NOT extra events from metadata.
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data:{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\ndata:{\"choices\":[],\"x-opencode-type\":\"inference-cost\",\"cost\":\"0.00\"}\n\ndata: [DONE]\n\n",
+        ))];
+        let mut adapter = OpenAiSseToAnthropic::new(stream::iter(chunks), "model");
+        let mut encoded = String::new();
+        while let Some(item) = adapter.next().await {
+            encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+        }
+
+        assert!(encoded.contains("message_start"));
+        assert!(encoded.contains("\"text\":\"hello\""));
+        assert!(encoded.contains("message_stop"));
+        // Count message_start — should be exactly 1 (metadata line must not trigger a second start)
+        assert_eq!(encoded.matches("event: message_start").count(), 1, "metadata line should not emit extra message_start");
+    }
+
+    #[tokio::test]
+    async fn metadata_line_does_not_disturb_standard_usage() {
+        // Content chunk + standard usage chunk + metadata line + [DONE]
+        // MessageDelta usage should reflect the standard usage chunk, not metadata.
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data:{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata:{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2,\"total_tokens\":6}}\n\ndata:{\"choices\":[],\"x-opencode-type\":\"inference-cost\"}\n\ndata: [DONE]\n\n",
+        ))];
+        let mut adapter = OpenAiSseToAnthropic::new(stream::iter(chunks), "model");
+        let mut encoded = String::new();
+        while let Some(item) = adapter.next().await {
+            encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+        }
+
+        // Verify usage from the standard chunk is reflected
+        assert!(encoded.contains("\"input_tokens\":4"));
+        assert!(encoded.contains("\"output_tokens\":2"));
+    }
+
+    #[tokio::test]
+    async fn metadata_line_before_content_still_yields_valid_stream() {
+        // Metadata line comes BEFORE the content chunk.
+        // Stream should still produce a valid message_start → ... → message_stop.
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data:{\"choices\":[],\"x-opencode-type\":\"inference-cost\"}\n\ndata:{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
+        ))];
+        let mut adapter = OpenAiSseToAnthropic::new(stream::iter(chunks), "model");
+        let mut encoded = String::new();
+        while let Some(item) = adapter.next().await {
+            encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+        }
+
+        assert!(encoded.contains("message_start"));
+        assert!(encoded.contains("\"text\":\"late\""));
+        assert!(encoded.contains("message_stop"));
+        // Exactly one message_start
+        assert_eq!(encoded.matches("event: message_start").count(), 1);
     }
 }
