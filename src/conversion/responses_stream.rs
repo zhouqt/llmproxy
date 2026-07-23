@@ -270,11 +270,21 @@ impl ResponsesStreamTranslator {
                     _ => "end_turn".to_string(),
                 });
             }
-            ResponsesStreamEvent::Error { code, message, .. } => {
+            ResponsesStreamEvent::Error {
+                code,
+                message,
+                extra,
+                ..
+            } => {
                 self.ensure_started(&mut out);
+                let msg = message
+                    .as_ref()
+                    .cloned()
+                    .or_else(|| extra.get("error").and_then(|v| v.get("message")).and_then(|v| v.as_str().map(|s| s.to_owned())))
+                    .unwrap_or_else(|| "upstream error".to_string());
                 let mut error_body = serde_json::json!({
                     "type": "upstream_error",
-                    "message": message,
+                    "message": msg,
                 });
                 if let Some(ref code) = code {
                     error_body["code"] = serde_json::Value::String(code.clone());
@@ -1293,8 +1303,9 @@ mod tests {
         // whatever ensure_started emitted (message_start if first event).
         let _ = t.push_event(&ResponsesStreamEvent::Error {
             code: Some("server_error".into()),
-            message: "upstream is overloaded".into(),
+            message: Some("upstream is overloaded".into()),
             param: None,
+            extra: serde_json::Value::default(),
         });
         // finalize() should notice finalized=true and return empty.
         let tail = t.finalize();
@@ -1416,6 +1427,85 @@ mod tests {
             !tail.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { .. })),
             "finalize must not emit extra content_block_stop"
         );
+    }
+
+    /// T23: Error event with missing or nested `message` field still
+    /// produces a terminating error event instead of panicking or being
+    /// silently dropped.
+    #[test]
+    fn error_event_with_missing_or_nested_message_still_terminates() {
+        use serde_json::json;
+        // Fixture 1: top-level message present.
+        let ev = serde_json::from_value::<ResponsesStreamEvent>(json!({
+            "type": "error",
+            "message": "oops",
+        }))
+        .unwrap();
+        assert!(
+            matches!(&ev, ResponsesStreamEvent::Error { code, message, extra, .. }
+                     if code.is_none() && message.as_deref() == Some("oops") && extra.is_object())
+        );
+
+        // Fixture 2: nested error.message.
+        let ev = serde_json::from_value::<ResponsesStreamEvent>(json!({
+            "type": "error",
+            "error": {"message": "nested"},
+        }))
+        .unwrap();
+        assert!(
+            matches!(&ev, ResponsesStreamEvent::Error { code, message, .. }
+                     if code.is_none() && message.is_none())
+        );
+        // The nested message is accessible via extra.error.message.
+        if let ResponsesStreamEvent::Error { extra, .. } = &ev {
+            let nested = extra["error"]["message"].as_str().unwrap_or("");
+            assert_eq!(nested, "nested", "nested error.message should be in extra");
+        }
+
+        // Fixture 3: empty body — no message at all.
+        let ev = serde_json::from_value::<ResponsesStreamEvent>(json!({
+            "type": "error",
+        }))
+        .unwrap();
+        assert!(
+            matches!(&ev, ResponsesStreamEvent::Error { code, message, .. }
+                     if code.is_none() && message.is_none())
+        );
+
+        // Now run through the translator and verify all three produce a
+        // terminating error event.
+        for fixture in [
+            json!({"type":"error","message":"oops"}),
+            json!({"type":"error","error":{"message":"nested"}}),
+            json!({"type":"error"}),
+        ] {
+            let ev = serde_json::from_value::<ResponsesStreamEvent>(fixture).unwrap();
+            let mut t = ResponsesStreamTranslator::new("msg_t23", "gpt-4o");
+            let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+                response: Box::new(placeholder_response("in_progress")),
+            });
+            let out = t.push_event(&ev);
+            // The translator should set finalized = true, clear
+            // final_stop_reason so finalize emits nothing, and emit
+            // a raw_error_event.
+            assert!(t.finalized, "translator must be finalized after error event");
+            assert!(t.final_stop_reason.is_none(), "final_stop_reason must be cleared");
+            // finalize() should emit nothing.
+            let tail = t.finalize();
+            assert!(
+                tail.iter().all(|e| !matches!(e, StreamEvent::MessageDelta { .. })),
+                "finalize must not emit message_delta after error"
+            );
+            // The SSE payload must contain "type":"error".
+            if let Some(raw) = &t.raw_error_event {
+                assert!(
+                    raw.contains(r#""type":"error""#),
+                    "raw_error_event must contain error-type envelope"
+                );
+            } else {
+                panic!("raw_error_event must be set after error event");
+            }
+        }
     }
 }
 
