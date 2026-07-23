@@ -68,12 +68,6 @@ pub struct ResponsesStreamTranslator {
 /// causes any data that arrives after the terminal event to be
 /// discarded. The upstream is not expected to send further meaningful
 /// data past this point.
-///
-/// This is intentional: once a terminal event is received the adapter
-/// stops polling the upstream stream and calls `finalize()`, which
-/// causes any data that arrives after the terminal event to be
-/// discarded. The upstream is not expected to send further meaningful
-/// data past this point.
 pub fn is_terminal_event(event: &ResponsesStreamEvent) -> bool {
     matches!(
         event,
@@ -825,9 +819,9 @@ mod tests {
 
     #[test]
     fn in_progress_event_starts_message_and_captures_id_model() {
-        // response.in_progress shares the ResponseCreated arm (line 79).
-        // It must open the message stream; the id/model capture (lines
-        // 82-87) updates internal state AFTER ensure_started has already
+        // response.in_progress shares the ResponseCreated arm.
+        // It must open the message stream; the id/model capture
+        // updates internal state AFTER ensure_started has already
         // emitted MessageStart, so that first event still carries the
         // constructor placeholders — the captured values would surface
         // on later events. We assert MessageStart is emitted exactly
@@ -850,7 +844,7 @@ mod tests {
 
     #[test]
     fn output_text_done_emits_content_block_stop() {
-        // response.output_text.done closes the text block (lines 118-121)
+        // response.output_text.done closes the text block
         // by mapping the output_index back to its allocated block and
         // emitting content_block_stop.
         let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
@@ -888,7 +882,7 @@ mod tests {
     #[test]
     fn function_call_arguments_done_emits_content_block_stop() {
         // response.function_call_arguments.done closes the tool_use
-        // block (lines 136-139).
+        // block.
         let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
         let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
             response: Box::new(placeholder_response("in_progress")),
@@ -915,7 +909,7 @@ mod tests {
     #[test]
     fn output_item_done_is_a_noop() {
         // response.output_item.done is redundant with the per-text /
-        // per-function-call done events (lines 140-143). It must not
+        // per-function-call done events. It must not
         // emit anything on its own.
         let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
         let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
@@ -940,7 +934,7 @@ mod tests {
     fn unknown_final_status_defaults_to_end_turn() {
         // A completed/failed/incomplete event whose status string is
         // none of the recognized values still resolves to end_turn via
-        // the catch-all arm (line 154). We drive this through the
+        // the catch-all arm. We drive this through the
         // ResponseCompleted variant carrying an odd status.
         let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
         let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
@@ -964,7 +958,7 @@ mod tests {
     fn output_item_added_with_unknown_content_part_opens_empty_text_block() {
         // A message item whose only content part is an unrecognized type
         // yields an empty-text block (output_item_to_block: the Unknown
-        // part is skipped by find_map → unwrap_or_default, line 203).
+        // part is skipped by find_map → unwrap_or_default).
         let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
         let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
             response: Box::new(placeholder_response("in_progress")),
@@ -993,7 +987,7 @@ mod tests {
     #[test]
     fn output_item_added_with_unknown_item_opens_empty_text_block() {
         // An unrecognized OutputItem type maps to an empty Text block
-        // (output_item_to_block Unknown arm, lines 222-224) so the block
+        // (output_item_to_block Unknown arm) so the block
         // accounting stays balanced even for item types we don't model.
         let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
         let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
