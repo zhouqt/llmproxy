@@ -57,6 +57,10 @@ impl OpenaiResponsesProvider {
     fn responses_url(&self) -> String {
         format!("{}/responses", self.api_base)
     }
+
+    fn models_url(&self) -> String {
+        format!("{}/models", self.api_base)
+    }
 }
 
 #[async_trait]
@@ -73,7 +77,7 @@ impl Provider for OpenaiResponsesProvider {
     }
 
     async fn list_models(&self) -> Option<Vec<serde_json::Value>> {
-        let url = format!("{}/models", self.api_base);
+        let url = self.models_url();
         let resp = self
             .http
             .get(&url)
@@ -84,28 +88,37 @@ impl Provider for OpenaiResponsesProvider {
             .ok()?;
         if !resp.status().is_success() {
             tracing::warn!(
-                provider = %self.name,
                 status = %resp.status(),
-                "GET /models returned non-success"
+                provider = %self.name,
+                "list_models returned non-success"
             );
             return None;
         }
         let body: serde_json::Value = resp.json().await.ok()?;
         let data = body.get("data")?.as_array()?;
-        let models: Vec<serde_json::Value> = data
-            .iter()
-            .filter_map(|entry| {
-                let id = entry.get("id")?.as_str()?;
-                Some(serde_json::json!({
-                    "id": id,
-                    "object": "model",
-                    "created": entry.get("created").and_then(|v| v.as_i64()).unwrap_or(0),
-                    "owned_by": entry.get("owned_by").and_then(|v| v.as_str()).unwrap_or("openai_responses"),
-                    "display_name": id,
-                }))
-            })
-            .collect();
-        Some(models)
+        Some(
+            data.iter()
+                .filter_map(|entry| {
+                    let id = entry.get("id")?.as_str()?;
+                    let owned_by = entry
+                        .get("owned_by")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("openai_responses");
+                    let display_name = entry
+                        .get("display_name")
+                        .or_else(|| entry.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(id);
+                    Some(serde_json::json!({
+                        "id": id,
+                        "object": "model",
+                        "created": entry.get("created").and_then(|v| v.as_i64()).unwrap_or(0),
+                        "owned_by": owned_by,
+                        "display_name": display_name,
+                    }))
+                })
+                .collect(),
+        )
     }
 
     async fn complete(
