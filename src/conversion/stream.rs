@@ -134,8 +134,8 @@ impl StreamTranslator {
                 stop_sequence: None,
                 stop_details: None,
                 container: None,
-                usage,
             },
+            usage,
         });
         out.push(StreamEvent::MessageStop);
         out
@@ -433,7 +433,7 @@ mod tests {
         assert!(has_json_delta);
 
         let md = events.iter().rev().find_map(|e| {
-            if let StreamEvent::MessageDelta { delta } = e {
+            if let StreamEvent::MessageDelta { delta, .. } = e {
                 Some(delta)
             } else {
                 None
@@ -532,14 +532,20 @@ mod tests {
         events.extend(t.finalize());
 
         let delta = events.iter().rev().find_map(|e| {
-            if let StreamEvent::MessageDelta { delta } = e {
+            if let StreamEvent::MessageDelta { delta, .. } = e {
                 Some(delta)
             } else {
                 None
             }
         });
         assert_eq!(delta.and_then(|d| d.stop_reason.as_deref()), Some("max_tokens"));
-        let usage = delta.and_then(|d| d.usage.clone());
+        let usage = events.iter().rev().find_map(|e| {
+            if let StreamEvent::MessageDelta { usage, .. } = e {
+                usage.clone()
+            } else {
+                None
+            }
+        });
         assert_eq!(usage.as_ref().and_then(|u| u.cache_read_input_tokens), Some(2));
     }
 
