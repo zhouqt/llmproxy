@@ -53,10 +53,28 @@ pub fn anthropic_to_openai_request(
 
     let hints = derive_cache_hints(req);
 
+    // GPT-5.x models and o-series reject the short `in_memory` retention
+    // tier on the Chat Completions path too. Escalate to `24h` for these
+    // models rather than letting the request 400.
+    let prompt_cache_retention = hints.prompt_cache_retention.map(|r| {
+        if r == "in_memory" && crate::util::gpt5_family(&model) {
+            "24h".to_string()
+        } else {
+            r
+        }
+    });
+
+    let (max_tokens, max_completion_tokens) = if crate::util::gpt5_family(&model) {
+        (None, Some(req.max_tokens))
+    } else {
+        (Some(req.max_tokens), None)
+    };
+
     ChatRequest {
         model,
         messages,
-        max_tokens: Some(req.max_tokens),
+        max_tokens,
+        max_completion_tokens,
         temperature: req.temperature,
         top_p: req.top_p,
         stop: req.stop_sequences.clone(),
@@ -75,10 +93,14 @@ pub fn anthropic_to_openai_request(
                 .collect()
         }),
         tool_choice: req.tool_choice.as_ref().map(convert_tool_choice),
-        user: req.metadata.as_ref().and_then(|m| m.user_id.clone()),
+        user: req
+            .metadata
+            .as_ref()
+            .and_then(|m| m.user_id.as_deref())
+            .map(|u| crate::conversion::responses::truncate_user(u)),
         reasoning_effort: extract_reasoning_effort(req),
         prompt_cache_key: hints.prompt_cache_key,
-        prompt_cache_retention: hints.prompt_cache_retention,
+        prompt_cache_retention,
         extra: json!({}),
     }
 }
@@ -704,5 +726,113 @@ mod tests {
 
         assert_eq!(converted.model, "模型-2025abcd");
         assert_eq!(converted.messages.len(), 1);
+    }
+
+    /// T13: Chat Completions request for a gpt-5 family model must
+    /// escalate `in_memory` prompt-cache retention to `24h` (same as
+    /// the Responses path). Non-gpt-5 models must keep `in_memory`.
+    #[test]
+    fn chat_completions_escalates_in_memory_to_24h_for_gpt5() {
+        // gpt-5 with cache_control markers → in_memory escalated to 24h
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}
+            ]}],
+            "metadata": {"user_id": "u-1"}
+        }))
+        .unwrap();
+        let mut rewrite = std::collections::HashMap::new();
+        rewrite.insert("claude-sonnet-4-5".to_string(), "gpt-5".to_string());
+        let converted = anthropic_to_openai_request(&req, &rewrite);
+        assert_eq!(
+            converted.prompt_cache_retention.as_deref(),
+            Some("24h"),
+            "gpt-5 must escalate in_memory to 24h"
+        );
+
+        // gpt-5-mini also escalates
+        let mut rewrite2 = std::collections::HashMap::new();
+        rewrite2.insert("claude-sonnet-4-5".to_string(), "gpt-5-mini".to_string());
+        let converted2 = anthropic_to_openai_request(&req, &rewrite2);
+        assert_eq!(
+            converted2.prompt_cache_retention.as_deref(),
+            Some("24h"),
+            "gpt-5-mini must escalate in_memory to 24h"
+        );
+
+        // o4-mini also escalates
+        let mut rewrite3 = std::collections::HashMap::new();
+        rewrite3.insert("claude-sonnet-4-5".to_string(), "o4-mini".to_string());
+        let converted3 = anthropic_to_openai_request(&req, &rewrite3);
+        assert_eq!(
+            converted3.prompt_cache_retention.as_deref(),
+            Some("24h"),
+            "o4-mini must escalate in_memory to 24h"
+        );
+
+        // non-gpt-5 model keeps in_memory
+        let converted4 = anthropic_to_openai_request(&req, &Default::default());
+        assert_eq!(
+            converted4.prompt_cache_retention.as_deref(),
+            Some("in_memory"),
+            "non-gpt-5 must keep in_memory"
+        );
+    }
+
+    /// T11: Chat Completions for a gpt-5 family model emits only
+    /// `max_completion_tokens` (not `max_tokens`).
+    #[test]
+    fn chat_completions_emits_only_max_completion_tokens_for_gpt5() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 200,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        let mut rewrite = std::collections::HashMap::new();
+        rewrite.insert("claude-sonnet-4-5".to_string(), "gpt-5".to_string());
+        let converted = anthropic_to_openai_request(&req, &rewrite);
+        assert_eq!(converted.max_tokens, None, "gpt-5 must not emit max_tokens");
+        assert_eq!(
+            converted.max_completion_tokens,
+            Some(200),
+            "gpt-5 must emit max_completion_tokens"
+        );
+
+        // o3-mini also uses max_completion_tokens
+        let mut rewrite2 = std::collections::HashMap::new();
+        rewrite2.insert("claude-sonnet-4-5".to_string(), "o3-mini".to_string());
+        let converted2 = anthropic_to_openai_request(&req, &rewrite2);
+        assert_eq!(converted2.max_tokens, None, "o3-mini must not emit max_tokens");
+        assert_eq!(
+            converted2.max_completion_tokens,
+            Some(200),
+            "o3-mini must emit max_completion_tokens"
+        );
+    }
+
+    /// T12: Chat Completions for a non-gpt-5 model emits only
+    /// `max_tokens` (not `max_completion_tokens`).
+    #[test]
+    fn chat_completions_emits_only_max_tokens_for_non_gpt5() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        let converted = anthropic_to_openai_request(&req, &Default::default());
+        assert_eq!(
+            converted.max_tokens,
+            Some(100),
+            "non-gpt-5 must emit max_tokens"
+        );
+        assert_eq!(
+            converted.max_completion_tokens,
+            None,
+            "non-gpt-5 must not emit max_completion_tokens"
+        );
     }
 }

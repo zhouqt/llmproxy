@@ -130,7 +130,7 @@ pub struct ResponsesResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incomplete_details: Option<IncompleteDetails>,
     #[serde(default)]
-    pub usage: ResponsesUsage,
+    pub usage: Option<ResponsesUsage>,
     /// Forward-compat for fields we don't model.
     #[serde(default, flatten)]
     pub extra: Value,
@@ -286,6 +286,20 @@ pub enum ResponsesStreamEvent {
         item_id: String,
         output_index: u32,
         arguments: String,
+    },
+    /// Upstream SSE error event. OpenAI send these inline during a
+    /// stream when something goes wrong mid-response (e.g. model
+    /// overload, internal error).
+    #[serde(rename = "error")]
+    Error {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        param: Option<String>,
+        #[serde(default, flatten)]
+        extra: Value,
     },
     #[serde(other)]
     Unknown,

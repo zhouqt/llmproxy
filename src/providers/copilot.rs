@@ -33,7 +33,19 @@ const COPILOT_INTERNAL_TOKEN_URL: &str =
 /// instead. Reference: copilot-api-py `endpoint_router.py`. Pure
 /// function so we can call it from both `complete` and `stream`
 /// without sharing provider state.
+///
+/// **Endpoint routing vs. request shaping**: This function uses the
+/// empirical prefix `gpt-5` because Copilot only serves GPT-5.x on
+/// `/responses`. O-series models (o1, o3-mini, o4-mini) must go to
+/// `/chat/completions`. Do NOT use `util::gpt5_family` here — that
+/// predicate is for request shaping (max_completion_tokens, 24h
+/// prompt-cache retention) where o-series IS valid.
 fn endpoint_for_model(model: &str) -> &'static str {
+    // Copilot /responses 仅支持 gpt-5.x; o-series 走 /chat/completions.
+    // 同样会被 reject (Copilot 暂时不支持 o-series)。如果未来 Copilot
+    // 把 o-series 也开进 /responses, 改这一行 + 加 o-series endpoint
+    // 测试即可。 request.rs / responses.rs 继续用 util::gpt5_family
+    // 做 max_tokens / 24h 升级 — o-series 在那两个场景下确实需要相同处理。
     if model.starts_with("gpt-5") {
         "responses"
     } else {
@@ -366,6 +378,12 @@ impl CopilotProvider {
             // we don't want to fail at the parse step before we get a
             // chance to classify the status.
             let text = resp.text().await.unwrap_or_default();
+            // Sanitize the body so a 5xx HTML error page (e.g. the
+            // GitHub 502 with its inline stylesheet and image refs)
+            // doesn't pollute the logs. Keep only the first short,
+            // tag-free line as a hint; URLs / images / links / scripts
+            // are stripped entirely.
+            let hint = crate::util::summarize_for_log(&text, "<empty body>");
             // 401 / 403 / 404 mean the stored github token is invalid or
             // lost access — the operator must re-authenticate. Anything
             // else (5xx, 408, 429) is treated as transient so we don't
@@ -373,11 +391,11 @@ impl CopilotProvider {
             if matches!(status.as_u16(), 401 | 403 | 404) {
                 return Err(CopilotFetchError::AuthRejected {
                     status: status.as_u16(),
-                    body: text,
+                    body: hint,
                 });
             }
             return Err(CopilotFetchError::Transient(format!(
-                "copilot token fetch failed: {status} {text}"
+                "copilot token fetch failed: {status} {hint}"
             )));
         }
         let body: Value = match resp.json().await {
@@ -579,12 +597,16 @@ impl Provider for CopilotProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
-        let endpoint = endpoint_for_model(&req.model);
+        let merged = merge_rewrites(&self.model_rewrite, model_rewrite);
+        let upstream_model = merged
+            .get(&req.model)
+            .map(String::as_str)
+            .unwrap_or(&req.model);
+        let endpoint = endpoint_for_model(upstream_model);
         if endpoint == "responses" {
-            return self.complete_responses(req, model_rewrite).await;
+            return self.complete_responses(req, &merged).await;
         }
 
-        let merged = merge_rewrites(&self.model_rewrite, model_rewrite);
         let mut openai_req =
             crate::conversion::anthropic_to_openai_request(req, &merged);
         openai_req.stream = false;
@@ -623,12 +645,16 @@ impl Provider for CopilotProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
-        let endpoint = endpoint_for_model(&req.model);
+        let merged = merge_rewrites(&self.model_rewrite, model_rewrite);
+        let upstream_model = merged
+            .get(&req.model)
+            .map(String::as_str)
+            .unwrap_or(&req.model);
+        let endpoint = endpoint_for_model(upstream_model);
         if endpoint == "responses" {
-            return self.stream_responses(req, model_rewrite).await;
+            return self.stream_responses(req, &merged).await;
         }
 
-        let merged = merge_rewrites(&self.model_rewrite, model_rewrite);
         let mut openai_req =
             crate::conversion::anthropic_to_openai_request(req, &merged);
         openai_req.stream = true;
@@ -741,6 +767,24 @@ mod tests {
                 "completion_tokens": 2,
                 "total_tokens": 6
             }
+        })
+    }
+
+    fn responses_response_json(content: &str) -> Value {
+        json!({
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5.5",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": content}]
+            }],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
         })
     }
 
@@ -872,6 +916,53 @@ mod tests {
             matches!(error, CopilotFetchError::Transient(ref m) if m.contains("503") && m.contains("upstream down")),
             "5xx must be Transient, got: {error:?}"
         );
+    }
+
+    /// Regression for the operator-noise issue: GitHub's `/copilot_internal/v2/token`
+    /// endpoint returns a full HTML page (the "Unicorn!" 502) on transient
+    /// failures. Without `summarize_http_body`, that entire HTML document —
+    /// inline stylesheets, image refs, links — would land verbatim in the
+    /// warn log. The hint must drop everything but the first short,
+    /// meaningful line.
+    #[tokio::test]
+    async fn fetch_copilot_token_5xx_html_body_is_summarized() {
+        let github_502_html = "<!DOCTYPE html>\n\
+            <!--\nHello future GitHubber! I bet you're here to remove those nasty inline styles,\n\
+DRY up these templates and make 'em nice and re-usable, right?\n\
+Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
+<html>\n\
+  <head>\n\
+    <title>Unicorn! &middot; GitHub</title>\n\
+    <style type=\"text/css\" media=\"screen\">\n\
+      body { font-family: sans-serif; background: url(https://example.test/bg.png); }\n\
+    </style>\n\
+    <link rel=\"stylesheet\" href=\"https://example.test/main.css\">\n\
+  </head>\n\
+  <body>\n\
+    <a href=\"https://status.github.com\"><img src=\"https://example.test/unicorn.png\" alt=\"Unicorn!\"></a>\n\
+  </body>\n\
+</html>\n";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/copilot_internal/v2/token"))
+            .respond_with(ResponseTemplate::new(502).set_body_string(github_502_html))
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(Some(&server), None);
+        let err = provider.fetch_copilot_token("github").await.unwrap_err();
+        let msg = err.to_string();
+        // Status code preserved.
+        assert!(msg.contains("502"), "missing 502 in: {msg}");
+        // The "Unicorn!" page title is the only meaningful text.
+        assert!(msg.contains("Unicorn!"), "expected page title in: {msg}");
+        // None of the noise should leak through.
+        assert!(!msg.contains("font-family"), "CSS leaked: {msg}");
+        assert!(!msg.contains("example.test"), "URL leaked: {msg}");
+        assert!(!msg.contains("background:"), "CSS url() leaked: {msg}");
+        assert!(!msg.contains("github.com/styleguide"), "comment URL leaked: {msg}");
+        assert!(!msg.contains(".css"), "stylesheet URL leaked: {msg}");
+        assert!(!msg.contains(".png"), "image URL leaked: {msg}");
+        assert!(!msg.contains("<html"), "raw HTML leaked: {msg}");
     }
 
     #[tokio::test]
@@ -1277,14 +1368,10 @@ mod tests {
 
     #[tokio::test]
     async fn non_gpt5_request_never_touches_responses_endpoint() {
-        // Mirror of the above: a non-GPT-5 model must NOT be routed to
-        // /responses even when the runtime model_rewrite maps it to a
-        // name that starts with "gpt-5". Dispatch reads req.model
-        // (the original incoming name), not the rewritten upstream
-        // name — so a rewrite `claude-sonnet-4.6 → gpt-5-mini` still
-        // goes to /chat/completions. Verify the upstream sees
-        // "gpt-5-mini" (the rewrite) but the mock on /responses is
-        // never hit.
+        // A non-GPT-5 source model with no rewrite resolving to a GPT-5
+        // upstream name must NOT be routed to /responses. The mock on
+        // /responses asserts it is never hit; the chat-completions mock
+        // is what serves the request.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/responses"))
@@ -1294,7 +1381,7 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(body_partial_json(json!({"model": "gpt-5-mini"})))
+            .and(body_partial_json(json!({"model": "claude-sonnet-4.6"})))
             .respond_with(ResponseTemplate::new(200).set_body_json(completion_response("via-chat")))
             .expect(1)
             .mount(&server)
@@ -1305,8 +1392,9 @@ mod tests {
         );
         let mut req = request(false);
         req.model = "claude-sonnet-4.6".to_string();
-        let mut rewrite = HashMap::new();
-        rewrite.insert("claude-sonnet-4.6".to_string(), "gpt-5-mini".to_string());
+        // No rewrite: upstream_model == req.model, classified as
+        // chat_completions.
+        let rewrite = HashMap::new();
 
         let output = provider
             .complete(&req, &rewrite)
@@ -1314,6 +1402,93 @@ mod tests {
             .unwrap();
         expect_variant!(output, ProviderOutput::Json(body) => {
             assert_eq!(body["content"][0]["text"], "via-chat");
+        });
+    }
+
+    #[tokio::test]
+    async fn rewritten_to_gpt5_routes_to_responses_endpoint() {
+        // The user's `work-high → gpt-5.5` mapping must dispatch to
+        // /responses, not /chat/completions. Previously dispatch keyed
+        // off the original `req.model` and missed the rewrite.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(body_partial_json(json!({"model": "gpt-5.5"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                responses_response_json("via-responses"),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("should not be called"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+        let mut req = request(false);
+        req.model = "work-high".to_string();
+        let mut rewrite = HashMap::new();
+        rewrite.insert("work-high".to_string(), "gpt-5.5".to_string());
+
+        let output = provider
+            .complete(&req, &rewrite)
+            .await
+            .unwrap();
+        expect_variant!(output, ProviderOutput::Json(body) => {
+            assert_eq!(body["content"][0]["text"], "via-responses");
+        });
+    }
+
+    #[tokio::test]
+    async fn streaming_rewritten_to_gpt5_routes_to_responses_endpoint() {
+        // Same routing must apply on the streaming path: a rewrite
+        // `work-high → gpt-5.5` must dispatch to /responses and the
+        // response.stream event text must reach the client.
+        let server = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"object\":\"response\",\"created_at\":0,\"model\":\"gpt-5.5\",\"status\":\"in_progress\",\"output\":[],\"usage\":{}}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"m1\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"output_index\":0,\"content_index\":0,\"delta\":\"via-stream\"}\n\n",
+            "data: {\"type\":\"response.output_text.done\",\"item_id\":\"m1\",\"output_index\":0,\"content_index\":0,\"text\":\"via-stream\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"object\":\"response\",\"created_at\":0,\"model\":\"gpt-5.5\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(body_partial_json(json!({"model": "gpt-5.5"})))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sse))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("should not be called"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+        let mut req = request(true);
+        req.model = "work-high".to_string();
+        let mut rewrite = HashMap::new();
+        rewrite.insert("work-high".to_string(), "gpt-5.5".to_string());
+
+        let output = provider.stream(&req, &rewrite).await.unwrap();
+        expect_variant!(output, ProviderOutput::Stream(mut output) => {
+            let mut encoded = String::new();
+            while let Some(item) = output.next().await {
+                encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+            }
+            assert!(
+                encoded.contains("\"text\":\"via-stream\""),
+                "expected text delta in stream, got: {encoded}"
+            );
         });
     }
 
@@ -1325,6 +1500,11 @@ mod tests {
         assert_eq!(endpoint_for_model("gpt-4"), "chat_completions");
         assert_eq!(endpoint_for_model("claude-sonnet-4.6"), "chat_completions");
         assert_eq!(endpoint_for_model(""), "chat_completions");
+        // T25: o-series routes to /chat/completions, not /responses.
+        // endpoint_for_model uses empirical gpt-5 prefix only.
+        assert_eq!(endpoint_for_model("o1"), "chat_completions");
+        assert_eq!(endpoint_for_model("o3-mini"), "chat_completions");
+        assert_eq!(endpoint_for_model("o4-mini"), "chat_completions");
     }
 
     #[test]
@@ -1405,6 +1585,54 @@ mod tests {
 
         let output = provider
             .complete(&request(false), &HashMap::new())
+            .await
+            .unwrap();
+
+        expect_variant!(output, ProviderOutput::Json(body) => {
+            assert_eq!(body["content"][0]["text"], "retried");
+        });
+    }
+
+    #[tokio::test]
+    async fn unauthorized_responses_refreshes_and_retries_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("authorization", "Bearer old-token"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("expired"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/copilot_internal/v2/token"))
+            .and(header("authorization", "token github-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "token": "new-token",
+                "expires_at": now() + 900,
+                "refresh_in": 800
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("authorization", "Bearer new-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                responses_response_json("retried"),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "old-token", 600)),
+        );
+
+        let mut req = request(false);
+        req.model = "gpt-5".to_string();
+
+        let output = provider
+            .complete(&req, &HashMap::new())
             .await
             .unwrap();
 

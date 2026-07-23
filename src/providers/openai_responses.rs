@@ -202,10 +202,26 @@ where
                         for out in t.push_event(&ev) {
                             self.output_buffer.push_back(Self::encode(&out));
                         }
+                        if t.finalized {
+                            self.finished = true;
+                            return;
+                        }
+                    }
+                    // Copilot often omits [DONE] after response.completed.
+                    // Finalize inline on terminal events so the client
+                    // always gets message_delta + message_stop.
+                    if crate::conversion::responses_stream::is_terminal_event(&ev) {
+                        if let Some(mut t) = self.translator.take() {
+                            for ev in t.finalize() {
+                                self.output_buffer.push_back(Self::encode(&ev));
+                            }
+                        }
+                        self.finished = true;
+                        return;
                     }
                 }
                 Err(e) => {
-                    tracing::debug!("skipping malformed Responses SSE line: {} ({e})", payload);
+                    tracing::debug!("skipping malformed Responses SSE line: {} ({e})", crate::util::summarize_for_log(payload, "<empty payload>"));
                 }
             }
         }
@@ -1027,8 +1043,211 @@ mod tests {
         );
     }
 
+    /// T2: P0-2 regression — when the upstream emits
+    /// `response.completed` but never sends `[DONE]` and keeps the TCP
+    /// connection open, the adapter must still finalize and emit
+    /// `message_stop`. Without this fix, the adapter would wait forever
+    /// (or until EOF) for the sentinel, and the client would hang.
+    #[tokio::test]
+    async fn stream_finalizes_on_response_completed_without_done_sentinel() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        // Feed a complete SSE sequence ending with response.completed,
+        // then hang the inner stream (stream::pending) to simulate a
+        // Copilot upstream that never sends [DONE] after completion.
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"object\":\"response\",\"created_at\":0,\"model\":\"m\",\"status\":\"in_progress\",\"output\":[],\"usage\":{}}}\n\n\
+              data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[{\"type\":\"output_text\",\"text\":\"\"}]}}\n\n\
+              data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg\",\"output_index\":0,\"content_index\":0,\"delta\":\"hi\"}\n\n\
+              data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"object\":\"response\",\"created_at\":0,\"model\":\"m\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+        ))];
+        let inner = stream::iter(chunks).chain(stream::pending());
+        let mut adapter = ResponsesSseToAnthropic::new(inner, "m");
+
+        let mut encoded = String::new();
+        // Collect events with a 500ms timeout — the adapter should emit
+        // message_stop from the inline finalize on response.completed
+        // and then terminate immediately (not hang).
+        let result = timeout(Duration::from_millis(500), async {
+            while let Some(item) = adapter.next().await {
+                encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+            }
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "adapter must terminate within 500ms after terminal event, not hang until timeout; got: {encoded}"
+        );
+        assert!(
+            encoded.contains("event: message_stop"),
+            "expected message_stop within timeout (inner stream never ends), got: {encoded}"
+        );
+        assert!(
+            encoded.contains("event: message_delta"),
+            "expected message_delta, got: {encoded}"
+        );
+        assert!(
+            encoded.contains("\"text\":\"hi\""),
+            "expected content delta text, got: {encoded}"
+        );
+
+        // Subsequent poll must return None immediately (not hang).
+        let after_none = timeout(Duration::from_millis(200), adapter.next())
+            .await
+            .expect("subsequent poll after stream end must not hang");
+        assert!(after_none.is_none(), "expected None after stream ended");
+    }
+
+    /// T7: P0-A regression — after a terminal event (response.completed)
+    /// without [DONE], the adapter must terminate immediately instead of
+    /// hanging on the inner stream, which is chained with stream::pending()
+    /// so it would never return on its own.
+    #[tokio::test]
+    async fn adapter_terminates_immediately_after_terminal_event_no_hang() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"object\":\"response\",\"created_at\":0,\"model\":\"m\",\"status\":\"in_progress\",\"output\":[],\"usage\":{}}}\n\n\
+              data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"object\":\"response\",\"created_at\":0,\"model\":\"m\",\"status\":\"completed\",\"output\":[],\"usage\":{}}}\n\n",
+        ))];
+        let inner = stream::iter(chunks).chain(stream::pending());
+        let mut adapter = ResponsesSseToAnthropic::new(inner, "m");
+
+        let result = timeout(Duration::from_secs(1), async {
+            let mut encoded = String::new();
+            while let Some(item) = adapter.next().await {
+                encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+            }
+            encoded
+        })
+        .await;
+
+        let encoded =
+            result.expect("adapter must return None within 1s after terminal event, not hang");
+        assert!(
+            encoded.contains("event: message_start"),
+            "expected message_start, got: {encoded}"
+        );
+        assert!(
+            encoded.contains("event: message_stop"),
+            "expected message_stop, got: {encoded}"
+        );
+        assert!(
+            encoded.contains("event: message_delta"),
+            "expected message_delta, got: {encoded}"
+        );
+    }
+
+    /// T10: P1-B regression — an upstream `error` SSE event must
+    /// surface as `event: error` with `type_:"upstream_error"` and
+    /// immediately terminate the stream (no hang, no message_stop).
+    #[tokio::test]
+    async fn midstream_error_event_surfaces_as_anthropic_error_and_terminates() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"object\":\"response\",\"created_at\":0,\"model\":\"m\",\"status\":\"in_progress\",\"output\":[],\"usage\":{}}}\n\n\
+              data: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"upstream is overloaded\"}\n\n",
+        ))];
+        let inner = stream::iter(chunks).chain(stream::pending());
+        let mut adapter = ResponsesSseToAnthropic::new(inner, "m");
+
+        let result = timeout(Duration::from_secs(1), async {
+            let mut items = Vec::new();
+            while let Some(item) = adapter.next().await {
+                items.push(item.unwrap());
+            }
+            items
+        })
+        .await;
+
+        let items = result.expect("adapter must terminate within 1s after error event, not hang");
+
+        let encoded: String = items
+            .iter()
+            .map(|b| std::str::from_utf8(b).unwrap())
+            .collect();
+
+        // Must contain the error event.
+        assert!(
+            encoded.contains("event: error"),
+            "expected event: error, got: {encoded}"
+        );
+        // Must NOT contain message_stop (final_stop_reason was cleared).
+        assert!(
+            !encoded.contains("event: message_stop"),
+            "must NOT emit message_stop after error event, got: {encoded}"
+        );
+        // Must contain the upstream_error marker with correct Anthropic shape.
+        assert!(
+            encoded.contains("\"type\":\"error\""),
+            "expected 'type: error' in envelope, got: {encoded}"
+        );
+        assert!(
+            encoded.contains("\"type\":\"upstream_error\""),
+            "expected upstream_error subtype, got: {encoded}"
+        );
+        // Must contain the error message text.
+        assert!(
+            encoded.contains("upstream is overloaded"),
+            "expected error message, got: {encoded}"
+        );
+    }
+
+    /// T14: P1-E regression — the error SSE envelope must use `"type"`
+    /// not `"type_"`, and match the Anthropic error wire shape exactly.
     #[test]
-    fn event_name_emits_ping_for_ping_variant() {
+    fn error_event_envelope_uses_type_not_type_under_score() {
+        use crate::anthropic::StreamEvent;
+        use crate::conversion::responses_stream::ResponsesStreamTranslator;
+        use crate::responses::ResponsesStreamEvent;
+
+        let mut t = ResponsesStreamTranslator::new("test_id", "test_model");
+        let ev = ResponsesStreamEvent::Error {
+            code: Some("server_error".into()),
+            message: Some("upstream is overloaded".into()),
+            param: None,
+            extra: serde_json::Value::default(),
+        };
+        let events = t.push_event(&ev);
+
+        // push_event now returns StreamEvent::Error directly (no bypass).
+        let error_ev = events
+            .iter()
+            .find(|e| matches!(e, StreamEvent::Error { .. }))
+            .expect("should have error event");
+        let payload = serde_json::to_string(error_ev).unwrap();
+        let raw = format!("event: error\ndata: {}\n\n", payload);
+
+        assert!(
+            raw.starts_with("event: error"),
+            "SSE event type must be 'error': {raw}"
+        );
+        assert!(
+            raw.contains("\"type\":\"error\""),
+            "wire envelope must use 'type' not 'type_': {raw}"
+        );
+        assert!(
+            raw.contains("\"type\":\"upstream_error\""),
+            "error subtype must be 'upstream_error': {raw}"
+        );
+        // Verify the payload is valid JSON matching Anthropic's error shape.
+        let data_part = raw
+            .strip_prefix("event: error\ndata: ")
+            .and_then(|s| s.strip_suffix("\n\n"))
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(data_part).unwrap();
+        assert_eq!(parsed["type"], "error");
+        assert_eq!(parsed["error"]["type"], "upstream_error");
+        assert_eq!(parsed["error"]["message"], "upstream is overloaded");
+    }
+
+    #[tokio::test]
+    async fn event_name_emits_ping_for_ping_variant() {
         // The Responses translator never emits a Ping, but the
         // event_name() match must still handle it for completeness
         // (if a future Responses variant maps to an Anthropic
@@ -1054,3 +1273,4 @@ mod tests {
         assert_eq!(event_name(&ev), "error");
     }
 }
+
