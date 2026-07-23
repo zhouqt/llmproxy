@@ -418,6 +418,8 @@ pub enum StreamEvent {
     },
     MessageDelta {
         delta: MessageDeltaPayload,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
     },
     MessageStop,
     Error {
@@ -445,8 +447,6 @@ pub struct MessageDeltaPayload {
     pub stop_details: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<Usage>,
 }
 
 #[cfg(test)]
@@ -687,11 +687,19 @@ mod schema_tests {
     }
 
     #[test]
-    fn message_delta_payload_carries_full_fields() {
+    fn message_delta_event_surfaces_usage_at_top_level() {
+        // The Anthropic Messages SSE spec places `usage` as a sibling of
+        // `delta` on the `message_delta` event, not nested inside `delta`.
+        // Putting it inside `delta` makes the SDK pydantic validator throw
+        // `usage: Field required`, which causes Claude Code to silently
+        // abort a tool_use response.
         let raw = json!({
-            "stop_reason": "end_turn",
-            "stop_details": {"reason": "policy"},
-            "container": {"id": "x"},
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": "end_turn",
+                "stop_details": {"reason": "policy"},
+                "container": {"id": "x"}
+            },
             "usage": {
                 "input_tokens": 1,
                 "output_tokens": 2,
@@ -716,9 +724,12 @@ mod schema_tests {
             stop_sequence: None,
             stop_details: Some(json!({"reason": "policy"})),
             container: Some(json!({"id": "x"})),
+        };
+        let ev = StreamEvent::MessageDelta {
+            delta: payload,
             usage: Some(usage),
         };
-        let v = serde_json::to_value(&payload).unwrap();
+        let v = serde_json::to_value(&ev).unwrap();
         assert_subset(&v, &raw);
     }
 

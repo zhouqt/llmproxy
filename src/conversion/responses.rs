@@ -25,11 +25,23 @@ use crate::anthropic::{
     ToolChoice, Usage,
 };
 use crate::conversion::derive_cache_hints;
-use crate::error::Result;
+use crate::error::{ProxyError, Result};
 use crate::responses::{
     OutputContentPart, OutputItem, ReasoningConfig, ResponseInputContent, ResponseInputItem,
     ResponseInputPart, ResponsesRequest, ResponsesResponse, ResponsesTool,
 };
+
+/// Truncate the `user` identifier to the 64-character limit enforced by
+/// Copilot's Responses API. The Anthropic `metadata.user_id` has no
+/// length constraint in the spec, so clients routinely send longer
+/// values that Copilot rejects.
+pub(crate) fn truncate_user(user: &str) -> String {
+    if user.chars().count() <= 64 {
+        user.to_string()
+    } else {
+        user.chars().take(64).collect()
+    }
+}
 
 /// Convert an Anthropic MessagesRequest into an OpenAI ResponsesRequest.
 pub fn anthropic_to_responses_request(
@@ -89,6 +101,19 @@ pub fn anthropic_to_responses_request(
 
     let hints = derive_cache_hints(req);
 
+    // GPT-5.x models on the Responses API reject the short `in_memory`
+    // retention tier: "This model is compatible only with 24h extended
+    // prompt caching". When the client asked for caching at all, honor
+    // that intent by escalating the short tier to `24h` for these models
+    // rather than letting the request 400.
+    let prompt_cache_retention = hints.prompt_cache_retention.map(|r| {
+        if r == "in_memory" && crate::util::gpt5_family(&model) {
+            "24h".to_string()
+        } else {
+            r
+        }
+    });
+
     ResponsesRequest {
         model,
         input,
@@ -100,9 +125,13 @@ pub fn anthropic_to_responses_request(
         tools,
         tool_choice: req.tool_choice.as_ref().and_then(convert_tool_choice),
         parallel_tool_calls: None,
-        user: req.metadata.as_ref().and_then(|m| m.user_id.clone()),
+        user: req
+            .metadata
+            .as_ref()
+            .and_then(|m| m.user_id.as_deref())
+            .map(|u| truncate_user(u)),
         prompt_cache_key: hints.prompt_cache_key,
-        prompt_cache_retention: hints.prompt_cache_retention,
+        prompt_cache_retention,
         reasoning: req.thinking.as_ref().and_then(convert_thinking),
         extra: json!({}),
     }
@@ -351,13 +380,28 @@ pub fn responses_to_anthropic_response(
         match resp.status.as_str() {
             "incomplete" => Some("max_tokens".to_string()),
             "completed" => Some("end_turn".to_string()),
-            "failed" => Some("end_turn".to_string()),
+            "failed" => {
+                // If the response carries error details in extra, surface
+                // them as an upstream error rather than silently mapping
+                // to end_turn.
+                let err_msg = resp
+                    .extra
+                    .get("error")
+                    .and_then(|v| v.get("message"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_owned())
+                    .unwrap_or_else(|| "upstream error".to_string());
+                return Err(ProxyError::Upstream {
+                    status: 502,
+                    body: err_msg,
+                });
+            }
             _ => None,
         }
     };
 
-    let cached = resp
-        .usage
+    let usage = resp.usage.clone().unwrap_or_default();
+    let cached = usage
         .input_tokens_details
         .as_ref()
         .map(|d| d.cached_tokens)
@@ -374,8 +418,8 @@ pub fn responses_to_anthropic_response(
         stop_details: None,
         container: None,
         usage: Usage {
-            input_tokens: resp.usage.input_tokens,
-            output_tokens: resp.usage.output_tokens,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: if cached > 0 { Some(cached) } else { None },
             cache_creation: None,
@@ -800,6 +844,83 @@ mod tests {
     }
 
     #[test]
+    fn gpt5_escalates_in_memory_retention_to_24h() {
+        // GPT-5.x rejects `in_memory`: "This model is compatible only
+        // with 24h extended prompt caching". A short-tier cache_control
+        // marker must be escalated to 24h for these models.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "hi",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }],
+            "metadata": {"user_id": "u-1"}
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert_eq!(out.prompt_cache_retention.as_deref(), Some("24h"));
+    }
+
+    #[test]
+    fn gpt5_leaves_24h_retention_unchanged() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "hi",
+                    "cache_control": {"type": "ephemeral_1h"}
+                }]
+            }]
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert_eq!(out.prompt_cache_retention.as_deref(), Some("24h"));
+    }
+
+    #[test]
+    fn non_gpt5_keeps_in_memory_retention() {
+        // A non-gpt-5 Responses model (e.g. rewritten to something else)
+        // must keep the client-requested short tier untouched.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "deepseek-chat",
+            "max_tokens": 64,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "hi",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }]
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert_eq!(out.prompt_cache_retention.as_deref(), Some("in_memory"));
+    }
+
+    #[test]
+    fn no_cache_control_emits_no_retention_even_for_gpt5() {
+        // Without any cache_control marker the field stays absent — the
+        // escalation must not conjure a retention value out of nothing.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert_eq!(out.prompt_cache_retention, None);
+    }
+
+    #[test]
     fn request_with_empty_messages_emits_no_input_items() {
         // Defensive: an empty messages array must serialize cleanly
         // (Responses permits it for stateless prompts).
@@ -874,10 +995,9 @@ mod tests {
     }
 
     #[test]
-    fn response_failed_status_maps_to_end_turn() {
-        // A failed Responses API response (status="failed") still has
-        // a valid Anthropic-side stop_reason; we surface end_turn so
-        // the client doesn't loop on max_tokens or tool_use.
+    fn response_failed_status_returns_upstream_error() {
+        // A failed Responses API response (status="failed") without error
+        // details returns a fallback upstream error.
         let raw = json!({
             "id": "resp_f",
             "object": "response",
@@ -891,8 +1011,36 @@ mod tests {
             "usage": {"input_tokens": 5, "output_tokens": 1, "total_tokens": 6}
         });
         let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
-        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_f").unwrap();
-        assert_eq!(out.stop_reason.as_deref(), Some("end_turn"));
+        let err = responses_to_anthropic_response(&resp, "gpt-5", "msg_f").unwrap_err();
+        assert!(
+            matches!(&err, ProxyError::Upstream { status: 502, .. }),
+            "expected Upstream(502), got: {err}"
+        );
+    }
+
+    #[test]
+    fn response_failed_with_error_details_surfaces_message() {
+        // A failed response with error details in extra should surface
+        // the upstream error message.
+        let raw = json!({
+            "id": "resp_f2",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "failed",
+            "output": [],
+            "usage": {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1},
+            "error": {"code": "rate_limited", "message": "too fast"}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let err = responses_to_anthropic_response(&resp, "gpt-5", "msg_f2").unwrap_err();
+        match &err {
+            ProxyError::Upstream { status, body } => {
+                assert_eq!(*status, 502);
+                assert!(body.contains("too fast"), "body: {body}");
+            }
+            _ => panic!("expected Upstream error, got: {err}"),
+        }
     }
 
     #[test]
@@ -1243,5 +1391,32 @@ mod tests {
         let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
         let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_s").unwrap();
         assert!(out.stop_reason.is_none());
+    }
+
+    #[test]
+    fn truncate_user_truncates_long_strings() {
+        assert_eq!(truncate_user("short"), "short");
+        assert_eq!(truncate_user(""), "");
+        let long = "a".repeat(150);
+        assert_eq!(truncate_user(&long).len(), 64);
+        assert_eq!(truncate_user(&long).chars().count(), 64);
+        // exactly 64 — no truncation needed
+        let exact = "b".repeat(64);
+        assert_eq!(truncate_user(&exact), exact);
+    }
+
+    /// T4: P0-4 regression — multibyte user_id must not panic from byte-
+    /// slicing across a character boundary.
+    #[test]
+    fn truncate_user_handles_multibyte_user_id_without_panic() {
+        let user = "\u{7528}".repeat(30); // 90 bytes, 30 chars
+        let truncated = truncate_user(&user);
+        assert_eq!(truncated.chars().count(), 30);
+        assert!(truncated.is_char_boundary(truncated.len()));
+        // A very long multibyte string that exceeds 64 characters
+        let long_mb = "\u{7528}".repeat(100); // 300 bytes, 100 chars
+        let truncated_long = truncate_user(&long_mb);
+        assert_eq!(truncated_long.chars().count(), 64);
+        assert!(truncated_long.is_char_boundary(truncated_long.len()));
     }
 }

@@ -25,18 +25,6 @@ pub struct CooldownCache {
 /// truncated for the warn log so operator can see *why* a provider
 /// was cooled down without flooding the log or holding onto KB-sized
 /// upstream payloads.
-const LOG_REASON_MAX_CHARS: usize = 200;
-
-/// Truncate `s` to `max_chars` characters, appending an ellipsis marker
-/// when truncated. Operates on char boundaries so multi-byte UTF-8 is
-/// never split mid-codepoint.
-fn truncate_for_log(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    let truncated: String = s.chars().take(max_chars).collect();
-    format!("{truncated}… [+{} chars]", s.chars().count() - max_chars)
-}
 
 impl CooldownCache {
     pub fn new() -> Self {
@@ -77,7 +65,7 @@ impl CooldownCache {
             provider = provider,
             status = status,
             duration_secs = duration.as_secs(),
-            reason = %truncate_for_log(reason, LOG_REASON_MAX_CHARS),
+            reason = %crate::util::summarize_for_log(reason, "<empty body>"),
             "provider marked cooldown"
         );
     }
@@ -221,42 +209,11 @@ mod tests {
         });
     }
 
-    #[test]
-    fn truncate_for_log_passes_through_short_strings() {
-        assert_eq!(truncate_for_log("short", 200), "short");
-        assert_eq!(truncate_for_log("", 200), "");
-    }
-
-    #[test]
-    fn truncate_for_log_truncates_long_strings_with_marker() {
-        let s = "x".repeat(500);
-        let out = truncate_for_log(&s, 200);
-        // 200 chars of 'x' + ellipsis marker + extra count
-        assert!(out.starts_with(&"x".repeat(200)), "got: {out}");
-        assert!(out.contains("…"), "expected ellipsis marker in: {out}");
-        assert!(
-            out.contains("[+300 chars]"),
-            "expected extra-count annotation in: {out}"
-        );
-    }
-
-    #[test]
-    fn truncate_for_log_respects_utf8_char_boundaries() {
-        // 4-byte chars: if we sliced mid-codepoint the function would panic
-        // or produce invalid UTF-8. Verify no panic and that the output
-        // round-trips through String.
-        let s = "🌀".repeat(300);
-        let out = truncate_for_log(&s, 200);
-        assert!(out.contains("…"));
-        // Must be valid UTF-8 (String constructor enforces this; we just
-        // assert the chars we kept are intact).
-        assert!(out.starts_with(&"🌀".repeat(200)));
-    }
 
     #[tokio::test]
     async fn mark_cooldown_does_not_cache_reason_body() {
         // After deleting the `reason` field on `CooldownEntry`, the cache
-        // no longer holds the upstream body — but `truncate_for_log` is
+        // no longer holds the upstream body — `crate::util::summarize_for_log` is
         // still applied to the warn log. We can't easily intercept
         // `tracing::warn!` here without a subscriber; what we *can*
         // assert is that `active()` (the only remaining snapshot
