@@ -192,15 +192,12 @@ async fn count_tokens_handler(
 }
 
 async fn list_models_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let mut models: Vec<serde_json::Value> = state
+    // Start with static config entries.
+    let mut entries: Vec<_> = state
         .config
         .models
         .iter()
         .map(|m| {
-            // display_name uses the model id as a placeholder — static
-            // config has no separate display-name field, and using id
-            // keeps the response shape identical to provider-discovered
-            // entries (which carry the upstream `name` field).
             serde_json::json!({
                 "id": m.name,
                 "object": "model",
@@ -211,37 +208,30 @@ async fn list_models_handler(State(state): State<AppState>) -> impl IntoResponse
         })
         .collect();
 
-    // Collect models from all configured providers (best-effort:
-    // individual provider failures are logged but do not block the
-    // overall listing).
+    // Collect models from all configured providers.
     for provider in state.router.providers().values() {
-        if let Some(provider_models) = provider.list_models().await {
-            models.extend(provider_models);
+        if let Some(models) = provider.list_models().await {
+            entries.extend(models);
         }
     }
 
-    // Reverse-dedup: reverse the list, deduplicate by id (first
-    // occurrence wins, which corresponds to the last occurrence in the
-    // original order), then reverse back. This means later providers
-    // win on id conflict, and static config entries come last in the
-    // final order (they were first in the original order).
-    models.reverse();
-    {
-        let mut seen = std::collections::HashSet::new();
-        models.retain(|m| {
-            let id = m
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            seen.insert(id)
-        });
-    }
-    models.reverse();
+    // Reverse-dedup by id: last occurrence wins.
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    entries.reverse();
+    entries.retain(|m| {
+        let id = m
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        seen.insert(id)
+    });
+    entries.reverse();
 
     Json(serde_json::json!({
         "object": "list",
-        "data": models,
+        "data": entries,
     }))
 }
 
