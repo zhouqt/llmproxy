@@ -77,7 +77,7 @@ impl CooldownCache {
             provider = provider,
             status = status,
             duration_secs = duration.as_secs(),
-            reason = %truncate_for_log(reason, LOG_REASON_MAX_CHARS),
+            reason = %crate::util::summarize_for_log(reason, "<empty body>"),
             "provider marked cooldown"
         );
     }
