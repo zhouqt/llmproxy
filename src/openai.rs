@@ -330,13 +330,70 @@ mod tests {
         let chunk: ChatChunk = serde_json::from_value(body).unwrap();
         assert_eq!(chunk.object, "chat.completion.chunk");
     }
+
+    #[test]
+    fn chat_chunk_accepts_opencode_metadata_line() {
+        let body = serde_json::json!({
+            "choices": [],
+            "x-opencode-type": "inference-cost",
+            "cost": "0.00000000",
+            "normalizedUsage": {"inputTokens": 776, "outputTokens": 1}
+        });
+        let chunk: ChatChunk = serde_json::from_value(body).unwrap();
+        assert!(chunk.id.is_none());
+        assert!(chunk.model.is_none());
+        assert!(chunk.choices.is_empty());
+        assert!(chunk.usage.is_none());
+        assert_eq!(chunk.extra["x-opencode-type"], "inference-cost");
+        assert_eq!(chunk.extra["cost"], "0.00000000");
+        assert_eq!(chunk.extra["normalizedUsage"]["inputTokens"], 776);
+    }
+
+    #[test]
+    fn chat_chunk_accepts_missing_choices() {
+        let body = serde_json::json!({"id": "c", "model": "m"});
+        let chunk: ChatChunk = serde_json::from_value(body).unwrap();
+        assert!(chunk.choices.is_empty());
+    }
+
+    #[test]
+    fn chat_chunk_accepts_minimal_openai_chunk() {
+        let body = serde_json::json!({});
+        let chunk: ChatChunk = serde_json::from_value(body).unwrap();
+        assert!(chunk.id.is_none());
+        assert_eq!(chunk.object, "chat.completion.chunk");
+        assert_eq!(chunk.created, 0);
+        assert!(chunk.model.is_none());
+        assert!(chunk.choices.is_empty());
+        assert!(chunk.usage.is_none());
+    }
+
+    #[test]
+    fn chat_chunk_preserves_extra_fields_alongside_known_fields() {
+        let body = serde_json::json!({
+            "id": "c",
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": null}],
+            "x-opencode-type": "inference-cost"
+        });
+        let chunk: ChatChunk = serde_json::from_value(body).unwrap();
+        assert_eq!(chunk.id.as_deref(), Some("c"));
+        assert_eq!(chunk.model.as_deref(), Some("gpt-4o"));
+        assert!(!chunk.choices.is_empty());
+        assert_eq!(chunk.extra["x-opencode-type"], "inference-cost");
+    }
 }
 
 // ─── Streaming chunks ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatChunk {
-    pub id: String,
+    /// Some upstreams (e.g. OpenCode Zen) emit non-standard SSE
+    /// metadata lines that lack `id`. Tolerate the missing field —
+    /// it is never read by the proxy (translator only uses
+    /// `choices` / `usage` / `object`).
+    #[serde(default)]
+    pub id: Option<String>,
     /// `object` is the OpenAI discriminator (`"chat.completion.chunk"`).
     /// Some upstreams omit it (e.g. GitHub Copilot's SSE chunks).
     /// Tolerate the missing field rather than dropping every chunk on
@@ -348,10 +405,21 @@ pub struct ChatChunk {
     /// Optional so deserialization still succeeds on those streams.
     #[serde(default)]
     pub created: i64,
-    pub model: String,
+    /// Some upstreams (e.g. OpenCode Zen metadata) emit chunks without
+    /// a model. Tolerate; never read by the proxy.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// OpenCode Zen metadata lines use `"choices": []`. Tolerate a
+    /// missing field too, mirroring `ChatRequest`'s extra-bag pattern.
+    #[serde(default)]
     pub choices: Vec<ChunkChoice>,
     #[serde(default)]
     pub usage: Option<ChatUsage>,
+    /// Catch-all for upstream-private fields (e.g. OpenCode Zen's
+    /// `x-opencode-type`, `cost`, `normalizedUsage`). Same pattern as
+    /// `ChatRequest.extra` (`src/openai.rs:69-70`).
+    #[serde(default, flatten)]
+    pub extra: Value,
 }
 
 #[derive(Debug, Clone, Deserialize)]
