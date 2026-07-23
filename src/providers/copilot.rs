@@ -791,6 +791,24 @@ impl Provider for CopilotProvider {
         self.model_rewrite.is_empty() || self.model_rewrite.contains_key(model)
     }
 
+    async fn list_models(&self) -> Option<Vec<serde_json::Value>> {
+        let cached = self.cached_models().await?;
+        Some(
+            cached
+                .iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "id": m.id,
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": m.vendor,
+                        "display_name": m.name,
+                    })
+                })
+                .collect(),
+        )
+    }
+
     async fn complete(
         &self,
         req: &MessagesRequest,
