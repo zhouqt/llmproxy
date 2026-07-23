@@ -33,8 +33,20 @@ const COPILOT_INTERNAL_TOKEN_URL: &str =
 /// instead. Reference: copilot-api-py `endpoint_router.py`. Pure
 /// function so we can call it from both `complete` and `stream`
 /// without sharing provider state.
+///
+/// **Endpoint routing vs. request shaping**: This function uses the
+/// empirical prefix `gpt-5` because Copilot only serves GPT-5.x on
+/// `/responses`. O-series models (o1, o3-mini, o4-mini) must go to
+/// `/chat/completions`. Do NOT use `util::gpt5_family` here — that
+/// predicate is for request shaping (max_completion_tokens, 24h
+/// prompt-cache retention) where o-series IS valid.
 fn endpoint_for_model(model: &str) -> &'static str {
-    if crate::util::gpt5_family(model) {
+    // Copilot's /responses only supports gpt-5.x; the o-series goes to /chat/completions.
+    // is rejected as well (Copilot does not support the o-series for now). If Copilot
+    // ever opens the o-series in /responses, change this line and add an o-series endpoint
+    // and the tests are enough. request.rs / responses.rs keep using util::gpt5_family
+    // do the max_tokens / 24h upgrade -- the o-series really needs the same handling in those two scenarios.
+    if model.starts_with("gpt-5") {
         "responses"
     } else {
         "chat_completions"
@@ -1488,6 +1500,11 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         assert_eq!(endpoint_for_model("gpt-4"), "chat_completions");
         assert_eq!(endpoint_for_model("claude-sonnet-4.6"), "chat_completions");
         assert_eq!(endpoint_for_model(""), "chat_completions");
+        // T25: o-series routes to /chat/completions, not /responses.
+        // endpoint_for_model uses empirical gpt-5 prefix only.
+        assert_eq!(endpoint_for_model("o1"), "chat_completions");
+        assert_eq!(endpoint_for_model("o3-mini"), "chat_completions");
+        assert_eq!(endpoint_for_model("o4-mini"), "chat_completions");
     }
 
     #[test]
