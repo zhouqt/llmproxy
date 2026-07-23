@@ -202,9 +202,6 @@ where
                         for out in t.push_event(&ev) {
                             self.output_buffer.push_back(Self::encode(&out));
                         }
-                        if let Some(raw) = t.take_raw_error() {
-                            self.output_buffer.push_back(Bytes::from(raw));
-                        }
                         if t.finalized {
                             self.finished = true;
                             return;
@@ -1205,6 +1202,7 @@ mod tests {
     /// not `"type_"`, and match the Anthropic error wire shape exactly.
     #[test]
     fn error_event_envelope_uses_type_not_type_under_score() {
+        use crate::anthropic::StreamEvent;
         use crate::conversion::responses_stream::ResponsesStreamTranslator;
         use crate::responses::ResponsesStreamEvent;
 
@@ -1215,8 +1213,15 @@ mod tests {
             param: None,
             extra: serde_json::Value::default(),
         };
-        let _ = t.push_event(&ev);
-        let raw = t.take_raw_error().expect("should have raw error payload");
+        let events = t.push_event(&ev);
+
+        // push_event now returns StreamEvent::Error directly (no bypass).
+        let error_ev = events
+            .iter()
+            .find(|e| matches!(e, StreamEvent::Error { .. }))
+            .expect("should have error event");
+        let payload = serde_json::to_string(error_ev).unwrap();
+        let raw = format!("event: error\ndata: {}\n\n", payload);
 
         assert!(
             raw.starts_with("event: error"),
