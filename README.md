@@ -295,6 +295,14 @@ endpoint (Responses API). All other names go to `/v1/chat/completions`
 as before. No configuration flag is needed — the dispatch happens
 per-request.
 
+Note: only `gpt-5*` model names are routed to `/v1/responses`. Models
+from the `o-series` (`o1*`, `o3*`, `o4*`) continue to use
+`/v1/chat/completions`, since Copilot's Responses endpoint does not
+serve them. The proxy still applies the same request-shape
+adjustments (`max_completion_tokens` instead of `max_tokens`,
+`in_memory` → `24h` cache retention escalation) to o-series on the
+Chat Completions path.
+
 | Field           | Default      | Notes                                                |
 |-----------------|--------------|------------------------------------------------------|
 | `name`          | (required)   | Internal key referenced by `models:`                 |
