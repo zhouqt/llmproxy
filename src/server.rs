@@ -191,6 +191,24 @@ async fn count_tokens_handler(
     Json(serde_json::json!({ "input_tokens": tokens }))
 }
 
+/// Reverse-dedup model entries by `id`: last occurrence wins.
+/// Entries with a missing or empty `id` are filtered out with a warning.
+fn dedup_models_last_wins(entries: &mut Vec<serde_json::Value>) {
+    let mut seen = std::collections::HashSet::new();
+    entries.reverse();
+    entries.retain(|m| {
+        let id = match m.get("id").and_then(|v| v.as_str()) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => {
+                tracing::warn!("model entry has empty or missing id, skipping");
+                return false;
+            }
+        };
+        seen.insert(id)
+    });
+    entries.reverse();
+}
+
 async fn list_models_handler(State(state): State<AppState>) -> impl IntoResponse {
     // Start with static config entries.
     let mut entries: Vec<_> = state
@@ -216,18 +234,7 @@ async fn list_models_handler(State(state): State<AppState>) -> impl IntoResponse
     }
 
     // Reverse-dedup by id: last occurrence wins.
-    use std::collections::HashSet;
-    let mut seen = HashSet::new();
-    entries.reverse();
-    entries.retain(|m| {
-        let id = m
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        seen.insert(id)
-    });
-    entries.reverse();
+    dedup_models_last_wins(&mut entries);
 
     Json(serde_json::json!({
         "object": "list",
@@ -747,5 +754,50 @@ mod tests {
             let body: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(body["type"], "error");
         }
+    }
+
+    #[test]
+    fn dedup_keeps_last_occurrence_for_duplicate_id() {
+        let mut entries = vec![
+            json!({"id": "a", "value": 1}),
+            json!({"id": "b", "value": 2}),
+            json!({"id": "a", "value": 3}),
+        ];
+        dedup_models_last_wins(&mut entries);
+        assert_eq!(entries.len(), 2);
+        // Last occurrence of "a" (value=3) wins; relative order is
+        // the position of each element's last occurrence.
+        assert_eq!(entries[0]["id"], "b");
+        assert_eq!(entries[0]["value"], 2);
+        assert_eq!(entries[1]["id"], "a");
+        assert_eq!(entries[1]["value"], 3);
+    }
+
+    #[test]
+    fn dedup_filters_out_empty_id_entries() {
+        let mut entries = vec![
+            json!({"id": "a"}),
+            json!({"id": ""}),
+            json!({"id": "b"}),
+            json!({"not_id": "c"}),
+        ];
+        dedup_models_last_wins(&mut entries);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["id"], "a");
+        assert_eq!(entries[1]["id"], "b");
+    }
+
+    #[test]
+    fn dedup_preserves_unique_entries() {
+        let mut entries = vec![
+            json!({"id": "a", "created": 1}),
+            json!({"id": "b", "created": 2}),
+            json!({"id": "c", "created": 3}),
+        ];
+        dedup_models_last_wins(&mut entries);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0]["id"], "a");
+        assert_eq!(entries[1]["id"], "b");
+        assert_eq!(entries[2]["id"], "c");
     }
 }
