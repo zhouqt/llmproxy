@@ -962,4 +962,135 @@ mod tests {
             ProxyError::Upstream { status: 400, ref body } if body == "plain text error"
         ));
     }
+
+    #[tokio::test]
+    async fn list_models_returns_normalized_entries_on_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("x-api-key", "test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [
+                    {"id": "model-a", "display_name": "Model A", "created": 1000},
+                    {"id": "model-b", "name": "Model B", "created": 2000},
+                    {"id": "model-c"}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new(
+            "test".to_string(),
+            "test-key".to_string(),
+            server.uri(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let models = provider.list_models().await;
+        let models = models.expect("expected Some(_)");
+        assert_eq!(models.len(), 3);
+
+        assert_eq!(models[0]["id"], "model-a");
+        assert_eq!(models[0]["display_name"], "Model A");
+        assert_eq!(models[0]["owned_by"], "anthropic");
+        assert_eq!(models[0]["created"], 1000);
+
+        assert_eq!(models[1]["id"], "model-b");
+        assert_eq!(models[1]["display_name"], "Model B");
+        assert_eq!(models[1]["owned_by"], "anthropic");
+
+        assert_eq!(models[2]["id"], "model-c");
+        assert_eq!(models[2]["display_name"], "model-c");
+        assert_eq!(models[2]["owned_by"], "anthropic");
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_none_on_non_success_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new(
+            "test".to_string(),
+            "test-key".to_string(),
+            server.uri(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        assert!(provider.list_models().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_none_on_network_error() {
+        let server = MockServer::start().await;
+        let uri = server.uri();
+        drop(server);
+
+        let provider = AnthropicProvider::new(
+            "test".to_string(),
+            "test-key".to_string(),
+            uri,
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        assert!(provider.list_models().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_none_on_malformed_json() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not-json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new(
+            "test".to_string(),
+            "test-key".to_string(),
+            server.uri(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        assert!(provider.list_models().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_none_when_data_field_is_missing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new(
+            "test".to_string(),
+            "test-key".to_string(),
+            server.uri(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        assert!(provider.list_models().await.is_none());
+    }
 }
