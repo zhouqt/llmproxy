@@ -56,6 +56,20 @@ pub trait Provider: Send + Sync {
         let _ = self;
         None
     }
+    /// Return a best-effort list of models served by this upstream.
+    ///
+    /// Providers that have an upstream model-catalog endpoint implement
+    /// this by issuing a GET to that endpoint and normalising the response
+    /// into a stable shape (`id`, `object:"model"`, `created`, `owned_by`,
+    /// `display_name`). Providers without a catalog endpoint return `None`.
+    ///
+    /// Individual provider failures are logged but not propagated — the
+    /// aggregator in `/v1/models` collects whatever each provider can
+    /// produce and moves on.
+    async fn list_models(&self) -> Option<Vec<serde_json::Value>> {
+        let _ = self;
+        None
+    }
 }
 
 pub type SharedProvider = Arc<dyn Provider>;
