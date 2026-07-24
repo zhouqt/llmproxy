@@ -35,6 +35,7 @@ struct TestProvider {
     name: String,
     complete: CompleteBehavior,
     stream: StreamBehavior,
+    models: Option<Vec<serde_json::Value>>,
 }
 
 #[async_trait]
@@ -88,6 +89,10 @@ impl Provider for TestProvider {
             ])))),
         }
     }
+
+    async fn list_models(&self) -> Option<Vec<serde_json::Value>> {
+        self.models.clone()
+    }
 }
 
 fn provider(
@@ -99,6 +104,7 @@ fn provider(
         name: name.to_string(),
         complete,
         stream,
+        models: None,
     })
 }
 
@@ -752,4 +758,133 @@ async fn admin_copilot_auth_requires_authentication() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn list_models_aggregates_static_and_provider_discovered_models() {
+    // Primary provider exposes models via list_models.
+    let primary = Arc::new(TestProvider {
+        name: "primary".to_string(),
+        complete: CompleteBehavior::Json,
+        stream: StreamBehavior::Bytes("unused"),
+        models: Some(vec![
+            json!({"id": "gpt-4o", "owned_by": "openai", "display_name": "GPT-4o"}),
+            json!({"id": "claude-extra", "owned_by": "openai"}),
+        ]),
+    }) as SharedProvider;
+
+    // Backup provider returns 503 and contributes no models.
+    let backup = Arc::new(TestProvider {
+        name: "backup".to_string(),
+        complete: CompleteBehavior::Error(503),
+        stream: StreamBehavior::Bytes("unused"),
+        models: None,
+    }) as SharedProvider;
+
+    let mut providers = HashMap::new();
+    providers.insert("primary".to_string(), primary);
+    providers.insert("backup".to_string(), backup);
+
+    let config = Config {
+        server: ServerConfig {
+            listen: "127.0.0.1:0".to_string(),
+            api_key: Some("test-key".to_string()),
+        },
+        proxy: Default::default(),
+        providers: vec![
+            ProviderConfig::OpenaiCompat {
+                name: "primary".to_string(),
+                api_key: "unused".to_string(),
+                api_base: "http://unused".to_string(),
+                model_rewrite: HashMap::new(),
+                use_proxy: false,
+            },
+            ProviderConfig::OpenaiCompat {
+                name: "backup".to_string(),
+                api_key: "unused".to_string(),
+                api_base: "http://unused".to_string(),
+                model_rewrite: HashMap::new(),
+                use_proxy: false,
+            },
+        ],
+        models: vec![
+            ModelConfig {
+                name: "gpt-4o".to_string(),
+                primary: "primary".to_string(),
+                fallback_chain: vec!["backup".to_string()],
+                cooldown_seconds: 60,
+                max_retries_per_provider: 1,
+                max_retries_total: 2,
+            },
+            ModelConfig {
+                name: "claude-shared".to_string(),
+                primary: "primary".to_string(),
+                fallback_chain: vec![],
+                cooldown_seconds: 60,
+                max_retries_per_provider: 1,
+                max_retries_total: 1,
+            },
+        ],
+        logging: Default::default(),
+    };
+    let config = Arc::new(config);
+    let cooldown = CooldownCache::new();
+    let router = Arc::new(Router::new(config.clone(), providers, cooldown.clone()));
+    let app = llmproxy::server::build_router(AppState {
+        config,
+        router,
+        cooldown,
+        http: reqwest::Client::new(),
+        copilot: None,
+    });
+
+    // Auth gate applies: /v1/models requires authentication.
+    let unauth = app
+        .clone()
+        .oneshot(test_request(Method::GET, "/v1/models", None))
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+    // Authenticated request.
+    let mut req = test_request(Method::GET, "/v1/models", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer test-key".parse().unwrap());
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = body_json(resp).await;
+    assert_eq!(body["object"], "list");
+
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(
+        data.len(),
+        3,
+        "expected 3 entries: gpt-4o, claude-shared, claude-extra"
+    );
+
+    // gpt-4o: provider-discovered wins over static (reverse-dedup keeps
+    // the later occurrence in the original list, which is the provider's).
+    let gpt4o = data
+        .iter()
+        .find(|m| m["id"] == "gpt-4o")
+        .expect("gpt-4o must be present");
+    assert_eq!(
+        gpt4o["owned_by"], "openai",
+        "provider-discovered entry must win dedup collision on id 'gpt-4o'"
+    );
+
+    // claude-shared: static-only, no collision.
+    let shared = data
+        .iter()
+        .find(|m| m["id"] == "claude-shared")
+        .expect("claude-shared must be present");
+    assert_eq!(shared["owned_by"], "llmproxy");
+
+    // claude-extra: from provider only.
+    let extra = data
+        .iter()
+        .find(|m| m["id"] == "claude-extra")
+        .expect("claude-extra must be present");
+    assert_eq!(extra["owned_by"], "openai");
 }
