@@ -57,6 +57,10 @@ impl OpenaiResponsesProvider {
     fn responses_url(&self) -> String {
         format!("{}/responses", self.api_base)
     }
+
+    fn models_url(&self) -> String {
+        format!("{}/models", self.api_base)
+    }
 }
 
 #[async_trait]
@@ -70,6 +74,51 @@ impl Provider for OpenaiResponsesProvider {
         // through verbatim (the upstream has its own model catalog);
         // non-empty = explicit allow-list. See fix-R11.
         self.model_rewrite.is_empty() || self.model_rewrite.contains_key(model)
+    }
+
+    async fn list_models(&self) -> Option<Vec<serde_json::Value>> {
+        let url = self.models_url();
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.api_key)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            tracing::warn!(
+                status = %resp.status(),
+                provider = %self.name,
+                "list_models returned non-success"
+            );
+            return None;
+        }
+        let body: serde_json::Value = resp.json().await.ok()?;
+        let data = body.get("data")?.as_array()?;
+        Some(
+            data.iter()
+                .filter_map(|entry| {
+                    let id = entry.get("id")?.as_str()?;
+                    let owned_by = entry
+                        .get("owned_by")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("openai_responses");
+                    let display_name = entry
+                        .get("display_name")
+                        .or_else(|| entry.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(id);
+                    Some(serde_json::json!({
+                        "id": id,
+                        "object": "model",
+                        "created": entry.get("created").and_then(|v| v.as_i64()).unwrap_or(0),
+                        "owned_by": owned_by,
+                        "display_name": display_name,
+                    }))
+                })
+                .collect(),
+        )
     }
 
     async fn complete(

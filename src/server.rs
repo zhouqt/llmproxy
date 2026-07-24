@@ -17,7 +17,6 @@ use serde_json::json;
 use crate::anthropic::{MessagesRequest, MessagesResponse};
 use crate::error::{ProxyError, Result};
 use crate::extractor::AppJson;
-use crate::providers::copilot::CopilotModel;
 use crate::providers::ProviderOutput;
 use crate::state::AppState;
 use crate::tokenize::estimate_request_tokens;
@@ -192,57 +191,13 @@ async fn count_tokens_handler(
     Json(serde_json::json!({ "input_tokens": tokens }))
 }
 
-/// Merge Copilot-discovered models into the static model list.
-///
-/// * Static entries whose id collides with a Copilot-discovered model are
-///   removed (Copilot wins).
-/// * Intra-Copilot duplicates are deduplicated (first-wins by order).
-/// * Each Copilot entry is mapped to the shape: `{id, object:"model",
-///   created:0, owned_by: vendor, display_name: name}`.
-fn merge_copilot_models(
-    static_entries: Vec<serde_json::Value>,
-    copilot: &[CopilotModel],
-) -> Vec<serde_json::Value> {
-    use std::collections::HashSet;
-
-    let mut copilot_ids: HashSet<String> = HashSet::new();
-    let mut copilot_entries: Vec<serde_json::Value> = Vec::new();
-
-    for m in copilot {
-        if copilot_ids.insert(m.id.clone()) {
-            copilot_entries.push(serde_json::json!({
-                "id": m.id,
-                "object": "model",
-                "created": 0,
-                "owned_by": m.vendor,
-                "display_name": m.name,
-            }));
-        }
-    }
-
-    let kept_static: Vec<serde_json::Value> = static_entries
-        .into_iter()
-        .filter(|m| {
-            let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            !copilot_ids.contains(id)
-        })
-        .collect();
-
-    let mut result = kept_static;
-    result.extend(copilot_entries);
-    result
-}
-
 async fn list_models_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let static_entries: Vec<_> = state
+    // Start with static config entries.
+    let mut entries: Vec<_> = state
         .config
         .models
         .iter()
         .map(|m| {
-            // display_name uses the model id as a placeholder — static
-            // config has no separate display-name field, and using id
-            // keeps the response shape identical to Copilot-discovered
-            // entries (which carry the upstream `name` field).
             serde_json::json!({
                 "id": m.name,
                 "object": "model",
@@ -253,19 +208,30 @@ async fn list_models_handler(State(state): State<AppState>) -> impl IntoResponse
         })
         .collect();
 
-    let models = if let Some(cp) = &state.copilot {
-        if let Some(copilot_models) = cp.cached_models().await {
-            merge_copilot_models(static_entries, &copilot_models)
-        } else {
-            static_entries
+    // Collect models from all configured providers.
+    for provider in state.router.providers().values() {
+        if let Some(models) = provider.list_models().await {
+            entries.extend(models);
         }
-    } else {
-        static_entries
-    };
+    }
+
+    // Reverse-dedup by id: last occurrence wins.
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    entries.reverse();
+    entries.retain(|m| {
+        let id = m
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        seen.insert(id)
+    });
+    entries.reverse();
 
     Json(serde_json::json!({
         "object": "list",
-        "data": models,
+        "data": entries,
     }))
 }
 
@@ -331,7 +297,6 @@ async fn admin_copilot_auth_handler(State(state): State<AppState>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::copilot::CopilotModel;
     use futures_util::stream;
     use std::pin::Pin;
 
@@ -479,112 +444,6 @@ mod tests {
     fn fresh_mapped_helper_is_not_done() {
         let s = fresh_mapped();
         assert!(!s.done);
-    }
-
-    // ──────────────────────────────────────────────────────────────────
-    // merge_copilot_models
-    // ──────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn merge_copilot_models_dedup_static_with_copilot() {
-        let static_entries = vec![serde_json::json!({
-            "id": "gpt-4",
-            "object": "model",
-            "created": 0,
-            "owned_by": "llmproxy",
-        })];
-        let copilot = vec![CopilotModel {
-            id: "gpt-4".to_string(),
-            name: "GPT-4".to_string(),
-            vendor: "OpenAI".to_string(),
-        }];
-        let result = merge_copilot_models(static_entries, &copilot);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0]["id"], "gpt-4");
-        assert_eq!(result[0]["owned_by"], "OpenAI");
-        assert_eq!(result[0]["display_name"], "GPT-4");
-    }
-
-    #[test]
-    fn merge_copilot_models_keeps_non_colliding_static() {
-        let static_entries = vec![serde_json::json!({
-            "id": "local-1",
-            "object": "model",
-            "created": 0,
-            "owned_by": "llmproxy",
-        })];
-        let copilot = vec![CopilotModel {
-            id: "gpt-4".to_string(),
-            name: "GPT-4".to_string(),
-            vendor: "OpenAI".to_string(),
-        }];
-        let result = merge_copilot_models(static_entries, &copilot);
-        assert_eq!(result.len(), 2);
-        // static entry comes first, then copilot entry.
-        assert_eq!(result[0]["id"], "local-1");
-        assert_eq!(result[0]["owned_by"], "llmproxy");
-        assert_eq!(result[1]["id"], "gpt-4");
-        assert_eq!(result[1]["owned_by"], "OpenAI");
-    }
-
-    #[test]
-    fn merge_copilot_models_empty_cache_passthrough() {
-        let static_entries = vec![serde_json::json!({
-            "id": "local-1",
-            "object": "model",
-            "created": 0,
-            "owned_by": "llmproxy",
-        })];
-        let copilot: Vec<CopilotModel> = vec![];
-        let result = merge_copilot_models(static_entries.clone(), &copilot);
-        assert_eq!(result, static_entries);
-    }
-
-    #[test]
-    fn merge_copilot_models_dedupes_intra_copilot_duplicates() {
-        let static_entries: Vec<serde_json::Value> = vec![];
-        let copilot = vec![
-            CopilotModel {
-                id: "dup".to_string(),
-                name: "First".to_string(),
-                vendor: "v1".to_string(),
-            },
-            CopilotModel {
-                id: "dup".to_string(),
-                name: "Second".to_string(),
-                vendor: "v2".to_string(),
-            },
-        ];
-        let result = merge_copilot_models(static_entries, &copilot);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0]["id"], "dup");
-        // First wins.
-        assert_eq!(result[0]["owned_by"], "v1");
-        assert_eq!(result[0]["display_name"], "First");
-    }
-
-    #[test]
-    fn merge_copilot_models_includes_display_name_on_every_entry() {
-        // Static entries carry display_name from list_models_handler;
-        // Copilot entries get it from the upstream name field.
-        // Every entry in the merged result must have the key.
-        let static_entries = vec![serde_json::json!({
-            "id": "local-1",
-            "display_name": "local-1",
-        })];
-        let copilot = vec![CopilotModel {
-            id: "gpt-4".to_string(),
-            name: "GPT-4".to_string(),
-            vendor: "OpenAI".to_string(),
-        }];
-        let result = merge_copilot_models(static_entries, &copilot);
-        assert_eq!(result.len(), 2);
-        for entry in &result {
-            assert!(
-                entry.get("display_name").is_some(),
-                "every entry must have a display_name key; missing in {entry}"
-            );
-        }
     }
 
     // ──────────────────────────────────────────────────────────────────
