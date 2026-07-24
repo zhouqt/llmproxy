@@ -74,6 +74,10 @@ impl Router {
         &self.cooldown
     }
 
+    pub fn providers(&self) -> &HashMap<String, SharedProvider> {
+        &self.providers
+    }
+
     pub fn find_model(&self, name: &str) -> Option<&ModelConfig> {
         self.cfg.find_model(name)
     }

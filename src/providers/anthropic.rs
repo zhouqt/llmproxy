@@ -56,6 +56,11 @@ impl AnthropicProvider {
         format!("{}/v1/messages", stripped)
     }
 
+    fn models_url(&self) -> String {
+        let stripped = self.api_base.trim_end_matches("/v1");
+        format!("{}/v1/models", stripped)
+    }
+
     fn merged_rewrite<'a>(
         &'a self,
         runtime: &'a HashMap<String, String>,
@@ -121,6 +126,49 @@ impl AnthropicProvider {
 impl Provider for AnthropicProvider {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    async fn list_models(&self) -> Option<Vec<serde_json::Value>> {
+        let url = self.models_url();
+        let resp = self
+            .http
+            .get(&url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("accept", "application/json")
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            tracing::warn!(
+                status = %resp.status(),
+                provider = %self.name,
+                "list_models returned non-success"
+            );
+            return None;
+        }
+        let body: serde_json::Value = resp.json().await.ok()?;
+        let data = body.get("data")?.as_array()?;
+        Some(
+            data.iter()
+                .filter_map(|entry| {
+                    let id = entry.get("id")?.as_str()?;
+                    let display_name = entry
+                        .get("display_name")
+                        .or_else(|| entry.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(id);
+                    let created = entry.get("created").and_then(|v| v.as_i64()).unwrap_or(0);
+                    Some(serde_json::json!({
+                        "id": id,
+                        "object": "model",
+                        "created": created,
+                        "owned_by": "anthropic",
+                        "display_name": display_name,
+                    }))
+                })
+                .collect(),
+        )
     }
 
     async fn complete(
