@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use crate::anthropic::{
@@ -132,8 +132,17 @@ pub fn anthropic_to_responses_request(
             .map(|u| truncate_user(u)),
         prompt_cache_key: hints.prompt_cache_key,
         prompt_cache_retention,
-        reasoning: req.thinking.as_ref().and_then(convert_thinking),
-        extra: json!({}),
+        reasoning: req.output_config.as_ref()
+            .and_then(|oc| oc.effort.clone())
+            .map(|e| ReasoningConfig::Enabled { effort: Some(e) })
+            .or_else(|| req.thinking.as_ref().and_then(convert_thinking)),
+        extra: {
+            let mut e = Value::Object(Map::new());
+            if let Some(fmt) = req.output_config.as_ref().and_then(|oc| oc.format.as_ref()) {
+                e["text"] = json!({"format": fmt.clone()});
+            }
+            e
+        },
     }
 }
 
@@ -1458,5 +1467,83 @@ mod tests {
         let truncated_long = truncate_user(&long_mb);
         assert_eq!(truncated_long.chars().count(), 64);
         assert!(truncated_long.is_char_boundary(truncated_long.len()));
+    }
+
+    #[test]
+    fn propagates_output_config_format_into_text_and_keeps_typed_reasoning() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "respond in json"}],
+            "output_config": {
+                "format": {"type": "json_schema", "schema": {
+                    "type": "object",
+                    "properties": {"ok": {"type": "boolean"}, "reason": {"type": "string"}},
+                    "required": ["ok", "reason"]
+                }},
+                "effort": "medium"
+            }
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert_eq!(
+            out.extra.get("text")
+                .and_then(|v| v.get("format"))
+                .and_then(|v| v.get("type"))
+                .and_then(|v| v.as_str()),
+            Some("json_schema")
+        );
+        assert!(matches!(
+            out.reasoning.as_ref(),
+            Some(ReasoningConfig::Enabled { effort: Some(e) }) if e == "medium"
+        ));
+    }
+
+    #[test]
+    fn output_config_with_only_format_does_not_set_reasoning() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "respond in json"}],
+            "output_config": {
+                "format": {"type": "json_object"}
+            }
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert!(out.extra.get("text").is_some());
+        assert!(out.reasoning.is_none());
+    }
+
+    #[test]
+    fn output_config_absent_leaves_extra_and_reasoning_empty() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert!(out.extra.as_object().unwrap().is_empty());
+        assert!(out.reasoning.is_none());
+    }
+
+    #[test]
+    fn output_config_effort_overrides_thinking_budget_derivation() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "reason about this"}],
+            "thinking": {"type": "enabled", "budget_tokens": 8000},
+            "output_config": {
+                "effort": "low"
+            }
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert!(matches!(
+            out.reasoning.as_ref(),
+            Some(ReasoningConfig::Enabled { effort: Some(e) }) if e == "low"
+        ));
     }
 }

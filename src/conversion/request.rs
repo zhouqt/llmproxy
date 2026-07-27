@@ -2,7 +2,7 @@
 //!
 //! Reference: copilot-api-py/src/routes/messages/non_stream_translation.py:36-286
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::anthropic::{
     ContentBlock, Message, MessageContent, MessagesRequest, SystemPrompt, ToolChoice,
@@ -98,10 +98,18 @@ pub fn anthropic_to_openai_request(
             .as_ref()
             .and_then(|m| m.user_id.as_deref())
             .map(|u| crate::conversion::responses::truncate_user(u)),
-        reasoning_effort: extract_reasoning_effort(req),
+        reasoning_effort: req.output_config.as_ref()
+            .and_then(|oc| oc.effort.clone())
+            .or_else(|| extract_reasoning_effort(req)),
         prompt_cache_key: hints.prompt_cache_key,
         prompt_cache_retention,
-        extra: json!({}),
+        extra: {
+            let mut e = Value::Object(Map::new());
+            if let Some(fmt) = req.output_config.as_ref().and_then(|oc| oc.format.as_ref()) {
+                e["response_format"] = fmt.clone();
+            }
+            e
+        },
     }
 }
 
@@ -834,5 +842,60 @@ mod tests {
             None,
             "non-gpt-5 must not emit max_completion_tokens"
         );
+    }
+
+    #[test]
+    fn propagates_output_config_format_to_response_format_and_effort_to_typed_field() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "respond in json"}],
+            "output_config": {
+                "format": {"type": "json_schema", "schema": {
+                    "type": "object",
+                    "properties": {"ok": {"type": "boolean"}},
+                    "required": ["ok"]
+                }},
+                "effort": "high"
+            }
+        }))
+        .unwrap();
+        let out = anthropic_to_openai_request(&req, &Default::default());
+        assert_eq!(
+            out.extra.get("response_format")
+                .and_then(|v| v.get("type"))
+                .and_then(|v| v.as_str()),
+            Some("json_schema")
+        );
+        assert_eq!(out.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn output_config_absent_leaves_extra_empty_and_no_effort() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let out = anthropic_to_openai_request(&req, &Default::default());
+        assert!(out.extra.as_object().unwrap().is_empty());
+        assert!(out.reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn output_config_effort_overrides_thinking_derivation() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "reason about this"}],
+            "thinking": {"type": "enabled", "budget_tokens": 8000},
+            "output_config": {
+                "effort": "low"
+            }
+        }))
+        .unwrap();
+        let out = anthropic_to_openai_request(&req, &Default::default());
+        assert_eq!(out.reasoning_effort.as_deref(), Some("low"));
     }
 }
