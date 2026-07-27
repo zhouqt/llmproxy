@@ -106,10 +106,102 @@ pub fn anthropic_to_openai_request(
         extra: {
             let mut e = Value::Object(Map::new());
             if let Some(fmt) = req.output_config.as_ref().and_then(|oc| oc.format.as_ref()) {
-                e["response_format"] = fmt.clone();
+                e["response_format"] = ensure_chat_json_schema_name(fmt);
             }
             e
         },
+    }
+}
+
+/// OpenAI Chat Completions requires `response_format.json_schema.name` on
+/// `json_schema` shapes; Anthropic's `output_config.format` is a flat
+/// `{type: "json_schema", schema: {...}}` with no `json_schema` wrapper and no
+/// `name`. Wrap the schema and synthesize `name` (stable default) plus
+/// `strict: true` so the schema constraint round-trips and is enforced.
+fn ensure_chat_json_schema_name(fmt: &Value) -> Value {
+    if fmt.get("type").and_then(|v| v.as_str()) != Some("json_schema") {
+        return fmt.clone();
+    }
+    let Some(obj) = fmt.as_object() else {
+        return fmt.clone();
+    };
+    let mut out = obj.clone();
+
+    // If json_schema wrapper already exists, just fill in name/strict if absent.
+    if let Some(j) = out.get("json_schema").and_then(|v| v.as_object()).cloned() {
+        let mut j = j;
+        if let Some(s) = j.get("schema").cloned() {
+            let mut s = s;
+            strictify_schema(&mut s);
+            j.insert("schema".to_string(), s);
+        }
+        j.entry("name".to_string())
+            .or_insert(json!("structured_output"));
+        j.entry("strict".to_string()).or_insert(json!(true));
+        out.insert("json_schema".to_string(), Value::Object(j));
+        return Value::Object(out);
+    }
+
+    // Anthropic-style flat: lift `schema` (and any top-level `name`) into a
+    // json_schema wrapper. Top-level `name` is honored so a future Anthropic
+    // schema-name field isn't silently dropped.
+    let schema = out.remove("schema").map(|mut s| {
+        strictify_schema(&mut s);
+        s
+    });
+    let top_name = out.remove("name");
+    let mut inner = serde_json::Map::new();
+    inner.insert(
+        "name".to_string(),
+        top_name.unwrap_or_else(|| json!("structured_output")),
+    );
+    inner.insert("strict".to_string(), json!(true));
+    if let Some(s) = schema {
+        inner.insert("schema".to_string(), s);
+    }
+    out.insert("json_schema".to_string(), Value::Object(inner));
+    Value::Object(out)
+}
+
+/// Recursively make a JSON Schema compliant with OpenAI Chat Completions
+/// strict mode: every object level gets `additionalProperties: false` and
+/// `required` populated with every property key. Mirrors litellm's
+/// `_add_additional_properties_false` (litellm/llms/anthropic/experimental_pass_through/adapters/transformation.py:823-855`).
+fn strictify_schema(schema: &mut Value) {
+    let Value::Object(obj) = schema else { return };
+    let is_object = obj.get("type").and_then(|v| v.as_str()) == Some("object")
+        && obj.contains_key("properties");
+    if is_object {
+        obj.insert("additionalProperties".to_string(), Value::Bool(false));
+        let keys: Option<Vec<Value>> = obj
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .map(|p| p.keys().map(|k| Value::String(k.clone())).collect());
+        if let Some(keys) = keys {
+            obj.insert("required".to_string(), Value::Array(keys));
+        }
+        if let Some(Value::Object(p)) = obj.get_mut("properties") {
+            for (_, v) in p.iter_mut() {
+                strictify_schema(v);
+            }
+        }
+    }
+    if let Some(items) = obj.get_mut("items") {
+        strictify_schema(items);
+    }
+    for key in ["anyOf", "oneOf", "allOf"] {
+        if let Some(Value::Array(arr)) = obj.get_mut(key) {
+            for sub in arr.iter_mut() {
+                strictify_schema(sub);
+            }
+        }
+    }
+    for key in ["$defs", "definitions"] {
+        if let Some(Value::Object(map)) = obj.get_mut(key) {
+            for (_, v) in map.iter_mut() {
+                strictify_schema(v);
+            }
+        }
     }
 }
 
@@ -861,12 +953,13 @@ mod tests {
         }))
         .unwrap();
         let out = anthropic_to_openai_request(&req, &Default::default());
-        assert_eq!(
-            out.extra.get("response_format")
-                .and_then(|v| v.get("type"))
-                .and_then(|v| v.as_str()),
-            Some("json_schema")
-        );
+        let resp_format = out.extra.get("response_format").unwrap();
+        assert_eq!(resp_format.get("type").and_then(|v| v.as_str()), Some("json_schema"));
+        // Anthropic doesn't carry a schema name; OpenAI requires one inside
+        // the nested json_schema object. Synthesized default + strict: true.
+        let inner = resp_format.get("json_schema").unwrap();
+        assert_eq!(inner.get("name").and_then(|v| v.as_str()), Some("structured_output"));
+        assert_eq!(inner.get("strict").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(out.reasoning_effort.as_deref(), Some("high"));
     }
 
@@ -897,5 +990,124 @@ mod tests {
         .unwrap();
         let out = anthropic_to_openai_request(&req, &Default::default());
         assert_eq!(out.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn output_config_format_with_existing_name_is_preserved() {
+        // If the client already supplied a `name` (e.g. via a future Anthropic
+        // schema field), we must not overwrite it. The synthesizer is an
+        // additive shim, not a rewriter.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "x"}],
+            "output_config": {
+                "format": {"type": "json_schema", "name": "my_schema", "schema": {"type": "object"}}
+            }
+        }))
+        .unwrap();
+        let out = anthropic_to_openai_request(&req, &Default::default());
+        let resp_format = out.extra.get("response_format").unwrap();
+        let inner = resp_format.get("json_schema").unwrap();
+        assert_eq!(inner.get("name").and_then(|v| v.as_str()), Some("my_schema"));
+    }
+
+    #[test]
+    fn output_config_format_with_optional_properties_is_strictified() {
+        // Claude Code's Stop-hook schema declares `impossible` as optional.
+        // OpenAI Chat Completions strict mode requires every property in
+        // `properties` to appear in `required`. The translator must rewrite the
+        // schema (litellm parity).
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "x"}],
+            "output_config": {
+                "format": {"type": "json_schema", "schema": {
+                    "type": "object",
+                    "properties": {
+                        "ok": {"type": "boolean"},
+                        "reason": {"type": "string"},
+                        "impossible": {"type": "boolean"}
+                    },
+                    "required": ["ok", "reason"]
+                }}
+            }
+        })).unwrap();
+        let out = anthropic_to_openai_request(&req, &Default::default());
+        let inner = out.extra.get("response_format").and_then(|v| v.get("json_schema")).unwrap();
+        assert_eq!(inner.get("name").and_then(|v| v.as_str()), Some("structured_output"));
+        assert_eq!(inner.get("strict").and_then(|v| v.as_bool()), Some(true));
+        let schema = inner.get("schema").unwrap();
+        let required = schema.get("required").and_then(|v| v.as_array()).unwrap();
+        let required: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(required.contains(&"impossible"), "optional property must be promoted to required under strict mode");
+        assert_eq!(schema.get("additionalProperties").and_then(|v| v.as_bool()), Some(false));
+    }
+
+    #[test]
+    fn strictify_schema_reaches_into_nested_object_properties() {
+        // Recursion check: strictify must descend into nested object
+        // properties, into `items` of arrays, and rewrite each nested object
+        // (adding additionalProperties: false and promoting its properties to
+        // `required`).
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "x"}],
+            "output_config": {
+                "format": {"type": "json_schema", "schema": {
+                    "type": "object",
+                    "properties": {
+                        "user": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "name": {"type": "string"}
+                            }
+                        },
+                        "tags": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": {"type": "string"}
+                                }
+                            }
+                        }
+                    }
+                }}
+            }
+        })).unwrap();
+        let out = anthropic_to_openai_request(&req, &Default::default());
+        let inner = out.extra.get("response_format").and_then(|v| v.get("json_schema")).unwrap();
+        let schema = inner.get("schema").unwrap();
+
+        // Top-level: all keys promoted to required, additionalProperties: false.
+        let top_required = schema.get("required").and_then(|v| v.as_array()).unwrap();
+        let top_required: Vec<&str> = top_required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(top_required.contains(&"user"), "top-level required must include `user`");
+        assert!(top_required.contains(&"tags"), "top-level required must include `tags`");
+        assert_eq!(schema.get("additionalProperties").and_then(|v| v.as_bool()), Some(false));
+
+        // Nested object property `user` must be rewritten in place.
+        let props = schema.get("properties").unwrap();
+        let user = props.get("user").unwrap();
+        assert_eq!(user.get("type").and_then(|v| v.as_str()), Some("object"));
+        assert_eq!(user.get("additionalProperties").and_then(|v| v.as_bool()), Some(false));
+        let user_required = user.get("required").and_then(|v| v.as_array()).unwrap();
+        let user_required: Vec<&str> = user_required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(user_required.contains(&"id"));
+        assert!(user_required.contains(&"name"));
+
+        // Array `items` (a nested object) must also be rewritten.
+        let tags = props.get("tags").unwrap();
+        assert_eq!(tags.get("type").and_then(|v| v.as_str()), Some("array"));
+        let items = tags.get("items").unwrap();
+        assert_eq!(items.get("type").and_then(|v| v.as_str()), Some("object"));
+        assert_eq!(items.get("additionalProperties").and_then(|v| v.as_bool()), Some(false));
+        let items_required = items.get("required").and_then(|v| v.as_array()).unwrap();
+        let items_required: Vec<&str> = items_required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(items_required.contains(&"label"));
     }
 }

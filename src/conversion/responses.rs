@@ -139,11 +139,30 @@ pub fn anthropic_to_responses_request(
         extra: {
             let mut e = Value::Object(Map::new());
             if let Some(fmt) = req.output_config.as_ref().and_then(|oc| oc.format.as_ref()) {
-                e["text"] = json!({"format": fmt.clone()});
+                e["text"] = json!({"format": ensure_json_schema_name(fmt)});
             }
             e
         },
     }
+}
+
+/// OpenAI Responses API requires `text.format.name` on `json_schema` shapes;
+/// Anthropic's `output_config.format` doesn't carry one. Synthesize a stable
+/// default so the schema constraint round-trips, and pin `strict: true` so the
+/// model is held to the schema (matches Anthropic's enforcement semantics).
+fn ensure_json_schema_name(fmt: &Value) -> Value {
+    let needs_name = fmt.get("type").and_then(|v| v.as_str()) == Some("json_schema")
+        && fmt.get("name").is_none();
+    if !needs_name {
+        return fmt.clone();
+    }
+    let Some(obj) = fmt.as_object() else {
+        return fmt.clone();
+    };
+    let mut out = obj.clone();
+    out.entry("name".to_string()).or_insert(json!("structured_output"));
+    out.entry("strict".to_string()).or_insert(json!(true));
+    Value::Object(out)
 }
 
 fn convert_message(m: &crate::anthropic::Message) -> Vec<ResponseInputItem> {
@@ -1486,13 +1505,12 @@ mod tests {
         }))
         .unwrap();
         let out = anthropic_to_responses_request(&req, &Default::default());
-        assert_eq!(
-            out.extra.get("text")
-                .and_then(|v| v.get("format"))
-                .and_then(|v| v.get("type"))
-                .and_then(|v| v.as_str()),
-            Some("json_schema")
-        );
+        let text_format = out.extra.get("text").and_then(|v| v.get("format")).unwrap();
+        assert_eq!(text_format.get("type").and_then(|v| v.as_str()), Some("json_schema"));
+        // Anthropic doesn't carry a schema name; OpenAI requires one. The
+        // translator synthesizes a stable default and pins strict: true.
+        assert_eq!(text_format.get("name").and_then(|v| v.as_str()), Some("structured_output"));
+        assert_eq!(text_format.get("strict").and_then(|v| v.as_bool()), Some(true));
         assert!(matches!(
             out.reasoning.as_ref(),
             Some(ReasoningConfig::Enabled { effort: Some(e) }) if e == "medium"
