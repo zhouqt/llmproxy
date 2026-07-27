@@ -418,7 +418,7 @@ pub fn responses_to_anthropic_response(
         stop_details: None,
         container: None,
         usage: Usage {
-            input_tokens: usage.input_tokens,
+            input_tokens: usage.input_tokens.saturating_sub(cached),
             output_tokens: usage.output_tokens,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: if cached > 0 { Some(cached) } else { None },
@@ -609,6 +609,46 @@ mod tests {
         let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
         let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_1").unwrap();
         assert_eq!(out.usage.cache_read_input_tokens, Some(7));
+    }
+
+    /// Bug repro: OpenAI Responses `input_tokens` is the *total* tokens
+    /// processed INCLUDING the cached portion (the documented
+    /// `input_tokens_details.cached_tokens` field is a subset of it).
+    /// Anthropic's `Usage.input_tokens` is by spec the *non-cached*
+    /// portion, while `cache_read_input_tokens` reports the cached
+    /// portion separately. The Anthropic SDK sums the two fields to
+    /// estimate context size, so passing `input_tokens` through
+    /// unchanged double-counts the cached subset.
+    ///
+    /// Observed in production (Claude Code session `z-landscape-admin`
+    /// against Copilot gpt-5.5 on 2026-07-27): the reported context
+    /// converges to ~165–167k tokens right before each auto-compact,
+    /// which is roughly 1.8x the real context (the actual context at
+    /// those moments was only ~80–93k tokens).
+    #[test]
+    fn input_tokens_excludes_cached_subset() {
+        let raw = json!({
+            "id": "resp_dup",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [{"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+                        "content": [{"type": "output_text", "text": "ok"}]}],
+            "usage": {"input_tokens": 100, "output_tokens": 10, "total_tokens": 110,
+                      "input_tokens_details": {"cached_tokens": 60}}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_dup").unwrap();
+        // Anthropic.input_tokens must be the non-cached portion: 100 - 60 = 40.
+        // Without the fix the translator returns 100 and Claude Code reads
+        // context as 100 + 60 = 160 instead of the actual 100.
+        assert_eq!(
+            out.usage.input_tokens, 40,
+            "input_tokens must be non-cached only (input - cached); got {}, expected 40",
+            out.usage.input_tokens
+        );
+        assert_eq!(out.usage.cache_read_input_tokens, Some(60));
     }
 
     // silence unused warnings for the helper kept to ensure imports stay live

@@ -112,20 +112,27 @@ impl StreamTranslator {
             .and_then(|r| map_stop_reason(r).ok().flatten())
             .unwrap_or_else(|| "end_turn".to_string());
 
-        let usage = self.final_usage.as_ref().map(|u| Usage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: u
+        let usage = self.final_usage.as_ref().map(|u| {
+            let cached = u
                 .prompt_tokens_details
                 .as_ref()
                 .and_then(|d| d.cached_tokens)
-                .filter(|&n| n > 0),
-            cache_creation: None,
-            server_tool_use: None,
-            output_tokens_details: None,
-            service_tier: None,
-            inference_geo: None,
+                .unwrap_or(0);
+            Usage {
+                input_tokens: u.prompt_tokens.saturating_sub(cached),
+                output_tokens: u.completion_tokens,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: u
+                    .prompt_tokens_details
+                    .as_ref()
+                    .and_then(|d| d.cached_tokens)
+                    .filter(|&n| n > 0),
+                cache_creation: None,
+                server_tool_use: None,
+                output_tokens_details: None,
+                service_tier: None,
+                inference_geo: None,
+            }
         });
 
         out.push(StreamEvent::MessageDelta {
@@ -547,6 +554,54 @@ mod tests {
             }
         });
         assert_eq!(usage.as_ref().and_then(|u| u.cache_read_input_tokens), Some(2));
+    }
+
+    /// Bug repro for Chat Completions streaming path — mirrors
+    /// `response.rs::input_tokens_excludes_cached_in_chat_completions`.
+    /// The streaming translator's `message_delta` `usage` must report
+    /// the non-cached portion as `input_tokens`; otherwise Claude Code
+    /// double-counts the cached subset and triggers auto-compact
+    /// prematurely.
+    #[test]
+    fn input_tokens_in_stream_finalize_excludes_cached_subset() {
+        let mut t = StreamTranslator::new("msg_1", "m");
+        let chunk: ChatChunk = serde_json::from_value(serde_json::json!({
+            "id": "c", "object": "chat.completion.chunk", "created": 0, "model": "m",
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "truncated"},
+                "finish_reason": "length"
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "total_tokens": 110,
+                "prompt_tokens_details": {"cached_tokens": 60}
+            }
+        }))
+        .unwrap();
+        let mut events = t.push_chunk(&chunk);
+        events.extend(t.finalize());
+
+        let usage = events
+            .iter()
+            .rev()
+            .find_map(|e| {
+                if let StreamEvent::MessageDelta { usage, .. } = e {
+                    usage.clone()
+                } else {
+                    None
+                }
+            })
+            .expect("finalize should emit MessageDelta with usage");
+        // Anthropic.input_tokens must be the non-cached portion: 100 - 60 = 40.
+        assert_eq!(
+            usage.input_tokens, 40,
+            "input_tokens must be non-cached only (prompt - cached); got {}, expected 40",
+            usage.input_tokens
+        );
+        assert_eq!(usage.cache_read_input_tokens, Some(60));
+        assert_eq!(usage.output_tokens, 10);
     }
 
     #[test]
