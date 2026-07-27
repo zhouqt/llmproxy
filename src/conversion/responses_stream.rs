@@ -345,8 +345,9 @@ impl ResponsesStreamTranslator {
             stop_reason
         };
         let raw = self.final_usage.take().unwrap_or_default();
+        let cached = raw.input_tokens_details.as_ref().map(|d| d.cached_tokens).unwrap_or(0);
         let usage = Some(Usage {
-            input_tokens: raw.input_tokens,
+            input_tokens: raw.input_tokens.saturating_sub(cached),
             output_tokens: raw.output_tokens,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: raw
@@ -410,7 +411,7 @@ fn output_item_to_block(item: &OutputItem) -> ResponseBlock {
 mod tests {
     use super::*;
     use crate::responses::{
-        OutputContentPart, ResponsesResponse, ResponsesUsage,
+        InputTokensDetails, OutputContentPart, ResponsesResponse, ResponsesUsage,
     };
     use serde_json::json;
 
@@ -632,6 +633,48 @@ mod tests {
             assert_eq!(usage.input_tokens, 10);
             assert_eq!(usage.output_tokens, 5);
         }
+    }
+
+    /// Bug repro for the streaming path — see the matching non-streaming
+    /// test in `responses.rs::input_tokens_excludes_cached_subset` for the
+    /// full rationale. The same fix (`input_tokens - cached`) must apply
+    /// to the streaming translator's final MessageDelta, otherwise
+    /// Claude Code receives a `message_delta` event whose `usage` over-
+    /// counts cached tokens and the harness triggers auto-compact
+    /// prematurely.
+    #[test]
+    fn input_tokens_in_final_delta_excludes_cached_subset() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let mut resp = placeholder_response("completed");
+        resp.usage = Some(ResponsesUsage {
+            input_tokens: 100,
+            output_tokens: 10,
+            total_tokens: 110,
+            input_tokens_details: Some(InputTokensDetails { cached_tokens: 60 }),
+            output_tokens_details: None,
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(resp),
+        });
+        let tail = t.finalize();
+        let usage = tail
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { usage, .. } => usage.as_ref(),
+                _ => None,
+            })
+            .expect("finalize must emit a MessageDelta with usage");
+        // Anthropic.input_tokens must be the non-cached portion: 100 - 60 = 40.
+        assert_eq!(
+            usage.input_tokens, 40,
+            "input_tokens must be non-cached only (input - cached); got {}, expected 40",
+            usage.input_tokens
+        );
+        assert_eq!(usage.cache_read_input_tokens, Some(60));
+        assert_eq!(usage.output_tokens, 10);
     }
 
     #[test]
