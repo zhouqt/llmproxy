@@ -142,6 +142,9 @@ impl ResponsesStreamTranslator {
             }
             ResponsesStreamEvent::ResponseOutputItemAdded { output_index, item } => {
                 self.ensure_started(&mut out);
+                if matches!(item, OutputItem::Unknown) {
+                    return out;
+                }
                 if let OutputItem::FunctionCall { id, .. } = item {
                     self.has_tool_calls = true;
                     self.fc_item_index.insert(id.clone(), *output_index);
@@ -1028,10 +1031,7 @@ mod tests {
     }
 
     #[test]
-    fn output_item_added_with_unknown_item_opens_empty_text_block() {
-        // An unrecognized OutputItem type maps to an empty Text block
-        // (output_item_to_block Unknown arm) so the block
-        // accounting stays balanced even for item types we don't model.
+    fn output_item_added_with_unknown_item_is_ignored() {
         let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
         let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
             response: Box::new(placeholder_response("in_progress")),
@@ -1040,16 +1040,56 @@ mod tests {
             output_index: 0,
             item: OutputItem::Unknown,
         });
-        assert_eq!(evs.len(), 1);
-        match &evs[0] {
-            StreamEvent::ContentBlockStart { index: 0, content_block } => {
-                match content_block {
-                    ResponseBlock::Text { text, .. } => assert!(text.is_empty()),
-                    _ => panic!("expected empty Text block"),
-                }
-            }
-            _ => panic!("expected ContentBlockStart"),
-        }
+        assert!(evs.is_empty());
+        assert!(!t.block_map.contains_key(&0));
+    }
+
+    #[test]
+    fn unknown_reasoning_item_before_json_message_does_not_create_empty_block() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+
+        let reasoning = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::Unknown,
+        });
+        assert!(reasoning.is_empty());
+
+        let start = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 1,
+            item: OutputItem::Message {
+                id: "msg_json".into(),
+                role: "assistant".into(),
+                status: "in_progress".into(),
+                content: vec![],
+            },
+        });
+        assert!(matches!(
+            start.as_slice(),
+            [StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: ResponseBlock::Text { .. }
+            }]
+        ));
+
+        let delta = t.push_event(&ResponsesStreamEvent::ResponseOutputTextDelta {
+            item_id: "msg_json".into(),
+            output_index: 1,
+            content_index: 0,
+            delta: r#"{"ok":true,"reason":"done","impossible":false}"#.into(),
+        });
+        assert!(matches!(
+            delta.as_slice(),
+            [StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: BlockDelta::TextDelta { text }
+            }] if text == r#"{"ok":true,"reason":"done","impossible":false}"#
+        ));
+        assert_eq!(t.block_map.len(), 1);
+        assert_eq!(t.block_map.get(&1), Some(&0));
+        assert!(!t.block_map.contains_key(&0));
     }
 
     /// T1: P0-1 regression — a stream containing a function_call output

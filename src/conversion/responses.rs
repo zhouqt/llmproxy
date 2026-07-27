@@ -151,16 +151,19 @@ pub fn anthropic_to_responses_request(
 /// default so the schema constraint round-trips, and pin `strict: true` so the
 /// model is held to the schema (matches Anthropic's enforcement semantics).
 fn ensure_json_schema_name(fmt: &Value) -> Value {
-    let needs_name = fmt.get("type").and_then(|v| v.as_str()) == Some("json_schema")
-        && fmt.get("name").is_none();
-    if !needs_name {
+    if fmt.get("type").and_then(|v| v.as_str()) != Some("json_schema") {
         return fmt.clone();
     }
     let Some(obj) = fmt.as_object() else {
         return fmt.clone();
     };
     let mut out = obj.clone();
-    out.entry("name".to_string()).or_insert(json!("structured_output"));
+    if let Some(mut schema) = out.get("schema").cloned() {
+        super::request::strictify_schema(&mut schema);
+        out.insert("schema".to_string(), schema);
+    }
+    out.entry("name".to_string())
+        .or_insert(json!("structured_output"));
     out.entry("strict".to_string()).or_insert(json!(true));
     Value::Object(out)
 }
@@ -1497,7 +1500,11 @@ mod tests {
             "output_config": {
                 "format": {"type": "json_schema", "schema": {
                     "type": "object",
-                    "properties": {"ok": {"type": "boolean"}, "reason": {"type": "string"}},
+                    "properties": {
+                        "ok": {"type": "boolean"},
+                        "reason": {"type": "string"},
+                        "impossible": {"type": "boolean"}
+                    },
                     "required": ["ok", "reason"]
                 }},
                 "effort": "medium"
@@ -1511,6 +1518,13 @@ mod tests {
         // translator synthesizes a stable default and pins strict: true.
         assert_eq!(text_format.get("name").and_then(|v| v.as_str()), Some("structured_output"));
         assert_eq!(text_format.get("strict").and_then(|v| v.as_bool()), Some(true));
+        let schema = text_format.get("schema").unwrap();
+        assert_eq!(
+            schema.get("additionalProperties").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        let required = schema.get("required").and_then(|v| v.as_array()).unwrap();
+        assert!(required.iter().any(|v| v.as_str() == Some("impossible")));
         assert!(matches!(
             out.reasoning.as_ref(),
             Some(ReasoningConfig::Enabled { effort: Some(e) }) if e == "medium"

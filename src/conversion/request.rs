@@ -167,7 +167,7 @@ fn ensure_chat_json_schema_name(fmt: &Value) -> Value {
 /// strict mode: every object level gets `additionalProperties: false` and
 /// `required` populated with every property key. Mirrors litellm's
 /// `_add_additional_properties_false` (litellm/llms/anthropic/experimental_pass_through/adapters/transformation.py:823-855`).
-fn strictify_schema(schema: &mut Value) {
+pub(super) fn strictify_schema(schema: &mut Value) {
     let Value::Object(obj) = schema else { return };
     let is_object = obj.get("type").and_then(|v| v.as_str()) == Some("object")
         && obj.contains_key("properties");
