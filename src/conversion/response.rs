@@ -66,7 +66,7 @@ pub fn openai_to_anthropic_response(
                 .and_then(|d| d.cached_tokens)
                 .unwrap_or(0);
             Usage {
-                input_tokens: u.prompt_tokens,
+                input_tokens: u.prompt_tokens.saturating_sub(cached),
                 output_tokens: u.completion_tokens,
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: if cached > 0 { Some(cached) } else { None },
@@ -281,6 +281,42 @@ mod tests {
         let out = openai_to_anthropic_response(&resp, "model", "msg_1").unwrap();
         assert_eq!(out.usage.cache_read_input_tokens, Some(4));
         assert_eq!(out.usage.cache_creation_input_tokens, None);
+    }
+
+    /// Bug repro for Chat Completions non-streaming path — mirrors
+    /// `responses.rs::input_tokens_excludes_cached_subset`. OpenAI
+    /// ChatCompletions `prompt_tokens` includes the cached subset
+    /// (`prompt_tokens_details.cached_tokens` has range
+    /// `[0, prompt_tokens]`), so the translator must subtract the
+    /// cached portion when populating Anthropic's `Usage.input_tokens`,
+    /// which is non-cached-only by spec.
+    #[test]
+    fn input_tokens_excludes_cached_in_chat_completions() {
+        let resp: ChatResponse = serde_json::from_value(serde_json::json!({
+            "id": "x", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "total_tokens": 110,
+                "prompt_tokens_details": {"cached_tokens": 60}
+            }
+        }))
+        .unwrap();
+
+        let out = openai_to_anthropic_response(&resp, "model", "msg_1").unwrap();
+        // Anthropic.input_tokens must be the non-cached portion: 100 - 60 = 40.
+        assert_eq!(
+            out.usage.input_tokens, 40,
+            "input_tokens must be non-cached only (prompt - cached); got {}, expected 40",
+            out.usage.input_tokens
+        );
+        assert_eq!(out.usage.cache_read_input_tokens, Some(60));
+        assert_eq!(out.usage.output_tokens, 10);
     }
 
     #[test]
