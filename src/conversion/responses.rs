@@ -145,7 +145,7 @@ pub fn anthropic_to_responses_request(
         }
     });
 
-    ResponsesRequest {
+    let out = ResponsesRequest {
         model,
         input,
         instructions,
@@ -174,7 +174,31 @@ pub fn anthropic_to_responses_request(
             }
             e
         },
+    };
+
+    // Diagnostic: log all function_call.call_id and function_call_output.call_id
+    // values in the converted request so we can verify id pairing end-to-end.
+    let mut fc_ids: Vec<&str> = Vec::new();
+    let mut fco_ids: Vec<&str> = Vec::new();
+    for item in &out.input {
+        match item {
+            ResponseInputItem::FunctionCall { call_id, .. } => fc_ids.push(call_id.as_str()),
+            ResponseInputItem::FunctionCallOutput { call_id, .. } => fco_ids.push(call_id.as_str()),
+            _ => {}
+        }
     }
+    tracing::debug!(
+        target: "tool_call_debug",
+        direction = "anthropic->openai_responses",
+        model = %out.model,
+        function_call_count = fc_ids.len(),
+        function_call_output_count = fco_ids.len(),
+        function_call_ids = ?fc_ids,
+        function_call_output_ids = ?fco_ids,
+        "request input[] ids sent upstream"
+    );
+
+    out
 }
 
 /// OpenAI Responses API requires `text.format.name` on `json_schema` shapes;
