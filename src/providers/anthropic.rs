@@ -176,6 +176,10 @@ impl Provider for AnthropicProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
+        let mut timer = crate::hook_timing::RequestTimer::new(
+            req.model.clone(),
+            crate::hook_timing::is_stop_hook_request(req),
+        );
         let merged = self.merged_rewrite(model_rewrite);
         let body = build_body(req, &merged, false)?;
         let resp = self
@@ -189,20 +193,30 @@ impl Provider for AnthropicProvider {
             .await?;
         let status = resp.status();
         let text = resp.text().await?;
+        timer.record_first_byte();
+        timer.record_chunk(text.as_bytes());
+        timer.record_end();
         if !status.is_success() {
             if status.as_u16() == 400 && has_thinking_error(&text) {
+                let upstream_model = merged
+                    .get(&req.model)
+                    .cloned()
+                    .unwrap_or_else(|| req.model.clone());
+                timer.emit();
                 return Err(self.thinking_not_supported_error(
                     &req.model,
-                    &merged.get(&req.model).cloned().unwrap_or_else(|| req.model.clone()),
+                    &upstream_model,
                     &text,
                 ));
             }
+            timer.emit();
             return Err(ProxyError::Upstream {
                 status: status.as_u16(),
                 body: text,
             });
         }
         let val: Value = serde_json::from_str(&text)?;
+        timer.emit();
         Ok(ProviderOutput::Json(val))
     }
 
@@ -211,6 +225,10 @@ impl Provider for AnthropicProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
+        let mut timer = crate::hook_timing::RequestTimer::new(
+            req.model.clone(),
+            crate::hook_timing::is_stop_hook_request(req),
+        );
         let url = self.messages_url();
         let api_key = self.api_key.clone();
         let merged = self.merged_rewrite(model_rewrite);
@@ -228,10 +246,18 @@ impl Provider for AnthropicProvider {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await?;
+            timer.record_first_byte();
+            timer.record_chunk(text.as_bytes());
+            timer.record_end();
+            timer.emit();
             if status.as_u16() == 400 && has_thinking_error(&text) {
+                let upstream_model = merged
+                    .get(&req.model)
+                    .cloned()
+                    .unwrap_or_else(|| req.model.clone());
                 return Err(self.thinking_not_supported_error(
                     &req.model,
-                    &merged.get(&req.model).cloned().unwrap_or_else(|| req.model.clone()),
+                    &upstream_model,
                     &text,
                 ));
             }
@@ -241,7 +267,8 @@ impl Provider for AnthropicProvider {
             });
         }
         let stream = resp.bytes_stream();
-        Ok(ProviderOutput::Stream(Box::new(PassthroughSse { inner: stream })))
+        let timed = crate::hook_timing::TimedProviderStream::new(stream, timer);
+        Ok(ProviderOutput::Stream(Box::new(PassthroughSse { inner: timed })))
     }
 }
 
