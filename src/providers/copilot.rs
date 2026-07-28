@@ -710,6 +710,7 @@ impl CopilotProvider {
         &self,
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
+        mut timer: crate::hook_timing::RequestTimer,
     ) -> Result<ProviderOutput> {
         let merged = merge_rewrites(&self.model_rewrite, model_rewrite);
         let mut responses_req =
@@ -720,7 +721,11 @@ impl CopilotProvider {
         let resp = self.send_with_token(&self.responses_url(), &body).await?;
         let status = resp.status();
         let text = resp.text().await?;
+        timer.record_first_byte();
+        timer.record_chunk(text.as_bytes());
+        timer.record_end();
         if !status.is_success() {
+            timer.emit();
             return Err(ProxyError::Upstream {
                 status: status.as_u16(),
                 body: text,
@@ -733,6 +738,7 @@ impl CopilotProvider {
             &req.model,
             &msg_id,
         )?;
+        timer.emit();
         Ok(ProviderOutput::Json(serde_json::to_value(anthropic)?))
     }
 
@@ -741,6 +747,7 @@ impl CopilotProvider {
         &self,
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
+        mut timer: crate::hook_timing::RequestTimer,
     ) -> Result<ProviderOutput> {
         let merged = merge_rewrites(&self.model_rewrite, model_rewrite);
         let mut responses_req =
@@ -752,14 +759,19 @@ impl CopilotProvider {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await?;
+            timer.record_first_byte();
+            timer.record_chunk(text.as_bytes());
+            timer.record_end();
+            timer.emit();
             return Err(ProxyError::Upstream {
                 status: status.as_u16(),
                 body: text,
             });
         }
         let stream = resp.bytes_stream();
+        let timed = crate::hook_timing::TimedProviderStream::new(stream, timer);
         let sse = crate::providers::openai_responses::ResponsesSseToAnthropic::new(
-            stream,
+            timed,
             &req.model,
         );
         Ok(ProviderOutput::Stream(Box::new(sse)))
@@ -814,6 +826,10 @@ impl Provider for CopilotProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
+        let mut timer = crate::hook_timing::RequestTimer::new(
+            req.model.clone(),
+            crate::hook_timing::is_stop_hook_request(req),
+        );
         let merged = merge_rewrites(&self.model_rewrite, model_rewrite);
         let upstream_model = merged
             .get(&req.model)
@@ -821,7 +837,7 @@ impl Provider for CopilotProvider {
             .unwrap_or(&req.model);
         let endpoint = endpoint_for_model(upstream_model);
         if endpoint == "responses" {
-            return self.complete_responses(req, &merged).await;
+            return self.complete_responses(req, &merged, timer).await;
         }
 
         let mut openai_req =
@@ -833,7 +849,11 @@ impl Provider for CopilotProvider {
         let resp = self.send_with_token(&self.chat_url(), &body).await?;
         let status = resp.status();
         let text = resp.text().await?;
+        timer.record_first_byte();
+        timer.record_chunk(text.as_bytes());
+        timer.record_end();
         if !status.is_success() {
+            timer.emit();
             return Err(ProxyError::Upstream {
                 status: status.as_u16(),
                 body: text,
@@ -848,12 +868,14 @@ impl Provider for CopilotProvider {
         let parsed: serde_json::Value = serde_json::from_str(&text)
             .map_err(ProxyError::Json)?;
         if crate::openai::looks_like_error_envelope(&parsed) {
+            timer.emit();
             return Err(ProxyError::Upstream { status: 400, body: text });
         }
         let chat: crate::openai::ChatResponse = serde_json::from_value(parsed)?;
         let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
         let anthropic =
             crate::conversion::openai_to_anthropic_response(&chat, &req.model, &msg_id)?;
+        timer.emit();
         Ok(ProviderOutput::Json(serde_json::to_value(anthropic)?))
     }
 
@@ -862,6 +884,10 @@ impl Provider for CopilotProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
+        let mut timer = crate::hook_timing::RequestTimer::new(
+            req.model.clone(),
+            crate::hook_timing::is_stop_hook_request(req),
+        );
         let merged = merge_rewrites(&self.model_rewrite, model_rewrite);
         let upstream_model = merged
             .get(&req.model)
@@ -869,7 +895,7 @@ impl Provider for CopilotProvider {
             .unwrap_or(&req.model);
         let endpoint = endpoint_for_model(upstream_model);
         if endpoint == "responses" {
-            return self.stream_responses(req, &merged).await;
+            return self.stream_responses(req, &merged, timer).await;
         }
 
         let mut openai_req =
@@ -884,13 +910,19 @@ impl Provider for CopilotProvider {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await?;
+            timer.record_first_byte();
+            timer.record_chunk(text.as_bytes());
+            timer.record_end();
+            timer.emit();
             return Err(ProxyError::Upstream {
                 status: status.as_u16(),
                 body: text,
             });
         }
+
         let stream = resp.bytes_stream();
-        let sse = OpenAiSseToAnthropic::new(stream, &req.model);
+        let timed = crate::hook_timing::TimedProviderStream::new(stream, timer);
+        let sse = OpenAiSseToAnthropic::new(timed, &req.model);
         Ok(ProviderOutput::Stream(Box::new(sse)))
     }
 

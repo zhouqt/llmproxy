@@ -7,6 +7,7 @@ pub mod conversion;
 pub mod cooldown;
 pub mod error;
 pub mod extractor;
+pub mod hook_timing;
 pub mod oauth;
 pub mod openai;
 pub mod proxy_client;
