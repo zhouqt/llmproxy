@@ -1110,4 +1110,168 @@ mod tests {
         let items_required: Vec<&str> = items_required.iter().filter_map(|v| v.as_str()).collect();
         assert!(items_required.contains(&"label"));
     }
+
+    #[test]
+    fn strictify_schema_recurses_into_any_of() {
+        // anyOf branches containing objects must each be strictified in
+        // place (additionalProperties: false + complete required).
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "result": {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "kind": {"type": "string"},
+                                "value": {"type": "number"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "kind": {"type": "string"},
+                                "error": {"type": "string"}
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        strictify_schema(&mut schema);
+        let result = schema.get("properties").and_then(|p| p.get("result")).unwrap();
+        let branches = result.get("anyOf").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(branches.len(), 2);
+        for (i, branch) in branches.iter().enumerate() {
+            assert_eq!(
+                branch.get("additionalProperties").and_then(|v| v.as_bool()),
+                Some(false),
+                "anyOf branch {i} must have additionalProperties: false"
+            );
+            let required = branch
+                .get("required")
+                .and_then(|v| v.as_array())
+                .unwrap_or_else(|| panic!("anyOf branch {i} must have a required array"));
+            let required: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+            assert!(
+                !required.is_empty(),
+                "anyOf branch {i} must populate required from its properties"
+            );
+        }
+    }
+
+    #[test]
+    fn strictify_schema_recurses_into_one_of() {
+        // oneOf behaves identically to anyOf for strictification.
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "value": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "id": {"type": "integer"}
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        strictify_schema(&mut schema);
+        let value = schema.get("properties").and_then(|p| p.get("value")).unwrap();
+        let branch = &value.get("oneOf").and_then(|v| v.as_array()).unwrap()[0];
+        assert_eq!(
+            branch.get("additionalProperties").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        let required: Vec<&str> = branch
+            .get("required")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(required.contains(&"name"));
+        assert!(required.contains(&"id"));
+    }
+
+    #[test]
+    fn strictify_schema_recurses_into_defs() {
+        // Reusable definitions inside `$defs` must be strictified the same
+        // way as inline objects — OpenAI strict mode applies to every
+        // nested object the model might emit.
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "address": {"$ref": "#/$defs/Address"}
+            },
+            "$defs": {
+                "Address": {
+                    "type": "object",
+                    "properties": {
+                        "street": {"type": "string"},
+                        "city": {"type": "string"}
+                    }
+                }
+            }
+        });
+        strictify_schema(&mut schema);
+        let defs = schema.get("$defs").and_then(|v| v.as_object()).unwrap();
+        let addr = defs.get("Address").unwrap();
+        assert_eq!(
+            addr.get("additionalProperties").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        let required: Vec<&str> = addr
+            .get("required")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(required.contains(&"street"));
+        assert!(required.contains(&"city"));
+    }
+
+    #[test]
+    fn strictify_schema_non_object_returns_early() {
+        // A schema whose top-level type is not "object" (e.g. "string")
+        // must not be rewritten — strict mode rules only apply to object
+        // schemas. The function takes &mut Value and returns nothing, so
+        // we assert the schema is unchanged.
+        let mut schema = serde_json::json!({"type": "string"});
+        let original = schema.clone();
+        strictify_schema(&mut schema);
+        assert_eq!(schema, original);
+        assert!(schema.get("additionalProperties").is_none());
+        assert!(schema.get("required").is_none());
+    }
+
+    #[test]
+    fn strictify_schema_object_without_properties_unchanged() {
+        // A schema with `type: "object"` but no `properties` key must not
+        // crash (no required array can be derived) and must not gain an
+        // additionalProperties field.
+        let mut schema = serde_json::json!({"type": "object"});
+        let original = schema.clone();
+        strictify_schema(&mut schema);
+        assert_eq!(schema, original);
+        assert!(schema.get("required").is_none());
+    }
+
+    #[test]
+    fn ensure_chat_json_schema_name_non_json_schema_passthrough() {
+        // ensure_chat_json_schema_name is a no-op for format types other
+        // than "json_schema" — e.g. plain "json_object" or "text" must be
+        // returned unchanged (no json_schema wrapper synthesized).
+        let input = serde_json::json!({"type": "json_object"});
+        let out = ensure_chat_json_schema_name(&input);
+        assert_eq!(out, input);
+
+        let input = serde_json::json!({"type": "text"});
+        let out = ensure_chat_json_schema_name(&input);
+        assert_eq!(out, input);
+    }
 }

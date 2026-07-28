@@ -1578,4 +1578,34 @@ mod tests {
             Some(ReasoningConfig::Enabled { effort: Some(e) }) if e == "low"
         ));
     }
+
+    #[test]
+    fn ensure_json_schema_name_non_json_schema_passthrough() {
+        // ensure_json_schema_name is a no-op for format types other than
+        // "json_schema" — the Responses API's text.format only requires
+        // the `name`+`strict` shim for json_schema shapes.
+        let input = json!({"type": "json_object"});
+        let out = ensure_json_schema_name(&input);
+        assert_eq!(out, input);
+
+        let input = json!({"type": "text"});
+        let out = ensure_json_schema_name(&input);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn ensure_json_schema_name_preserves_existing_name() {
+        // If the json_schema payload already has a `name` field, the
+        // translator must NOT overwrite it (parity with the Chat path —
+        // see `output_config_format_with_existing_name_is_preserved` in
+        // request.rs).
+        let input = json!({
+            "type": "json_schema",
+            "name": "my_response",
+            "schema": {"type": "object", "properties": {"x": {"type": "integer"}}}
+        });
+        let out = ensure_json_schema_name(&input);
+        assert_eq!(out.get("name").and_then(|v| v.as_str()), Some("my_response"));
+        assert_eq!(out.get("strict").and_then(|v| v.as_bool()), Some(true));
+    }
 }

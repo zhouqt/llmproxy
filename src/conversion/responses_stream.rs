@@ -403,10 +403,9 @@ fn output_item_to_block(item: &OutputItem) -> ResponseBlock {
                 caller: None,
             }
         }
-        OutputItem::Unknown => ResponseBlock::Text {
-            text: String::new(),
-            citations: None,
-        },
+        // Caller (`ResponseOutputItemAdded` arm) early-returns on
+        // `OutputItem::Unknown`, so this variant is unreachable here.
+        OutputItem::Unknown => unreachable!("OutputItem::Unknown is filtered before output_item_to_block"),
     }
 }
 
