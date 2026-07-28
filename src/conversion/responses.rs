@@ -25,6 +25,7 @@ use crate::anthropic::{
     ToolChoice, Usage,
 };
 use crate::conversion::derive_cache_hints;
+use crate::conversion::util::strictify_schema;
 use crate::error::{ProxyError, Result};
 use crate::responses::{
     OutputContentPart, OutputItem, ReasoningConfig, ResponseInputContent, ResponseInputItem,
@@ -159,7 +160,7 @@ fn ensure_json_schema_name(fmt: &Value) -> Value {
     };
     let mut out = obj.clone();
     if let Some(mut schema) = out.get("schema").cloned() {
-        super::request::strictify_schema(&mut schema);
+        strictify_schema(&mut schema);
         out.insert("schema".to_string(), schema);
     }
     out.entry("name".to_string())
