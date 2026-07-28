@@ -126,6 +126,10 @@ impl Provider for OpenaiResponsesProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
+        let mut timer = crate::hook_timing::RequestTimer::new(
+            req.model.clone(),
+            crate::hook_timing::is_stop_hook_request(req),
+        );
         let mut merged = self.model_rewrite.clone();
         merged.extend(model_rewrite.iter().map(|(k, v)| (k.clone(), v.clone())));
 
@@ -143,7 +147,11 @@ impl Provider for OpenaiResponsesProvider {
 
         let status = resp.status();
         let body = resp.text().await?;
+        timer.record_first_byte();
+        timer.record_chunk(body.as_bytes());
+        timer.record_end();
         if !status.is_success() {
+            timer.emit();
             return Err(ProxyError::Upstream {
                 status: status.as_u16(),
                 body,
@@ -153,6 +161,7 @@ impl Provider for OpenaiResponsesProvider {
         let parsed: ResponsesResponse = serde_json::from_str(&body)?;
         let msg_id = make_message_id();
         let anthropic_resp = responses_to_anthropic_response(&parsed, &req.model, &msg_id)?;
+        timer.emit();
         Ok(ProviderOutput::Json(serde_json::to_value(anthropic_resp)?))
     }
 
@@ -161,6 +170,10 @@ impl Provider for OpenaiResponsesProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
+        let mut timer = crate::hook_timing::RequestTimer::new(
+            req.model.clone(),
+            crate::hook_timing::is_stop_hook_request(req),
+        );
         let mut merged = self.model_rewrite.clone();
         merged.extend(model_rewrite.iter().map(|(k, v)| (k.clone(), v.clone())));
 
@@ -179,6 +192,10 @@ impl Provider for OpenaiResponsesProvider {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await?;
+            timer.record_first_byte();
+            timer.record_chunk(body.as_bytes());
+            timer.record_end();
+            timer.emit();
             return Err(ProxyError::Upstream {
                 status: status.as_u16(),
                 body,
@@ -186,7 +203,8 @@ impl Provider for OpenaiResponsesProvider {
         }
 
         let byte_stream = resp.bytes_stream();
-        let sse = ResponsesSseToAnthropic::new(byte_stream, &req.model);
+        let timed = crate::hook_timing::TimedProviderStream::new(byte_stream, timer);
+        let sse = ResponsesSseToAnthropic::new(timed, &req.model);
         Ok(ProviderOutput::Stream(Box::new(sse)))
     }
 }

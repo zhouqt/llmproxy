@@ -128,6 +128,10 @@ impl Provider for OpenAiCompatProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
+        let mut timer = crate::hook_timing::RequestTimer::new(
+            req.model.clone(),
+            crate::hook_timing::is_stop_hook_request(req),
+        );
         let mut merged = self.model_rewrite.clone();
         merged.extend(model_rewrite.iter().map(|(k, v)| (k.clone(), v.clone())));
 
@@ -146,7 +150,11 @@ impl Provider for OpenAiCompatProvider {
 
         let status = resp.status();
         let body = resp.text().await?;
+        timer.record_first_byte();
+        timer.record_chunk(body.as_bytes());
+        timer.record_end();
         if !status.is_success() {
+            timer.emit();
             return Err(ProxyError::Upstream {
                 status: status.as_u16(),
                 body,
@@ -159,6 +167,7 @@ impl Provider for OpenAiCompatProvider {
             // with an OpenAI error envelope instead of a chat response. Treat
             // it as a 400-class upstream failure so the client sees the real
             // message instead of a generic 500 "missing field `object`".
+            timer.emit();
             return Err(ProxyError::Upstream {
                 status: 400,
                 body,
@@ -167,6 +176,7 @@ impl Provider for OpenAiCompatProvider {
         let chat: crate::openai::ChatResponse = serde_json::from_value(parsed)?;
         let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
         let anthropic_resp = openai_to_anthropic_response(&chat, &req.model, &msg_id)?;
+        timer.emit();
         Ok(ProviderOutput::Json(serde_json::to_value(anthropic_resp)?))
     }
 
@@ -175,6 +185,10 @@ impl Provider for OpenAiCompatProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
+        let mut timer = crate::hook_timing::RequestTimer::new(
+            req.model.clone(),
+            crate::hook_timing::is_stop_hook_request(req),
+        );
         let mut merged = self.model_rewrite.clone();
         merged.extend(model_rewrite.iter().map(|(k, v)| (k.clone(), v.clone())));
 
@@ -193,6 +207,10 @@ impl Provider for OpenAiCompatProvider {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await?;
+            timer.record_first_byte();
+            timer.record_chunk(body.as_bytes());
+            timer.record_end();
+            timer.emit();
             return Err(ProxyError::Upstream {
                 status: status.as_u16(),
                 body,
@@ -200,7 +218,8 @@ impl Provider for OpenAiCompatProvider {
         }
 
         let byte_stream = resp.bytes_stream();
-        let sse = OpenAiSseToAnthropic::new(byte_stream, &req.model);
+        let timed = crate::hook_timing::TimedProviderStream::new(byte_stream, timer);
+        let sse = OpenAiSseToAnthropic::new(timed, &req.model);
         Ok(ProviderOutput::Stream(Box::new(sse)))
     }
 }
