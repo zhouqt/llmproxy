@@ -17,6 +17,7 @@ use serde_json::json;
 use crate::anthropic::{MessagesRequest, MessagesResponse};
 use crate::error::{ProxyError, Result};
 use crate::extractor::AppJson;
+use crate::hook_timing::{is_stop_hook_request, ProxyTimer};
 use crate::providers::ProviderOutput;
 use crate::state::AppState;
 use crate::tokenize::estimate_request_tokens;
@@ -56,6 +57,7 @@ async fn messages_handler(
     State(state): State<AppState>,
     AppJson(req): AppJson<MessagesRequest>,
 ) -> Result<Response> {
+    let mut proxy_timer = ProxyTimer::new(req.model.clone(), is_stop_hook_request(&req));
     let model_cfg = state
         .router
         .find_model(&req.model)
@@ -64,7 +66,7 @@ async fn messages_handler(
 
     if req.stream {
         let (_provider, output, attempts) = state.router.stream(&model_cfg, &req).await?;
-        return Ok(stream_response(output, attempts));
+        return Ok(stream_response(output, attempts, proxy_timer));
     }
 
     let (output, attempts) = state.router.complete(&model_cfg, &req).await?;
@@ -83,7 +85,8 @@ async fn messages_handler(
             headers.insert("x-llmproxy-failed-providers", v);
         }
     }
-
+    proxy_timer.record_first_byte();
+    proxy_timer.emit(None);
     Ok((StatusCode::OK, headers, Json(resp)).into_response())
 }
 
@@ -95,7 +98,11 @@ fn format_attempts(attempts: &[crate::router::RouteAttempt]) -> String {
         .join(",")
 }
 
-fn stream_response(output: ProviderOutput, attempts: Vec<crate::router::RouteAttempt>) -> Response {
+fn stream_response(
+    output: ProviderOutput,
+    attempts: Vec<crate::router::RouteAttempt>,
+    proxy_timer: ProxyTimer,
+) -> Response {
     let ProviderOutput::Stream(stream) = output else {
         return ProxyError::Internal("expected stream output".into()).into_response();
     };
@@ -103,7 +110,8 @@ fn stream_response(output: ProviderOutput, attempts: Vec<crate::router::RouteAtt
     let inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, ProxyError>> + Send>> =
         Box::into_pin(stream);
     let mapped = MappedStream::new(inner);
-    let body = Body::from_stream(mapped);
+    let timed = TimedMappedStream::new(mapped, proxy_timer);
+    let body = Body::from_stream(timed);
 
     let mut resp = Response::new(body);
     let h = resp.headers_mut();
@@ -168,6 +176,105 @@ impl Stream for MappedStream {
             }
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+/// Stream wrapper that fires `ProxyTimer::emit()` when the wrapped
+/// stream ends. Captures `proxy_first_byte_ms` on the first emitted
+/// chunk and `proxy_total_ms` on end. The timer is taken out of the
+/// wrapper before returning so Drop's "leaked without emit" warn does
+/// not double-fire.
+pub struct TimedMappedStream {
+    inner: MappedStream,
+    timer: Option<ProxyTimer>,
+}
+
+impl TimedMappedStream {
+    pub fn new(inner: MappedStream, timer: ProxyTimer) -> Self {
+        Self {
+            inner,
+            timer: Some(timer),
+        }
+    }
+}
+
+impl Stream for TimedMappedStream {
+    type Item = std::result::Result<Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let poll = Pin::new(&mut self.inner).poll_next(cx);
+        if let Poll::Ready(Some(Ok(_))) = &poll {
+            if let Some(t) = self.timer.as_mut() {
+                t.record_first_byte();
+            }
+        }
+        if matches!(poll, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
+            if let Some(t) = self.timer.take() {
+                t.emit(None);
+            }
+        }
+        poll
+    }
+}
+
+#[cfg(test)]
+mod proxy_timing_tests {
+    use super::*;
+    use futures_util::stream;
+
+    #[test]
+    fn timed_mapped_stream_records_first_byte_and_emits_on_end() {
+        let inner_stream: Pin<
+            Box<dyn Stream<Item = std::result::Result<Bytes, ProxyError>> + Send>,
+        > = Box::pin(stream::iter(vec![
+            Ok(Bytes::from_static(b"data: x\n\n")),
+            Ok(Bytes::from_static(b"data: y\n\n")),
+        ]));
+        let mapped = MappedStream::new(inner_stream);
+        let timer = ProxyTimer::new("m".into(), false);
+        let mut timed = TimedMappedStream::new(mapped, timer);
+
+        let waker = futures_util::task::noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+        // Drain the two Ready(Some(Ok)) items.
+        for expected in [b"data: x\n\n".to_vec(), b"data: y\n\n".to_vec()] {
+            match Pin::new(&mut timed).poll_next(&mut cx) {
+                Poll::Ready(Some(Ok(b))) => assert_eq!(b.as_ref(), expected.as_slice()),
+                other => panic!("expected Ready(Some(Ok)), got {other:?}"),
+            }
+        }
+        // One more poll drives to Ready(None), which fires emit.
+        match Pin::new(&mut timed).poll_next(&mut cx) {
+            Poll::Ready(None) => {}
+            other => panic!("expected Ready(None), got {other:?}"),
+        }
+        // Timer was taken out — Drop's leaked-without-emit warn won't fire.
+        assert!(timed.timer.is_none());
+    }
+
+    #[test]
+    fn timed_mapped_stream_emits_on_inner_error() {
+        let inner_stream: Pin<
+            Box<dyn Stream<Item = std::result::Result<Bytes, ProxyError>> + Send>,
+        > = Box::pin(stream::iter(vec![
+            Err::<Bytes, _>(ProxyError::Other(anyhow::anyhow!("boom"))),
+        ]));
+        let mapped = MappedStream::new(inner_stream);
+        let timer = ProxyTimer::new("m".into(), true);
+        let mut timed = TimedMappedStream::new(mapped, timer);
+        let waker = futures_util::task::noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+        // Inner Err is wrapped into a synthetic `event: error` SSE chunk,
+        // so the outer stream yields Some(Ok(...)) first, then None.
+        match Pin::new(&mut timed).poll_next(&mut cx) {
+            Poll::Ready(Some(Ok(_))) => {}
+            other => panic!("expected Ready(Some(Ok)) wrapping inner Err, got {other:?}"),
+        }
+        match Pin::new(&mut timed).poll_next(&mut cx) {
+            Poll::Ready(None) => {}
+            other => panic!("expected Ready(None) after error chunk, got {other:?}"),
+        }
+        assert!(timed.timer.is_none());
     }
 }
 
