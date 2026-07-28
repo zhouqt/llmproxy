@@ -148,6 +148,30 @@ impl ResponsesStreamTranslator {
                 if let OutputItem::FunctionCall { id, .. } = item {
                     self.has_tool_calls = true;
                     self.fc_item_index.insert(id.clone(), *output_index);
+                    // Diagnostic: capture the call_id we received so we can
+                    // check whether upstream Copilot/OpenAI ever returns ids
+                    // that violate Anthropic's ^[a-zA-Z0-9_-]{1,64}$.
+                    let id_len = id.chars().count();
+                    let id_anthropic_compatible = (1..=64).contains(&id_len)
+                        && id.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+                    tracing::debug!(
+                        target: "tool_call_debug",
+                        direction = "openai_responses->anthropic_stream",
+                        output_index = *output_index,
+                        call_id = %id,
+                        id_chars = id_len,
+                        id_anthropic_compatible = id_anthropic_compatible,
+                        "function_call item added (responses, stream)"
+                    );
+                    if !id_anthropic_compatible {
+                        tracing::warn!(
+                            target: "tool_call_debug",
+                            call_id = %id,
+                            id_chars = id_len,
+                            "responses call_id violates Anthropic ^[a-zA-Z0-9_-]{{1,64}}$"
+                        );
+                    }
                 }
                 let block_idx = self.allocate_block(*output_index);
                 let block = output_item_to_block(item);
