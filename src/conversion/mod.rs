@@ -4,6 +4,7 @@ pub mod response;
 pub mod responses;
 pub mod responses_stream;
 pub mod stream;
+pub mod util;
 
 pub use cache_hint::{derive_cache_hints, CacheHints};
 pub use request::anthropic_to_openai_request;
