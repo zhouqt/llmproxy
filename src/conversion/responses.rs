@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use crate::anthropic::{
@@ -25,6 +25,7 @@ use crate::anthropic::{
     ToolChoice, Usage,
 };
 use crate::conversion::derive_cache_hints;
+use crate::conversion::util::strictify_schema;
 use crate::error::{ProxyError, Result};
 use crate::responses::{
     OutputContentPart, OutputItem, ReasoningConfig, ResponseInputContent, ResponseInputItem,
@@ -132,9 +133,40 @@ pub fn anthropic_to_responses_request(
             .map(|u| truncate_user(u)),
         prompt_cache_key: hints.prompt_cache_key,
         prompt_cache_retention,
-        reasoning: req.thinking.as_ref().and_then(convert_thinking),
-        extra: json!({}),
+        reasoning: req.output_config.as_ref()
+            .and_then(|oc| oc.effort.clone())
+            .map(|e| ReasoningConfig::Enabled { effort: Some(e) })
+            .or_else(|| req.thinking.as_ref().and_then(convert_thinking)),
+        extra: {
+            let mut e = Value::Object(Map::new());
+            if let Some(fmt) = req.output_config.as_ref().and_then(|oc| oc.format.as_ref()) {
+                e["text"] = json!({"format": ensure_json_schema_name(fmt)});
+            }
+            e
+        },
     }
+}
+
+/// OpenAI Responses API requires `text.format.name` on `json_schema` shapes;
+/// Anthropic's `output_config.format` doesn't carry one. Synthesize a stable
+/// default so the schema constraint round-trips, and pin `strict: true` so the
+/// model is held to the schema (matches Anthropic's enforcement semantics).
+fn ensure_json_schema_name(fmt: &Value) -> Value {
+    if fmt.get("type").and_then(|v| v.as_str()) != Some("json_schema") {
+        return fmt.clone();
+    }
+    let Some(obj) = fmt.as_object() else {
+        return fmt.clone();
+    };
+    let mut out = obj.clone();
+    if let Some(mut schema) = out.get("schema").cloned() {
+        strictify_schema(&mut schema);
+        out.insert("schema".to_string(), schema);
+    }
+    out.entry("name".to_string())
+        .or_insert(json!("structured_output"));
+    out.entry("strict".to_string()).or_insert(json!(true));
+    Value::Object(out)
 }
 
 fn convert_message(m: &crate::anthropic::Message) -> Vec<ResponseInputItem> {
@@ -1458,5 +1490,123 @@ mod tests {
         let truncated_long = truncate_user(&long_mb);
         assert_eq!(truncated_long.chars().count(), 64);
         assert!(truncated_long.is_char_boundary(truncated_long.len()));
+    }
+
+    #[test]
+    fn propagates_output_config_format_into_text_and_keeps_typed_reasoning() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "respond in json"}],
+            "output_config": {
+                "format": {"type": "json_schema", "schema": {
+                    "type": "object",
+                    "properties": {
+                        "ok": {"type": "boolean"},
+                        "reason": {"type": "string"},
+                        "impossible": {"type": "boolean"}
+                    },
+                    "required": ["ok", "reason"]
+                }},
+                "effort": "medium"
+            }
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        let text_format = out.extra.get("text").and_then(|v| v.get("format")).unwrap();
+        assert_eq!(text_format.get("type").and_then(|v| v.as_str()), Some("json_schema"));
+        // Anthropic doesn't carry a schema name; OpenAI requires one. The
+        // translator synthesizes a stable default and pins strict: true.
+        assert_eq!(text_format.get("name").and_then(|v| v.as_str()), Some("structured_output"));
+        assert_eq!(text_format.get("strict").and_then(|v| v.as_bool()), Some(true));
+        let schema = text_format.get("schema").unwrap();
+        assert_eq!(
+            schema.get("additionalProperties").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        let required = schema.get("required").and_then(|v| v.as_array()).unwrap();
+        assert!(required.iter().any(|v| v.as_str() == Some("impossible")));
+        assert!(matches!(
+            out.reasoning.as_ref(),
+            Some(ReasoningConfig::Enabled { effort: Some(e) }) if e == "medium"
+        ));
+    }
+
+    #[test]
+    fn output_config_with_only_format_does_not_set_reasoning() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "respond in json"}],
+            "output_config": {
+                "format": {"type": "json_object"}
+            }
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert!(out.extra.get("text").is_some());
+        assert!(out.reasoning.is_none());
+    }
+
+    #[test]
+    fn output_config_absent_leaves_extra_and_reasoning_empty() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert!(out.extra.as_object().unwrap().is_empty());
+        assert!(out.reasoning.is_none());
+    }
+
+    #[test]
+    fn output_config_effort_overrides_thinking_budget_derivation() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "reason about this"}],
+            "thinking": {"type": "enabled", "budget_tokens": 8000},
+            "output_config": {
+                "effort": "low"
+            }
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert!(matches!(
+            out.reasoning.as_ref(),
+            Some(ReasoningConfig::Enabled { effort: Some(e) }) if e == "low"
+        ));
+    }
+
+    #[test]
+    fn ensure_json_schema_name_non_json_schema_passthrough() {
+        // ensure_json_schema_name is a no-op for format types other than
+        // "json_schema" — the Responses API's text.format only requires
+        // the `name`+`strict` shim for json_schema shapes.
+        let input = json!({"type": "json_object"});
+        let out = ensure_json_schema_name(&input);
+        assert_eq!(out, input);
+
+        let input = json!({"type": "text"});
+        let out = ensure_json_schema_name(&input);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn ensure_json_schema_name_preserves_existing_name() {
+        // If the json_schema payload already has a `name` field, the
+        // translator must NOT overwrite it (parity with the Chat path —
+        // see `output_config_format_with_existing_name_is_preserved` in
+        // request.rs).
+        let input = json!({
+            "type": "json_schema",
+            "name": "my_response",
+            "schema": {"type": "object", "properties": {"x": {"type": "integer"}}}
+        });
+        let out = ensure_json_schema_name(&input);
+        assert_eq!(out.get("name").and_then(|v| v.as_str()), Some("my_response"));
+        assert_eq!(out.get("strict").and_then(|v| v.as_bool()), Some(true));
     }
 }

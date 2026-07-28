@@ -1070,3 +1070,167 @@ async fn mock_llm_provider_skips_provider_with_unsupported_model_via_runtime_400
     // The model-unsupported branch puts primary on a short (60s) cooldown.
     assert!(router.cooldown().is_cooling_down("primary").await);
 }
+
+// ────────────────────────────────────────────────────────────────────────
+// output_config propagation through the full router stack.
+// ────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn output_config_propagation_through_router() {
+    // End-to-end check that the `output_config.format` block from an
+    // Anthropic Messages request lands in the OpenAI Chat Completions
+    // upstream as `response_format`. We use the real `OpenAiCompatProvider`
+    // so the conversion layer is exercised (rather than a hand-rolled
+    // mock that bypasses the actual translation code path). The
+    // wiremock's closure-based responder captures the upstream request
+    // body so we can assert the response_format shape on the wire.
+    use llmproxy::providers::openai_compat::OpenAiCompatProvider;
+
+    let captured_body: Arc<std::sync::Mutex<Option<Value>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let captured_for_responder = captured_body.clone();
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |req: &wiremock::Request| {
+            // Parse the request body so we can inspect it after the
+            // proxy call returns. The captured body is asserted below.
+            let parsed: Value = serde_json::from_slice(&req.body)
+                .unwrap_or_else(|_| json!({"_unparseable": true}));
+            *captured_for_responder.lock().unwrap() = Some(parsed);
+            // OpenAI Chat Completions response shape (the real provider
+            // converts this into an Anthropic envelope before returning
+            // to the caller).
+            ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "claude-test",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "structured answer"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 3,
+                    "completion_tokens": 2,
+                    "total_tokens": 5
+                }
+            }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // OpenAiCompatProvider appends `/chat/completions` to api_base, so
+    // the api_base must end with `/v1/` for the wiremock URL to land on
+    // `/v1/chat/completions` (matching the existing unit tests in
+    // openai_compat.rs).
+    let api_base = format!("{}/v1/", server.uri());
+
+    // Real provider, pointing at the wiremock's chat/completions path.
+    let provider = OpenAiCompatProvider::new(
+        "primary".to_string(),
+        api_base.clone(),
+        "k".to_string(),
+        HashMap::new(),
+        reqwest::Client::new(),
+    )
+    .expect("OpenAiCompatProvider must construct against wiremock URI");
+
+    let mut providers = HashMap::new();
+    providers.insert("primary".to_string(), Arc::new(provider) as SharedProvider);
+    let configs = vec![ProviderConfig::OpenaiCompat {
+        name: "primary".to_string(),
+        api_key: "k".to_string(),
+        api_base,
+        model_rewrite: HashMap::new(),
+        use_proxy: false,
+    }];
+    let app = build_axum_app(providers, configs, vec!["primary".to_string()]);
+
+    // Anthropic Messages body carrying an output_config.format json_schema.
+    let body = json!({
+        "model": "claude-test",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "respond in json"}],
+        "output_config": {
+            "format": {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "ok": {"type": "boolean"},
+                        "reason": {"type": "string"}
+                    },
+                    "required": ["ok", "reason"]
+                }
+            }
+        }
+    });
+
+    let resp = app.oneshot(post("/v1/messages", body)).await.unwrap();
+    let (status, _headers, resp_body) = collect_bytes(resp).await;
+
+    // 1. Proxy returns 200 OK (no crash / panic).
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "proxy must return 200 OK; got {status} with body {}",
+        std::str::from_utf8(&resp_body).unwrap_or("<non-utf8>")
+    );
+
+    // 2. Upstream wiremock received the body with `response_format` set
+    //    to the strictified json_schema shape that the Chat Completions
+    //    path produces (wrapper, name, strict: true, schema with
+    //    additionalProperties: false).
+    let captured = captured_body
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("wiremock must have captured the upstream request body");
+    let response_format = captured
+        .get("response_format")
+        .unwrap_or_else(|| panic!("upstream body must include response_format, got {captured}"));
+    assert_eq!(
+        response_format.get("type").and_then(|v| v.as_str()),
+        Some("json_schema"),
+        "response_format.type must be json_schema, got {response_format}"
+    );
+    let inner = response_format
+        .get("json_schema")
+        .expect("response_format must wrap schema in json_schema");
+    assert_eq!(
+        inner.get("name").and_then(|v| v.as_str()),
+        Some("structured_output"),
+        "response_format.json_schema.name must be synthesized"
+    );
+    assert_eq!(
+        inner.get("strict").and_then(|v| v.as_bool()),
+        Some(true),
+        "response_format.json_schema.strict must be true"
+    );
+    let schema = inner
+        .get("schema")
+        .expect("response_format.json_schema must include the schema");
+    assert_eq!(
+        schema.get("additionalProperties").and_then(|v| v.as_bool()),
+        Some(false),
+        "upstream schema must be strictified (additionalProperties: false)"
+    );
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(|v| v.as_array())
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(required.contains(&"ok"));
+    assert!(required.contains(&"reason"));
+
+    // 3. Proxy response body is the Anthropic envelope from upstream.
+    let resp_body_json: Value = serde_json::from_slice(&resp_body).unwrap();
+    assert_eq!(resp_body_json["type"], "message");
+    assert_eq!(resp_body_json["content"][0]["text"], "structured answer");
+}

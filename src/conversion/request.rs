@@ -2,12 +2,13 @@
 //!
 //! Reference: copilot-api-py/src/routes/messages/non_stream_translation.py:36-286
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::anthropic::{
     ContentBlock, Message, MessageContent, MessagesRequest, SystemPrompt, ToolChoice,
 };
 use crate::conversion::derive_cache_hints;
+use crate::conversion::util::strictify_schema;
 use crate::openai::{
     ChatMessage, ChatRequest, ChatTool, ContentPart, FunctionDef, UserContent,
 };
@@ -98,11 +99,69 @@ pub fn anthropic_to_openai_request(
             .as_ref()
             .and_then(|m| m.user_id.as_deref())
             .map(|u| crate::conversion::responses::truncate_user(u)),
-        reasoning_effort: extract_reasoning_effort(req),
+        reasoning_effort: req.output_config.as_ref()
+            .and_then(|oc| oc.effort.clone())
+            .or_else(|| extract_reasoning_effort(req)),
         prompt_cache_key: hints.prompt_cache_key,
         prompt_cache_retention,
-        extra: json!({}),
+        extra: {
+            let mut e = Value::Object(Map::new());
+            if let Some(fmt) = req.output_config.as_ref().and_then(|oc| oc.format.as_ref()) {
+                e["response_format"] = ensure_chat_json_schema_name(fmt);
+            }
+            e
+        },
     }
+}
+
+/// OpenAI Chat Completions requires `response_format.json_schema.name` on
+/// `json_schema` shapes; Anthropic's `output_config.format` is a flat
+/// `{type: "json_schema", schema: {...}}` with no `json_schema` wrapper and no
+/// `name`. Wrap the schema and synthesize `name` (stable default) plus
+/// `strict: true` so the schema constraint round-trips and is enforced.
+fn ensure_chat_json_schema_name(fmt: &Value) -> Value {
+    if fmt.get("type").and_then(|v| v.as_str()) != Some("json_schema") {
+        return fmt.clone();
+    }
+    let Some(obj) = fmt.as_object() else {
+        return fmt.clone();
+    };
+    let mut out = obj.clone();
+
+    // If json_schema wrapper already exists, just fill in name/strict if absent.
+    if let Some(j) = out.get("json_schema").and_then(|v| v.as_object()).cloned() {
+        let mut j = j;
+        if let Some(s) = j.get("schema").cloned() {
+            let mut s = s;
+            strictify_schema(&mut s);
+            j.insert("schema".to_string(), s);
+        }
+        j.entry("name".to_string())
+            .or_insert(json!("structured_output"));
+        j.entry("strict".to_string()).or_insert(json!(true));
+        out.insert("json_schema".to_string(), Value::Object(j));
+        return Value::Object(out);
+    }
+
+    // Anthropic-style flat: lift `schema` (and any top-level `name`) into a
+    // json_schema wrapper. Top-level `name` is honored so a future Anthropic
+    // schema-name field isn't silently dropped.
+    let schema = out.remove("schema").map(|mut s| {
+        strictify_schema(&mut s);
+        s
+    });
+    let top_name = out.remove("name");
+    let mut inner = serde_json::Map::new();
+    inner.insert(
+        "name".to_string(),
+        top_name.unwrap_or_else(|| json!("structured_output")),
+    );
+    inner.insert("strict".to_string(), json!(true));
+    if let Some(s) = schema {
+        inner.insert("schema".to_string(), s);
+    }
+    out.insert("json_schema".to_string(), Value::Object(inner));
+    Value::Object(out)
 }
 
 fn system_to_text(sys: &SystemPrompt) -> String {
@@ -834,5 +893,128 @@ mod tests {
             None,
             "non-gpt-5 must not emit max_completion_tokens"
         );
+    }
+
+    #[test]
+    fn propagates_output_config_format_to_response_format_and_effort_to_typed_field() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "respond in json"}],
+            "output_config": {
+                "format": {"type": "json_schema", "schema": {
+                    "type": "object",
+                    "properties": {"ok": {"type": "boolean"}},
+                    "required": ["ok"]
+                }},
+                "effort": "high"
+            }
+        }))
+        .unwrap();
+        let out = anthropic_to_openai_request(&req, &Default::default());
+        let resp_format = out.extra.get("response_format").unwrap();
+        assert_eq!(resp_format.get("type").and_then(|v| v.as_str()), Some("json_schema"));
+        // Anthropic doesn't carry a schema name; OpenAI requires one inside
+        // the nested json_schema object. Synthesized default + strict: true.
+        let inner = resp_format.get("json_schema").unwrap();
+        assert_eq!(inner.get("name").and_then(|v| v.as_str()), Some("structured_output"));
+        assert_eq!(inner.get("strict").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(out.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn output_config_absent_leaves_extra_empty_and_no_effort() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let out = anthropic_to_openai_request(&req, &Default::default());
+        assert!(out.extra.as_object().unwrap().is_empty());
+        assert!(out.reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn output_config_effort_overrides_thinking_derivation() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "reason about this"}],
+            "thinking": {"type": "enabled", "budget_tokens": 8000},
+            "output_config": {
+                "effort": "low"
+            }
+        }))
+        .unwrap();
+        let out = anthropic_to_openai_request(&req, &Default::default());
+        assert_eq!(out.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn output_config_format_with_existing_name_is_preserved() {
+        // If the client already supplied a `name` (e.g. via a future Anthropic
+        // schema field), we must not overwrite it. The synthesizer is an
+        // additive shim, not a rewriter.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "x"}],
+            "output_config": {
+                "format": {"type": "json_schema", "name": "my_schema", "schema": {"type": "object"}}
+            }
+        }))
+        .unwrap();
+        let out = anthropic_to_openai_request(&req, &Default::default());
+        let resp_format = out.extra.get("response_format").unwrap();
+        let inner = resp_format.get("json_schema").unwrap();
+        assert_eq!(inner.get("name").and_then(|v| v.as_str()), Some("my_schema"));
+    }
+
+    #[test]
+    fn output_config_format_with_optional_properties_is_strictified() {
+        // Claude Code's Stop-hook schema declares `impossible` as optional.
+        // OpenAI Chat Completions strict mode requires every property in
+        // `properties` to appear in `required`. The translator must rewrite the
+        // schema (litellm parity).
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "x"}],
+            "output_config": {
+                "format": {"type": "json_schema", "schema": {
+                    "type": "object",
+                    "properties": {
+                        "ok": {"type": "boolean"},
+                        "reason": {"type": "string"},
+                        "impossible": {"type": "boolean"}
+                    },
+                    "required": ["ok", "reason"]
+                }}
+            }
+        })).unwrap();
+        let out = anthropic_to_openai_request(&req, &Default::default());
+        let inner = out.extra.get("response_format").and_then(|v| v.get("json_schema")).unwrap();
+        assert_eq!(inner.get("name").and_then(|v| v.as_str()), Some("structured_output"));
+        assert_eq!(inner.get("strict").and_then(|v| v.as_bool()), Some(true));
+        let schema = inner.get("schema").unwrap();
+        let required = schema.get("required").and_then(|v| v.as_array()).unwrap();
+        let required: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(required.contains(&"impossible"), "optional property must be promoted to required under strict mode");
+        assert_eq!(schema.get("additionalProperties").and_then(|v| v.as_bool()), Some(false));
+    }
+
+    #[test]
+    fn ensure_chat_json_schema_name_non_json_schema_passthrough() {
+        // ensure_chat_json_schema_name is a no-op for format types other
+        // than "json_schema" — e.g. plain "json_object" or "text" must be
+        // returned unchanged (no json_schema wrapper synthesized).
+        let input = serde_json::json!({"type": "json_object"});
+        let out = ensure_chat_json_schema_name(&input);
+        assert_eq!(out, input);
+
+        let input = serde_json::json!({"type": "text"});
+        let out = ensure_chat_json_schema_name(&input);
+        assert_eq!(out, input);
     }
 }
