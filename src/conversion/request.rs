@@ -71,6 +71,38 @@ pub fn anthropic_to_openai_request(
         (Some(req.max_tokens), None)
     };
 
+    // Diagnostic: capture tool definitions about to cross to OpenAI so we can
+    // inspect name lengths and `tool_choice` shape end-to-end. Off by default;
+    // enable with `RUST_LOG=tool_call_debug=debug` (debug) or =info (warn-level
+    // hits for names >64 chars fire regardless).
+    if let Some(ts) = req.tools.as_ref() {
+        let names: Vec<&str> = ts.iter().map(|t| t.name.as_str()).collect();
+        let lens: Vec<usize> = ts.iter().map(|t| t.name.chars().count()).collect();
+        let over_64: Vec<&str> = ts
+            .iter()
+            .filter(|t| t.name.chars().count() > 64)
+            .map(|t| t.name.as_str())
+            .collect();
+        let max_len = lens.iter().copied().max().unwrap_or(0);
+        tracing::debug!(
+            target: "tool_call_debug",
+            direction = "anthropic->openai_chat",
+            model = %model,
+            tool_count = ts.len(),
+            max_name_chars = max_len,
+            names = ?names,
+            "tool definitions sent upstream (chat)"
+        );
+        if !over_64.is_empty() {
+            tracing::warn!(
+                target: "tool_call_debug",
+                model = %model,
+                over_64 = ?over_64,
+                "openai tool name(s) exceed 64-char limit; upstream will 400"
+            );
+        }
+    }
+
     ChatRequest {
         model,
         messages,

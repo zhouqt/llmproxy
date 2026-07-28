@@ -44,9 +44,45 @@ pub fn openai_to_anthropic_response(
     }
 
     if let Some(tool_calls) = &choice.message.tool_calls {
-        for tc in tool_calls {
-            let input: Value = serde_json::from_str(&tc.function.arguments)
-                .unwrap_or_else(|_| json!({}));
+        for (idx, tc) in tool_calls.iter().enumerate() {
+            let args = &tc.function.arguments;
+            let input: Value = match serde_json::from_str(args) {
+                Ok(v) => v,
+                Err(_) => json!({}),
+            };
+            let id = &tc.id;
+            let id_len = id.chars().count();
+            // Anthropic tool_use_id must match ^[a-zA-Z0-9_-]{1,64}$; an id that
+            // violates this gets the response rejected downstream. Probe cheaply
+            // without allocating: every char in [a-zA-Z0-9_-] and len 1..=64.
+            let id_anthropic_compatible = (1..=64).contains(&id_len)
+                && id.chars().all(|c| {
+                    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+                });
+            let name = &tc.function.name;
+            let name_len = name.chars().count();
+            tracing::debug!(
+                target: "tool_call_debug",
+                direction = "openai_chat->anthropic",
+                model = %model,
+                tool_call_index = idx,
+                id = %id,
+                id_chars = id_len,
+                id_anthropic_compatible = id_anthropic_compatible,
+                name = %name,
+                name_chars = name_len,
+                args_bytes = args.len(),
+                "tool_call from upstream (chat, non-stream)"
+            );
+            if !id_anthropic_compatible {
+                tracing::warn!(
+                    target: "tool_call_debug",
+                    model = %model,
+                    id = %id,
+                    id_chars = id_len,
+                    "tool_call.id violates Anthropic ^[a-zA-Z0-9_-]{{1,64}}$"
+                );
+            }
             content.push(ResponseBlock::ToolUse {
                 id: tc.id.clone(),
                 name: tc.function.name.clone(),
