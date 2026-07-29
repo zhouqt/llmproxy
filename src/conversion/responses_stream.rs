@@ -54,6 +54,15 @@ pub struct ResponsesStreamTranslator {
     /// Signals to the adapter that it should stop processing the stream
     /// immediately and avoid calling `finalize()` on EOF.
     pub(crate) finalized: bool,
+    /// Set of Anthropic block indices that have received at least one
+    /// `function_call_arguments.delta`. Used to detect function calls
+    /// that only carry arguments on the `*.done` event (snapshot-only,
+    /// no deltas arrived). When no delta was seen, the done event's
+    /// `arguments` is emitted as a fallback InputJsonDelta so the
+    /// client does not see an empty tool_input (which Anthropic SDK
+    /// rejects as "Invalid tool parameters" or similar). Symmetric
+    /// with `deltas_seen` for text.
+    fc_deltas_seen: std::collections::HashSet<u32>,
 }
 
 /// Returns `true` for SSE events that signal the upstream response is
@@ -92,6 +101,7 @@ impl ResponsesStreamTranslator {
             fc_item_index: std::collections::HashMap::new(),
             deltas_seen: std::collections::HashSet::new(),
             finalized: false,
+            fc_deltas_seen: std::collections::HashSet::new(),
         }
     }
 
@@ -148,6 +158,30 @@ impl ResponsesStreamTranslator {
                 if let OutputItem::FunctionCall { id, .. } = item {
                     self.has_tool_calls = true;
                     self.fc_item_index.insert(id.clone(), *output_index);
+                    // Diagnostic: capture the call_id we received so we can
+                    // check whether upstream Copilot/OpenAI ever returns ids
+                    // that violate Anthropic's ^[a-zA-Z0-9_-]{1,64}$.
+                    let id_len = id.chars().count();
+                    let id_anthropic_compatible = (1..=64).contains(&id_len)
+                        && id.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+                    tracing::debug!(
+                        target: "tool_call_debug",
+                        direction = "openai_responses->anthropic_stream",
+                        output_index = *output_index,
+                        call_id = %id,
+                        id_chars = id_len,
+                        id_anthropic_compatible = id_anthropic_compatible,
+                        "function_call item added (responses, stream)"
+                    );
+                    if !id_anthropic_compatible {
+                        tracing::warn!(
+                            target: "tool_call_debug",
+                            call_id = %id,
+                            id_chars = id_len,
+                            "responses call_id violates Anthropic ^[a-zA-Z0-9_-]{{1,64}}$"
+                        );
+                    }
                 }
                 let block_idx = self.allocate_block(*output_index);
                 let block = output_item_to_block(item);
@@ -218,6 +252,7 @@ impl ResponsesStreamTranslator {
                     tracing::warn!(?output_index, ?item_id, ?fc_index, "fc args delta for unseen block; ignoring");
                     return out;
                 };
+                self.fc_deltas_seen.insert(block_idx);
                 out.push(StreamEvent::ContentBlockDelta {
                     index: block_idx,
                     delta: BlockDelta::InputJsonDelta {
@@ -228,7 +263,7 @@ impl ResponsesStreamTranslator {
             ResponsesStreamEvent::ResponseFunctionCallArgumentsDone {
                 output_index,
                 item_id,
-                ..
+                arguments,
             } => {
                 let fc_index = self
                     .fc_item_index
@@ -239,6 +274,23 @@ impl ResponsesStreamTranslator {
                     tracing::warn!(?fc_index, ?item_id, "fc_args.done for unseen block; ignoring");
                     return out;
                 };
+                // Snapshot-only fallback. The upstream sent no
+                // incremental deltas — typically because the entire
+                // argument payload fits in one chunk (e.g. short
+                // Write/Edit calls) or because upstream optimized
+                // deltas away. Without this fallback the client sees
+                // an empty tool_input (just start + stop) and rejects
+                // calls like Write/Edit with "Invalid tool
+                // parameters". Symmetric with the text-done fallback
+                // above.
+                if !self.fc_deltas_seen.contains(&block_idx) {
+                    out.push(StreamEvent::ContentBlockDelta {
+                        index: block_idx,
+                        delta: BlockDelta::InputJsonDelta {
+                            partial_json: arguments.clone(),
+                        },
+                    });
+                }
                 if self.closed_blocks.insert(block_idx) {
                     out.push(StreamEvent::ContentBlockStop { index: block_idx });
                 }
@@ -927,7 +979,10 @@ mod tests {
     #[test]
     fn function_call_arguments_done_emits_content_block_stop() {
         // response.function_call_arguments.done closes the tool_use
-        // block.
+        // block. When no incremental deltas were seen, it also emits
+        // the full arguments as a fallback InputJsonDelta (symmetric
+        // with the text-done snapshot fallback) so the client does
+        // not see an empty tool_input.
         let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
         let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
             response: Box::new(placeholder_response("in_progress")),
@@ -947,8 +1002,16 @@ mod tests {
             output_index: 0,
             arguments: "{\"x\":1}".into(),
         });
-        assert_eq!(evs.len(), 1);
-        assert!(matches!(evs[0], StreamEvent::ContentBlockStop { index: 0 }));
+        assert_eq!(evs.len(), 2);
+        assert!(matches!(
+            evs[0],
+            StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: BlockDelta::InputJsonDelta { ref partial_json },
+                ..
+            } if partial_json == "{\"x\":1}"
+        ));
+        assert!(matches!(evs[1], StreamEvent::ContentBlockStop { index: 0 }));
     }
 
     #[test]
@@ -1686,5 +1749,69 @@ mod tests {
             "must not emit a content_block_delta for unknown item_id; got {out:?}"
         );
     }
+    /// Tools without declared mutex groups stream incrementally as
+    /// before — the common case must remain unchanged.
+    #[test]
+    fn stream_passes_through_deltas_for_tool_without_mutex_groups() {
+        let mut t = ResponsesStreamTranslator::new("msg_b", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::FunctionCall {
+                id: "fc_b".into(),
+                call_id: "call_b".into(),
+                name: "Bash".into(),
+                arguments: "{}".into(),
+                status: "in_progress".into(),
+            },
+        });
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseFunctionCallArgumentsDelta {
+            item_id: "fc_b".into(),
+            output_index: 0,
+            delta: r##"{"command":"ls"}"##.into(),
+        });
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            StreamEvent::ContentBlockDelta {
+                delta: BlockDelta::InputJsonDelta { ref partial_json },
+                ..
+            } if partial_json == r##"{"command":"ls"}"##
+        )));
+    }
+
+    /// Snapshot-only function calls must emit their full arguments when no
+    /// incremental deltas arrive.
+    #[test]
+    fn stream_emits_full_arguments_on_done_without_deltas_for_non_mutex_tool() {
+        let mut t = ResponsesStreamTranslator::new("msg_snap", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::FunctionCall {
+                id: "fc_snap".into(),
+                call_id: "call_snap".into(),
+                name: "Write".into(),
+                arguments: "".into(),
+                status: "in_progress".into(),
+            },
+        });
+        let done_events = t.push_event(&ResponsesStreamEvent::ResponseFunctionCallArgumentsDone {
+            output_index: 0,
+            item_id: "fc_snap".into(),
+            arguments: r#"{"file_path":"/tmp/foo","content":"hello"}"#.into(),
+        });
+        assert!(done_events.iter().any(|e| matches!(
+            e,
+            StreamEvent::ContentBlockDelta {
+                delta: BlockDelta::InputJsonDelta { ref partial_json },
+                ..
+            } if partial_json == r#"{"file_path":"/tmp/foo","content":"hello"}"#
+        )));
+    }
+
 }
 

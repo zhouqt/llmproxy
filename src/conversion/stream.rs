@@ -226,6 +226,35 @@ impl StreamTranslator {
                 .and_then(|f| f.arguments.clone())
                 .unwrap_or_default();
 
+            // Diagnostic: log the first delta of each tool block so we can see
+            // the upstream id/name shape in streaming flows too.
+            let id_len = id.chars().count();
+            let id_anthropic_compatible = (1..=64).contains(&id_len)
+                && id.chars().all(|c| {
+                    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+                });
+            let name_len = name.chars().count();
+            tracing::debug!(
+                target: "tool_call_debug",
+                direction = "openai_chat->anthropic_stream",
+                chunk_index = ?tc.index,
+                declared_index,
+                id = %id,
+                id_chars = id_len,
+                id_anthropic_compatible = id_anthropic_compatible,
+                name = %name,
+                name_chars = name_len,
+                "tool_call open delta (chat, stream)"
+            );
+            if !id_anthropic_compatible && !id.is_empty() {
+                tracing::warn!(
+                    target: "tool_call_debug",
+                    id = %id,
+                    id_chars = id_len,
+                    "streamed tool_call.id violates Anthropic ^[a-zA-Z0-9_-]{{1,64}}$"
+                );
+            }
+
             self.blocks[declared_index as usize] = BlockState::ToolUse {
                 id: id.clone(),
                 name: name.clone(),

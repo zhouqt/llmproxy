@@ -752,6 +752,14 @@ impl CopilotProvider {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await?;
+            tracing::warn!(
+                target: "tool_call_debug",
+                direction = "anthropic->openai_responses",
+                model = %req.model,
+                upstream_status = status.as_u16(),
+                body = %crate::util::summarize_for_log(&text, "<empty>"),
+                "upstream responses stream returned non-success"
+            );
             return Err(ProxyError::Upstream {
                 status: status.as_u16(),
                 body: text,
@@ -834,6 +842,14 @@ impl Provider for CopilotProvider {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
+            tracing::warn!(
+                target: "tool_call_debug",
+                direction = "anthropic->openai_chat",
+                model = %req.model,
+                upstream_status = status.as_u16(),
+                body = %crate::util::summarize_for_log(&text, "<empty>"),
+                "upstream chat non-stream returned non-success"
+            );
             return Err(ProxyError::Upstream {
                 status: status.as_u16(),
                 body: text,
@@ -884,6 +900,14 @@ impl Provider for CopilotProvider {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await?;
+            tracing::warn!(
+                target: "tool_call_debug",
+                direction = "anthropic->openai_chat",
+                model = %req.model,
+                upstream_status = status.as_u16(),
+                body = %crate::util::summarize_for_log(&text, "<empty>"),
+                "upstream chat stream returned non-success"
+            );
             return Err(ProxyError::Upstream {
                 status: status.as_u16(),
                 body: text,

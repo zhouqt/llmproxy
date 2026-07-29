@@ -100,6 +100,36 @@ pub fn anthropic_to_responses_request(
             .collect()
     });
 
+    // Diagnostic: same shape as the chat-completions path. Off by default;
+    // enable with `RUST_LOG=tool_call_debug=debug`.
+    if let Some(ts) = req.tools.as_ref() {
+        let names: Vec<&str> = ts.iter().map(|t| t.name.as_str()).collect();
+        let lens: Vec<usize> = ts.iter().map(|t| t.name.chars().count()).collect();
+        let over_64: Vec<&str> = ts
+            .iter()
+            .filter(|t| t.name.chars().count() > 64)
+            .map(|t| t.name.as_str())
+            .collect();
+        let max_len = lens.iter().copied().max().unwrap_or(0);
+        tracing::debug!(
+            target: "tool_call_debug",
+            direction = "anthropic->openai_responses",
+            model = %model,
+            tool_count = ts.len(),
+            max_name_chars = max_len,
+            names = ?names,
+            "tool definitions sent upstream (responses)"
+        );
+        if !over_64.is_empty() {
+            tracing::warn!(
+                target: "tool_call_debug",
+                model = %model,
+                over_64 = ?over_64,
+                "openai tool name(s) exceed 64-char limit; upstream will 400"
+            );
+        }
+    }
+
     let hints = derive_cache_hints(req);
 
     // GPT-5.x models on the Responses API reject the short `in_memory`
@@ -115,7 +145,7 @@ pub fn anthropic_to_responses_request(
         }
     });
 
-    ResponsesRequest {
+    let out = ResponsesRequest {
         model,
         input,
         instructions,
@@ -144,7 +174,31 @@ pub fn anthropic_to_responses_request(
             }
             e
         },
+    };
+
+    // Diagnostic: log all function_call.call_id and function_call_output.call_id
+    // values in the converted request so we can verify id pairing end-to-end.
+    let mut fc_ids: Vec<&str> = Vec::new();
+    let mut fco_ids: Vec<&str> = Vec::new();
+    for item in &out.input {
+        match item {
+            ResponseInputItem::FunctionCall { call_id, .. } => fc_ids.push(call_id.as_str()),
+            ResponseInputItem::FunctionCallOutput { call_id, .. } => fco_ids.push(call_id.as_str()),
+            _ => {}
+        }
     }
+    tracing::debug!(
+        target: "tool_call_debug",
+        direction = "anthropic->openai_responses",
+        model = %out.model,
+        function_call_count = fc_ids.len(),
+        function_call_output_count = fco_ids.len(),
+        function_call_ids = ?fc_ids,
+        function_call_output_ids = ?fco_ids,
+        "request input[] ids sent upstream"
+    );
+
+    out
 }
 
 /// OpenAI Responses API requires `text.format.name` on `json_schema` shapes;
@@ -392,6 +446,33 @@ pub fn responses_to_anthropic_response(
                 arguments,
                 ..
             } => {
+                // Diagnostic: capture call_id and tool name on every non-stream
+                // Responses function_call so we can correlate against any
+                // Anthropic-side rejection.
+                let id_len = call_id.chars().count();
+                let id_anthropic_compatible = (1..=64).contains(&id_len)
+                    && call_id.chars().all(|c| {
+                        c.is_ascii_alphanumeric() || c == '_' || c == '-'
+                    });
+                tracing::debug!(
+                    target: "tool_call_debug",
+                    direction = "openai_responses->anthropic",
+                    call_id = %call_id,
+                    id_chars = id_len,
+                    id_anthropic_compatible = id_anthropic_compatible,
+                    name = %name,
+                    name_chars = name.chars().count(),
+                    args_bytes = arguments.len(),
+                    "function_call from upstream (responses, non-stream)"
+                );
+                if !id_anthropic_compatible {
+                    tracing::warn!(
+                        target: "tool_call_debug",
+                        call_id = %call_id,
+                        id_chars = id_len,
+                        "responses call_id violates Anthropic ^[a-zA-Z0-9_-]{{1,64}}$"
+                    );
+                }
                 let input: Value = serde_json::from_str(arguments)
                     .unwrap_or_else(|_| Value::Object(Default::default()));
                 content.push(ResponseBlock::ToolUse {
