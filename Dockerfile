@@ -1,9 +1,8 @@
 # syntax=docker/dockerfile:1
-FROM docker.io/library/rust:1-slim-bookworm AS builder
+FROM docker.io/library/rust:1-alpine AS builder
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk update && apk add pkgconf openssl-dev \
+    && rm -rf /var/cache/apk/*
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
@@ -14,10 +13,9 @@ COPY src/ src/
 RUN cargo build --release && \
     cp target/release/llmproxy /llmproxy
 
-FROM docker.io/library/debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+FROM docker.io/library/alpine:3
+RUN apk update && apk add ca-certificates \
+    && rm -rf /var/cache/apk/*
 
 COPY --from=builder /llmproxy /usr/local/bin/llmproxy
 
