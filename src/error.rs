@@ -85,7 +85,7 @@ impl ProxyError {
     pub fn is_cooldownable(&self) -> bool {
         match self {
             ProxyError::Upstream { status, .. } => {
-                matches!(*status, 401 | 404 | 408 | 429) || *status >= 500
+                matches!(*status, 401 | 402 | 404 | 408 | 429) || *status >= 500
             }
             _ => false,
         }
@@ -222,10 +222,10 @@ mod tests {
             .is_cooldownable();
             assert_eq!(actual, expected, "status {status} expected cooldownable={expected}");
         }
-        for s in [401u16, 404, 408, 429, 500, 502, 503, 504] {
+        for s in [401u16, 402, 404, 408, 429, 500, 502, 503, 504] {
             check(s, true);
         }
-        for s in [400u16, 402, 403, 409] {
+        for s in [400u16, 403, 409] {
             check(s, false);
         }
         // Non-Upstream errors are never cooldownable.
