@@ -110,7 +110,16 @@ pub fn anthropic_to_openai_request(
             let has_web_search = req.tools.as_ref().map_or(false, |ts| {
                 ts.iter().any(crate::conversion::util::is_web_search_tool)
             });
-            if has_web_search
+            // When ALL tools are hosted, the tools field collapsed to
+            // None above.  Don't emit tool_choice alone — strict
+            // OpenAI-compat upstreams reject "tool_choice only supported
+            // when tools are enabled".
+            let non_hosted_count = req.tools.as_ref().map_or(0, |ts| {
+                ts.iter().filter(|t| !crate::conversion::util::is_web_search_tool(t)).count()
+            });
+            if non_hosted_count == 0 {
+                None
+            } else if has_web_search
                 && matches!(req.tool_choice, Some(ToolChoice::Tool { ref name }) if name == "web_search")
             {
                 Some(json!("auto"))

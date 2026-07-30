@@ -127,9 +127,9 @@ pub fn anthropic_to_responses_request(
                             // bounds call count, `search_context_size`
                             // bounds token budget — but Anthropic
                             // doesn't have a direct equivalent. This
-                            // mapping is approximate; PR4 / `web-search-followup.md`
-                            // item F may replace it with explicit
-                            // `None` (drop the field entirely).
+                            // mapping is approximate; a future change
+                            // may drop the field entirely (see
+                            // docs/PLANS/web-search-followup.md).
                             t.extra.get("max_uses")
                                 .and_then(|v| v.as_u64())
                                 .map(|u| {

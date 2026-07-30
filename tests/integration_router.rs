@@ -789,40 +789,46 @@ async fn http_end_to_end_hosted_web_search_tool_passes_through_extractor() {
     // Before PR1, requests with `tools: [{type: "web_search_20250305", ...}]`
     // (no `input_schema`) failed serde's required-field check at the
     // AppJson extractor layer. This test sends the exact Claude Code
-    // wire shape through the full axum stack and asserts AppJson accepts
-    // it (status != 400 Bad Request). Upstream behavior on the
-    // OpenAI-compat path is exercised by the unit tests in
-    // src/providers/openai_compat.rs.
+    // wire shape through the full axum stack and asserts:
+    // 1. AppJson accepts it (status != 400 Bad Request)
+    // 2. The real OpenAiCompatProvider converter injects web_search_options
+    // 3. The upstream receives the converted request
     let upstream = MockServer::start().await;
-    // Body is asserted to be a superset via body_partial_json; the
-    // OpenAI-compat converter injects `web_search_options` and strips
-    // the hosted tool from tools[].
     Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
+        .and(path("/chat/completions"))
         .and(body_partial_json(json!({
             "web_search_options": {},
-            "model": "gpt-4o",
+            "model": "claude-test"
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "cmpl_1",
             "object": "chat.completion",
             "created": 0,
-            "model": "gpt-4o",
+            "model": "claude-test",
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": "ok"},
+                "message": {"role": "assistant", "content": "searched"},
                 "finish_reason": "stop"
             }],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
         })))
+        .expect(1)
         .mount(&upstream)
         .await;
 
-    let mut providers = HashMap::new();
-    providers.insert(
+    // Use real OpenAiCompatProvider, not WiremockOpenAiProvider
+    let real_provider = llmproxy::providers::openai_compat::OpenAiCompatProvider::new(
         "primary".to_string(),
-        wiremock_provider("primary", &upstream),
-    );
+        upstream.uri(),
+        "wiremock-key".to_string(),
+        HashMap::new(),
+        reqwest::Client::new(),
+    )
+    .unwrap();
+
+    let mut providers = HashMap::new();
+    providers.insert("primary".to_string(), Arc::new(real_provider) as SharedProvider);
+
     let configs = vec![ProviderConfig::OpenaiCompat {
         name: "primary".to_string(),
         api_key: "k".to_string(),
@@ -841,9 +847,9 @@ async fn http_end_to_end_hosted_web_search_tool_passes_through_extractor() {
     });
     let resp = app.oneshot(post("/v1/messages", body)).await.unwrap();
     let (status, _headers, _body) = collect_bytes(resp).await;
-    // The point of this test is to assert AppJson accepts the request
-    // — i.e. we no longer return 400 `missing field 'input_schema'`.
-    // Whether the upstream returns 200 or 4xx, AppJson must not reject.
+    // The point of this test is to assert:
+    // 1. AppJson accepts the request (no 400)
+    // 2. The real converter path works (upstream gets the request)
     assert_ne!(
         status,
         StatusCode::BAD_REQUEST,
