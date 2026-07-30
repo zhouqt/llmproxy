@@ -833,6 +833,110 @@ mod tests {
     }
 
     #[test]
+    fn text_then_thinking_then_tool_produces_three_distinct_anthropic_blocks() {
+        let mut t = StreamTranslator::new("msg_1", "m");
+        let text: ChatChunk = serde_json::from_value(serde_json::json!({
+            "id": "c", "object": "chat.completion.chunk", "created": 0, "model": "m",
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "before"},
+                "finish_reason": null
+            }]
+        }))
+        .unwrap();
+        let thinking: ChatChunk = serde_json::from_value(serde_json::json!({
+            "id": "c", "object": "chat.completion.chunk", "created": 0, "model": "m",
+            "choices": [{
+                "index": 0,
+                "delta": {"reasoning_content": "considering"},
+                "finish_reason": null
+            }]
+        }))
+        .unwrap();
+        let tool: ChatChunk = serde_json::from_value(serde_json::json!({
+            "id": "c", "object": "chat.completion.chunk", "created": 0, "model": "m",
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"/tmp/x\"}"}
+                }]},
+                "finish_reason": null
+            }]
+        }))
+        .unwrap();
+
+        let mut events = t.push_chunk(&text);
+        events.extend(t.push_chunk(&thinking));
+        events.extend(t.push_chunk(&tool));
+        events.extend(t.push_chunk(&chunk_final("tool_calls")));
+        events.extend(t.finalize());
+
+        let block_sequence: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockStart {
+                    index,
+                    content_block: ResponseBlock::Text { .. },
+                } => Some(format!("start:text:{index}")),
+                StreamEvent::ContentBlockStart {
+                    index,
+                    content_block: ResponseBlock::ToolUse { .. },
+                } => Some(format!("start:tool_use:{index}")),
+                StreamEvent::ContentBlockStart {
+                    index,
+                    content_block: ResponseBlock::Thinking { .. },
+                } => Some(format!("start:thinking:{index}")),
+                StreamEvent::ContentBlockDelta {
+                    index,
+                    delta: BlockDelta::TextDelta { text },
+                } => Some(format!("delta:text:{index}:{text}")),
+                StreamEvent::ContentBlockDelta {
+                    index,
+                    delta: BlockDelta::InputJsonDelta { partial_json },
+                } => Some(format!("delta:input_json:{index}:{partial_json}")),
+                StreamEvent::ContentBlockDelta {
+                    index,
+                    delta: BlockDelta::ThinkingDelta { thinking },
+                } => Some(format!("delta:thinking:{index}:{thinking}")),
+                StreamEvent::ContentBlockStop { index } => Some(format!("stop:{index}")),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            block_sequence,
+            vec![
+                "start:text:0",
+                "delta:text:0:before",
+                "stop:0",
+                "start:thinking:1",
+                "delta:thinking:1:considering",
+                "stop:1",
+                "start:tool_use:2",
+                "delta:input_json:2:{\"path\":\"/tmp/x\"}",
+                "stop:2",
+            ],
+            "block sequence for text->thinking->tool must have distinct indices [0, 1, 2], got {block_sequence:#?}"
+        );
+
+        for index in [0, 1, 2] {
+            let starts = block_sequence
+                .iter()
+                .filter(|event| event.starts_with("start:") && event.ends_with(&format!(":{index}")))
+                .count();
+            let stops = block_sequence
+                .iter()
+                .filter(|event| event == &&format!("stop:{index}"))
+                .count();
+            assert_eq!(starts, 1, "index {index} should start once: {block_sequence:?}");
+            assert_eq!(stops, 1, "index {index} should stop once: {block_sequence:?}");
+        }
+    }
+
+    #[test]
     fn tool_only_first_call_uses_anthropic_index_zero() {
         let mut t = StreamTranslator::new("msg_1", "m");
         let tool: ChatChunk = serde_json::from_value(serde_json::json!({
