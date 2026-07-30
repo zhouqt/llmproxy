@@ -81,25 +81,28 @@ pub fn anthropic_to_openai_request(
         stop: req.stop_sequences.clone(),
         stream: req.stream,
         stream_options,
-        tools: req.tools.as_ref().map(|ts| {
-            ts.iter()
-                .filter_map(|t| {
-                    // Web search is declared via top-level
-                    // `web_search_options`, not as a function tool.
-                    // Strip it here; `extra` carries the options.
-                    if crate::conversion::util::is_web_search_tool(t) {
-                        return None;
-                    }
-                    Some(ChatTool {
-                        kind: "function".to_string(),
-                        function: FunctionDef {
-                            name: t.name.clone(),
-                            description: t.description.clone().unwrap_or_default(),
-                            parameters: t.input_schema.clone(),
-                        },
-                    })
-                })
-                .collect()
+        tools: req.tools.as_ref().and_then(|ts| {
+            let mut result: Vec<ChatTool> = Vec::new();
+            for t in ts {
+                // Web search is declared via top-level
+                // `web_search_options`, not as a function tool.
+                // Strip it here; `extra` carries the options.
+                if crate::conversion::util::is_web_search_tool(t) {
+                    continue;
+                }
+                result.push(ChatTool {
+                    kind: "function".to_string(),
+                    function: FunctionDef {
+                        name: t.name.clone(),
+                        description: t.description.clone().unwrap_or_default(),
+                        parameters: t.input_schema.clone(),
+                    },
+                });
+            }
+            // If the only tool was a hosted web_search, emit `None`
+            // instead of an empty array. Some strict OpenAI-compat
+            // upstreams 400 on `"tools": []`.
+            if result.is_empty() { None } else { Some(result) }
         }),
         tool_choice: {
             // If the client forced tool_choice to a hosted tool name,

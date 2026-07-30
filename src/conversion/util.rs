@@ -22,6 +22,12 @@ use crate::anthropic::Tool;
 ///   coincidentally named "web_search")
 pub fn is_web_search_tool(t: &Tool) -> bool {
     if let Some(type_str) = &t.kind {
+        // `type_str == "web_search"` is the Azure OpenAI Responses-API
+        // stable alias for `web_search_preview` (Microsoft Foundry
+        // docs). Anthropic's hosted-tool type is always the versioned
+        // `web_search_20250305`, so this branch is dead for Anthropic
+        // inbound traffic — but harmless and defensive against future
+        // OpenAI naming changes.
         return type_str.starts_with("web_search_")
             || type_str == "web_search"
             || type_str == "web_search_preview";

@@ -119,8 +119,17 @@ pub fn anthropic_to_responses_request(
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())
                         .or_else(|| {
-                            // Map Anthropic `max_uses` → OpenAI
-                            // `search_context_size`.
+                            // Heuristic fallback: Anthropic's `max_uses`
+                            // (search-count cap) is bucketed into
+                            // OpenAI's `search_context_size`
+                            // (result-quality tier). These are
+                            // semantically different — `max_uses`
+                            // bounds call count, `search_context_size`
+                            // bounds token budget — but Anthropic
+                            // doesn't have a direct equivalent. This
+                            // mapping is approximate; PR4 / `web-search-followup.md`
+                            // item F may replace it with explicit
+                            // `None` (drop the field entirely).
                             t.extra.get("max_uses")
                                 .and_then(|v| v.as_u64())
                                 .map(|u| {

@@ -784,6 +784,74 @@ async fn http_end_to_end_primary_succeeds_returns_requested_model_name() {
 }
 
 #[tokio::test]
+async fn http_end_to_end_hosted_web_search_tool_passes_through_extractor() {
+    // Regression guard for the entry-level 400 that PR1 fixed.
+    // Before PR1, requests with `tools: [{type: "web_search_20250305", ...}]`
+    // (no `input_schema`) failed serde's required-field check at the
+    // AppJson extractor layer. This test sends the exact Claude Code
+    // wire shape through the full axum stack and asserts AppJson accepts
+    // it (status != 400 Bad Request). Upstream behavior on the
+    // OpenAI-compat path is exercised by the unit tests in
+    // src/providers/openai_compat.rs.
+    let upstream = MockServer::start().await;
+    // Body is asserted to be a superset via body_partial_json; the
+    // OpenAI-compat converter injects `web_search_options` and strips
+    // the hosted tool from tools[].
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(json!({
+            "web_search_options": {},
+            "model": "gpt-4o",
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "cmpl_1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })))
+        .mount(&upstream)
+        .await;
+
+    let mut providers = HashMap::new();
+    providers.insert(
+        "primary".to_string(),
+        wiremock_provider("primary", &upstream),
+    );
+    let configs = vec![ProviderConfig::OpenaiCompat {
+        name: "primary".to_string(),
+        api_key: "k".to_string(),
+        api_base: upstream.uri(),
+        model_rewrite: HashMap::new(),
+        use_proxy: false,
+    }];
+    let app = build_axum_app(providers, configs, vec!["primary".to_string()]);
+
+    let body = json!({
+        "model": "claude-test",
+        "max_tokens": 32,
+        "stream": false,
+        "messages": [{"role": "user", "content": "search this"}],
+        "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}]
+    });
+    let resp = app.oneshot(post("/v1/messages", body)).await.unwrap();
+    let (status, _headers, _body) = collect_bytes(resp).await;
+    // The point of this test is to assert AppJson accepts the request
+    // — i.e. we no longer return 400 `missing field 'input_schema'`.
+    // Whether the upstream returns 200 or 4xx, AppJson must not reject.
+    assert_ne!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "AppJson must accept Claude Code's hosted-tool wire shape (was 400'd before PR1)"
+    );
+}
+
+#[tokio::test]
 async fn http_end_to_end_429_falls_back_to_backup_with_failed_providers_header() {
     // Same scenario as the router-level test, but exercised through the
     // full axum stack (extractor → handler → router → SSE adapter →
