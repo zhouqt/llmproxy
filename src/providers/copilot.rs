@@ -37,31 +37,16 @@ pub struct CopilotModel {
     pub id: String,
     pub name: String,
     pub vendor: String,
-}
-
-/// Copilot rejects `/chat/completions` for GPT-5.x with
-/// `unsupported_api_for_model` — those models must hit `/responses`
-/// instead. Reference: copilot-api-py `endpoint_router.py`. Pure
-/// function so we can call it from both `complete` and `stream`
-/// without sharing provider state.
-///
-/// **Endpoint routing vs. request shaping**: This function uses the
-/// empirical prefix `gpt-5` because Copilot only serves GPT-5.x on
-/// `/responses`. O-series models (o1, o3-mini, o4-mini) must go to
-/// `/chat/completions`. Do NOT use `util::gpt5_family` here — that
-/// predicate is for request shaping (max_completion_tokens, 24h
-/// prompt-cache retention) where o-series IS valid.
-fn endpoint_for_model(model: &str) -> &'static str {
-    // Copilot /responses 仅支持 gpt-5.x; o-series 走 /chat/completions.
-    // 同样会被 reject (Copilot 暂时不支持 o-series)。如果未来 Copilot
-    // 把 o-series 也开进 /responses, 改这一行 + 加 o-series endpoint
-    // 测试即可。 request.rs / responses.rs 继续用 util::gpt5_family
-    // 做 max_tokens / 24h 升级 — o-series 在那两个场景下确实需要相同处理。
-    if model.starts_with("gpt-5") {
-        "responses"
-    } else {
-        "chat_completions"
-    }
+    /// Endpoints Copilot advertises for this model, e.g.
+    /// `["/chat/completions", "/responses"]`. Drives endpoint selection in
+    /// [`CopilotProvider::endpoint_for_model`]: when `/chat/completions` is
+    /// listed we prefer it (parity with llmgateway), since the Responses
+    /// path triggers GPT-5.x to emit malformed `EnterWorktree` `name` values
+    /// (empty strings / absolute paths) that fail Claude Code's `Kor(name)`
+    /// validator. Missing/empty on older Copilot payloads — falls back to
+    /// the `gpt-5` heuristic.
+    #[serde(default)]
+    pub supported_endpoints: Vec<String>,
 }
 
 pub struct CopilotProvider {
@@ -117,7 +102,65 @@ impl std::fmt::Display for CopilotFetchError {
 
 impl std::error::Error for CopilotFetchError {}
 
+/// Heuristic endpoint used when the `/models` cache is unavailable or the
+/// model isn't listed. Kept as the historical default so a cold cache can't
+/// regress behavior: GPT-5.x → `/responses`, everything else →
+/// `/chat/completions`.
+///
+/// **Endpoint routing vs. request shaping**: uses the empirical prefix
+/// `gpt-5` (not `util::gpt5_family`) because O-series models go to
+/// `/chat/completions` even though they share request-shaping rules with
+/// GPT-5.x (max_completion_tokens, 24h prompt-cache retention).
+fn endpoint_for_model_fallback(model: &str) -> &'static str {
+    if model.starts_with("gpt-5") {
+        "responses"
+    } else {
+        "chat_completions"
+    }
+}
+
 impl CopilotProvider {
+    /// Pick the upstream endpoint for a model.
+    ///
+    /// Prefers `/chat/completions` when Copilot's `/models` cache advertises it
+    /// for the model — parity with llmgateway (`auth/github_device.ex`), which
+    /// always prefers chat when available. This matters because the Responses
+    /// path triggers GPT-5.x to emit malformed `EnterWorktree` `name` values
+    /// (empty strings, absolute paths, or both mutex keys non-empty) that fail
+    /// Claude Code's `Kor(name)` / object-level refine validators — see
+    /// `docs/REVIEWS/llmproxy-vs-llmgateway-translation-diff.md`.
+    ///
+    /// Falls back to [`endpoint_for_model_fallback`] when the cache is cold or
+    /// the model isn't listed: GPT-5.x → `/responses` (the historical default,
+    /// kept so a cold cache never regresses pre-existing behavior), everything
+    /// else → `/chat/completions`.
+    async fn endpoint_for_model(&self, model: &str) -> &'static str {
+        let endpoint = if let Some(models) = self.cached_models().await {
+            if let Some(entry) = models.iter().find(|m| m.id == model) {
+                if entry
+                    .supported_endpoints
+                    .iter()
+                    .any(|e| e == "/chat/completions" || e == "chat/completions")
+                {
+                    "chat_completions"
+                } else if entry
+                    .supported_endpoints
+                    .iter()
+                    .any(|e| e == "/responses" || e == "responses")
+                {
+                    "responses"
+                } else {
+                    endpoint_for_model_fallback(model)
+                }
+            } else {
+                endpoint_for_model_fallback(model)
+            }
+        } else {
+            endpoint_for_model_fallback(model)
+        };
+        endpoint
+    }
+
     pub fn new(
         name: String,
         vscode_version: String,
@@ -702,10 +745,10 @@ impl CopilotProvider {
         Ok(resp)
     }
 
-    /// Complete path for GPT-5.x models — Copilot rejects
-    /// `/chat/completions` for those (`unsupported_api_for_model`), so
-    /// we route them to `/responses` instead. See
-    /// `endpoint_for_model`.
+    /// Complete path via the Responses API. Reached when
+    /// [`endpoint_for_model`](Self::endpoint_for_model) selects `/responses`
+    /// — either because the `/models` cache advertises only `/responses` for
+    /// the model, or as the cold-cache fallback for `gpt-5*`.
     async fn complete_responses(
         &self,
         req: &MessagesRequest,
@@ -827,7 +870,7 @@ impl Provider for CopilotProvider {
             .get(&req.model)
             .map(String::as_str)
             .unwrap_or(&req.model);
-        let endpoint = endpoint_for_model(upstream_model);
+        let endpoint = self.endpoint_for_model(upstream_model).await;
         if endpoint == "responses" {
             return self.complete_responses(req, &merged).await;
         }
@@ -883,7 +926,7 @@ impl Provider for CopilotProvider {
             .get(&req.model)
             .map(String::as_str)
             .unwrap_or(&req.model);
-        let endpoint = endpoint_for_model(upstream_model);
+        let endpoint = self.endpoint_for_model(upstream_model).await;
         if endpoint == "responses" {
             return self.stream_responses(req, &merged).await;
         }
@@ -1372,8 +1415,10 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
 
     #[tokio::test]
     async fn complete_routes_gpt5_to_responses_endpoint() {
-        // GPT-5.x models must hit /responses, not /chat/completions —
-        // Copilot rejects the latter with unsupported_api_for_model.
+        // Cold-cache fallback: with no /models cache populated, GPT-5.x
+        // falls back to /responses (the historical default). When the cache
+        // IS populated and advertises /chat/completions, the cache-aware path
+        // prefers chat — see complete_routes_gpt5_to_chat_when_cache_advertises_it.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/responses"))
@@ -1563,10 +1608,11 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
 
     #[tokio::test]
     async fn gpt5_request_never_touches_chat_completions_endpoint() {
-        // Regression guard: ensure GPT-5 dispatch is exclusive to
-        // /responses. We assert `expect(1)` on /responses AND `expect(0)`
-        // on /chat/completions via a mock that 404s if hit, so any
-        // accidental chat-side request would fail.
+        // Cold-cache regression guard: with no /models cache, GPT-5 falls
+        // back to /responses and must NOT hit /chat/completions. Asserts
+        // `expect(1)` on /responses AND `expect(0)` on /chat/completions via
+        // a mock that 500s if hit. (When the cache advertises chat, the
+        // cache-aware path does hit chat — covered by a separate test.)
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
@@ -1598,6 +1644,166 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             Some(&server),
             Some(stored_tokens("github-token", "copilot-token", 600)),
         );
+        let mut gpt5_req = request(false);
+        gpt5_req.model = "gpt-5".to_string();
+
+        let output = provider
+            .complete(&gpt5_req, &HashMap::new())
+            .await
+            .unwrap();
+        expect_variant!(output, ProviderOutput::Json(body) => {
+            assert_eq!(body["content"][0]["text"], "ok");
+        });
+    }
+
+    #[tokio::test]
+    async fn complete_routes_gpt5_to_chat_when_cache_advertises_it() {
+        // Cache-aware routing: when Copilot's /models cache lists GPT-5 with
+        // /chat/completions in supported_endpoints, we MUST prefer chat over
+        // /responses. This is the root-cause fix for EnterWorktree
+        // "Invalid tool parameters" — the Responses path makes GPT-5.x emit
+        // malformed EnterWorktree `name` values (empty strings / paths) that
+        // fail Claude Code's Kor(name) validator; chat doesn't. Parity with
+        // llmgateway. See docs/REVIEWS/llmproxy-vs-llmgateway-translation-diff.md.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("should not be called"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(json!({"model": "gpt-5", "stream": false})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "gpt-5",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hello-from-chat"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+        // Prime the cache: GPT-5 advertises BOTH endpoints → chat wins.
+        *provider.state.cached_models.write().await = Some(vec![CopilotModel {
+            id: "gpt-5".to_string(),
+            name: "GPT-5".to_string(),
+            vendor: "openai".to_string(),
+            supported_endpoints: vec![
+                "/chat/completions".to_string(),
+                "/responses".to_string(),
+            ],
+        }]);
+        let mut gpt5_req = request(false);
+        gpt5_req.model = "gpt-5".to_string();
+
+        let output = provider
+            .complete(&gpt5_req, &HashMap::new())
+            .await
+            .unwrap();
+        expect_variant!(output, ProviderOutput::Json(body) => {
+            assert_eq!(body["content"][0]["text"], "hello-from-chat");
+        });
+    }
+
+    #[tokio::test]
+    async fn stream_routes_gpt5_to_chat_when_cache_advertises_it() {
+        // Streaming twin of the above: cache advertises chat → stream goes
+        // to /chat/completions, not /responses.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("should not be called"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let sse = concat!(
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+        *provider.state.cached_models.write().await = Some(vec![CopilotModel {
+            id: "gpt-5".to_string(),
+            name: "GPT-5".to_string(),
+            vendor: "openai".to_string(),
+            supported_endpoints: vec!["/chat/completions".to_string()],
+        }]);
+        let mut gpt5_req = request(true);
+        gpt5_req.model = "gpt-5".to_string();
+
+        let output = provider.stream(&gpt5_req, &HashMap::new()).await.unwrap();
+        expect_variant!(output, ProviderOutput::Stream(mut stream) => {
+            let mut encoded = String::new();
+            while let Some(item) = stream.next().await {
+                encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+            }
+            assert!(encoded.contains("event: message_start"));
+            assert!(encoded.contains("hi"));
+        });
+    }
+
+    #[tokio::test]
+    async fn complete_routes_gpt5_to_responses_when_cache_lists_only_responses() {
+        // Cache lists only /responses for GPT-5 (no chat) → must use
+        // /responses even though the cache is populated. Confirms the
+        // cache-aware path doesn't blindly default to chat.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("should not be called"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_1",
+                "object": "response",
+                "created_at": 0,
+                "model": "gpt-5",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+        *provider.state.cached_models.write().await = Some(vec![CopilotModel {
+            id: "gpt-5".to_string(),
+            name: "GPT-5".to_string(),
+            vendor: "openai".to_string(),
+            supported_endpoints: vec!["/responses".to_string()],
+        }]);
         let mut gpt5_req = request(false);
         gpt5_req.model = "gpt-5".to_string();
 
@@ -1737,33 +1943,37 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
     }
 
     #[test]
-    fn endpoint_for_model_classifies_by_prefix() {
-        assert_eq!(endpoint_for_model("gpt-5"), "responses");
-        assert_eq!(endpoint_for_model("gpt-5-mini"), "responses");
-        assert_eq!(endpoint_for_model("gpt-5.5"), "responses");
-        assert_eq!(endpoint_for_model("gpt-4"), "chat_completions");
-        assert_eq!(endpoint_for_model("claude-sonnet-4.6"), "chat_completions");
-        assert_eq!(endpoint_for_model(""), "chat_completions");
+    fn endpoint_for_model_fallback_classifies_by_prefix() {
+        // Cold-cache heuristic: GPT-5.x → /responses, everything else →
+        // /chat/completions. This is only used when the /models cache is
+        // unavailable; the cache-aware path prefers /chat/completions when
+        // Copilot advertises it (see endpoint_for_model_prefers_chat_* tests).
+        assert_eq!(endpoint_for_model_fallback("gpt-5"), "responses");
+        assert_eq!(endpoint_for_model_fallback("gpt-5-mini"), "responses");
+        assert_eq!(endpoint_for_model_fallback("gpt-5.5"), "responses");
+        assert_eq!(endpoint_for_model_fallback("gpt-4"), "chat_completions");
+        assert_eq!(endpoint_for_model_fallback("claude-sonnet-4.6"), "chat_completions");
+        assert_eq!(endpoint_for_model_fallback(""), "chat_completions");
         // T25: o-series routes to /chat/completions, not /responses.
-        // endpoint_for_model uses empirical gpt-5 prefix only.
-        assert_eq!(endpoint_for_model("o1"), "chat_completions");
-        assert_eq!(endpoint_for_model("o3-mini"), "chat_completions");
-        assert_eq!(endpoint_for_model("o4-mini"), "chat_completions");
+        // The fallback uses empirical gpt-5 prefix only.
+        assert_eq!(endpoint_for_model_fallback("o1"), "chat_completions");
+        assert_eq!(endpoint_for_model_fallback("o3-mini"), "chat_completions");
+        assert_eq!(endpoint_for_model_fallback("o4-mini"), "chat_completions");
     }
 
     #[test]
-    fn endpoint_for_model_is_case_sensitive() {
+    fn endpoint_for_model_fallback_is_case_sensitive() {
         // Routing is case-sensitive: only the exact lowercase prefix
         // "gpt-5" hits /responses. Mixed-case model names fall through
         // to /chat/completions, which is the safer default — we'd
         // rather retry on the wrong endpoint than silently mis-route
         // an unknown model.
-        assert_eq!(endpoint_for_model("GPT-5"), "chat_completions");
-        assert_eq!(endpoint_for_model("Gpt-5-mini"), "chat_completions");
-        assert_eq!(endpoint_for_model("GPT5"), "chat_completions");
+        assert_eq!(endpoint_for_model_fallback("GPT-5"), "chat_completions");
+        assert_eq!(endpoint_for_model_fallback("Gpt-5-mini"), "chat_completions");
+        assert_eq!(endpoint_for_model_fallback("GPT5"), "chat_completions");
         // Real-world GPT-5 variants: all lowercase prefix matches.
-        assert_eq!(endpoint_for_model("gpt-5.5-mini"), "responses");
-        assert_eq!(endpoint_for_model("gpt-5-2025-08-07"), "responses");
+        assert_eq!(endpoint_for_model_fallback("gpt-5.5-mini"), "responses");
+        assert_eq!(endpoint_for_model_fallback("gpt-5-2025-08-07"), "responses");
     }
 
     #[test]
@@ -2877,6 +3087,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             id: "cached-m1".to_string(),
             name: "Cached Model".to_string(),
             vendor: "v".to_string(),
+            supported_endpoints: vec![],
         }]);
 
         // cache_models() will call ensure_token (succeeds, token unexpired),
@@ -2948,6 +3159,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             id: "stale-1".to_string(),
             name: "Stale".to_string(),
             vendor: "v".to_string(),
+            supported_endpoints: vec![],
         }]);
 
         p.cache_models().await;
@@ -2981,6 +3193,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             id: "stale-1".to_string(),
             name: "Stale".to_string(),
             vendor: "v".to_string(),
+            supported_endpoints: vec![],
         }]);
 
         p.cache_models().await;
@@ -3017,6 +3230,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             id: "stale-503".to_string(),
             name: "Stale 503".to_string(),
             vendor: "v".to_string(),
+            supported_endpoints: vec![],
         }]);
 
         p.cache_models().await;
