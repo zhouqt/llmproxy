@@ -90,14 +90,51 @@ pub fn anthropic_to_responses_request(
     });
 
     let tools = req.tools.as_ref().map(|ts| {
-        ts.iter()
-            .map(|t| ResponsesTool::Function {
+        let mut result: Vec<ResponsesTool> = Vec::new();
+
+        // Function tools — strip web_search because it becomes a hosted
+        // tool entry below.
+        for t in ts {
+            if crate::conversion::util::is_web_search_tool(t) {
+                // This tool will be appended as ResponsesTool::WebSearch
+                // after the loop; don't emit as Function.
+                continue;
+            }
+            result.push(ResponsesTool::Function {
                 name: t.name.clone(),
                 description: t.description.clone(),
                 parameters: Some(t.input_schema.clone()),
                 strict: None,
-            })
-            .collect()
+            });
+        }
+
+        // Hosted web search tool — add after all function tools so the
+        // upstream lists web_search_preview separately.
+        for t in ts {
+            if crate::conversion::util::is_web_search_tool(t) {
+                result.push(ResponsesTool::WebSearch {
+                    search_context_size: t
+                        .extra
+                        .get("search_context_size")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| {
+                            // Map Anthropic `max_uses` → OpenAI
+                            // `search_context_size`.
+                            t.extra.get("max_uses")
+                                .and_then(|v| v.as_u64())
+                                .map(|u| {
+                                    if u >= 10 { "high".to_string() }
+                                    else if u >= 5 { "medium".to_string() }
+                                    else { "low".to_string() }
+                                })
+                        }),
+                    user_location: t.extra.get("user_location").cloned(),
+                });
+            }
+        }
+
+        result
     });
 
     let hints = derive_cache_hints(req);
@@ -124,7 +161,21 @@ pub fn anthropic_to_responses_request(
         top_p: req.top_p,
         stream: req.stream,
         tools,
-        tool_choice: req.tool_choice.as_ref().and_then(convert_tool_choice),
+        tool_choice: {
+            // Detect forced web_search tool_choice. The upstream has no
+            // function tool named "web_search" — remap to auto.
+            let has_web_search = req.tools.as_ref().map_or(false, |ts| {
+                ts.iter().any(crate::conversion::util::is_web_search_tool)
+            });
+            let tc = req.tool_choice.as_ref().and_then(convert_tool_choice);
+            if has_web_search
+                && matches!(req.tool_choice, Some(ToolChoice::Tool { ref name }) if name == "web_search")
+            {
+                Some(json!("auto"))
+            } else {
+                tc
+            }
+        },
         parallel_tool_calls: None,
         user: req
             .metadata
@@ -402,6 +453,10 @@ pub fn responses_to_anthropic_response(
                 });
                 has_tool_calls = true;
             }
+            // WebSearchCall doesn't carry result text directly —
+            // search results appear as url_citation annotations on
+            // the subsequent output_text block. No block to emit.
+            OutputItem::WebSearchCall { .. } => {}
             OutputItem::Unknown => {}
         }
     }
@@ -575,6 +630,7 @@ mod tests {
                 assert_eq!(name, "f");
                 assert!(parameters.is_some());
             }
+            _ => panic!("expected Function tool"),
         }
     }
 

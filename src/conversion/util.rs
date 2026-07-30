@@ -9,6 +9,26 @@
 
 use serde_json::Value;
 
+use crate::anthropic::Tool;
+
+/// Detect whether a `Tool` is an Anthropic-native hosted web search tool.
+///
+/// Matches:
+/// - `{type: "web_search_20250305", name: "web_search"}` (canonical Anthropic)
+/// - `{type: "web_search_preview", ...}` (OpenAI Responses API shape)
+///
+/// Does NOT match:
+/// - `{name: "web_search", type: "function"}` (user-defined function tool
+///   coincidentally named "web_search")
+pub fn is_web_search_tool(t: &Tool) -> bool {
+    if let Some(type_str) = &t.kind {
+        return type_str.starts_with("web_search_")
+            || type_str == "web_search"
+            || type_str == "web_search_preview";
+    }
+    false
+}
+
 /// Recursively make a JSON Schema compliant with OpenAI strict mode.
 ///
 /// # What this does

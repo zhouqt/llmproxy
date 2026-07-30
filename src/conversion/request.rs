@@ -83,17 +83,38 @@ pub fn anthropic_to_openai_request(
         stream_options,
         tools: req.tools.as_ref().map(|ts| {
             ts.iter()
-                .map(|t| ChatTool {
-                    kind: "function".to_string(),
-                    function: FunctionDef {
-                        name: t.name.clone(),
-                        description: t.description.clone().unwrap_or_default(),
-                        parameters: t.input_schema.clone(),
-                    },
+                .filter_map(|t| {
+                    // Web search is declared via top-level
+                    // `web_search_options`, not as a function tool.
+                    // Strip it here; `extra` carries the options.
+                    if crate::conversion::util::is_web_search_tool(t) {
+                        return None;
+                    }
+                    Some(ChatTool {
+                        kind: "function".to_string(),
+                        function: FunctionDef {
+                            name: t.name.clone(),
+                            description: t.description.clone().unwrap_or_default(),
+                            parameters: t.input_schema.clone(),
+                        },
+                    })
                 })
                 .collect()
         }),
-        tool_choice: req.tool_choice.as_ref().map(convert_tool_choice),
+        tool_choice: {
+            // If the client forced tool_choice to a hosted tool name,
+            // upstream has no function with that name — remap to auto.
+            let has_web_search = req.tools.as_ref().map_or(false, |ts| {
+                ts.iter().any(crate::conversion::util::is_web_search_tool)
+            });
+            if has_web_search
+                && matches!(req.tool_choice, Some(ToolChoice::Tool { ref name }) if name == "web_search")
+            {
+                Some(json!("auto"))
+            } else {
+                req.tool_choice.as_ref().map(convert_tool_choice)
+            }
+        },
         user: req
             .metadata
             .as_ref()
@@ -108,6 +129,14 @@ pub fn anthropic_to_openai_request(
             let mut e = Value::Object(Map::new());
             if let Some(fmt) = req.output_config.as_ref().and_then(|oc| oc.format.as_ref()) {
                 e["response_format"] = ensure_chat_json_schema_name(fmt);
+            }
+            // When web search tools are present, inject
+            // web_search_options into extra_body. The tool was stripped
+            // from tools[] above so it doesn't appear as a function.
+            if req.tools.as_ref().map_or(false, |ts| {
+                ts.iter().any(crate::conversion::util::is_web_search_tool)
+            }) {
+                e["web_search_options"] = json!({});
             }
             e
         },

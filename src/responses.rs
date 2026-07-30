@@ -104,6 +104,18 @@ pub enum ResponsesTool {
         #[serde(skip_serializing_if = "Option::is_none")]
         strict: Option<bool>,
     },
+    /// OpenAI Responses API hosted web search tool declared as a tool
+    /// entry with `{"type": "web_search_preview", ...}`.
+    /// References:
+    /// - https://platform.openai.com/docs/guides/tools-web-search
+    /// - litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py:186-188
+    #[serde(rename = "web_search_preview")]
+    WebSearch {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        search_context_size: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user_location: Option<Value>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +195,15 @@ pub enum OutputItem {
         name: String,
         arguments: String,
         status: String,
+    },
+    /// Hosted web search call produced by a `web_search_preview` tool.
+    /// References:
+    /// - https://platform.openai.com/docs/guides/tools-web-search
+    /// - litellm/types/llms/openai.py:1638-1653 (SSE events)
+    #[serde(rename = "web_search_call")]
+    WebSearchCall {
+        id: String,
+        status: String, // "in_progress" | "searching" | "completed"
     },
     /// Unknown item type — kept for forward compatibility.
     #[serde(other)]
@@ -286,6 +307,25 @@ pub enum ResponsesStreamEvent {
         item_id: String,
         output_index: u32,
         arguments: String,
+    },
+    /// SSE event indicating a web search call is in progress (hosted
+    /// tool provider has started the search).
+    #[serde(rename = "response.web_search_call.in_progress")]
+    ResponseWebSearchCallInProgress {
+        output_index: u32,
+        item_id: String,
+    },
+    /// SSE event indicating the web search provider is actively searching.
+    #[serde(rename = "response.web_search_call.searching")]
+    ResponseWebSearchCallSearching {
+        output_index: u32,
+        item_id: String,
+    },
+    /// SSE event indicating the web search has completed.
+    #[serde(rename = "response.web_search_call.completed")]
+    ResponseWebSearchCallCompleted {
+        output_index: u32,
+        item_id: String,
     },
     /// Upstream SSE error event. OpenAI send these inline during a
     /// stream when something goes wrong mid-response (e.g. model
