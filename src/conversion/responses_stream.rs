@@ -50,6 +50,10 @@ pub struct ResponsesStreamTranslator {
     /// arrived). When no delta was seen, the done event's `text` is emitted
     /// as a fallback text delta so the client does not see an empty block.
     deltas_seen: std::collections::HashSet<u32>,
+    /// Raw argument fragments forwarded to the client, keyed by Anthropic
+    /// block index. Used only to verify that the concatenated delta stream
+    /// matches the upstream `*.done` snapshot; values are never logged.
+    fc_delta_args: std::collections::HashMap<u32, String>,
     /// Set to true when an upstream `error` SSE event was handled.
     /// Signals to the adapter that it should stop processing the stream
     /// immediately and avoid calling `finalize()` on EOF.
@@ -100,6 +104,7 @@ impl ResponsesStreamTranslator {
             has_tool_calls: false,
             fc_item_index: std::collections::HashMap::new(),
             deltas_seen: std::collections::HashSet::new(),
+            fc_delta_args: std::collections::HashMap::new(),
             finalized: false,
             fc_deltas_seen: std::collections::HashSet::new(),
         }
@@ -253,6 +258,10 @@ impl ResponsesStreamTranslator {
                     return out;
                 };
                 self.fc_deltas_seen.insert(block_idx);
+                self.fc_delta_args
+                    .entry(block_idx)
+                    .or_default()
+                    .push_str(delta);
                 out.push(StreamEvent::ContentBlockDelta {
                     index: block_idx,
                     delta: BlockDelta::InputJsonDelta {
@@ -274,6 +283,30 @@ impl ResponsesStreamTranslator {
                     tracing::warn!(?fc_index, ?item_id, "fc_args.done for unseen block; ignoring");
                     return out;
                 };
+                let delta_args = self.fc_delta_args.get(&block_idx);
+                let delta_snapshot_match = delta_args.is_none_or(|raw| raw == arguments);
+                let delta_raw_bytes = delta_args.map_or(0, String::len);
+                tracing::debug!(
+                    target: "tool_call_debug",
+                    direction = "openai_responses->anthropic_stream",
+                    item_id = %item_id,
+                    block_idx,
+                    raw_bytes = arguments.len(),
+                    deltas_seen = self.fc_deltas_seen.contains(&block_idx),
+                    delta_snapshot_match,
+                    delta_raw_bytes,
+                    "function_call arguments finalized (responses, stream)"
+                );
+                if !delta_snapshot_match {
+                    tracing::warn!(
+                        target: "tool_call_debug",
+                        item_id = %item_id,
+                        block_idx,
+                        delta_raw_bytes,
+                        snapshot_raw_bytes = arguments.len(),
+                        "responses function-call delta stream differs from done snapshot"
+                    );
+                }
                 // Snapshot-only fallback. The upstream sent no
                 // incremental deltas — typically because the entire
                 // argument payload fits in one chunk (e.g. short
