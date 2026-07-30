@@ -278,6 +278,241 @@ async fn mock_llm_provider_falls_back_when_primary_returns_429() {
 }
 
 #[tokio::test]
+async fn mock_llm_provider_falls_back_when_primary_returns_402_quota() {
+    // Copilot can reject inference with HTTP 402 ("You have exceeded your
+    // monthly quota"). The router must (a) treat 402 as a cooldownable
+    // quota failure, (b) record the attempt with the original body, and
+    // (c) call backup. Without this, 402 surfaced directly to the client.
+    let primary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(402)
+                .set_body_string("You have exceeded your monthly quota"),
+        )
+        .expect(1)
+        .mount(&primary)
+        .await;
+    let backup = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_ok(
+            "from backup",
+            "claude-test",
+        )))
+        .expect(1)
+        .mount(&backup)
+        .await;
+
+    let mut providers = HashMap::new();
+    providers.insert("primary".to_string(), wiremock_provider("primary", &primary));
+    providers.insert("backup".to_string(), wiremock_provider("backup", &backup));
+
+    let cfg = Config {
+        server: ServerConfig {
+            listen: "127.0.0.1:0".to_string(),
+            api_key: None,
+        },
+        proxy: Default::default(),
+        providers: vec![
+            ProviderConfig::OpenaiCompat {
+                name: "primary".to_string(),
+                api_key: "k".to_string(),
+                api_base: primary.uri(),
+                model_rewrite: HashMap::new(),
+                use_proxy: false,
+            },
+            ProviderConfig::OpenaiCompat {
+                name: "backup".to_string(),
+                api_key: "k".to_string(),
+                api_base: backup.uri(),
+                model_rewrite: HashMap::new(),
+                use_proxy: false,
+            },
+        ],
+        models: vec![ModelConfig {
+            name: "claude-test".into(),
+            primary: "primary".into(),
+            fallback_chain: vec!["backup".into()],
+            cooldown_seconds: 60,
+            max_retries_per_provider: 1,
+            max_retries_total: 2,
+        }],
+        logging: Default::default(),
+    };
+    let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
+
+    let model_cfg = router.find_model("claude-test").unwrap();
+    let (out, attempts) = router
+        .complete(model_cfg, &make_req("claude-test"))
+        .await
+        .unwrap();
+    let ProviderOutput::Json(body) = out else {
+        panic!("expected JSON output");
+    };
+    assert_eq!(body["content"][0]["text"], "from backup");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].provider, "primary");
+    assert_eq!(attempts[0].status, 402);
+    assert_eq!(attempts[0].body, "You have exceeded your monthly quota");
+}
+
+#[tokio::test]
+async fn mock_llm_provider_falls_back_when_primary_returns_empty_body_402() {
+    // 402 fallback classification must be status-based, not body-based:
+    // an empty body must still trigger fallback/cooldown because
+    // is_cooldownable() inspects the status code only.
+    let primary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(402))
+        .mount(&primary)
+        .await;
+    let backup = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_ok(
+            "from backup",
+            "claude-test",
+        )))
+        .expect(1)
+        .mount(&backup)
+        .await;
+
+    let mut providers = HashMap::new();
+    providers.insert("primary".to_string(), wiremock_provider("primary", &primary));
+    providers.insert("backup".to_string(), wiremock_provider("backup", &backup));
+
+    let cfg = Config {
+        server: ServerConfig {
+            listen: "127.0.0.1:0".to_string(),
+            api_key: None,
+        },
+        proxy: Default::default(),
+        providers: vec![
+            ProviderConfig::OpenaiCompat {
+                name: "primary".to_string(),
+                api_key: "k".to_string(),
+                api_base: primary.uri(),
+                model_rewrite: HashMap::new(),
+                use_proxy: false,
+            },
+            ProviderConfig::OpenaiCompat {
+                name: "backup".to_string(),
+                api_key: "k".to_string(),
+                api_base: backup.uri(),
+                model_rewrite: HashMap::new(),
+                use_proxy: false,
+            },
+        ],
+        models: vec![ModelConfig {
+            name: "claude-test".into(),
+            primary: "primary".into(),
+            fallback_chain: vec!["backup".into()],
+            cooldown_seconds: 60,
+            max_retries_per_provider: 1,
+            max_retries_total: 2,
+        }],
+        logging: Default::default(),
+    };
+    let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
+
+    let model_cfg = router.find_model("claude-test").unwrap();
+    let (out, attempts) = router
+        .complete(model_cfg, &make_req("claude-test"))
+        .await
+        .unwrap();
+    let ProviderOutput::Json(body) = out else {
+        panic!("expected JSON output");
+    };
+    assert_eq!(body["content"][0]["text"], "from backup");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, 402);
+    assert_eq!(attempts[0].body, "");
+}
+
+#[tokio::test]
+async fn mock_llm_provider_does_not_fall_back_on_403() {
+    // 403 Forbidden must surface immediately: it is NOT cooldownable,
+    // so backup must never be called and primary must not enter
+    // cooldown. This is the negative control that guards against an
+    // over-eager expansion of the cooldownable status set.
+    let primary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+        .expect(1)
+        .mount(&primary)
+        .await;
+    let backup = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_ok(
+            "must not be called",
+            "claude-test",
+        )))
+        .expect(0)
+        .mount(&backup)
+        .await;
+
+    let mut providers = HashMap::new();
+    providers.insert("primary".to_string(), wiremock_provider("primary", &primary));
+    providers.insert("backup".to_string(), wiremock_provider("backup", &backup));
+
+    let cfg = Config {
+        server: ServerConfig {
+            listen: "127.0.0.1:0".to_string(),
+            api_key: None,
+        },
+        proxy: Default::default(),
+        providers: vec![
+            ProviderConfig::OpenaiCompat {
+                name: "primary".to_string(),
+                api_key: "k".to_string(),
+                api_base: primary.uri(),
+                model_rewrite: HashMap::new(),
+                use_proxy: false,
+            },
+            ProviderConfig::OpenaiCompat {
+                name: "backup".to_string(),
+                api_key: "k".to_string(),
+                api_base: backup.uri(),
+                model_rewrite: HashMap::new(),
+                use_proxy: false,
+            },
+        ],
+        models: vec![ModelConfig {
+            name: "claude-test".into(),
+            primary: "primary".into(),
+            fallback_chain: vec!["backup".into()],
+            cooldown_seconds: 60,
+            max_retries_per_provider: 1,
+            max_retries_total: 2,
+        }],
+        logging: Default::default(),
+    };
+    let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
+
+    let model_cfg = router.find_model("claude-test").unwrap();
+    let err = router
+        .complete(model_cfg, &make_req("claude-test"))
+        .await
+        .err()
+        .expect("403 must surface as Err, not silently fall back");
+    match err {
+        ProxyError::Upstream { status, body } => {
+            assert_eq!(status, 403);
+            assert_eq!(body, "forbidden");
+        }
+        other => panic!("expected Upstream 403, got {other:?}"),
+    }
+    assert!(
+        !router.cooldown().is_cooling_down("primary").await,
+        "primary must NOT be on cooldown for a non-cooldownable 403"
+    );
+}
+
+#[tokio::test]
 async fn mock_llm_provider_chain_exhausted_returns_last_upstream_error() {
     // Every provider returns 500 — the chain is exhausted. The router
     // must surface `AllProvidersFailed` with both attempts and the last
@@ -872,6 +1107,102 @@ async fn mock_llm_provider_short_cooldown_for_non_429_upstream_error() {
     );
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].status, 503);
+}
+
+#[tokio::test]
+async fn mock_llm_provider_402_uses_configured_cooldown_seconds_and_skips_primary() {
+    // A 402 (e.g. monthly quota) must use the configured
+    // cooldown_seconds, not the 5-second transient fallback. Verify
+    // both the TTL on the entry AND that a subsequent request skips
+    // the primary entirely while it's on cooldown.
+    let primary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(402)
+                .set_body_string("You have exceeded your monthly quota"),
+        )
+        .expect(1)
+        .mount(&primary)
+        .await;
+    let backup = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_ok(
+            "backup served",
+            "claude-test",
+        )))
+        .expect(2)
+        .mount(&backup)
+        .await;
+
+    let mut providers = HashMap::new();
+    providers.insert("primary".to_string(), wiremock_provider("primary", &primary));
+    providers.insert("backup".to_string(), wiremock_provider("backup", &backup));
+    let cfg = Config {
+        server: ServerConfig {
+            listen: "127.0.0.1:0".to_string(),
+            api_key: None,
+        },
+        proxy: Default::default(),
+        providers: vec![
+            ProviderConfig::OpenaiCompat {
+                name: "primary".to_string(),
+                api_key: "k".to_string(),
+                api_base: primary.uri(),
+                model_rewrite: HashMap::new(),
+                use_proxy: false,
+            },
+            ProviderConfig::OpenaiCompat {
+                name: "backup".to_string(),
+                api_key: "k".to_string(),
+                api_base: backup.uri(),
+                model_rewrite: HashMap::new(),
+                use_proxy: false,
+            },
+        ],
+        models: vec![ModelConfig {
+            name: "claude-test".into(),
+            primary: "primary".into(),
+            fallback_chain: vec!["backup".into()],
+            cooldown_seconds: 60,
+            max_retries_per_provider: 1,
+            max_retries_total: 2,
+        }],
+        logging: Default::default(),
+    };
+    let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
+
+    let model_cfg = router.find_model("claude-test").unwrap();
+    let req = make_req("claude-test");
+
+    // First request: primary returns 402 → backup takes over. The
+    // primary entry's remaining TTL must be close to the configured
+    // 60s (allow scheduler drift), not the 5s transient window.
+    let (_out, _attempts) = router.complete(model_cfg, &req).await.unwrap();
+    let active = router.cooldown().active().await;
+    let primary_entry = active
+        .iter()
+        .find(|(name, _, _)| name == "primary")
+        .expect("primary must be on cooldown after 402");
+    assert_eq!(
+        primary_entry.1, 402,
+        "cooldown entry status should match the upstream's 402"
+    );
+    let ttl = primary_entry.2;
+    assert!(
+        ttl <= Duration::from_secs(60) && ttl > Duration::from_secs(55),
+        "402 cooldown must use the configured cooldown_seconds (~60s), got {ttl:?}"
+    );
+
+    // Second request: primary must be actively skipped (its call
+    // count stays at 1 because the wiremock expectation already
+    // pinned the limit).
+    let (_out, attempts2) = router.complete(model_cfg, &req).await.unwrap();
+    assert!(
+        attempts2.is_empty(),
+        "primary must be skipped on the second request; got {attempts2:?}"
+    );
 }
 
 #[tokio::test]

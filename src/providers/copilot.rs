@@ -1938,6 +1938,142 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
     }
 
     #[tokio::test]
+    async fn complete_responses_preserves_402_quota() {
+        // The Responses upstream path must surface the exact HTTP status
+        // and body for a 402 (Copilot's monthly-quota signal) instead
+        // of remapping or swallowing it. The router relies on this
+        // preservation to fall back to the next provider in the chain.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(402)
+                    .set_body_string("You have exceeded your monthly quota"),
+            )
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+        let mut gpt5_req = request(false);
+        gpt5_req.model = "gpt-5".to_string();
+
+        let error = provider
+            .complete(&gpt5_req, &HashMap::new())
+            .await
+            .err()
+            .expect("upstream 402 should fail");
+
+        assert!(matches!(
+            error,
+            ProxyError::Upstream { status: 402, ref body }
+                if body == "You have exceeded your monthly quota"
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_responses_preserves_402_quota() {
+        // Streaming Responses variant: a 402 returned before any SSE
+        // bytes are emitted must surface as ProxyError::Upstream so the
+        // router can fall back; constructing the SSE stream here would
+        // lock the client into a single provider with no recovery.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(402)
+                    .set_body_string("You have exceeded your monthly quota"),
+            )
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+        let mut gpt5_req = request(true);
+        gpt5_req.model = "gpt-5".to_string();
+
+        let error = provider
+            .stream(&gpt5_req, &HashMap::new())
+            .await
+            .err()
+            .expect("upstream 402 should fail");
+
+        assert!(matches!(
+            error,
+            ProxyError::Upstream { status: 402, ref body }
+                if body == "You have exceeded your monthly quota"
+        ));
+    }
+
+    #[tokio::test]
+    async fn complete_chat_completions_preserves_402_quota() {
+        // Chat Completions non-streaming path: same preservation
+        // contract as Responses — the router's classification is
+        // status-based, so a remapped or translated 402 would silently
+        // bypass the cooldown path.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(402)
+                    .set_body_string("You have exceeded your monthly quota"),
+            )
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+
+        let error = provider
+            .complete(&request(false), &HashMap::new())
+            .await
+            .err()
+            .expect("upstream 402 should fail");
+
+        assert!(matches!(
+            error,
+            ProxyError::Upstream { status: 402, ref body }
+                if body == "You have exceeded your monthly quota"
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_chat_completions_preserves_402_quota() {
+        // Chat Completions streaming variant: the HTTP status check
+        // must run before the SSE stream is constructed so the router
+        // still has a chance to fall back; emitting a 200-then-error
+        // envelope here would bypass fallback entirely.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(402)
+                    .set_body_string("You have exceeded your monthly quota"),
+            )
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+
+        let error = provider
+            .stream(&request(true), &HashMap::new())
+            .await
+            .err()
+            .expect("upstream 402 should fail");
+
+        assert!(matches!(
+            error,
+            ProxyError::Upstream { status: 402, ref body }
+                if body == "You have exceeded your monthly quota"
+        ));
+    }
+
+    #[tokio::test]
     async fn complete_surfaces_error_envelope_on_http_200() {
         // GitHub Copilot returns HTTP 200 with an OpenAI error envelope
         // when the requested model isn't supported. Without the envelope
