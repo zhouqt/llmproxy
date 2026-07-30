@@ -178,7 +178,7 @@ impl Router {
                                 status: *status,
                                 body: body.clone(),
                             });
-                            let ttl = if *status == 429 {
+                            let ttl = if matches!(*status, 402 | 429) {
                                 Duration::from_secs(model.cooldown_seconds)
                             } else {
                                 Duration::from_secs(5)
@@ -314,7 +314,7 @@ impl Router {
                             status: *status,
                             body: body.clone(),
                         });
-                        let ttl = if *status == 429 {
+                        let ttl = if matches!(*status, 402 | 429) {
                             Duration::from_secs(model.cooldown_seconds)
                         } else {
                             Duration::from_secs(5)
@@ -756,6 +756,145 @@ mod tests {
         assert_eq!(attempts[0].status, 429);
         assert_eq!(attempts[0].body, "rate limited");
         assert!(router.cooldown().is_cooling_down("primary").await);
+    }
+
+    /// Streaming twin of `falls_back_on_429`: a 402 returned by primary's
+    /// `stream()` before any bytes flow must (a) be recorded as a
+    /// cooldownable attempt and (b) advance the router to backup. This
+    /// covers the copilot-402 plan's claim that `Router::stream()` uses
+    /// the same classification as `Router::complete()`.
+    #[tokio::test]
+    async fn stream_falls_back_on_402_quota() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "primary".to_string(),
+            Arc::new(MockProvider {
+                name: "primary".into(),
+                fail_status: 402,
+                fail_count: u32::MAX,
+                call_count: AtomicU32::new(0),
+            }) as SharedProvider,
+        );
+        providers.insert(
+            "backup".to_string(),
+            Arc::new(MockProvider {
+                name: "backup".into(),
+                fail_status: 0,
+                fail_count: 0,
+                call_count: AtomicU32::new(0),
+            }) as SharedProvider,
+        );
+        let cfg = Config {
+            server: Default::default(),
+            proxy: Default::default(),
+            providers: vec![
+                ProviderConfig::OpenaiCompat {
+                    name: "primary".into(),
+                    api_key: "k".into(),
+                    api_base: "http://x".into(),
+                    model_rewrite: Default::default(),
+                    use_proxy: false,
+                },
+                ProviderConfig::OpenaiCompat {
+                    name: "backup".into(),
+                    api_key: "k".into(),
+                    api_base: "http://x".into(),
+                    model_rewrite: Default::default(),
+                    use_proxy: false,
+                },
+            ],
+            models: vec![ModelConfig {
+                name: "m".into(),
+                primary: "primary".into(),
+                fallback_chain: vec!["backup".into()],
+                cooldown_seconds: 60,
+                max_retries_per_provider: 1,
+                max_retries_total: 3,
+            }],
+            logging: Default::default(),
+        };
+        let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
+        let model = router.find_model("m").unwrap();
+
+        let (provider, output, attempts) = router
+            .stream(model, &dummy_request())
+            .await
+            .unwrap();
+
+        assert_eq!(provider.name(), "backup");
+        assert!(matches!(output, ProviderOutput::Stream(_)));
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].provider, "primary");
+        assert_eq!(attempts[0].status, 402);
+        assert_eq!(attempts[0].body, "rate limited");
+
+        // Quota cooldown must use the configured cooldown_seconds, not
+        // the 5s transient fallback — mirrors the wire-level TTL test
+        // at tests/integration_router.rs:1111-1209.
+        let active = router.cooldown().active().await;
+        let primary_entry = active
+            .iter()
+            .find(|(name, _, _)| name == "primary")
+            .expect("primary must be on cooldown after 402");
+        assert_eq!(primary_entry.1, 402);
+        let ttl = primary_entry.2;
+        assert!(
+            ttl <= Duration::from_secs(60) && ttl > Duration::from_secs(55),
+            "402 cooldown must use configured ~60s, got {ttl:?}"
+        );
+    }
+
+    /// 403 must surface immediately and NOT enter cooldown — without
+    /// this, a non-quota authorization failure could silently mask a
+    /// policy misconfiguration by chaining the request to a provider
+    /// with different access controls. See copilot-402 plan: do not add
+    /// 403 globally.
+    #[tokio::test]
+    async fn stream_surfaces_403_without_cooldown() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "primary".to_string(),
+            Arc::new(MockProvider {
+                name: "primary".into(),
+                fail_status: 403,
+                fail_count: u32::MAX,
+                call_count: AtomicU32::new(0),
+            }) as SharedProvider,
+        );
+        // No backup — a single-provider chain must surface 403 directly.
+        let cfg = Config {
+            server: Default::default(),
+            proxy: Default::default(),
+            providers: vec![ProviderConfig::OpenaiCompat {
+                name: "primary".into(),
+                api_key: "k".into(),
+                api_base: "http://x".into(),
+                model_rewrite: Default::default(),
+                use_proxy: false,
+            }],
+            models: vec![ModelConfig {
+                name: "m".into(),
+                primary: "primary".into(),
+                fallback_chain: vec![],
+                cooldown_seconds: 60,
+                max_retries_per_provider: 1,
+                max_retries_total: 1,
+            }],
+            logging: Default::default(),
+        };
+        let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
+        let model = router.find_model("m").unwrap();
+
+        let error = router
+            .stream(model, &dummy_request())
+            .await
+            .err()
+            .expect("403 must surface immediately");
+        assert!(matches!(error, ProxyError::Upstream { status: 403, .. }));
+
+        // 403 must not be recorded in the cooldown cache.
+        assert!(!router.cooldown().is_cooling_down("primary").await);
+        assert!(router.cooldown().active().await.is_empty());
     }
 
     #[tokio::test]
@@ -1495,6 +1634,24 @@ mod tests {
                 "body={body} expected={expected}"
             );
         }
+    }
+
+    #[test]
+    fn quota_402_body_is_not_model_unsupported() {
+        // Copilot's monthly-quota exhaustion uses HTTP 402 with a body
+        // that does not mention any model-support keyword. The router
+        // must treat it as cooldownable quota failure, not as a
+        // model-catalog mismatch. This guards the precedence: the
+        // cooldownable branch fires first at runtime, and
+        // `is_model_unsupported` must agree.
+        let quota = ProxyError::Upstream {
+            status: 402,
+            body: "You have exceeded your monthly quota".into(),
+        };
+        assert!(!is_model_unsupported(&quota));
+        // The 402 must be classified as cooldownable at the error
+        // boundary so the router advances to the next provider.
+        assert!(quota.is_cooldownable());
     }
 
     #[test]
