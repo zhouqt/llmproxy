@@ -652,6 +652,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_maps_text_then_tool_wiremock_full_path() {
+        // Wiremock-based end-to-end test: SSE stream with text followed by
+        // tool call at tc.index=0 must produce distinct Anthropic blocks
+        // (text at 0, tool_use at 1). This exercises the real
+        // OpenAiCompatProvider::stream() HTTP -> SSE -> translation path.
+        let sse = concat!(
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"before\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Edit\",\"arguments\":\"{\\\"file_path\\\":\\\"/tmp/x\\\",\\\"old_string\\\":\\\"a\\\",\\\"new_string\\\":\\\"b\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":5,\"total_tokens\":9}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = OpenAiCompatProvider::new(
+            "test".to_string(),
+            server.uri(),
+            "key".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let mut rewrite = HashMap::new();
+        rewrite.insert("claude-sonnet-4-20250514".to_string(), "m".to_string());
+        let output = provider.stream(&request(true), &rewrite).await.unwrap();
+        expect_variant!(output, ProviderOutput::Stream(mut output) => {
+            let mut events = Vec::new();
+            while let Some(item) = output.next().await {
+                let encoded = String::from_utf8(item.unwrap().to_vec()).unwrap();
+                let data = encoded
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .expect("encoded SSE event must contain data");
+                events.push(serde_json::from_str::<Value>(data).unwrap());
+            }
+
+            let lifecycle: Vec<(&str, u64)> = events
+                .iter()
+                .filter_map(|event| match event["type"].as_str()? {
+                    "content_block_start" => Some(("start", event["index"].as_u64()?)),
+                    "content_block_stop" => Some(("stop", event["index"].as_u64()?)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                lifecycle,
+                vec![("start", 0), ("stop", 0), ("start", 1), ("stop", 1)],
+                "block start/stop indices must be [0 text, 1 tool_use], got {lifecycle:?}"
+            );
+
+            let tool_delta = events
+                .iter()
+                .find(|event| event["delta"]["type"] == "input_json_delta")
+                .expect("tool arguments delta must be emitted");
+            assert_eq!(tool_delta["index"], 1);
+            assert_eq!(
+                tool_delta["delta"]["partial_json"],
+                "{\"file_path\":\"/tmp/x\",\"old_string\":\"a\",\"new_string\":\"b\"}"
+            );
+
+            let msg_delta = events
+                .iter()
+                .find(|event| event["type"] == "message_delta")
+                .expect("message_delta must be emitted");
+            assert_eq!(msg_delta["delta"]["stop_reason"], "tool_use");
+            assert_eq!(msg_delta["delta"]["stop_sequence"], serde_json::Value::Null);
+        });
+    }
+
+    #[tokio::test]
     async fn stream_preserves_upstream_error() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
