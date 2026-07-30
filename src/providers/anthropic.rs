@@ -470,6 +470,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_passes_through_web_search_20250305_hosted_tool() {
+        // Regression guard: a request whose only tool is a hosted
+        // Anthropic server tool (web_search_20250305) must reach the
+        // upstream without being 400'd by the extractor.
+        //
+        // Before the Tool struct fix, input_schema was required and
+        // the hosted tool had none -> serde "missing field" -> AppJson
+        // returned 400.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("authorization", "Bearer router-key"))
+            .and(header("anthropic-version", "2023-06-01"))
+            .and(body_partial_json(json!({
+                "model": "claude-model",
+                "stream": false,
+                "max_tokens": 1024,
+                "tools": [
+                    {"type": "web_search_20250305", "name": "web_search", "max_uses": 8}
+                ],
+                "messages": [{"role": "user", "content": "hello"}],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_ws",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ok"}],
+                "model": "claude-model",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new(
+            "router".to_string(),
+            "router-key".to_string(),
+            format!("{}/", server.uri()),
+            empty_rewrite(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}]
+        }))
+        .unwrap();
+
+        let output = provider.complete(&req, &empty_rewrite()).await.unwrap();
+        expect_variant!(output, ProviderOutput::Json(body) => {
+            assert_eq!(body["id"], "msg_ws");
+            assert_eq!(body["content"][0]["text"], "ok");
+        });
+    }
+
+    #[tokio::test]
     async fn complete_preserves_thinking_signature_in_response() {
         // Regression guard for the original bug: Anthropic-format
         // responses must include `signature` on thinking blocks so the
