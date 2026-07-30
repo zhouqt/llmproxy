@@ -81,19 +81,52 @@ pub fn anthropic_to_openai_request(
         stop: req.stop_sequences.clone(),
         stream: req.stream,
         stream_options,
-        tools: req.tools.as_ref().map(|ts| {
-            ts.iter()
-                .map(|t| ChatTool {
+        tools: req.tools.as_ref().and_then(|ts| {
+            let mut result: Vec<ChatTool> = Vec::new();
+            for t in ts {
+                // Web search is declared via top-level
+                // `web_search_options`, not as a function tool.
+                // Strip it here; `extra` carries the options.
+                if crate::conversion::util::is_web_search_tool(t) {
+                    continue;
+                }
+                result.push(ChatTool {
                     kind: "function".to_string(),
                     function: FunctionDef {
                         name: t.name.clone(),
                         description: t.description.clone().unwrap_or_default(),
                         parameters: t.input_schema.clone(),
                     },
-                })
-                .collect()
+                });
+            }
+            // If the only tool was a hosted web_search, emit `None`
+            // instead of an empty array. Some strict OpenAI-compat
+            // upstreams 400 on `"tools": []`.
+            if result.is_empty() { None } else { Some(result) }
         }),
-        tool_choice: req.tool_choice.as_ref().map(convert_tool_choice),
+        tool_choice: {
+            // If the client forced tool_choice to a hosted tool name,
+            // upstream has no function with that name — remap to auto.
+            let has_web_search = req.tools.as_ref().map_or(false, |ts| {
+                ts.iter().any(crate::conversion::util::is_web_search_tool)
+            });
+            // When ALL tools are hosted, the tools field collapsed to
+            // None above.  Don't emit tool_choice alone — strict
+            // OpenAI-compat upstreams reject "tool_choice only supported
+            // when tools are enabled".
+            let non_hosted_count = req.tools.as_ref().map_or(0, |ts| {
+                ts.iter().filter(|t| !crate::conversion::util::is_web_search_tool(t)).count()
+            });
+            if non_hosted_count == 0 {
+                None
+            } else if has_web_search
+                && matches!(req.tool_choice, Some(ToolChoice::Tool { ref name }) if name == "web_search")
+            {
+                Some(json!("auto"))
+            } else {
+                req.tool_choice.as_ref().map(convert_tool_choice)
+            }
+        },
         user: req
             .metadata
             .as_ref()
@@ -108,6 +141,14 @@ pub fn anthropic_to_openai_request(
             let mut e = Value::Object(Map::new());
             if let Some(fmt) = req.output_config.as_ref().and_then(|oc| oc.format.as_ref()) {
                 e["response_format"] = ensure_chat_json_schema_name(fmt);
+            }
+            // When web search tools are present, inject
+            // web_search_options into extra_body. The tool was stripped
+            // from tools[] above so it doesn't appear as a function.
+            if req.tools.as_ref().map_or(false, |ts| {
+                ts.iter().any(crate::conversion::util::is_web_search_tool)
+            }) {
+                e["web_search_options"] = json!({});
             }
             e
         },
