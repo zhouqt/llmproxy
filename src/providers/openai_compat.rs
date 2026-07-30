@@ -262,7 +262,31 @@ where
                 self.finished = true;
                 return;
             }
-            match serde_json::from_str::<crate::openai::ChatChunk>(payload) {
+            let parsed = match serde_json::from_str::<Value>(payload) {
+                Ok(value) => value,
+                Err(e) => {
+                    tracing::debug!("skipping malformed SSE line: {} ({e})", crate::util::summarize_for_log(payload, "<empty payload>"));
+                    continue;
+                }
+            };
+            if looks_like_error_envelope(&parsed) {
+                let message = parsed
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("upstream error");
+                let event = StreamEvent::Error {
+                    error: serde_json::json!({
+                        "type": "upstream_error",
+                        "message": message,
+                    }),
+                };
+                self.output_buffer.push_back(Self::encode(&event));
+                self.translator.take();
+                self.finished = true;
+                return;
+            }
+            match serde_json::from_value::<crate::openai::ChatChunk>(parsed) {
                 Ok(c) => {
                     if c.extra.get("x-opencode-type").is_some() {
                         tracing::trace!(
@@ -590,6 +614,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_maps_text_then_first_tool_to_distinct_anthropic_blocks() {
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data:{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"before\"},\"finish_reason\":null}]}\n\ndata:{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"EnterWorktree\",\"arguments\":\"{\\\"path\\\":\\\"/tmp/x\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata:{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+        ))];
+        let mut adapter = OpenAiSseToAnthropic::new(stream::iter(chunks), "model");
+        let mut events = Vec::new();
+
+        while let Some(item) = adapter.next().await {
+            let encoded = String::from_utf8(item.unwrap().to_vec()).unwrap();
+            let data = encoded
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .expect("encoded SSE event must contain data");
+            events.push(serde_json::from_str::<Value>(data).unwrap());
+        }
+
+        let lifecycle: Vec<(&str, u64)> = events
+            .iter()
+            .filter_map(|event| match event["type"].as_str()? {
+                "content_block_start" => Some(("start", event["index"].as_u64()?)),
+                "content_block_stop" => Some(("stop", event["index"].as_u64()?)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lifecycle,
+            vec![("start", 0), ("stop", 0), ("start", 1), ("stop", 1)]
+        );
+
+        let tool_delta = events
+            .iter()
+            .find(|event| event["delta"]["type"] == "input_json_delta")
+            .expect("tool arguments delta must be emitted");
+        assert_eq!(tool_delta["index"], 1);
+        assert_eq!(tool_delta["delta"]["partial_json"], "{\"path\":\"/tmp/x\"}");
+    }
+
+    #[tokio::test]
     async fn stream_preserves_upstream_error() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -655,6 +717,23 @@ mod tests {
         assert!(encoded.contains("\"text\":\"hi\""));
         // No event should be emitted for empty payloads or comments.
         assert!(!encoded.contains("data: \n\n"));
+    }
+
+    #[tokio::test]
+    async fn adapter_surfaces_error_envelope_in_successful_sse_response() {
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data: {\"error\":{\"message\":\"model rejected request\",\"type\":\"invalid_request_error\"}}\n\n",
+        ))];
+        let mut adapter = OpenAiSseToAnthropic::new(stream::iter(chunks), "model");
+        let mut encoded = String::new();
+
+        while let Some(item) = adapter.next().await {
+            encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+        }
+
+        assert!(encoded.contains("event: error"));
+        assert!(encoded.contains("model rejected request"));
+        assert!(!encoded.contains("event: message_stop"));
     }
 
     #[tokio::test]
