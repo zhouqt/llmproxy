@@ -233,7 +233,23 @@ pub struct Tool {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Server-tool type discriminator (e.g. "web_search_20250305"). Anthropic
+    /// server tools are not client-side functions — they must be forwarded
+    /// upstream with their original type field. `None` for client function
+    /// tools.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "type")]
+    pub kind: Option<String>,
+    /// Tool schema. Required for function tools but absent on server tools
+    /// (web_search, web_fetch, code_execution). Defaulted to `Value::Null`
+    /// so Anthropic's hosted tool shapes (no `input_schema`) parse without
+    /// 400. `Value::is_null` skip keeps absent-and-null off the wire.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
     pub input_schema: Value,
+    /// Server-tool parameters (max_uses, allowed_domains, user_location, …).
+    /// Flattened so new hosted-tool fields can be added without further
+    /// struct changes.
+    #[serde(default, flatten, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -530,7 +546,10 @@ mod schema_tests {
             "top_k": 40,
             "stop_sequences": ["STOP"],
             "stream": true,
-            "tools": [{"name": "f", "description": "d", "input_schema": {"type": "object"}}],
+            "tools": [
+                {"name": "f", "description": "d", "input_schema": {"type": "object"}},
+                {"type": "web_search_20250305", "name": "web_search", "max_uses": 8}
+            ],
             "tool_choice": {"type": "tool", "name": "f"},
             "metadata": {"user_id": "u-1"},
             "thinking": {"type": "enabled", "budget_tokens": 4000, "display": "summarized"},

@@ -784,6 +784,80 @@ async fn http_end_to_end_primary_succeeds_returns_requested_model_name() {
 }
 
 #[tokio::test]
+async fn http_end_to_end_hosted_web_search_tool_passes_through_extractor() {
+    // Regression guard for the entry-level 400 that PR1 fixed.
+    // Before PR1, requests with `tools: [{type: "web_search_20250305", ...}]`
+    // (no `input_schema`) failed serde's required-field check at the
+    // AppJson extractor layer. This test sends the exact Claude Code
+    // wire shape through the full axum stack and asserts:
+    // 1. AppJson accepts it (status != 400 Bad Request)
+    // 2. The real OpenAiCompatProvider converter injects web_search_options
+    // 3. The upstream receives the converted request
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_partial_json(json!({
+            "web_search_options": {},
+            "model": "claude-test"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "cmpl_1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "claude-test",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "searched"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    // Use real OpenAiCompatProvider, not WiremockOpenAiProvider
+    let real_provider = llmproxy::providers::openai_compat::OpenAiCompatProvider::new(
+        "primary".to_string(),
+        upstream.uri(),
+        "wiremock-key".to_string(),
+        HashMap::new(),
+        reqwest::Client::new(),
+    )
+    .unwrap();
+
+    let mut providers = HashMap::new();
+    providers.insert("primary".to_string(), Arc::new(real_provider) as SharedProvider);
+
+    let configs = vec![ProviderConfig::OpenaiCompat {
+        name: "primary".to_string(),
+        api_key: "k".to_string(),
+        api_base: upstream.uri(),
+        model_rewrite: HashMap::new(),
+        use_proxy: false,
+    }];
+    let app = build_axum_app(providers, configs, vec!["primary".to_string()]);
+
+    let body = json!({
+        "model": "claude-test",
+        "max_tokens": 32,
+        "stream": false,
+        "messages": [{"role": "user", "content": "search this"}],
+        "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}]
+    });
+    let resp = app.oneshot(post("/v1/messages", body)).await.unwrap();
+    let (status, _headers, _body) = collect_bytes(resp).await;
+    // The point of this test is to assert:
+    // 1. AppJson accepts the request (no 400)
+    // 2. The real converter path works (upstream gets the request)
+    assert_ne!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "AppJson must accept Claude Code's hosted-tool wire shape (was 400'd before PR1)"
+    );
+}
+
+#[tokio::test]
 async fn http_end_to_end_429_falls_back_to_backup_with_failed_providers_header() {
     // Same scenario as the router-level test, but exercised through the
     // full axum stack (extractor → handler → router → SSE adapter →
