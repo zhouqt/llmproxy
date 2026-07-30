@@ -142,7 +142,10 @@ impl ResponsesStreamTranslator {
             }
             ResponsesStreamEvent::ResponseOutputItemAdded { output_index, item } => {
                 self.ensure_started(&mut out);
-                if matches!(item, OutputItem::Unknown) {
+                // Hosted tools (web_search_call) and unknown items don't
+                // produce content blocks — skip them here so the caller
+                // doesn't hit unreachable! in output_item_to_block.
+                if matches!(item, OutputItem::Unknown | OutputItem::WebSearchCall { .. }) {
                     return out;
                 }
                 if let OutputItem::FunctionCall { id, .. } = item {
@@ -248,6 +251,11 @@ impl ResponsesStreamTranslator {
                 // per-text / per-function-call done events above. No-op.
             }
             ResponsesStreamEvent::ResponseContentPartDone { .. } => {}
+            // Web-search progress events are informational (no data to
+            // map to Anthropic SSE). Silently skip.
+            ResponsesStreamEvent::ResponseWebSearchCallInProgress { .. }
+            | ResponsesStreamEvent::ResponseWebSearchCallSearching { .. }
+            | ResponsesStreamEvent::ResponseWebSearchCallCompleted { .. } => {}
             ResponsesStreamEvent::ResponseCompleted { response }
             | ResponsesStreamEvent::ResponseIncomplete { response } => {
                 self.ensure_started(&mut out);
@@ -404,8 +412,14 @@ fn output_item_to_block(item: &OutputItem) -> ResponseBlock {
             }
         }
         // Caller (`ResponseOutputItemAdded` arm) early-returns on
-        // `OutputItem::Unknown`, so this variant is unreachable here.
+        // `OutputItem::Unknown` and `OutputItem::WebSearchCall`, so this
+        // variant is unreachable here.
         OutputItem::Unknown => unreachable!("OutputItem::Unknown is filtered before output_item_to_block"),
+        // Caller early-returns on WebSearchCall (same as Unknown) — this
+        // arm is a compile-time safety net.
+        OutputItem::WebSearchCall { .. } => unreachable!(
+            "OutputItem::WebSearchCall is filtered before output_item_to_block"
+        ),
     }
 }
 
