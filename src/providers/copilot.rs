@@ -414,8 +414,8 @@ impl CopilotProvider {
             let _g = provider_for_task.state.refresh_lock.lock().await;
             let result = provider_for_task.complete_bootstrap(dc_for_task).await;
             match result {
-                Ok(()) => tracing::info!(provider = %name, "copilot bootstrap completed"),
-                Err(e) => tracing::error!(provider = %name, error = %e, "copilot bootstrap failed"),
+                Ok(()) => tracing::debug!(provider = %name, "copilot bootstrap completed"),
+                Err(e) => tracing::debug!(provider = %name, error = %e, "copilot bootstrap failed"),
             }
         });
 
@@ -615,14 +615,14 @@ impl CopilotProvider {
     pub async fn cache_models_with_token(&self, token: &str) {
         match self.fetch_models(token).await {
             Ok(models) => {
-                tracing::info!(
+                tracing::debug!(
                     model_count = models.len(),
                     "copilot models cached"
                 );
                 *self.state.cached_models.write().await = Some(models);
             }
             Err(CopilotFetchError::Auth(msg)) => {
-                tracing::info!("{msg}");
+                tracing::warn!("{msg}");
                 *self.state.cached_models.write().await = None;
             }
             Err(e) => {
@@ -657,7 +657,7 @@ impl CopilotProvider {
             let code = status.as_u16();
             return Err(match code {
                 401 | 403 => {
-                    tracing::info!(
+                    tracing::warn!(
                         status = code,
                         body = %text,
                         "copilot token rejected by /models; clearing cache"

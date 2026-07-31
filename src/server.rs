@@ -62,9 +62,19 @@ async fn messages_handler(
         .ok_or_else(|| ProxyError::BadRequest(format!("unknown model: {}", req.model)))?
         .clone();
 
+    let start = std::time::Instant::now();
+
     if req.stream {
-        let (_provider, output, attempts) = state.router.stream(&model_cfg, &req).await?;
-        return Ok(stream_response(output, attempts));
+        let (provider, output, attempts) = state.router.stream(&model_cfg, &req).await?;
+        let summary = format_attempts(&attempts);
+        tracing::info!(
+            model = req.model.as_str(),
+            stream = req.stream,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            failed_providers = %summary,
+            "request completed"
+        );
+        return Ok(stream_response(provider.name(), req.model.as_str(), output, attempts));
     }
 
     let (output, attempts) = state.router.complete(&model_cfg, &req).await?;
@@ -76,6 +86,15 @@ async fn messages_handler(
 
     let mut resp: MessagesResponse = serde_json::from_value(value)?;
     resp.model = req.model.clone();
+
+    let summary = format_attempts(&attempts);
+    tracing::info!(
+        model = req.model.as_str(),
+        stream = req.stream,
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        failed_providers = %summary,
+        "request completed"
+    );
 
     let mut headers = HeaderMap::new();
     if !attempts.is_empty() {
@@ -95,14 +114,28 @@ fn format_attempts(attempts: &[crate::router::RouteAttempt]) -> String {
         .join(",")
 }
 
-fn stream_response(output: ProviderOutput, attempts: Vec<crate::router::RouteAttempt>) -> Response {
+/// Public summary formatter for router attempts. Exposed for `Router` so
+/// fallback / "all providers failed" logs can render the same shape that
+/// the response header (`x-llmproxy-failed-providers`) emits. Keep the
+/// two formats in sync — operators correlate header + log entries by
+/// this string.
+pub fn format_attempts_summary(attempts: &[crate::router::RouteAttempt]) -> String {
+    format_attempts(attempts)
+}
+
+fn stream_response(
+    provider_name: &str,
+    model: &str,
+    output: ProviderOutput,
+    attempts: Vec<crate::router::RouteAttempt>,
+) -> Response {
     let ProviderOutput::Stream(stream) = output else {
         return ProxyError::Internal("expected stream output".into()).into_response();
     };
 
     let inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, ProxyError>> + Send>> =
         Box::into_pin(stream);
-    let mapped = MappedStream::new(inner);
+    let mapped = MappedStream::new(provider_name, model, inner);
     let body = Body::from_stream(mapped);
 
     let mut resp = Response::new(body);
@@ -127,13 +160,25 @@ fn stream_response(output: ProviderOutput, attempts: Vec<crate::router::RouteAtt
 /// don't see an incomplete body with no signal that something went
 /// wrong.
 pub struct MappedStream {
+    /// Provider name, carried into the upstream-error log so operators
+    /// can see which provider's stream failed in a multi-provider
+    /// deployment.
+    provider: String,
+    /// Client-requested model name, same purpose as `provider`.
+    model: String,
     inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, ProxyError>> + Send>>,
     done: bool,
 }
 
 impl MappedStream {
-    pub fn new(inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, ProxyError>> + Send>>) -> Self {
+    pub fn new(
+        provider: &str,
+        model: &str,
+        inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, ProxyError>> + Send>>,
+    ) -> Self {
         Self {
+            provider: provider.to_string(),
+            model: model.to_string(),
             inner,
             done: false,
         }
@@ -150,7 +195,12 @@ impl Stream for MappedStream {
         match self.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(b))) => Poll::Ready(Some(Ok(b))),
             Poll::Ready(Some(Err(e))) => {
-                tracing::error!("upstream stream error: {e}");
+                tracing::error!(
+                    provider = %self.provider,
+                    model = %self.model,
+                    error = %e,
+                    "upstream stream error"
+                );
                 // Emit a synthetic Anthropic `event: error` SSE chunk so
                 // the client can distinguish "stream ended normally"
                 // from "stream aborted by upstream failure" — without
@@ -315,6 +365,8 @@ mod tests {
 
     fn fresh_mapped() -> MappedStream {
         MappedStream {
+            provider: "test".to_string(),
+            model: "test".to_string(),
             inner: make_stream(vec![]),
             done: false,
         }
@@ -346,6 +398,8 @@ mod tests {
         // Once `done` is set, poll_next must short-circuit to Ready(None)
         // without touching the inner stream at all.
         let mut s = MappedStream {
+            provider: "test".to_string(),
+            model: "test".to_string(),
             inner: make_stream(vec![Err(ProxyError::Internal("unused".into()))]),
             done: true,
         };
@@ -360,6 +414,8 @@ mod tests {
         // When the inner stream returns Poll::Pending, the wrapper must
         // also return Poll::Pending (and must NOT mark itself done).
         let mut s = MappedStream {
+            provider: "test".to_string(),
+            model: "test".to_string(),
             inner: Box::pin(stream::pending::<std::result::Result<Bytes, ProxyError>>()),
             done: false,
         };
@@ -378,6 +434,8 @@ mod tests {
         // chunk so the SDK can distinguish aborted streams from normal
         // end-of-stream.
         let mut s = MappedStream {
+            provider: "test".to_string(),
+            model: "test".to_string(),
             inner: make_stream(vec![Err(ProxyError::Internal("boom".into()))]),
             done: false,
         };
@@ -409,6 +467,8 @@ mod tests {
     #[tokio::test]
     async fn mapped_stream_emits_bytes_then_terminates() {
         let mut s = MappedStream {
+            provider: "test".to_string(),
+            model: "test".to_string(),
             inner: make_stream(vec![
                 Ok(Bytes::from_static(b"event: foo\n\n")),
                 Ok(Bytes::from_static(b"event: bar\n\n")),
