@@ -294,13 +294,3 @@ models:
   - name: deepseek-v4-flash-free
     primary: opencode_zen
 
-# ───────────────────────────────────────────────────────────────────────
-# logging
-# ───────────────────────────────────────────────────────────────────────
-logging:
-  # level: trace | debug | info | warn | error (RUST_LOG syntax also
-  # accepted via env var, e.g. RUST_LOG=llmproxy=debug,tower_http=info).
-  level: info
-  # format: pretty (default, human-readable) | json (one structured
-  # JSON object per line, suitable for log aggregators).
-  format: pretty

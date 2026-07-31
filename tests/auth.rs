@@ -23,7 +23,6 @@ fn dummy_state(api_key: Option<String>) -> AppState {
         proxy: Default::default(),
         providers: vec![],
         models: vec![],
-        logging: Default::default(),
     };
     // We don't exercise providers here — just auth.
     AppState {
@@ -34,7 +33,6 @@ fn dummy_state(api_key: Option<String>) -> AppState {
                 proxy: Default::default(),
                 providers: vec![],
                 models: vec![],
-                logging: Default::default(),
             }),
             Default::default(),
             llmproxy::cooldown::CooldownCache::new(),
