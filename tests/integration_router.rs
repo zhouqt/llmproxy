@@ -152,6 +152,26 @@ fn make_req(model: &str) -> MessagesRequest {
     .unwrap()
 }
 
+/// Multi-turn request whose history carries an assistant thinking block
+/// (with a signature) — the exact scenario that makes the
+/// AnthropicProvider's strip-and-retry fire on a thinking 400.
+fn make_thinking_history_req(model: &str) -> MessagesRequest {
+    serde_json::from_value(json!({
+        "model": model,
+        "max_tokens": 64,
+        "thinking": {"type": "enabled", "budget_tokens": 2000},
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "let me think", "signature": "sig-1"},
+                {"type": "text", "text": "previous answer"}
+            ]},
+            {"role": "user", "content": "continue"}
+        ]
+    }))
+    .unwrap()
+}
+
 #[tokio::test]
 async fn mock_llm_provider_primary_succeeds_returns_anthropic_response() {
     // A primary provider whose /v1/messages endpoint returns a valid
@@ -672,6 +692,204 @@ async fn mock_llm_provider_per_provider_retry_three_times_before_chain_advance()
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts.iter().filter(|a| a.status == 429).count(), 2);
     assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn http_end_to_end_anthropic_provider_strips_and_succeeds() {
+    // Real AnthropicProvider (type: anthropic, DeepSeek-style compat
+    // endpoint) against a mock upstream. First request — carrying an
+    // assistant-thinking history block — gets the canonical thinking 400;
+    // the provider strips thinking blocks from the outgoing body and
+    // retries; the second attempt returns 200. Wiremock receives exactly
+    // 2 requests and the retried body carries no thinking /
+    // redacted_thinking block.
+    let server = MockServer::start().await;
+    let captured: Arc<std::sync::Mutex<Option<Value>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let captured_for_responder = captured.clone();
+    let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let counter_clone = counter.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(move |req: &wiremock::Request| {
+            let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                ResponseTemplate::new(400).set_body_json(json!({
+                    "error": {"message": "The `content[].thinking` in the thinking mode must be passed back to the API."}
+                }))
+            } else {
+                *captured_for_responder.lock().unwrap() = Some(
+                    serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
+                );
+                ResponseTemplate::new(200)
+                    .set_body_json(anthropic_ok("stripped answer", "claude-test"))
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let real = llmproxy::providers::anthropic::AnthropicProvider::new(
+        "deepseek".to_string(),
+        "k".to_string(),
+        format!("{}/v1", server.uri()),
+        HashMap::new(),
+        reqwest::Client::new(),
+    )
+    .unwrap();
+
+    let mut providers = HashMap::new();
+    providers.insert("deepseek".to_string(), Arc::new(real) as SharedProvider);
+    let cfg = Config {
+        server: ServerConfig {
+            listen: "127.0.0.1:0".to_string(),
+            api_key: None,
+        },
+        proxy: Default::default(),
+        providers: vec![ProviderConfig::Anthropic {
+            name: "deepseek".to_string(),
+            api_key: "k".to_string(),
+            api_base: format!("{}/v1", server.uri()),
+            model_rewrite: HashMap::new(),
+            use_proxy: false,
+        }],
+        models: vec![ModelConfig {
+            name: "claude-test".into(),
+            primary: "deepseek".into(),
+            fallback_chain: vec![],
+            cooldown_seconds: 60,
+            max_retries_per_provider: 1,
+            max_retries_total: 1,
+        }],
+        logging: Default::default(),
+    };
+    let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
+
+    let model_cfg = router.find_model("claude-test").unwrap();
+    let (out, attempts) = router
+        .complete(model_cfg, &make_thinking_history_req("claude-test"))
+        .await
+        .unwrap();
+    let ProviderOutput::Json(body) = out else {
+        panic!("expected JSON output");
+    };
+    assert_eq!(body["content"][0]["text"], "stripped answer");
+    assert!(
+        attempts.is_empty(),
+        "strip-retry is internal to the provider; no fallback attempt expected"
+    );
+    assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    // The retried request body must be stripped of all thinking and
+    // redacted_thinking blocks across every message — and it must NOT
+    // drop non-thinking content: all 3 messages survive and the
+    // assistant message (index 1) keeps its text block. These pinned
+    // assertions make a "strip everything / strip nothing" false green
+    // impossible.
+    let sent = captured.lock().unwrap().clone().expect("second body captured");
+    assert_eq!(sent["messages"].as_array().unwrap().len(), 3);
+    let assistant = &sent["messages"][1];
+    assert_eq!(assistant["role"], "assistant");
+    let text_block = assistant["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == "text")
+        .expect("assistant message must keep its text block after strip");
+    assert_eq!(text_block["text"], "previous answer");
+    for msg in sent["messages"].as_array().unwrap() {
+        if let Some(blocks) = msg["content"].as_array() {
+            for b in blocks {
+                let t = b["type"].as_str();
+                assert_ne!(t, Some("thinking"));
+                assert_ne!(t, Some("redacted_thinking"));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn http_end_to_end_anthropic_provider_strip_max_attempts_then_passthrough() {
+    // The mock upstream always answers with the thinking 400. The provider
+    // strips and retries exactly once (wiremock expect(2)) and then
+    // surfaces the LAST upstream body verbatim — not a friendly envelope.
+    // Because 400 is not cooldownable (error.rs is_cooldownable only covers
+    // 401/402/404/408/429/5xx) and is_model_unsupported does not match the
+    // thinking body, the router returns the error directly: no fallback
+    // chain is entered, no RouteAttempt is recorded.
+    let server = MockServer::start().await;
+    let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let counter_clone = counter.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(move |_req: &wiremock::Request| {
+            counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "The `content[].thinking` in the thinking mode must be passed back to the API."}
+            }))
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let real = llmproxy::providers::anthropic::AnthropicProvider::new(
+        "deepseek".to_string(),
+        "k".to_string(),
+        format!("{}/v1", server.uri()),
+        HashMap::new(),
+        reqwest::Client::new(),
+    )
+    .unwrap();
+
+    let mut providers = HashMap::new();
+    providers.insert("deepseek".to_string(), Arc::new(real) as SharedProvider);
+    let cfg = Config {
+        server: ServerConfig {
+            listen: "127.0.0.1:0".to_string(),
+            api_key: None,
+        },
+        proxy: Default::default(),
+        providers: vec![ProviderConfig::Anthropic {
+            name: "deepseek".to_string(),
+            api_key: "k".to_string(),
+            api_base: format!("{}/v1", server.uri()),
+            model_rewrite: HashMap::new(),
+            use_proxy: false,
+        }],
+        models: vec![ModelConfig {
+            name: "claude-test".into(),
+            primary: "deepseek".into(),
+            fallback_chain: vec![],
+            cooldown_seconds: 60,
+            max_retries_per_provider: 1,
+            max_retries_total: 1,
+        }],
+        logging: Default::default(),
+    };
+    let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
+
+    let model_cfg = router.find_model("claude-test").unwrap();
+    let err = router
+        .complete(model_cfg, &make_thinking_history_req("claude-test"))
+        .await
+        .err()
+        .expect("second 400 must surface as Err, not fall back");
+    match err {
+        ProxyError::Upstream { status, body } => {
+            assert_eq!(status, 400);
+            assert!(
+                body.contains("must be passed back"),
+                "must surface the raw upstream thinking body, got: {body}"
+            );
+            let parsed: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({}));
+            assert_ne!(
+                parsed["error"]["type"], "thinking_not_supported",
+                "after the strip retry, the raw body (not the friendly envelope) must surface"
+            );
+        }
+        other => panic!("expected direct Upstream, got: {other:?}"),
+    }
+    assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
 // ────────────────────────────────────────────────────────────────────────
