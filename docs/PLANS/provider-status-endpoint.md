@@ -12,7 +12,7 @@ that state as a stable two-value keyword per provider (`available` /
 label, and served models, so a shell hook can render a line like:
 
 ```
-🔴 copilot(429/137s)  🟢 deepseek  🔴 openai_direct(503/3s)
+🔴 opencode_zen  🟢 deepseek  🔴 openai_direct
 ```
 
 Two explicit user constraints on the hook:
@@ -96,12 +96,19 @@ json=$(curl -s --max-time 2 -H "Authorization: Bearer ${LLMPROXY_API_KEY:-}" \
 echo "$json" | jq -r '
   [ .providers[] |
     if .status == "cooling_down" then
-      "🔴 \(.name)(\(.last_error_status)/\(.cooling_down_remaining_secs)s)"
+      "🔴 \(.name)"
     else
       "🟢 \(.name)"
     end
   ] | join("  ")'
 ```
+
+Output is just the emoji + provider name (no `available`/`unavailable`
+words, no TTL): `🔴 opencode_zen  🟢 deepseek`. The cooldown TTL is
+deliberately not shown — the statusline is not a real-time poller, so
+remaining-seconds info would be stale and useless. `status`/`name`/
+`last_error_status`/`cooling_down_remaining_secs` stay in the API response
+for other consumers; only the hook omits the TTL.
 
 The parent appends the segment only when non-empty
 (`content="$content|$pstatus"`), matching the existing `usage_text` /
