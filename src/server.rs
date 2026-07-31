@@ -36,6 +36,7 @@ pub fn build_router(state: AppState) -> AxumRouter {
     // the user code in stdout and the device flow runs in the background.
     let admin = AxumRouter::new()
         .route("/admin/copilot/auth", post(admin_copilot_auth_handler))
+        .route("/admin/status", get(admin_status_handler))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             crate::auth::require_auth,
@@ -304,6 +305,34 @@ async fn list_models_handler(State(state): State<AppState>) -> impl IntoResponse
     Json(serde_json::json!({
         "object": "list",
         "data": entries,
+    }))
+}
+
+/// Report current health of every configured provider.
+///
+/// The response shape is the contract for the Claude Code statusline
+/// hook — see `docs/PLANS/provider-status-endpoint.md`. Each row carries
+/// a stable machine-readable `status` keyword (`available`/`cooling_down`)
+/// that mirrors the router's own cooldown state, the provider kind label,
+/// served models, and — when cooling — the triggering upstream status and
+/// remaining cooldown seconds. Always 200 when the proxy is reachable; the
+/// endpoint answers out of in-memory state and never contacts upstreams.
+async fn admin_status_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let statuses = state.router.provider_status().await;
+    let total = statuses.len();
+    let cooling_down = statuses
+        .iter()
+        .filter(|s| s.status == crate::router::ProviderHealth::CoolingDown)
+        .count();
+    let available = total - cooling_down;
+    Json(json!({
+        "status": "ok",
+        "providers": statuses,
+        "summary": {
+            "total": total,
+            "available": available,
+            "cooling_down": cooling_down,
+        }
     }))
 }
 

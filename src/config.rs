@@ -151,6 +151,20 @@ impl ProviderConfig {
         }
     }
 
+    /// Stable machine-readable type label for this provider — the same
+    /// string the serde `type` tag (`src/config.rs:63`) deserializes into,
+    /// so the status endpoint and any consumer can identify provider kind
+    /// without re-deriving it from the enum. See
+    /// `docs/PLANS/provider-status-endpoint.md`.
+    pub fn type_label(&self) -> &'static str {
+        match self {
+            ProviderConfig::GithubCopilot { .. } => "github_copilot",
+            ProviderConfig::Anthropic { .. } => "anthropic",
+            ProviderConfig::OpenaiCompat { .. } => "openai_compat",
+            ProviderConfig::OpenaiResponses { .. } => "openai_responses",
+        }
+    }
+
     /// Whether this provider should route its outbound requests through
     /// the global proxy. See the field doc-comment on each variant.
     pub fn use_proxy(&self) -> bool {
@@ -541,6 +555,63 @@ models:
             config.models[0].chain().collect::<Vec<_>>(),
             vec!["copilot", "router", "compat"]
         );
+    }
+
+    #[test]
+    fn type_label_matches_serde_tag_for_every_variant() {
+        // `type_label()` must return exactly the serde `type` tag string
+        // used when serializing each variant, so consumers (e.g. the
+        // /admin/status endpoint) can key on a stable label without
+        // re-deriving the tag.
+        let cases: Vec<(ProviderConfig, &str)> = vec![
+            (
+                ProviderConfig::GithubCopilot {
+                    name: "copilot".into(),
+                    vscode_version: default_vscode_version(),
+                    account_type: default_account_type(),
+                    model_rewrite: HashMap::new(),
+                    use_proxy: false,
+                },
+                "github_copilot",
+            ),
+            (
+                ProviderConfig::Anthropic {
+                    name: "router".into(),
+                    api_key: "k".into(),
+                    api_base: "https://example.test/v1".into(),
+                    model_rewrite: HashMap::new(),
+                    use_proxy: false,
+                },
+                "anthropic",
+            ),
+            (
+                ProviderConfig::OpenaiCompat {
+                    name: "compat".into(),
+                    api_key: "k".into(),
+                    api_base: "https://example.test/v1".into(),
+                    model_rewrite: HashMap::new(),
+                    use_proxy: false,
+                },
+                "openai_compat",
+            ),
+            (
+                ProviderConfig::OpenaiResponses {
+                    name: "responses".into(),
+                    api_key: "k".into(),
+                    api_base: "https://example.test/v1".into(),
+                    model_rewrite: HashMap::new(),
+                    use_proxy: false,
+                },
+                "openai_responses",
+            ),
+        ];
+        for (provider, expected) in cases {
+            assert_eq!(provider.type_label(), expected);
+            // And the label round-trips through the serde tag: the enum
+            // serializes as {"type": <label>, ...}.
+            let value = serde_json::to_value(&provider).unwrap();
+            assert_eq!(value["type"], expected);
+        }
     }
 
     #[test]
