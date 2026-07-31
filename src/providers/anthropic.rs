@@ -19,7 +19,7 @@ use bytes::Bytes;
 use futures_util::stream::Stream;
 use serde_json::{json, Value};
 
-use crate::anthropic::MessagesRequest;
+use crate::anthropic::{ContentBlock, MessageContent, MessagesRequest};
 use crate::error::{ProxyError, Result};
 use crate::providers::{Provider, ProviderOutput};
 
@@ -177,33 +177,71 @@ impl Provider for AnthropicProvider {
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
         let merged = self.merged_rewrite(model_rewrite);
-        let body = build_body(req, &merged, false)?;
-        let resp = self
-            .http
-            .post(self.messages_url())
-            .bearer_auth(&self.api_key)
-            .header("content-type", "application/json")
-            .header("anthropic-version", "2023-06-01")
-            .json(&body)
-            .send()
-            .await?;
-        let status = resp.status();
-        let text = resp.text().await?;
-        if !status.is_success() {
-            if status.as_u16() == 400 && has_thinking_error(&text) {
-                return Err(self.thinking_not_supported_error(
-                    &req.model,
-                    &merged.get(&req.model).cloned().unwrap_or_else(|| req.model.clone()),
-                    &text,
-                ));
+        let mut body = build_body(req, &merged, false)?;
+        let url = self.messages_url();
+        let api_key = self.api_key.clone();
+
+        let mut attempt: u32 = 0;
+        let max_attempts: u32 = 2;
+        loop {
+            attempt += 1;
+            let resp = self
+                .http
+                .post(&url)
+                .bearer_auth(&api_key)
+                .header("content-type", "application/json")
+                .header("anthropic-version", "2023-06-01")
+                .json(&body)
+                .send()
+                .await?;
+            let status = resp.status();
+            let text = resp.text().await?;
+            if status.is_success() {
+                let val: Value = serde_json::from_str(&text)?;
+                return Ok(ProviderOutput::Json(val));
             }
+
+            // Decide whether to strip thinking blocks and retry.
+            let status_code = status.as_u16();
+            let is_thinking_400 =
+                status_code == 400 && has_thinking_error(&text);
+
+            if is_thinking_400
+                && attempt < max_attempts
+                && should_strip_and_retry(req, &text)
+            {
+                tracing::warn!(
+                    provider = %self.name,
+                    client_model = %req.model,
+                    attempt = attempt,
+                    "stripping thinking blocks from request and retrying once (upstream rejected cross-model thinking signature)"
+                );
+                // Mutate the OUTGOING body in place:
+                //   - drop content blocks of type {thinking, redacted_thinking}
+                //     from every assistant/user message;
+                //   - skip entire messages whose content array becomes empty;
+                //   - remove the top-level thinking param.
+                strip_thinking_blocks(&mut body);
+                continue;
+            }
+
+            tracing::warn!(
+                status = status_code,
+                provider = %self.name,
+                client_model = %req.model,
+                attempt = attempt,
+                "thinking-strip retry exhausted, surfacing raw upstream error"
+            );
+            // No retry path applies: surface the raw upstream body verbatim.
+            // In particular a thinking-400 with nothing to strip (no
+            // assistant-thinking block in the request history) passes
+            // through untouched — the friendly `thinking_not_supported`
+            // envelope is only produced on the streaming path.
             return Err(ProxyError::Upstream {
-                status: status.as_u16(),
+                status: status_code,
                 body: text,
             });
         }
-        let val: Value = serde_json::from_str(&text)?;
-        Ok(ProviderOutput::Json(val))
     }
 
     async fn stream(
@@ -228,6 +266,13 @@ impl Provider for AnthropicProvider {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await?;
+            // Streaming keeps the original friendly-error path on purpose:
+            // once the SSE byte stream starts flowing, retrying would
+            // double-emit content to the client. See Router::stream comment
+            // at router.rs:303-307 for the system-wide "no retry once
+            // streaming" contract. The AnthropicProvider::stream path
+            // therefore DOES NOT apply strip-and-retry; a thinking-style
+            // 400 still surfaces as `thinking_not_supported` here.
             if status.as_u16() == 400 && has_thinking_error(&text) {
                 return Err(self.thinking_not_supported_error(
                     &req.model,
@@ -250,6 +295,67 @@ impl Provider for AnthropicProvider {
 ///   `The content[].thinking in the thinking mode must be passed back to the API.`
 fn has_thinking_error(body: &str) -> bool {
     body.contains("content[].thinking") && body.contains("must be passed back")
+}
+
+/// Decide whether a 400 with a thinking-style body should trigger the
+/// strip-and-retry path. The body alone cannot disambiguate "real
+/// protocol violation" from "the upstream's compat layer dislikes the
+/// cross-model signature"; the request context decides.
+///
+/// Both conditions must hold:
+///   (a) upstream body matches the canonical thinking-error substring
+///       pair (delegated to `has_thinking_error`), AND
+///   (b) the incoming request already contains an assistant message
+///       whose `content` includes a `Thinking` or `RedactedThinking`
+///       block (i.e. there is something concrete to strip) — the gate
+///       deliberately covers the same block types `strip_thinking_blocks`
+///       removes, so a history that only carries a redacted_thinking
+///       block is stripped and retried rather than passed through as a
+///       400.
+fn should_strip_and_retry(req: &MessagesRequest, body: &str) -> bool {
+    if !has_thinking_error(body) {
+        return false;
+    }
+    req.messages.iter().any(|m| {
+        m.role == "assistant"
+            && matches!(
+                &m.content,
+                MessageContent::Blocks(bs) if bs.iter().any(|b| matches!(
+                    b,
+                    ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
+                ))
+            )
+    })
+}
+
+/// Strip thinking-related content from the outgoing `body` JSON value
+/// in place. After this call:
+///   - every Thinking / RedactedThinking block has been dropped;
+///   - if a message's `content` array is now empty (or contained only
+///     thinking blocks), the message itself is removed;
+///   - the top-level `thinking` key is removed entirely (litellm's
+///     `data.pop("thinking")` semantics), whether or not it existed.
+fn strip_thinking_blocks(body: &mut Value) {
+    if let Some(messages) = body.get_mut("messages").and_then(|v| v.as_array_mut()) {
+        messages.retain_mut(|msg| {
+            if let Some(blocks) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
+                blocks.retain(|b| !matches!(
+                    b.get("type").and_then(|t| t.as_str()),
+                    Some("thinking") | Some("redacted_thinking")
+                ));
+                !blocks.is_empty() // keep only if there's still content
+            } else {
+                true
+            }
+        });
+    }
+    // Remove the top-level `thinking` param entirely (litellm's
+    // `data.pop("thinking")` semantics) rather than nulling it — DeepSeek
+    // is a strict validator and a spurious `"thinking": null` on a request
+    // that never enabled thinking could itself be rejected.
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("thinking");
+    }
 }
 
 fn build_body(
@@ -313,6 +419,11 @@ mod tests {
 
     #[test]
     fn has_thinking_error_matches_anthropic_error_message() {
+        assert!(has_thinking_error(
+            r#"{"error":{"message":"The `content[].thinking` in the thinking mode must be passed back to the API."}}"#
+        ));
+        // DeepSeek's Anthropic-compatible endpoint emits the identical
+        // literal when it rejects a cross-model signature.
         assert!(has_thinking_error(
             r#"{"error":{"message":"The `content[].thinking` in the thinking mode must be passed back to the API."}}"#
         ));
@@ -780,108 +891,327 @@ mod tests {
         .unwrap()
     }
 
+    /// Build a multi-turn request whose history carries an assistant
+    /// thinking block (with a signature). This is the scenario that
+    /// triggers strip-and-retry on a thinking 400: the upstream's compat
+    /// layer dislikes the cross-model signature and there is concrete
+    /// content to strip.
+    fn thinking_history_request(stream: bool) -> MessagesRequest {
+        serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 64,
+            "stream": stream,
+            "thinking": {"type": "enabled", "budget_tokens": 2000},
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "let me think", "signature": "sig-1"},
+                    {"type": "text", "text": "previous answer"}
+                ]},
+                {"role": "user", "content": "continue"}
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn should_strip_and_retry_matches_thinking_and_redacted_thinking() {
+        // P3: the strip gate must cover exactly the block types
+        // `strip_thinking_blocks` removes (Thinking + RedactedThinking).
+        // Before the P3 fix this test fails on the redacted_thinking
+        // case — the gate only matched Thinking, so a history carrying
+        // only a redacted_thinking block was passed through as a 400
+        // instead of being stripped and retried.
+        let thinking_400 = r#"{"error":{"message":"The `content[].thinking` in the thinking mode must be passed back to the API."}}"#;
+
+        // Assistant history carries a Thinking block -> gate fires.
+        let req_with_thinking: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "let me think", "signature": "sig-1"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        assert!(should_strip_and_retry(&req_with_thinking, thinking_400));
+
+        // Assistant history carries a RedactedThinking block -> gate fires.
+        let req_with_redacted: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": [
+                    {"type": "redacted_thinking", "data": "encrypted-blob"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        assert!(should_strip_and_retry(&req_with_redacted, thinking_400));
+
+        // Only a USER message carries a thinking block -> nothing to strip.
+        let req_user_thinking: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "thinking", "thinking": "let me think", "signature": "sig-1"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        assert!(!should_strip_and_retry(&req_user_thinking, thinking_400));
+
+        // Assistant message is plain text -> nothing to strip.
+        let req_plain: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "plain text answer"}
+            ]
+        }))
+        .unwrap();
+        assert!(!should_strip_and_retry(&req_plain, thinking_400));
+    }
+
+    #[test]
+    fn strip_thinking_blocks_removes_thinking_and_keeps_text() {
+        let mut body = json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "let me think", "signature": "sig-1"},
+                    {"type": "text", "text": "answer"}
+                ]}
+            ]
+        });
+        strip_thinking_blocks(&mut body);
+        let messages = body["messages"].as_array().unwrap();
+        // 2 messages survive — the assistant message is kept, not dropped.
+        assert_eq!(messages.len(), 2);
+        // user message untouched.
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "hi");
+        // assistant message keeps exactly one block: the text block.
+        let assistant_blocks = messages[1]["content"].as_array().unwrap();
+        assert_eq!(assistant_blocks.len(), 1);
+        assert_eq!(assistant_blocks[0]["type"], "text");
+        assert_eq!(assistant_blocks[0]["text"], "answer");
+        // the thinking block is gone from the whole body, not relabelled.
+        assert!(!body.to_string().contains("thinking"));
+    }
+
+    #[test]
+    fn strip_thinking_blocks_removes_redacted_thinking() {
+        let mut body = json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "redacted_thinking", "data": "encrypted-blob"},
+                    {"type": "text", "text": "answer"}
+                ]}
+            ]
+        });
+        strip_thinking_blocks(&mut body);
+        let assistant_blocks = body["messages"][1]["content"].as_array().unwrap();
+        // only the text block survives.
+        assert_eq!(assistant_blocks.len(), 1);
+        assert_eq!(assistant_blocks[0]["type"], "text");
+        assert_eq!(assistant_blocks[0]["text"], "answer");
+        // the redacted_thinking block is gone, not relabelled.
+        for b in assistant_blocks {
+            assert_ne!(b["type"], "redacted_thinking");
+        }
+        assert!(!body.to_string().contains("redacted_thinking"));
+    }
+
+    #[test]
+    fn strip_thinking_blocks_deletes_message_that_becomes_empty() {
+        let mut body = json!({
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "let me think", "signature": "sig-1"}
+                ]},
+                {"role": "user", "content": "continue"}
+            ]
+        });
+        strip_thinking_blocks(&mut body);
+        let messages = body["messages"].as_array().unwrap();
+        // the assistant message had ONLY a thinking block, so it is dropped
+        // entirely rather than left as an empty-content message.
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "first");
+        // remaining messages keep their original relative order.
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "continue");
+    }
+
+    #[test]
+    fn strip_thinking_blocks_removes_top_level_thinking_key() {
+        let mut body = json!({
+            "thinking": {"type": "enabled", "budget_tokens": 2000},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert!(body.as_object().unwrap().contains_key("thinking"));
+        strip_thinking_blocks(&mut body);
+        // key removed ENTIRELY, not nulled — `get` would be Some(null) if
+        // the code only set it to null, so the contains_key check is the
+        // distinguishing assertion.
+        assert!(!body.as_object().unwrap().contains_key("thinking"));
+        assert!(body.get("thinking").is_none());
+        // messages survive untouched.
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn strip_thinking_blocks_handles_missing_messages_key() {
+        let mut body = json!({
+            "thinking": {"type": "enabled", "budget_tokens": 2000}
+        });
+        strip_thinking_blocks(&mut body);
+        // no messages key -> nothing to iterate, must not panic, and the
+        // top-level thinking key is still removed.
+        assert!(!body.as_object().unwrap().contains_key("thinking"));
+        assert!(body.get("messages").is_none());
+    }
+
+    #[test]
+    fn strip_thinking_blocks_handles_string_content() {
+        let mut body = json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "plain text answer"}
+            ]
+        });
+        strip_thinking_blocks(&mut body);
+        let messages = body["messages"].as_array().unwrap();
+        // string content is not a block array: left untouched, message kept.
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "plain text answer");
+    }
+
+    #[test]
+    fn strip_thinking_blocks_handles_empty_object() {
+        let mut body = json!({});
+        strip_thinking_blocks(&mut body);
+        assert!(body.as_object().unwrap().is_empty());
+    }
+
     #[tokio::test]
-    async fn complete_returns_friendly_error_on_thinking_mismatch() {
-        // The upstream rejects with the canonical Anthropic thinking
-        // error. The proxy must NOT silently strip thinking and retry —
-        // it must surface a clear, actionable message telling the
-        // operator to reconfigure the fallback chain. The message must
-        // include both the provider name and the model name (preferring
-        // the upstream-rewritten name so the operator can match it to
-        // their upstream dashboard).
+    async fn complete_thinking_error_strips_and_retries_with_thinking_history() {
+        // Multi-turn scenario: the client echoes its previous thinking
+        // block (with signature) back in history. DeepSeek's Anthropic
+        // compat layer rejects the cross-model signature with the same
+        // literal thinking 400. The proxy must strip the thinking blocks
+        // from the outgoing body and retry once; the second attempt
+        // succeeds. wiremock expect(2) pins the retry to exactly one.
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured.clone();
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = counter.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(move |req: &wiremock::Request| {
+                let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    ResponseTemplate::new(400).set_body_json(json!({
+                        "error": {"message": "The `content[].thinking` in the thinking mode must be passed back to the API."}
+                    }))
+                } else {
+                    *captured_for_responder.lock().unwrap() = Some(
+                        serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
+                    );
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "id": "msg_retried",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "model": "claude-model",
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new(
+            "deepseek".to_string(),
+            "key".to_string(),
+            format!("{}/v1", server.uri()),
+            empty_rewrite(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let output = provider
+            .complete(&thinking_history_request(false), &empty_rewrite())
+            .await
+            .unwrap();
+        expect_variant!(output, ProviderOutput::Json(body) => {
+            assert_eq!(body["id"], "msg_retried");
+        });
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // The retried request body must be stripped of all thinking and
+        // redacted_thinking blocks across every message — and it must
+        // NOT drop non-thinking content: all 3 messages survive and the
+        // assistant message (index 1) keeps its text block. These pinned
+        // assertions make a "strip everything / strip nothing" false
+        // green impossible.
+        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        assert_eq!(sent["messages"].as_array().unwrap().len(), 3);
+        let assistant = &sent["messages"][1];
+        assert_eq!(assistant["role"], "assistant");
+        let text_block = assistant["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["type"] == "text")
+            .expect("assistant message must keep its text block after strip");
+        assert_eq!(text_block["text"], "previous answer");
+        for msg in sent["messages"].as_array().unwrap() {
+            if let Some(blocks) = msg["content"].as_array() {
+                for b in blocks {
+                    let t = b["type"].as_str();
+                    assert_ne!(t, Some("thinking"));
+                    assert_ne!(t, Some("redacted_thinking"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_thinking_error_does_not_strip_when_no_thinking_history() {
+        // A request whose history contains no assistant thinking block has
+        // nothing to strip, so the strip-and-retry gate does not fire and
+        // the upstream is hit exactly once (wiremock expect(1)). The
+        // upstream's canonical thinking 400 is passed through VERBATIM as
+        // `Upstream { status: 400 }` — the complete() path no longer
+        // translates it into the friendly `thinking_not_supported`
+        // envelope; that friendly path survives only on stream().
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-                "type": "error",
-                "error": {
-                    "type": "invalid_request_error",
-                    "message": "The `content[].thinking` in the thinking mode must be passed back to the API."
-                }
+                "error": {"message": "The `content[].thinking` in the thinking mode must be passed back to the API."}
             })))
             .expect(1)
             .mount(&server)
             .await;
 
-        let mut rewrite = HashMap::new();
-        // Operator maps `claude-model` to `upstream-variant` for this provider.
-        rewrite.insert("claude-model".to_string(), "upstream-variant".to_string());
         let provider = AnthropicProvider::new(
-            "minimax".to_string(),
-            "key".to_string(),
-            format!("{}/v1", server.uri()),
-            rewrite,
-            reqwest::Client::new(),
-        )
-        .unwrap();
-
-        let err = provider
-            .complete(&thinking_request(false), &empty_rewrite())
-            .await
-            .err()
-            .expect("thinking-mismatch must surface as Err");
-
-        let (status, body) = match err {
-            ProxyError::Upstream { status, body } => (status, body),
-            other => panic!("expected Upstream error, got: {other:?}"),
-        };
-        assert_eq!(status, 400);
-
-        let parsed: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["type"], "error");
-        assert_eq!(parsed["error"]["type"], "thinking_not_supported");
-
-        // Structured fields for programmatic inspection.
-        assert_eq!(parsed["error"]["provider"], "minimax");
-        assert_eq!(parsed["error"]["client_model"], "claude-model");
-        assert_eq!(
-            parsed["error"]["upstream_model"], "upstream-variant",
-            "upstream_model must reflect the rewrite, not the original"
-        );
-
-        let message = parsed["error"]["message"].as_str().unwrap();
-        // Provider name appears in the message.
-        assert!(
-            message.contains("minimax"),
-            "message must name the offending provider: {message}"
-        );
-        // Upstream (rewritten) model name appears — not the client model.
-        assert!(
-            message.contains("upstream-variant"),
-            "message must name the upstream model after rewrite: {message}"
-        );
-        // Thinking-not-supported phrasing and a reconfigure hint.
-        assert!(
-            message.contains("does not support thinking"),
-            "message must explain the mismatch: {message}"
-        );
-        assert!(
-            message.contains("Reconfigure"),
-            "message must tell the operator what to do: {message}"
-        );
-        // Original upstream body is preserved for debugging.
-        assert!(parsed["error"]["upstream_body"].as_str().unwrap().contains("thinking"));
-    }
-
-    #[tokio::test]
-    async fn complete_friendly_error_uses_client_model_when_no_rewrite() {
-        // When there's no model_rewrite mapping, upstream_model should
-        // fall back to the original client model name (no fabricated
-        // upstream name).
-        let server = MockServer::start().await;
-        // Plain-text 400 body that still triggers has_thinking_error
-        // via the `content[].thinking` and `must be passed back` markers.
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .respond_with(ResponseTemplate::new(400).set_body_string(
-                "The `content[].thinking` in the thinking mode must be passed back to the API.",
-            ))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let provider = AnthropicProvider::new(
-            "no-rewrite".to_string(),
+            "no-history".to_string(),
             "key".to_string(),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
@@ -890,21 +1220,282 @@ mod tests {
         .unwrap();
 
         let err = provider
-            .complete(&thinking_request(false), &empty_rewrite())
+            .complete(&request(false), &empty_rewrite())
             .await
             .err()
             .expect("should fail");
-
-        let body = match err {
-            ProxyError::Upstream { body, .. } => body,
+        let (status, body) = match err {
+            ProxyError::Upstream { status, body } => (status, body),
             other => panic!("expected Upstream, got: {other:?}"),
         };
+        assert_eq!(status, 400);
+        // Raw upstream body, untouched: the original thinking literal is
+        // present and none of the friendly-envelope fields are.
         let parsed: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["error"]["client_model"], "claude-model");
         assert_eq!(
-            parsed["error"]["upstream_model"], "claude-model",
-            "upstream_model must equal client_model when no rewrite applies"
+            parsed["error"]["message"],
+            "The `content[].thinking` in the thinking mode must be passed back to the API."
         );
+        assert_ne!(parsed["error"]["type"], "thinking_not_supported");
+        assert!(
+            parsed["error"].get("provider").is_none(),
+            "raw passthrough must not carry the friendly provider field: {body}"
+        );
+        assert!(
+            parsed["error"].get("client_model").is_none(),
+            "raw passthrough must not carry the friendly client_model field: {body}"
+        );
+        assert!(
+            parsed["error"].get("upstream_model").is_none(),
+            "raw passthrough must not carry the friendly upstream_model field: {body}"
+        );
+        // No strip-and-retry fired: the upstream was called exactly once
+        // (enforced by wiremock expect(1)).
+    }
+
+    #[tokio::test]
+    async fn complete_unrelated_400_with_thinking_history_does_not_strip() {
+        // The strip-and-retry decision needs BOTH gates: the upstream body
+        // must be a thinking error AND the history must carry an assistant
+        // thinking block. Here the history DOES carry one
+        // (`thinking_history_request`) but the 400 body is an unrelated
+        // "model not found" error. The body gate (`has_thinking_error`)
+        // must reject it on its own: no strip, no retry, exactly one
+        // upstream hit, raw body passthrough.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "model not found"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new(
+            "unrelated-400".to_string(),
+            "key".to_string(),
+            format!("{}/v1", server.uri()),
+            empty_rewrite(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let err = provider
+            .complete(&thinking_history_request(false), &empty_rewrite())
+            .await
+            .err()
+            .expect("should fail");
+        let (status, body) = match err {
+            ProxyError::Upstream { status, body } => (status, body),
+            other => panic!("expected Upstream, got: {other:?}"),
+        };
+        assert_eq!(status, 400);
+        // Raw upstream body, verbatim — no friendly envelope fields.
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["error"]["message"], "model not found");
+        assert_ne!(parsed["error"]["type"], "thinking_not_supported");
+        // wiremock expect(1) pins: no strip-and-retry fired despite the
+        // thinking history being present.
+    }
+
+    #[tokio::test]
+    async fn complete_thinking_error_strip_removes_top_level_thinking_param() {
+        // The top-level `thinking` param (enabled + budget) must be removed
+        // from the retried request (litellm's `data.pop("thinking")`
+        // semantics), in addition to the message blocks being stripped —
+        // otherwise the upstream still sees a thinking-mode request it
+        // rejects. The assertion checks the key is ABSENT rather than null:
+        // nulling would still be caught by `is_null()` only vacuously, and
+        // a spurious `"thinking": null` could itself be rejected by a
+        // strict validator like DeepSeek.
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured.clone();
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = counter.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(move |req: &wiremock::Request| {
+                let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    ResponseTemplate::new(400).set_body_json(json!({
+                        "error": {"message": "The `content[].thinking` in the thinking mode must be passed back to the API."}
+                    }))
+                } else {
+                    *captured_for_responder.lock().unwrap() = Some(
+                        serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
+                    );
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "id": "msg_ok2",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "model": "claude-model",
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new(
+            "deepseek".to_string(),
+            "key".to_string(),
+            format!("{}/v1", server.uri()),
+            empty_rewrite(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let _out = provider
+            .complete(&thinking_history_request(false), &empty_rewrite())
+            .await
+            .expect("strip then 200 must succeed");
+
+        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        assert!(
+            sent.as_object().unwrap().get("thinking").is_none(),
+            "top-level thinking must be removed, not nulled"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_thinking_error_strips_only_once_when_second_attempt_still_fails() {
+        // Both attempts return the thinking 400. The proxy must strip and
+        // retry exactly once (wiremock expect(2)) and then surface the
+        // SECOND upstream body verbatim — not the first, not a friendly
+        // envelope — because we've already applied our one remedy.
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = counter.clone();
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(move |req: &wiremock::Request| {
+                let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    ResponseTemplate::new(400).set_body_json(json!({
+                        "error": {"message": "The `content[].thinking` in the thinking mode must be passed back to the API."}
+                    }))
+                } else {
+                    *captured_for_responder.lock().unwrap() = Some(
+                        serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
+                    );
+                    ResponseTemplate::new(400).set_body_json(json!({
+                        "error": {"message": "The `content[].thinking` in the thinking mode must be passed back to the API.", "attempt": 2}
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new(
+            "deepseek".to_string(),
+            "key".to_string(),
+            format!("{}/v1", server.uri()),
+            empty_rewrite(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let err = provider
+            .complete(&thinking_history_request(false), &empty_rewrite())
+            .await
+            .err()
+            .expect("second 400 must surface as Err");
+        let (status, body) = match err {
+            ProxyError::Upstream { status, body } => (status, body),
+            other => panic!("expected Upstream, got: {other:?}"),
+        };
+        assert_eq!(status, 400);
+        let parsed: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({}));
+        assert_eq!(
+            parsed["error"]["attempt"], 2,
+            "must surface the SECOND attempt's raw body, got: {body}"
+        );
+        // The retried request was actually stripped before being re-sent.
+        // Assert the top-level thinking param is REMOVED (not nulled) and
+        // that stripping only dropped thinking blocks — all 3 messages
+        // survive and the assistant message (index 1) keeps its text.
+        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        assert!(
+            sent.as_object().unwrap().get("thinking").is_none(),
+            "top-level thinking must be removed, not nulled"
+        );
+        assert_eq!(sent["messages"].as_array().unwrap().len(), 3);
+        let assistant = &sent["messages"][1];
+        assert_eq!(assistant["role"], "assistant");
+        let text_block = assistant["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["type"] == "text")
+            .expect("assistant message must keep its text block after strip");
+        assert_eq!(text_block["text"], "previous answer");
+        for msg in sent["messages"].as_array().unwrap() {
+            if let Some(blocks) = msg["content"].as_array() {
+                for b in blocks {
+                    let t = b["type"].as_str();
+                    assert_ne!(t, Some("thinking"));
+                    assert_ne!(t, Some("redacted_thinking"));
+                }
+            }
+        }
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn stream_does_not_apply_strip_and_retry_on_thinking_error() {
+        // Duality of the complete() strip-and-retry: even when the request
+        // carries an assistant-thinking history block (the exact scenario
+        // complete() would strip and retry), the streaming path must NOT
+        // retry — wiremock expect(1) pins the single request. Once the
+        // SSE byte stream starts flowing, retrying would double-emit
+        // content to the client (see router.rs:303-307 contract), so a
+        // thinking-style 400 still surfaces as the friendly
+        // `thinking_not_supported` envelope here.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "The `content[].thinking` in the thinking mode must be passed back to the API."}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new(
+            "minimax".to_string(),
+            "key".to_string(),
+            format!("{}/v1", server.uri()),
+            empty_rewrite(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let err = provider
+            .stream(&thinking_history_request(true), &empty_rewrite())
+            .await
+            .err()
+            .expect("thinking-mismatch must surface as Err");
+        match err {
+            ProxyError::Upstream { status, body } => {
+                assert_eq!(status, 400);
+                let parsed: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(parsed["error"]["type"], "thinking_not_supported");
+                assert_eq!(parsed["error"]["provider"], "minimax");
+                assert_eq!(parsed["error"]["client_model"], "claude-model");
+                assert_eq!(parsed["error"]["upstream_model"], "claude-model");
+            }
+            other => panic!("expected Upstream error, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -945,7 +1536,10 @@ mod tests {
 
     #[tokio::test]
     async fn stream_returns_friendly_error_on_thinking_mismatch() {
-        // Streaming twin of complete_returns_friendly_error_on_thinking_mismatch.
+        // Streaming keeps the friendly envelope on a thinking 400 (unlike
+        // complete(), which passes the raw body through when there is no
+        // assistant-thinking history to strip). See the stream() comment
+        // about the "no retry once streaming" contract.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
