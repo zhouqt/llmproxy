@@ -69,6 +69,7 @@ async fn messages_handler(
         let summary = format_attempts(&attempts);
         tracing::info!(
             model = req.model.as_str(),
+            provider = provider.name(),
             stream = req.stream,
             elapsed_ms = start.elapsed().as_millis() as u64,
             failed_providers = %summary,
@@ -88,8 +89,22 @@ async fn messages_handler(
     resp.model = req.model.clone();
 
     let summary = format_attempts(&attempts);
+    // For non-streaming, infer the provider that served the request: when
+    // no attempts failed, it was the primary; otherwise it's the last
+    // chain entry that didn't appear in `attempts`.
+    let provider_label = if attempts.is_empty() {
+        model_cfg.primary.clone()
+    } else {
+        model_cfg
+            .chain()
+            .filter(|n| !attempts.iter().any(|a| a.provider == *n))
+            .last()
+            .unwrap_or("unknown")
+            .to_string()
+    };
     tracing::info!(
         model = req.model.as_str(),
+        provider = %provider_label,
         stream = req.stream,
         elapsed_ms = start.elapsed().as_millis() as u64,
         failed_providers = %summary,

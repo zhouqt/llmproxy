@@ -162,21 +162,15 @@ impl Router {
             }
             tried.push(name.clone());
 
-            // Log "trying provider" only when this is a fresh provider
-            // (not a retry against one we already logged) — the inner
-            // `max_retries_per_provider` loop would otherwise print
-            // "trying provider" per attempt, which is misleading for
-            // 429 retries.
-            if attempts.is_empty() {
+            // Log "fallback triggered" only when this is a fallback attempt
+            // (not the first provider). The healthy path is covered by the
+            // server's "request completed" log, which already names the
+            // provider that served the request — adding a "trying provider"
+            // line here would just duplicate that.
+            if !attempts.is_empty() {
                 tracing::info!(
                     model = req.model.as_str(),
-                    provider = name.as_str(),
-                    "trying provider"
-                );
-            } else {
-                tracing::info!(
-                    model = req.model.as_str(),
-                    failed_provider = name.as_str(),
+                    failed_provider = attempts.last().map(|a| a.provider.as_str()).unwrap_or("unknown"),
                     status = attempts.last().map(|a| a.status).unwrap_or(0),
                     "fallback triggered"
                 );
@@ -190,24 +184,7 @@ impl Router {
             // the first error — that's the whole point of this counter.
             for _ in 0..model.max_retries_per_provider {
                 match provider.complete(req, &HashMap::new()).await {
-                    Ok(out) => {
-                        if attempts.is_empty() {
-                            tracing::info!(
-                                model = req.model.as_str(),
-                                provider = name.as_str(),
-                                "request succeeded"
-                            );
-                        } else {
-                            let summary = crate::server::format_attempts_summary(&attempts);
-                            tracing::info!(
-                                model = req.model.as_str(),
-                                provider = name.as_str(),
-                                failed_providers = %summary,
-                                "fallback succeeded"
-                            );
-                        }
-                        return Ok((out, attempts));
-                    }
+                    Ok(out) => return Ok((out, attempts)),
                     Err(e) if e.is_cooldownable() => {
                         if let ProxyError::Upstream { status, body } = &e {
                             attempts.push(RouteAttempt {
@@ -344,18 +321,15 @@ impl Router {
             }
             tried.push(name.clone());
 
-            // Log "trying provider" only when this is a fresh provider
-            // (not a retry against one we already logged).
-            if attempts.is_empty() {
+            // Log "fallback triggered" only when this is a fallback attempt
+            // (not the first provider). The healthy path is covered by the
+            // server's "request completed" log, which already names the
+            // provider that served the request — adding a "trying provider"
+            // line here would just duplicate that.
+            if !attempts.is_empty() {
                 tracing::info!(
                     model = req.model.as_str(),
-                    provider = name.as_str(),
-                    "trying provider"
-                );
-            } else {
-                tracing::info!(
-                    model = req.model.as_str(),
-                    failed_provider = name.as_str(),
+                    failed_provider = attempts.last().map(|a| a.provider.as_str()).unwrap_or("unknown"),
                     status = attempts.last().map(|a| a.status).unwrap_or(0),
                     "fallback triggered"
                 );
@@ -367,24 +341,7 @@ impl Router {
             // (we'd double-emit content to the client), so the per-provider
             // attempt count for streaming is implicitly 1.
             match provider.stream(req, &HashMap::new()).await {
-                Ok(out) => {
-                    if attempts.is_empty() {
-                        tracing::info!(
-                            model = req.model.as_str(),
-                            provider = name.as_str(),
-                            "request succeeded"
-                        );
-                    } else {
-                        let summary = crate::server::format_attempts_summary(&attempts);
-                        tracing::info!(
-                            model = req.model.as_str(),
-                            provider = name.as_str(),
-                            failed_providers = %summary,
-                            "fallback succeeded"
-                        );
-                    }
-                    return Ok((provider, out, attempts));
-                }
+                Ok(out) => return Ok((provider, out, attempts)),
                 Err(e) if e.is_cooldownable() => {
                     if let ProxyError::Upstream { status, body } = &e {
                         attempts.push(RouteAttempt {
