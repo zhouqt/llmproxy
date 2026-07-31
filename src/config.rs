@@ -15,8 +15,6 @@ pub struct Config {
     pub providers: Vec<ProviderConfig>,
     #[serde(default)]
     pub models: Vec<ModelConfig>,
-    #[serde(default)]
-    pub logging: LoggingConfig,
 }
 
 impl Default for Config {
@@ -26,7 +24,6 @@ impl Default for Config {
             proxy: ProxyConfig::default(),
             providers: Vec::new(),
             models: Vec::new(),
-            logging: LoggingConfig::default(),
         }
     }
 }
@@ -192,32 +189,6 @@ fn default_max_retries() -> u32 {
 impl ModelConfig {
     pub fn chain(&self) -> impl Iterator<Item = &str> {
         std::iter::once(self.primary.as_str()).chain(self.fallback_chain.iter().map(String::as_str))
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct LoggingConfig {
-    #[serde(default = "default_log_level")]
-    pub level: String,
-    #[serde(default = "default_log_format")]
-    pub format: String,
-}
-
-fn default_log_level() -> String {
-    "info".to_string()
-}
-
-fn default_log_format() -> String {
-    "pretty".to_string()
-}
-
-impl Default for LoggingConfig {
-    fn default() -> Self {
-        Self {
-            level: default_log_level(),
-            format: default_log_format(),
-        }
     }
 }
 

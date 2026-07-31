@@ -162,6 +162,20 @@ impl Router {
             }
             tried.push(name.clone());
 
+            // Log "fallback triggered" only when this is a fallback attempt
+            // (not the first provider). The healthy path is covered by the
+            // server's "request completed" log, which already names the
+            // provider that served the request — adding a "trying provider"
+            // line here would just duplicate that.
+            if !attempts.is_empty() {
+                tracing::info!(
+                    model = req.model.as_str(),
+                    failed_provider = attempts.last().map(|a| a.provider.as_str()).unwrap_or("unknown"),
+                    status = attempts.last().map(|a| a.status).unwrap_or(0),
+                    "fallback triggered"
+                );
+            }
+
             // Try the primary provider up to max_retries_per_provider times.
             // Each attempt that returns a cooldownable error marks the
             // provider on cooldown and falls through to the next iteration;
@@ -232,6 +246,13 @@ impl Router {
             // the *last* one so the operator can see what really happened,
             // instead of the generic "all cooling down" message that
             // would imply we never even tried.
+            let summary = crate::server::format_attempts_summary(&attempts);
+            tracing::warn!(
+                model = model.name.as_str(),
+                failed_providers = %summary,
+                last_error = %err,
+                "all providers failed"
+            );
             return Err(ProxyError::AllProvidersFailed {
                 model: model.name.clone(),
                 attempts,
@@ -300,6 +321,20 @@ impl Router {
             }
             tried.push(name.clone());
 
+            // Log "fallback triggered" only when this is a fallback attempt
+            // (not the first provider). The healthy path is covered by the
+            // server's "request completed" log, which already names the
+            // provider that served the request — adding a "trying provider"
+            // line here would just duplicate that.
+            if !attempts.is_empty() {
+                tracing::info!(
+                    model = req.model.as_str(),
+                    failed_provider = attempts.last().map(|a| a.provider.as_str()).unwrap_or("unknown"),
+                    status = attempts.last().map(|a| a.status).unwrap_or(0),
+                    "fallback triggered"
+                );
+            }
+
             // Streaming has no inner retry: a stream() call is a single HTTP
             // request whose response begins streaming immediately on
             // success. Retrying after the first byte has flowed is unsafe
@@ -349,6 +384,13 @@ impl Router {
         }
 
         if let Some(err) = last_error {
+            let summary = crate::server::format_attempts_summary(&attempts);
+            tracing::warn!(
+                model = model.name.as_str(),
+                failed_providers = %summary,
+                last_error = %err,
+                "all providers failed"
+            );
             return Err(ProxyError::AllProvidersFailed {
                 model: model.name.clone(),
                 attempts,
@@ -508,7 +550,6 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-            logging: Default::default(),
         };
 
         Router::new(Arc::new(cfg), providers, CooldownCache::new())
@@ -584,7 +625,6 @@ mod tests {
                 max_retries_per_provider: 3,
                 max_retries_total: 3,
             }],
-            logging: Default::default(),
         };
         let router = Router::new(Arc::new(cfg), providers.clone(), CooldownCache::new());
         let model = router.find_model("m").unwrap();
@@ -811,7 +851,6 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-            logging: Default::default(),
         };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
@@ -880,7 +919,6 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 1,
             }],
-            logging: Default::default(),
         };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
@@ -1079,7 +1117,6 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 5,
             }],
-            logging: Default::default(),
         };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
@@ -1145,7 +1182,6 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 5,
             }],
-            logging: Default::default(),
         };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
@@ -1239,7 +1275,6 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-            logging: Default::default(),
         };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
@@ -1412,7 +1447,6 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-            logging: Default::default(),
         };
         (
             Router::new(Arc::new(cfg), providers, CooldownCache::new()),
@@ -1572,7 +1606,6 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-            logging: Default::default(),
         };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
@@ -1756,7 +1789,6 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-            logging: Default::default(),
         };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
@@ -1828,7 +1860,6 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-            logging: Default::default(),
         };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
@@ -1895,7 +1926,6 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-            logging: Default::default(),
         };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();

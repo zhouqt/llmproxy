@@ -134,7 +134,6 @@ fn build_router(
             max_retries_per_provider: 1,
             max_retries_total: model_chain.len() as u32,
         }],
-        logging: Default::default(),
     };
     Router::new(Arc::new(cfg), providers, CooldownCache::new())
 }

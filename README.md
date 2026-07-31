@@ -402,6 +402,47 @@ one based on `use_proxy`. This means all proxy-enabled providers share
 one connection pool (and all direct providers share another) — no
 per-provider pool fragmentation.
 
+## Logging
+
+Log output goes to **stderr** and is controlled entirely by the
+`RUST_LOG` environment variable — there is no logging section in
+`config.yaml`. The default filter (used when `RUST_LOG` is unset) is:
+
+```
+llmproxy=info,tower_http=info
+```
+
+`RUST_LOG` uses the standard `tracing-subscriber` `EnvFilter` syntax, so
+you can set a global level, per-crate levels, or both:
+
+```sh
+# Normal operation — INFO-level request/fallback events
+RUST_LOG=info
+
+# Debug the router: also show per-provider routing decisions and the
+# thinking/tool-conversion internals under `llmproxy`
+RUST_LOG=info,llmproxy=debug
+
+# Deepest detail — background model-cache refreshes etc. only appear at
+# TRACE, so use this when diagnosing cache/auth issues
+RUST_LOG=llmproxy=trace
+```
+
+What to expect at each level:
+
+| Level | Typical messages                                                    |
+|-------|---------------------------------------------------------------------|
+| INFO  | `request completed` (model, provider, elapsed), `fallback triggered` |
+| WARN  | `provider marked cooldown`, `fallback triggered` (transient failure) |
+| WARN  | `all providers failed` (chain exhausted), copilot auth problems       |
+| ERROR | `upstream stream error`, background refresh failures                  |
+| DEBUG | bootstrap progress, conversion internals (`tool_call_debug` target)   |
+| TRACE | `copilot models cached` (background cache maintenance)                |
+
+When running under `docker compose`, `RUST_LOG` is forwarded from the
+host (or `.env`) via `docker-compose.yaml`; set it there or in `.env`
+to change the level without touching `config.yaml`.
+
 ## Architecture
 
 - **axum** HTTP server with Bearer-token middleware
