@@ -584,7 +584,6 @@ mod tests {
                     max_retries_per_provider: 1,
                     max_retries_total: 1,
                 }],
-                logging: Default::default(),
             };
             let cfg = Arc::new(cfg);
             let cooldown = CooldownCache::new();

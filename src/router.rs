@@ -550,7 +550,6 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-            logging: Default::default(),
         };
 
         Router::new(Arc::new(cfg), providers, CooldownCache::new())
@@ -626,7 +625,6 @@ mod tests {
                 max_retries_per_provider: 3,
                 max_retries_total: 3,
             }],
-            logging: Default::default(),
         };
         let router = Router::new(Arc::new(cfg), providers.clone(), CooldownCache::new());
         let model = router.find_model("m").unwrap();
@@ -853,7 +851,6 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-            logging: Default::default(),
         };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
@@ -922,7 +919,6 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 1,
             }],
-            logging: Default::default(),
         };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
@@ -1121,7 +1117,6 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 5,
             }],
-            logging: Default::default(),
         };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
@@ -1187,7 +1182,6 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 5,
             }],
-            logging: Default::default(),
         };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
@@ -1281,7 +1275,6 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-            logging: Default::default(),
         };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
@@ -1454,7 +1447,6 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-            logging: Default::default(),
         };
         (
             Router::new(Arc::new(cfg), providers, CooldownCache::new()),
@@ -1614,7 +1606,6 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-            logging: Default::default(),
         };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
@@ -1798,7 +1789,6 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-            logging: Default::default(),
         };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
@@ -1870,7 +1860,6 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-            logging: Default::default(),
         };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
@@ -1937,7 +1926,6 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-            logging: Default::default(),
         };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();

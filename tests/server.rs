@@ -150,7 +150,6 @@ fn build_app(
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-        logging: Default::default(),
     };
     let config = Arc::new(config);
     let cooldown = CooldownCache::new();
@@ -825,7 +824,6 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
                 max_retries_total: 1,
             },
         ],
-        logging: Default::default(),
     };
     let config = Arc::new(config);
     let cooldown = CooldownCache::new();

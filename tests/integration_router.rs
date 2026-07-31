@@ -211,7 +211,6 @@ async fn mock_llm_provider_primary_succeeds_returns_anthropic_response() {
             max_retries_per_provider: 1,
             max_retries_total: 1,
         }],
-        logging: Default::default(),
     };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
@@ -281,7 +280,6 @@ async fn mock_llm_provider_falls_back_when_primary_returns_429() {
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-        logging: Default::default(),
     };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
@@ -358,7 +356,6 @@ async fn mock_llm_provider_falls_back_when_primary_returns_402_quota() {
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-        logging: Default::default(),
     };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
@@ -433,7 +430,6 @@ async fn mock_llm_provider_falls_back_when_primary_returns_empty_body_402() {
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-        logging: Default::default(),
     };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
@@ -509,7 +505,6 @@ async fn mock_llm_provider_does_not_fall_back_on_403() {
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-        logging: Default::default(),
     };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
@@ -584,7 +579,6 @@ async fn mock_llm_provider_chain_exhausted_returns_last_upstream_error() {
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-        logging: Default::default(),
     };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
@@ -678,7 +672,6 @@ async fn mock_llm_provider_per_provider_retry_three_times_before_chain_advance()
             max_retries_per_provider: 3,
             max_retries_total: 5,
         }],
-        logging: Default::default(),
     };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
@@ -761,7 +754,6 @@ async fn http_end_to_end_anthropic_provider_strips_and_succeeds() {
             max_retries_per_provider: 1,
             max_retries_total: 1,
         }],
-        logging: Default::default(),
     };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
@@ -864,7 +856,6 @@ async fn http_end_to_end_anthropic_provider_strip_max_attempts_then_passthrough(
             max_retries_per_provider: 1,
             max_retries_total: 1,
         }],
-        logging: Default::default(),
     };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
@@ -916,7 +907,6 @@ fn build_axum_app(
             max_retries_per_provider: 1,
             max_retries_total: model_chain.len() as u32,
         }],
-        logging: Default::default(),
     };
     let cfg = Arc::new(cfg);
     let cooldown = CooldownCache::new();
@@ -1367,7 +1357,6 @@ async fn mock_llm_provider_short_cooldown_for_non_429_upstream_error() {
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-        logging: Default::default(),
     };
     let router = Router::new(Arc::new(cfg), providers.clone(), CooldownCache::new());
 
@@ -1461,7 +1450,6 @@ async fn mock_llm_provider_402_uses_configured_cooldown_seconds_and_skips_primar
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-        logging: Default::default(),
     };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
@@ -1561,7 +1549,6 @@ async fn mock_llm_provider_subsequent_request_skips_cooldown_provider_directly()
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-        logging: Default::default(),
     };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
@@ -1676,7 +1663,6 @@ async fn mock_llm_provider_skips_provider_with_unsupported_model_via_runtime_400
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-        logging: Default::default(),
     };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
