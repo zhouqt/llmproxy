@@ -615,7 +615,11 @@ impl CopilotProvider {
     pub async fn cache_models_with_token(&self, token: &str) {
         match self.fetch_models(token).await {
             Ok(models) => {
-                tracing::debug!(
+                // Background cache maintenance fires on every refresh-loop
+                // iteration, so this is TRACE — the count is useful only
+                // when debugging model-cache issues, and at INFO/DEBUG it
+                // would just pollute the log.
+                tracing::trace!(
                     model_count = models.len(),
                     "copilot models cached"
                 );
