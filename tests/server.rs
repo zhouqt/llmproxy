@@ -228,6 +228,125 @@ async fn health_is_public_while_api_routes_are_protected() {
 }
 
 #[tokio::test]
+async fn admin_status_requires_auth() {
+    let app = build_app(
+        Some("secret"),
+        provider(
+            "primary",
+            CompleteBehavior::Json,
+            StreamBehavior::Bytes("unused"),
+        ),
+        Some(provider(
+            "backup",
+            CompleteBehavior::Json,
+            StreamBehavior::Bytes("unused"),
+        )),
+    );
+
+    let resp = app
+        .oneshot(test_request(Method::GET, "/admin/status", None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn admin_status_lists_providers_with_available_summary() {
+    let app = build_app(
+        Some("secret"),
+        provider(
+            "primary",
+            CompleteBehavior::Json,
+            StreamBehavior::Bytes("unused"),
+        ),
+        Some(provider(
+            "backup",
+            CompleteBehavior::Json,
+            StreamBehavior::Bytes("unused"),
+        )),
+    );
+
+    let mut req = test_request(Method::GET, "/admin/status", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = body_json(resp).await;
+    assert_eq!(body["status"], "ok");
+    let providers = body["providers"].as_array().unwrap();
+    assert_eq!(providers.len(), 2);
+    // Config declaration order: primary, then backup.
+    assert_eq!(providers[0]["name"], "primary");
+    assert_eq!(providers[0]["type"], "openai_compat");
+    assert_eq!(providers[0]["status"], "available");
+    assert!(providers[0]["last_error_status"].is_null());
+    assert!(providers[0]["cooling_down_remaining_secs"].is_null());
+    assert_eq!(providers[0]["models"][0], "claude-test");
+    assert_eq!(providers[1]["name"], "backup");
+    assert_eq!(providers[1]["status"], "available");
+    assert_eq!(body["summary"]["total"], 2);
+    assert_eq!(body["summary"]["available"], 2);
+    assert_eq!(body["summary"]["cooling_down"], 0);
+}
+
+#[tokio::test]
+async fn admin_status_marks_provider_cooling_down_after_failed_request() {
+    let app = build_app(
+        Some("secret"),
+        provider(
+            "primary",
+            CompleteBehavior::Error(429),
+            StreamBehavior::Bytes("unused"),
+        ),
+        Some(provider(
+            "backup",
+            CompleteBehavior::Json,
+            StreamBehavior::Bytes("unused"),
+        )),
+    );
+
+    // Trigger fallback: primary returns 429 (cooldownable), backup serves.
+    let mut msg_req = test_request(
+        Method::POST,
+        "/v1/messages",
+        Some(messages_request(false)),
+    );
+    msg_req
+        .headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let msg_resp = app.clone().oneshot(msg_req).await.unwrap();
+    assert_eq!(msg_resp.status(), StatusCode::OK);
+    assert_eq!(
+        msg_resp.headers()["x-llmproxy-failed-providers"],
+        "primary:429"
+    );
+
+    // The status endpoint must now report primary as cooling down.
+    let mut req = test_request(Method::GET, "/admin/status", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = body_json(resp).await;
+    let providers = body["providers"].as_array().unwrap();
+    let primary = providers.iter().find(|p| p["name"] == "primary").unwrap();
+    assert_eq!(primary["status"], "cooling_down");
+    assert_eq!(primary["last_error_status"], 429);
+    let remaining = primary["cooling_down_remaining_secs"].as_u64().unwrap();
+    assert!(
+        (55..=60).contains(&remaining),
+        "429 cooldown should report ~60s remaining, got {remaining}"
+    );
+    let backup = providers.iter().find(|p| p["name"] == "backup").unwrap();
+    assert_eq!(backup["status"], "available");
+    assert_eq!(body["summary"]["total"], 2);
+    assert_eq!(body["summary"]["available"], 1);
+    assert_eq!(body["summary"]["cooling_down"], 1);
+}
+
+#[tokio::test]
 async fn count_tokens_returns_word_based_estimate() {
     // R5: the old `len(json) / 4` heuristic under-counted English
     // inputs by up to 27% (e.g. 9-word panagram: 11 estimated vs 14
