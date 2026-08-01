@@ -213,6 +213,48 @@ The proxy polls for the token in the background and stores it at
 
 If a bootstrap is already in progress, returns HTTP 409.
 
+### `GET /admin/status`
+
+Live health of every configured provider, driven by the router's cooldown
+state: a provider that returned a cooldownable error (401/402/404/408/429 or
+any 5xx) inside its TTL window is reported as `cooling_down`; otherwise
+`available`. The endpoint answers purely from in-memory state and never
+contacts upstreams. Requires the same bearer auth as other `/admin/` routes.
+
+Response (HTTP 200):
+
+```json
+{
+  "status": "ok",
+  "providers": [
+    {
+      "name": "deepseek",
+      "type": "openai_compat",
+      "status": "available",
+      "models": ["claude-sonnet-4.6", "gpt-4o"],
+      "last_error_status": null,
+      "cooling_down_remaining_secs": null
+    },
+    {
+      "name": "copilot",
+      "type": "github_copilot",
+      "status": "cooling_down",
+      "models": ["gpt-5"],
+      "last_error_status": 429,
+      "cooling_down_remaining_secs": 137
+    }
+  ],
+  "summary": {"total": 2, "available": 1, "cooling_down": 1}
+}
+```
+
+`providers[]` is in config declaration order. Per provider: `type` is the
+config tag (`github_copilot` / `anthropic` / `openai_compat` /
+`openai_responses`), `models` lists the client models whose fallback chain
+includes the provider, and `last_error_status` / `cooling_down_remaining_secs`
+are non-null only while cooling. `summary` gives the counts. Designed for a
+Claude Code statusline hook — see `docs/PLANS/provider-status-endpoint.md`.
+
 ### `GET /health`
 
 Liveness probe. No auth required. Returns `200 OK` with body `OK`.
@@ -459,7 +501,9 @@ to change the level without touching `config.yaml`.
 ## Limitations
 
 - No persistent cooldown storage across restarts.
-- No metrics endpoint (logs to stderr only).
+- No metrics or usage-tracking endpoint; the only live operational view is
+  the per-provider health snapshot at `GET /admin/status` (logs go to
+  stderr).
 - Tool-use streaming supported; prompt caching passed through but not optimized.
 - `count_tokens` is a rough word-based estimate (4 chars / token), not
   provider-accurate. Don't use it for billing.
