@@ -11,6 +11,7 @@ use crate::config::{Config, ModelConfig};
 use crate::cooldown::CooldownCache;
 use crate::error::{ProxyError, Result};
 use crate::providers::{ProviderOutput, SharedProvider};
+use serde::Serialize;
 
 /// Detect "this upstream cannot serve the requested model" responses
 /// that arrive at runtime as a 400-level `Upstream` error. Used by the
@@ -61,6 +62,40 @@ pub struct RouteAttempt {
     pub body: String,
 }
 
+/// Serialized health state of a single provider for the `/admin/status`
+/// endpoint. Deliberately only two values — see
+/// `docs/PLANS/provider-status-endpoint.md`. The proxy does not actively
+/// probe upstreams, so `CoolingDown` means "a cooldownable failure is
+/// still inside its TTL window (the router will skip this provider)",
+/// NOT a broader "unavailable" claim; consumers render it as 🔴.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderHealth {
+    Available,
+    CoolingDown,
+}
+
+/// One provider's row in the status snapshot. Field names and semantics
+/// are part of the `/admin/status` contract consumed by the Claude Code
+/// statusline hook — keep changes backwards-compatible.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderStatus {
+    pub name: String,
+    /// Stable kind label, equal to the provider config's serde `type`
+    /// tag (`github_copilot`/`anthropic`/`openai_compat`/`openai_responses`).
+    #[serde(rename = "type")]
+    pub provider_type: &'static str,
+    pub status: ProviderHealth,
+    /// Client-visible model names whose chain (`primary` + `fallback`)
+    /// includes this provider.
+    pub models: Vec<String>,
+    /// Upstream HTTP status that triggered the cooldown, when cooling.
+    pub last_error_status: Option<u16>,
+    /// Remaining cooldown in whole seconds (aligns with `Retry-After`),
+    /// when cooling.
+    pub cooling_down_remaining_secs: Option<u64>,
+}
+
 impl Router {
     pub fn new(cfg: Arc<Config>, providers: HashMap<String, SharedProvider>, cooldown: CooldownCache) -> Self {
         Self { cfg, providers, cooldown }
@@ -80,6 +115,46 @@ impl Router {
 
     pub fn find_model(&self, name: &str) -> Option<&ModelConfig> {
         self.cfg.find_model(name)
+    }
+
+    /// Snapshot of every configured provider's current health, in config
+    /// declaration order (deterministic — never rely on the internal
+    /// `providers` HashMap ordering). A provider is `CoolingDown` iff a
+    /// live cooldown entry exists for it, which is exactly the signal the
+    /// router's own dispatch (`is_cooling_down`) consumes, so the status
+    /// endpoint can never disagree with actual routing decisions.
+    pub async fn provider_status(&self) -> Vec<ProviderStatus> {
+        let active = self.cooldown.active().await;
+        let cooling: HashMap<&str, (u16, Duration)> = active
+            .iter()
+            .map(|(name, status, remaining)| (name.as_str(), (*status, *remaining)))
+            .collect();
+
+        let mut out = Vec::with_capacity(self.cfg.providers.len());
+        for p in &self.cfg.providers {
+            let name = p.name();
+            let models = self
+                .cfg
+                .models
+                .iter()
+                .filter(|m| m.chain().any(|n| n == name))
+                .map(|m| m.name.clone())
+                .collect();
+            let entry = cooling.get(name).copied();
+            out.push(ProviderStatus {
+                name: name.to_string(),
+                provider_type: p.type_label(),
+                status: if entry.is_some() {
+                    ProviderHealth::CoolingDown
+                } else {
+                    ProviderHealth::Available
+                },
+                models,
+                last_error_status: entry.map(|(s, _)| s),
+                cooling_down_remaining_secs: entry.map(|(_, d)| d.as_secs()),
+            });
+        }
+        out
     }
 
     /// Pick the first non-cooling-down provider in the model's chain.
@@ -717,6 +792,66 @@ mod tests {
             .await;
         let (name, _p) = router.select_provider(model).await.unwrap();
         assert_eq!(name, "backup");
+    }
+
+    #[tokio::test]
+    async fn provider_status_reflects_cooldown_and_models() {
+        // The status snapshot must mirror the cooldown cache exactly:
+        // a provider with a live cooldown entry is CoolingDown with the
+        // triggering status + remaining TTL; everything else is
+        // Available. `models` lists every client model whose chain
+        // includes the provider.
+        let router = build_test_router();
+        router
+            .cooldown()
+            .mark_cooldown("primary", Duration::from_secs(60), 429, "rate limited")
+            .await;
+
+        let statuses = router.provider_status().await;
+        assert_eq!(statuses.len(), 2, "both configured providers must appear");
+
+        let primary = statuses.iter().find(|s| s.name == "primary").unwrap();
+        assert_eq!(primary.status, ProviderHealth::CoolingDown);
+        assert_eq!(primary.provider_type, "openai_compat");
+        assert_eq!(primary.last_error_status, Some(429));
+        let remaining = primary.cooling_down_remaining_secs.unwrap();
+        assert!(
+            (55..=60).contains(&remaining),
+            "429 cooldown should report ~60s remaining, got {remaining}"
+        );
+
+        let backup = statuses.iter().find(|s| s.name == "backup").unwrap();
+        assert_eq!(backup.status, ProviderHealth::Available);
+        assert_eq!(backup.last_error_status, None);
+        assert_eq!(backup.cooling_down_remaining_secs, None);
+
+        // Model "m" has chain primary -> backup, so both list it.
+        for s in &statuses {
+            assert_eq!(s.models, vec!["m".to_string()]);
+        }
+
+        // Serialization must emit the documented contract keywords so the
+        // statusline hook can branch on a fixed enum.
+        let arr = serde_json::to_value(&statuses).unwrap();
+        let arr = arr.as_array().unwrap();
+        let primary_json = arr.iter().find(|v| v["name"] == "primary").unwrap();
+        assert_eq!(primary_json["type"], "openai_compat");
+        assert_eq!(primary_json["status"], "cooling_down");
+        assert_eq!(primary_json["last_error_status"], 429);
+        assert!(primary_json["cooling_down_remaining_secs"].is_u64());
+        let backup_json = arr.iter().find(|v| v["name"] == "backup").unwrap();
+        assert_eq!(backup_json["status"], "available");
+        assert!(backup_json["last_error_status"].is_null());
+        assert!(backup_json["cooling_down_remaining_secs"].is_null());
+    }
+
+    #[tokio::test]
+    async fn provider_status_all_available_when_no_cooldown() {
+        let router = build_test_router();
+        let statuses = router.provider_status().await;
+        assert_eq!(statuses.len(), 2);
+        assert!(statuses.iter().all(|s| s.status == ProviderHealth::Available));
+        assert!(statuses.iter().all(|s| s.last_error_status.is_none()));
     }
 
     #[tokio::test]
