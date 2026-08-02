@@ -19,6 +19,9 @@ config.local.yaml
 # Claude Code session data (per-machine, not source)
 /.claude/
 
+# Local planning docs (work-in-progress, not source — never commit)
+/plans/
+
 # Editor / OS noise
 .DS_Store
 Thumbs.db
