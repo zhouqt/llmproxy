@@ -64,7 +64,7 @@ pub struct RouteAttempt {
 
 /// Serialized health state of a single provider for the `/admin/status`
 /// endpoint. Deliberately only two values — see
-/// `docs/PLANS/provider-status-endpoint.md`. The proxy does not actively
+/// `plans/provider-status-endpoint.md`. The proxy does not actively
 /// probe upstreams, so `CoolingDown` means "a cooldownable failure is
 /// still inside its TTL window (the router will skip this provider)",
 /// NOT a broader "unavailable" claim; consumers render it as 🔴.

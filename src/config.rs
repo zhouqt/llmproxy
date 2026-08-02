@@ -155,7 +155,7 @@ impl ProviderConfig {
     /// string the serde `type` tag (`src/config.rs:63`) deserializes into,
     /// so the status endpoint and any consumer can identify provider kind
     /// without re-deriving it from the enum. See
-    /// `docs/PLANS/provider-status-endpoint.md`.
+    /// `plans/provider-status-endpoint.md`.
     pub fn type_label(&self) -> &'static str {
         match self {
             ProviderConfig::GithubCopilot { .. } => "github_copilot",
