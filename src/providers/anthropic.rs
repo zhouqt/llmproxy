@@ -23,6 +23,16 @@ use crate::anthropic::{ContentBlock, MessageContent, MessagesRequest};
 use crate::error::{ProxyError, Result};
 use crate::providers::{Provider, ProviderOutput};
 
+/// Value of the `anthropic-client-platform` header the real Claude Code
+/// CLI sends to Anthropic-format gateways (see
+/// plans/simulate-claude-code-identity.md). Presenting it lets upstreams
+/// like OpenRouter's native `/v1/messages` or MiniMax classify the
+/// proxy's traffic as coming from Claude Code instead of an unknown
+/// client. Hardcoded rather than configurable because the proxy is always
+/// driven by the Claude Code CLI — the value never needs to vary per
+/// deployment.
+const ANTHROPIC_CLIENT_PLATFORM: &str = "claude_code_cli";
+
 pub struct AnthropicProvider {
     name: String,
     api_key: String,
@@ -135,6 +145,7 @@ impl Provider for AnthropicProvider {
             .get(&url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
+            .header("anthropic-client-platform", ANTHROPIC_CLIENT_PLATFORM)
             .header("accept", "application/json")
             .send()
             .await
@@ -191,6 +202,7 @@ impl Provider for AnthropicProvider {
                 .bearer_auth(&api_key)
                 .header("content-type", "application/json")
                 .header("anthropic-version", "2023-06-01")
+                .header("anthropic-client-platform", ANTHROPIC_CLIENT_PLATFORM)
                 .json(&body)
                 .send()
                 .await?;
@@ -259,6 +271,7 @@ impl Provider for AnthropicProvider {
             .bearer_auth(&api_key)
             .header("content-type", "application/json")
             .header("anthropic-version", "2023-06-01")
+            .header("anthropic-client-platform", ANTHROPIC_CLIENT_PLATFORM)
             .header("accept", "text/event-stream")
             .json(&body)
             .send()
@@ -450,6 +463,7 @@ mod tests {
             .and(path("/v1/messages"))
             .and(header("authorization", "Bearer router-key"))
             .and(header("anthropic-version", "2023-06-01"))
+            .and(header("anthropic-client-platform", "claude_code_cli"))
             .and(body_partial_json(json!({
                 "model": "rewritten-model",
                 "stream": false,
@@ -736,6 +750,7 @@ mod tests {
             .and(path("/api/v1/messages"))
             .and(header("authorization", "Bearer router-key"))
             .and(header("anthropic-version", "2023-06-01"))
+            .and(header("anthropic-client-platform", "claude_code_cli"))
             .and(body_partial_json(json!({
                 "model": "rewritten-model",
                 "stream": false
@@ -775,6 +790,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .and(header("accept", "text/event-stream"))
+            .and(header("anthropic-client-platform", "claude_code_cli"))
             .and(body_partial_json(json!({"stream": true})))
             .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
             .expect(1)
@@ -1623,6 +1639,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/v1/models"))
             .and(header("x-api-key", "test-key"))
+            .and(header("anthropic-client-platform", "claude_code_cli"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "object": "list",
                 "data": [

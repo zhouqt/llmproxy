@@ -19,11 +19,11 @@ use crate::anthropic::MessagesRequest;
 use crate::error::{ProxyError, Result};
 use crate::oauth::device_flow::{request_device_code, DeviceCodeResponse};
 use crate::oauth::token_store::{StoredTokens, TokenStore};
+use crate::oauth::USER_AGENT;
 use crate::providers::openai_compat::OpenAiSseToAnthropic;
 use crate::providers::{Provider, ProviderOutput};
 
 const EDITOR_PLUGIN_VERSION: &str = "copilot-chat/0.26.7";
-const USER_AGENT: &str = "GitHubCopilotChat/0.26.7";
 const GITHUB_API_VERSION: &str = "2025-04-01";
 const COPILOT_INTERNAL_TOKEN_URL: &str =
     "https://api.github.com/copilot_internal/v2/token";

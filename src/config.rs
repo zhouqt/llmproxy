@@ -11,6 +11,17 @@ pub struct Config {
     pub server: ServerConfig,
     #[serde(default)]
     pub proxy: ProxyConfig,
+    /// User-Agent presented to upstream LLM providers on outbound
+    /// requests (all providers sharing the client pools in
+    /// `proxy_client.rs`). Defaults to simulating Claude Code
+    /// (`claude-code/<version>`) so gateways classify the proxy's
+    /// traffic as coming from Claude Code instead of an unknown client.
+    /// Copilot is unaffected — it overrides this header per-request with
+    /// `GitHubCopilotChat/<version>`. A top-level setting because it
+    /// describes the client identity, not the `proxy:` outbound HTTP
+    /// proxy.
+    #[serde(default = "default_user_agent")]
+    pub user_agent: String,
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
     #[serde(default)]
@@ -22,6 +33,7 @@ impl Default for Config {
         Self {
             server: ServerConfig::default(),
             proxy: ProxyConfig::default(),
+            user_agent: default_user_agent(),
             providers: Vec::new(),
             models: Vec::new(),
         }
@@ -57,6 +69,16 @@ pub struct ProxyConfig {
     pub url: Option<String>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+}
+
+/// Outbound User-Agent default. Mirrors the `claude-code/${VERSION}`
+/// format the real Claude Code CLI sends (extracted from its binary —
+/// see plans/simulate-claude-code-identity.md). Any `claude-code/<ver>`
+/// satisfies provider classification; the value here tracks the
+/// currently installed Claude Code version and is overridable via the
+/// top-level `user_agent` in config.
+pub fn default_user_agent() -> String {
+    "claude-code/2.1.220".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -395,6 +417,59 @@ models:
 "#;
         let err = Config::parse(raw).unwrap_err();
         assert!(format!("{err}").contains("not in providers"));
+    }
+
+    #[test]
+    fn user_agent_defaults_to_claude_code() {
+        // The whole point of the identity simulation: with no config
+        // override, outbound requests must present the Claude Code UA so
+        // providers don't label the proxy "Unknown". Both the manual
+        // Default impl and the serde default for an absent `user_agent:`
+        // key must yield it.
+        assert_eq!(Config::default().user_agent, "claude-code/2.1.220");
+
+        let raw = r#"
+providers:
+  - name: copilot
+    type: github_copilot
+models:
+  - name: gpt-4
+    primary: copilot
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        assert_eq!(cfg.user_agent, "claude-code/2.1.220");
+    }
+
+    #[test]
+    fn user_agent_parses_from_config() {
+        let raw = r#"
+user_agent: "custom-agent/9.9"
+providers:
+  - name: copilot
+    type: github_copilot
+models:
+  - name: gpt-4
+    primary: copilot
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        assert_eq!(cfg.user_agent, "custom-agent/9.9");
+    }
+
+    #[test]
+    fn user_agent_rejects_unknown_fields() {
+        // deny_unknown_fields is on Config; a typo'd key must surface as
+        // a YAML error rather than being silently ignored.
+        let raw = r#"
+user_agentt: "typo"
+providers:
+  - name: copilot
+    type: github_copilot
+models:
+  - name: gpt-4
+    primary: copilot
+"#;
+        let err = Config::parse(raw).unwrap_err();
+        assert!(matches!(err, ProxyError::Yaml(_)), "got: {err:?}");
     }
 
     #[test]

@@ -21,6 +21,7 @@ fn dummy_state(api_key: Option<String>) -> AppState {
             api_key,
         },
         proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
         providers: vec![],
         models: vec![],
     };
@@ -31,6 +32,7 @@ fn dummy_state(api_key: Option<String>) -> AppState {
             Arc::new(Config {
                 server: Default::default(),
                 proxy: Default::default(),
+                user_agent: llmproxy::config::default_user_agent(),
                 providers: vec![],
                 models: vec![],
             }),

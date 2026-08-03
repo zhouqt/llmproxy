@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::time::Duration;
 
 use crate::error::{ProxyError, Result};
-use crate::oauth::{GITHUB_BASE_URL, GITHUB_CLIENT_ID, GITHUB_SCOPES};
+use crate::oauth::{GITHUB_BASE_URL, GITHUB_CLIENT_ID, GITHUB_SCOPES, USER_AGENT};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceCodeResponse {
@@ -49,6 +49,11 @@ async fn request_device_code_at(
         .post(&url)
         .header("accept", "application/json")
         .header("content-type", "application/json")
+        // GitHub-facing traffic presents the Copilot client identity
+        // explicitly (not the shared pool's Claude Code default) so the
+        // device flow is indistinguishable from the real Copilot client —
+        // see plans/simulate-claude-code-identity.md.
+        .header("user-agent", USER_AGENT)
         .json(&serde_json::json!({
             "client_id": GITHUB_CLIENT_ID,
             "scope": GITHUB_SCOPES,
@@ -86,6 +91,8 @@ async fn poll_access_token_at(
         .post(&url)
         .header("accept", "application/json")
         .header("content-type", "application/json")
+        // Same Copilot client identity as the device-code request.
+        .header("user-agent", USER_AGENT)
         .json(&serde_json::json!({
             "client_id": GITHUB_CLIENT_ID,
             "device_code": device_code,
@@ -197,6 +204,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/login/oauth/access_token"))
             .and(header("accept", "application/json"))
+            .and(header("user-agent", USER_AGENT))
             .and(body_json(json!({
                 "client_id": GITHUB_CLIENT_ID,
                 "device_code": "device-1",
@@ -215,6 +223,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/login/device/code"))
             .and(header("accept", "application/json"))
+            .and(header("user-agent", USER_AGENT))
             .and(body_json(json!({
                 "client_id": GITHUB_CLIENT_ID,
                 "scope": GITHUB_SCOPES,
@@ -423,6 +432,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/login/device/code"))
             .and(header("accept", "application/json"))
+            .and(header("user-agent", USER_AGENT))
             .and(body_json(json!({
                 "client_id": GITHUB_CLIENT_ID,
                 "scope": GITHUB_SCOPES,
