@@ -75,11 +75,12 @@ The response carries `x-llmproxy-failed-providers` (e.g. `copilot:429,deepseek:5
 - **Anthropic passthrough thinking retry**: `complete()` strips thinking blocks and retries **once** on the cross-model "must be passed back" 400 (only when history has a thinking block). `stream()` never retries — once SSE flows, retrying would double-emit to the client; it surfaces a friendly `thinking_not_supported` error instead.
 - **Fallback semantics**: cooldownable = 429/401/408/404/5xx/402 (402 = quota exhaustion). 400s surface to the client unless `is_model_unsupported` matches. Retry caps: `max_retries_per_provider`, `max_retries_total`. No retry once streaming starts.
 - **Copilot specifics**: 402 → cooldownable; `/models` cache drives `can_serve_model`-style routing and endpoint choice; token refresh runs as a background task.
+- **Client identity simulation**: non-Copilot outbound requests present a `claude-code/<version>` User-Agent (default, from the top-level `user_agent` config) and — on the `anthropic` provider — an `anthropic-client-platform: claude_code_cli` header, mirroring the real Claude Code CLI so upstream gateways classify the proxy as Claude Code rather than an unknown client. Copilot deliberately keeps `GitHubCopilotChat/<version>` (it overrides the header per-request and GitHub gates by client version).
 - **`/admin/status` contract**: `ProviderHealth` is deliberately binary (`available`/`cooling_down`) and reflects in-memory cooldown state only — it never probes upstreams. Consumed by a Claude Code statusline hook; keep shape backwards-compatible.
 
 ## Config quick reference
 
-`config.yaml` → `server` (listen, api_key), `proxy` (url + timeout), `providers` (typed: `github_copilot`/`anthropic`/`openai_compat`/`openai_responses`, each with `model_rewrite` and `use_proxy`), `models` (client-facing `name` → `primary` + `fallback_chain` + cooldown/retry knobs).
+`config.yaml` → `server` (listen, api_key), `proxy` (url + timeout), `user_agent` (client identity, default `claude-code/<version>`), `providers` (typed: `github_copilot`/`anthropic`/`openai_compat`/`openai_responses`, each with `model_rewrite` and `use_proxy`), `models` (client-facing `name` → `primary` + `fallback_chain` + cooldown/retry knobs).
 
 - `model_rewrite`: maps incoming Claude names → upstream names. **Non-empty table = explicit allow-list** (`can_serve_model`); the router skips a provider for names not in the table rather than forwarding an unmapped name and getting a misleading 400. Empty table = pass any name verbatim.
 - Claude Code client setup: `ANTHROPIC_BASE_URL=http://127.0.0.1:<listen>` + `ANTHROPIC_AUTH_TOKEN=<server.api_key>`.

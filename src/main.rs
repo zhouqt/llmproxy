@@ -45,8 +45,8 @@ async fn async_main() -> anyhow::Result<()> {
         .with_context(|| format!("loading config from {}", config_path.display()))?;
 
     let listen = resolve_listen_addr(&args, &cfg);
-    let proxied_http = proxy_client::build_client(&cfg.proxy)?;
-    let direct_http = proxy_client::build_direct_client(&cfg.proxy)?;
+    let proxied_http = proxy_client::build_client(&cfg.proxy, &cfg.user_agent)?;
+    let direct_http = proxy_client::build_direct_client(&cfg.proxy, &cfg.user_agent)?;
 
     let (state, bg_handles) =
         build_state(cfg, proxied_http, direct_http).map_err(|e| anyhow::anyhow!("{e}"))?;
