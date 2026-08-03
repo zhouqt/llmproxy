@@ -196,6 +196,7 @@ async fn mock_llm_provider_primary_succeeds_returns_anthropic_response() {
             api_key: None,
         },
         proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
         providers: vec![ProviderConfig::OpenaiCompat {
             name: "primary".to_string(),
             api_key: "k".to_string(),
@@ -256,6 +257,7 @@ async fn mock_llm_provider_falls_back_when_primary_returns_429() {
             api_key: None,
         },
         proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
@@ -332,6 +334,7 @@ async fn mock_llm_provider_falls_back_when_primary_returns_402_quota() {
             api_key: None,
         },
         proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
@@ -406,6 +409,7 @@ async fn mock_llm_provider_falls_back_when_primary_returns_empty_body_402() {
             api_key: None,
         },
         proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
@@ -481,6 +485,7 @@ async fn mock_llm_provider_does_not_fall_back_on_403() {
             api_key: None,
         },
         proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
@@ -555,6 +560,7 @@ async fn mock_llm_provider_chain_exhausted_returns_last_upstream_error() {
             api_key: None,
         },
         proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
@@ -648,6 +654,7 @@ async fn mock_llm_provider_per_provider_retry_three_times_before_chain_advance()
             api_key: None,
         },
         proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
@@ -739,6 +746,7 @@ async fn http_end_to_end_anthropic_provider_strips_and_succeeds() {
             api_key: None,
         },
         proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
         providers: vec![ProviderConfig::Anthropic {
             name: "deepseek".to_string(),
             api_key: "k".to_string(),
@@ -841,6 +849,7 @@ async fn http_end_to_end_anthropic_provider_strip_max_attempts_then_passthrough(
             api_key: None,
         },
         proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
         providers: vec![ProviderConfig::Anthropic {
             name: "deepseek".to_string(),
             api_key: "k".to_string(),
@@ -898,6 +907,7 @@ fn build_axum_app(
             api_key: None,
         },
         proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
         providers: provider_configs,
         models: vec![ModelConfig {
             name: "claude-test".to_string(),
@@ -1333,6 +1343,7 @@ async fn mock_llm_provider_short_cooldown_for_non_429_upstream_error() {
             api_key: None,
         },
         proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
@@ -1426,6 +1437,7 @@ async fn mock_llm_provider_402_uses_configured_cooldown_seconds_and_skips_primar
             api_key: None,
         },
         proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
@@ -1525,6 +1537,7 @@ async fn mock_llm_provider_subsequent_request_skips_cooldown_provider_directly()
             api_key: None,
         },
         proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
@@ -1639,6 +1652,7 @@ async fn mock_llm_provider_skips_provider_with_unsupported_model_via_runtime_400
             api_key: None,
         },
         proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),

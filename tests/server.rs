@@ -141,6 +141,7 @@ fn build_app(
             api_key: api_key.map(str::to_string),
         },
         proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
         providers: provider_configs,
         models: vec![ModelConfig {
             name: "claude-test".to_string(),
@@ -909,6 +910,7 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
             api_key: Some("test-key".to_string()),
         },
         proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
