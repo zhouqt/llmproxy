@@ -46,6 +46,18 @@ server:
 #   timeout_secs: 600
 
 # ───────────────────────────────────────────────────────────────────────
+# user_agent: client identity presented to upstream LLM providers
+# ───────────────────────────────────────────────────────────────────────
+# User-Agent sent on outbound requests to upstream providers. Defaults to
+# simulating the Claude Code CLI — `claude-code/2.1.220` (format
+# `claude-code/<version>`) — so gateways classify the proxy's traffic as
+# coming from Claude Code instead of an unknown client. Override only if
+# you need a custom identity. The github_copilot provider is unaffected:
+# it sends `GitHubCopilotChat/<version>` regardless of this setting.
+#
+# user_agent: "claude-code/2.1.220"
+
+# ───────────────────────────────────────────────────────────────────────
 # providers: backend LLM services the proxy can route to
 # ───────────────────────────────────────────────────────────────────────
 # Each provider is keyed by `name`; the `models:` section below refers

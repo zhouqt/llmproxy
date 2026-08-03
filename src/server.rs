@@ -598,6 +598,7 @@ mod tests {
                     api_key: None,
                 },
                 proxy: Default::default(),
+                user_agent: crate::config::default_user_agent(),
                 providers: vec![ProviderConfig::GithubCopilot {
                     name: "copilot".to_string(),
                     vscode_version: "1.95.0".to_string(),
