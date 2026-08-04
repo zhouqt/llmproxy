@@ -1391,9 +1391,11 @@ mod tests {
 
     #[tokio::test]
     async fn list_models_returns_none_on_network_error() {
-        let server = MockServer::start().await;
-        let uri = server.uri();
-        drop(server);
+        // Reserved, unlisten-able loopback port: the request is refused
+        // immediately. Avoid start+drop of a MockServer here — the OS may
+        // reuse the freed port for a parallel test's MockServer, making
+        // this request hit a live mock and return Some instead of None.
+        let uri = "http://127.0.0.1:1".to_string();
 
         let provider = OpenaiResponsesProvider::new(
             "test".to_string(),
