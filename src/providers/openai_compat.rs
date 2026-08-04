@@ -14,12 +14,12 @@ use std::task::{Context, Poll};
 use async_trait::async_trait;
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::Stream;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::anthropic::{MessagesRequest, StreamEvent};
 use crate::conversion::{anthropic_to_openai_request, openai_to_anthropic_response};
 use crate::error::{ProxyError, Result};
-use crate::openai::looks_like_error_envelope;
+use crate::openai::{looks_like_error_envelope, ChatMessage, ChatRequest};
 use crate::providers::{Provider, ProviderOutput};
 
 pub struct OpenAiCompatProvider {
@@ -54,6 +54,86 @@ impl OpenAiCompatProvider {
 
     fn models_url(&self) -> String {
         format!("{}/models", self.api_base)
+    }
+
+    /// Build a friendly Anthropic-shaped error body when an OpenAI-compat
+    /// upstream (DeepSeek/opencode in thinking mode) rejects the request
+    /// because `reasoning_content` could not be echoed back on every
+    /// assistant message. Mirrors `AnthropicProvider::thinking_not_supported_error`
+    /// (anthropic.rs) but with a type specific to the reasoning-echo gap, so
+    /// statusline / logs can tell this failure apart from "model doesn't
+    /// support thinking".
+    ///
+    /// `client_model` is the name the proxy received from the client;
+    /// `upstream_model` is the wire name actually sent upstream (the
+    /// ChatRequest.model the conversion produced after `model_rewrite` +
+    /// `strip_date_suffix` fallback) — what the operator needs to look up
+    /// in the upstream dashboard.
+    fn reasoning_echo_error(
+        &self,
+        client_model: &str,
+        upstream_model: &str,
+        upstream_body: &str,
+    ) -> ProxyError {
+        // Truncate upstream body for the human-readable message so the
+        // envelope stays compact; the full body is preserved in
+        // `upstream_body` for debugging.
+        let snippet: String = upstream_body.chars().take(200).collect();
+        let friendly = json!({
+            "type": "error",
+            "error": {
+                "type": "reasoning_content_not_passed_back",
+                "message": format!(
+                    "Provider '{}' rejected this request in thinking mode: the upstream \
+                     requires `reasoning_content` to be passed back on every assistant \
+                     message, but the request history's thinking content is missing or \
+                     cannot be echoed back (e.g. a redacted_thinking block, or a \
+                     signature-less thinking block). This provider/model does not \
+                     support cross-model thinking echo. Reconfigure config.yaml: \
+                     either remove this provider from chains whose primary uses \
+                     thinking, or use a non-thinking request for model '{}'. \
+                     Upstream response: {}",
+                    self.name, upstream_model, snippet
+                ),
+                "provider": self.name,
+                "client_model": client_model,
+                "upstream_model": upstream_model,
+                "upstream_body": upstream_body,
+            }
+        });
+        ProxyError::Upstream {
+            status: 400,
+            body: friendly.to_string(),
+        }
+    }
+}
+
+/// Detect OpenAI-style thinking-echo rejection. opencode/DeepSeek require
+/// `reasoning_content` to be passed back on every assistant message in
+/// thinking mode; when a message is missing it they return e.g.
+///   [invalid_request_error] The reasoning_content in the thinking mode must
+///   be passed back to the API
+/// Match the two substrings (mirror of `anthropic.rs::has_thinking_error`,
+/// but for the OpenAI wording). Case-sensitive; upstream variants with a
+/// space (`reasoning content`) would miss — accepted, matches litellm.
+fn has_reasoning_echo_error(body: &str) -> bool {
+    body.contains("reasoning_content") && body.contains("must be passed back")
+}
+
+/// Strip every thinking-echo signal from an OpenAI request so a retry is
+/// sent in non-thinking mode: each assistant message's `reasoning_content`
+/// → None, top-level `reasoning_effort` → None, and any `thinking` key in
+/// `extra` is removed. Non-destructive — on a request with no reasoning
+/// signals it is a pure no-op.
+fn strip_reasoning_echo(req: &mut ChatRequest) {
+    for m in &mut req.messages {
+        if let ChatMessage::Assistant { reasoning_content, .. } = m {
+            *reasoning_content = None;
+        }
+    }
+    req.reasoning_effort = None;
+    if let Some(obj) = req.extra.as_object_mut() {
+        obj.remove("thinking");
     }
 }
 
@@ -135,39 +215,77 @@ impl Provider for OpenAiCompatProvider {
         openai_req.stream = false;
         openai_req.stream_options = None;
 
-        let resp = self
-            .http
-            .post(self.chat_url())
-            .bearer_auth(&self.api_key)
-            .header("content-type", "application/json")
-            .json(&openai_req)
-            .send()
-            .await?;
+        // Strip-and-retry loop (mirrors `AnthropicProvider::complete`):
+        // DeepSeek/opencode in thinking mode reject requests whose assistant
+        // history can't echo `reasoning_content` back. On that specific 400
+        // we downgrade the SAME request to non-thinking mode and retry once.
+        // The retry reuses the mutated `openai_req` — never rebuilt via
+        // `anthropic_to_openai_request`, which would lose the strip.
+        let mut attempt: u32 = 0;
+        let max_attempts: u32 = 2;
+        let mut stripped = false; // whether a downgrade happened (for the recovery warn)
+        loop {
+            attempt += 1;
+            let resp = self
+                .http
+                .post(self.chat_url())
+                .bearer_auth(&self.api_key)
+                .header("content-type", "application/json")
+                .json(&openai_req)
+                .send()
+                .await?;
 
-        let status = resp.status();
-        let body = resp.text().await?;
-        if !status.is_success() {
-            return Err(ProxyError::Upstream {
-                status: status.as_u16(),
-                body,
-            });
-        }
+            let status = resp.status();
+            let body = resp.text().await?;
+            if !status.is_success() {
+                // 400 + reasoning-echo wording + not yet retried → strip
+                // reasoning signals and retry once in non-thinking mode.
+                if status.as_u16() == 400
+                    && attempt < max_attempts
+                    && has_reasoning_echo_error(&body)
+                {
+                    tracing::warn!(
+                        provider = %self.name,
+                        client_model = %req.model,
+                        attempt = attempt,
+                        "stripping reasoning echo from request and retrying once (upstream demands reasoning_content be passed back)"
+                    );
+                    strip_reasoning_echo(&mut openai_req);
+                    stripped = true;
+                    continue;
+                }
+                return Err(ProxyError::Upstream {
+                    status: status.as_u16(),
+                    body,
+                });
+            }
 
-        let parsed: Value = serde_json::from_str(&body)?;
-        if looks_like_error_envelope(&parsed) {
-            // Some upstreams (e.g. DeepSeek on unknown model) return HTTP 200
-            // with an OpenAI error envelope instead of a chat response. Treat
-            // it as a 400-class upstream failure so the client sees the real
-            // message instead of a generic 500 "missing field `object`".
-            return Err(ProxyError::Upstream {
-                status: 400,
-                body,
-            });
+            let parsed: Value = serde_json::from_str(&body)?;
+            if looks_like_error_envelope(&parsed) {
+                // Some upstreams (e.g. DeepSeek on unknown model) return HTTP 200
+                // with an OpenAI error envelope instead of a chat response. Treat
+                // it as a 400-class upstream failure so the client sees the real
+                // message instead of a generic 500 "missing field `object`".
+                return Err(ProxyError::Upstream {
+                    status: 400,
+                    body,
+                });
+            }
+            let chat: crate::openai::ChatResponse = serde_json::from_value(parsed)?;
+            let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+            let anthropic_resp = openai_to_anthropic_response(&chat, &req.model, &msg_id)?;
+            // Downgrade is invisible to the client (response shape is
+            // unchanged), but operators need observability — only warn on a
+            // success that actually stripped, not on ordinary successes.
+            if stripped {
+                tracing::warn!(
+                    provider = %self.name,
+                    client_model = %req.model,
+                    "recovered by downgrading request to non-thinking mode after upstream reasoning-echo 400"
+                );
+            }
+            return Ok(ProviderOutput::Json(serde_json::to_value(anthropic_resp)?));
         }
-        let chat: crate::openai::ChatResponse = serde_json::from_value(parsed)?;
-        let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
-        let anthropic_resp = openai_to_anthropic_response(&chat, &req.model, &msg_id)?;
-        Ok(ProviderOutput::Json(serde_json::to_value(anthropic_resp)?))
     }
 
     async fn stream(
@@ -192,10 +310,22 @@ impl Provider for OpenAiCompatProvider {
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await?;
+            let text = resp.text().await?;
+            // Streaming keeps the friendly-error path on purpose: once the
+            // SSE byte stream starts flowing, retrying would double-emit
+            // content to the client (see Router::stream "no retry once
+            // streaming" contract). So a reasoning-echo 400 surfaces as a
+            // friendly envelope rather than retrying.
+            if status.as_u16() == 400 && has_reasoning_echo_error(&text) {
+                return Err(self.reasoning_echo_error(
+                    &req.model,
+                    &openai_req.model, // wire name: real model sent upstream
+                    &text,
+                ));
+            }
             return Err(ProxyError::Upstream {
                 status: status.as_u16(),
-                body,
+                body: text,
             });
         }
 
@@ -376,6 +506,7 @@ fn event_name(ev: &StreamEvent) -> &'static str {
 mod tests {
     use super::*;
     use crate::expect_variant;
+    use crate::openai::{ChatTool, FunctionCall, FunctionDef, ToolCall, UserContent};
     use futures_util::{stream, StreamExt};
     use serde_json::json;
     use wiremock::matchers::{body_partial_json, header, method, path};
@@ -444,6 +575,32 @@ mod tests {
                 "total_tokens": 5
             }
         })
+    }
+
+    /// The user-reported upstream 400: OpenAI-style wording on the
+    /// /chat/completions path (opencode Zen → deepseek in thinking mode).
+    const REASONING_ECHO_400: &str = r#"{"error":{"message":"Upstream request failed: [invalid_request_error] The reasoning_content in the thinking mode must be passed back to the API"}}"#;
+
+    /// Multi-turn request with thinking enabled. After conversion the wire
+    /// carries `reasoning_effort: "medium"` (budget 2000) and an assistant
+    /// message with `reasoning_content: "let me think"` — the exact
+    /// situation DeepSeek/opencode reject when the echo is missing.
+    fn thinking_request(stream: bool) -> MessagesRequest {
+        serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 64,
+            "stream": stream,
+            "thinking": {"type": "enabled", "budget_tokens": 2000},
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "let me think", "signature": "sig-1"},
+                    {"type": "text", "text": "previous answer"}
+                ]},
+                {"role": "user", "content": "continue"}
+            ]
+        }))
+        .unwrap()
     }
 
     #[tokio::test]
@@ -1318,5 +1475,443 @@ mod tests {
         .unwrap();
 
         assert!(provider.list_models().await.is_none());
+    }
+
+    // ─── A group: has_reasoning_echo_error ────────────────────────────────
+
+    #[test]
+    fn has_reasoning_echo_error_matches_reasoning_content_wording() {
+        // The user-reported body (exact wording) must match.
+        assert!(has_reasoning_echo_error(REASONING_ECHO_400));
+        // Bare literal, no JSON envelope — pins that matching is
+        // substring-based, not envelope-dependent.
+        assert!(has_reasoning_echo_error(
+            "The reasoning_content in the thinking mode must be passed back to the API."
+        ));
+        // Neither substring alone matches; bare 400 / model-not-found /
+        // rate-limited / empty bodies never trigger a strip.
+        assert!(!has_reasoning_echo_error("400 Bad Request"));
+        assert!(!has_reasoning_echo_error(r#"{"error":{"message":"model not found"}}"#));
+        assert!(!has_reasoning_echo_error("rate limited"));
+        assert!(!has_reasoning_echo_error(""));
+        assert!(!has_reasoning_echo_error("must be passed back"));
+        assert!(!has_reasoning_echo_error("reasoning_content"));
+    }
+
+    // ─── B group: strip_reasoning_echo ────────────────────────────────────
+
+    #[test]
+    fn strip_reasoning_echo_clears_reasoning_signals_only() {
+        // ChatRequest has no Deserialize/PartialEq, so construct it with a
+        // struct literal and assert field-by-field after the strip.
+        let mut req = ChatRequest {
+            model: "m".to_string(),
+            messages: vec![
+                ChatMessage::User {
+                    content: UserContent::Text("hello".to_string()),
+                    name: None,
+                },
+                ChatMessage::Assistant {
+                    content: Some("previous answer".to_string()),
+                    tool_calls: Some(vec![ToolCall {
+                        id: "t1".to_string(),
+                        kind: "function".to_string(),
+                        function: FunctionCall {
+                            name: "f".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                    }]),
+                    reasoning_content: Some("let me think".to_string()),
+                },
+            ],
+            max_tokens: Some(64),
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+            stream: false,
+            stream_options: None,
+            tools: Some(vec![ChatTool {
+                kind: "function".to_string(),
+                function: FunctionDef {
+                    name: "f".to_string(),
+                    description: String::new(),
+                    parameters: json!({"type": "object"}),
+                },
+            }]),
+            tool_choice: None,
+            user: None,
+            reasoning_effort: Some("medium".to_string()),
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            extra: json!({"thinking": {"type": "enabled"}}),
+        };
+
+        strip_reasoning_echo(&mut req);
+
+        // Every assistant message's reasoning_content is cleared.
+        for m in &req.messages {
+            if let ChatMessage::Assistant { reasoning_content, .. } = m {
+                assert!(reasoning_content.is_none());
+            }
+        }
+        // Top-level reasoning_effort cleared.
+        assert!(req.reasoning_effort.is_none());
+        // extra no longer carries a `thinking` key.
+        assert!(req.extra.as_object().unwrap().get("thinking").is_none());
+        // Everything else is untouched (field-by-field; ChatRequest has no
+        // PartialEq so we cannot assert_eq! the whole object).
+        assert!(matches!(
+            &req.messages[0],
+            ChatMessage::User { content: UserContent::Text(t), .. } if t == "hello"
+        ));
+        let (content, tool_calls, reasoning_content) = match &req.messages[1] {
+            ChatMessage::Assistant { content, tool_calls, reasoning_content } => {
+                (content, tool_calls, reasoning_content)
+            }
+            other => panic!("expected Assistant, got {other:?}"),
+        };
+        assert_eq!(content.as_deref(), Some("previous answer"));
+        assert_eq!(tool_calls.as_ref().unwrap().len(), 1);
+        assert_eq!(tool_calls.as_ref().unwrap()[0].function.name, "f");
+        assert!(reasoning_content.is_none());
+        assert_eq!(req.tools.as_ref().unwrap().len(), 1);
+        assert_eq!(req.model, "m");
+        assert!(!req.stream);
+    }
+
+    #[test]
+    fn strip_reasoning_echo_is_noop_without_reasoning_signals() {
+        // A plain request converted from `request(false)` has no reasoning
+        // signals — stripping must leave it untouched (a pure no-op).
+        let mut req = anthropic_to_openai_request(&request(false), &HashMap::new());
+        strip_reasoning_echo(&mut req);
+        assert!(req.reasoning_effort.is_none());
+        assert!(req.extra.as_object().unwrap().is_empty());
+        assert_eq!(req.messages.len(), 1);
+        assert!(matches!(
+            &req.messages[0],
+            ChatMessage::User { content: UserContent::Text(t), .. } if t == "hello"
+        ));
+    }
+
+    #[test]
+    fn strip_reasoning_echo_handles_null_extra_without_panicking() {
+        // `extra: Value::Null` → `as_object_mut()` returns None and the
+        // thinking-key removal is skipped; the message loop still clears
+        // reasoning_content. Must not panic.
+        let mut req = ChatRequest {
+            model: "m".to_string(),
+            messages: vec![
+                ChatMessage::User {
+                    content: UserContent::Text("hi".to_string()),
+                    name: None,
+                },
+                ChatMessage::Assistant {
+                    content: Some("answer".to_string()),
+                    tool_calls: None,
+                    reasoning_content: Some("let me think".to_string()),
+                },
+            ],
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+            stream: false,
+            stream_options: None,
+            tools: None,
+            tool_choice: None,
+            user: None,
+            reasoning_effort: Some("medium".to_string()),
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            extra: Value::Null,
+        };
+
+        strip_reasoning_echo(&mut req);
+
+        assert!(req.extra.is_null());
+        assert!(req.reasoning_effort.is_none());
+        for m in &req.messages {
+            if let ChatMessage::Assistant { reasoning_content, .. } = m {
+                assert!(reasoning_content.is_none());
+            }
+        }
+    }
+
+    // ─── C group: complete() strip-and-retry ──────────────────────────────
+
+    #[tokio::test]
+    async fn complete_reasoning_echo_error_strips_and_retries() {
+        // C1: first 400 (reasoning_content wording) + second 200 → the proxy
+        // strips the reasoning signals from the SAME request and retries once
+        // (wiremock expect(2)). The retried body must keep the full message
+        // structure (3 messages, assistant content == "previous answer", user
+        // messages intact) and drop ONLY the reasoning signals — no
+        // reasoning_content / reasoning_effort / thinking — so a "strip
+        // everything / strip nothing" false green is impossible.
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured.clone();
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = counter.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |req: &wiremock::Request| {
+                let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    ResponseTemplate::new(400).set_body_string(REASONING_ECHO_400)
+                } else {
+                    *captured_for_responder.lock().unwrap() = Some(
+                        serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
+                    );
+                    ResponseTemplate::new(200).set_body_json(chat_response())
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new(
+            "p".to_string(),
+            server.uri(),
+            "key".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let output = provider
+            .complete(&thinking_request(false), &HashMap::new())
+            .await
+            .unwrap();
+        expect_variant!(output, ProviderOutput::Json(body) => {
+            assert_eq!(body["content"][0]["text"], "world");
+        });
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // Retried body: only reasoning signals stripped, structure intact.
+        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        let messages = sent["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3, "must not drop/merge messages: {sent}");
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "hello");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "previous answer");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"], "continue");
+        for m in messages {
+            assert!(
+                m.get("reasoning_content").is_none(),
+                "assistant reasoning_content must be gone after strip: {m}"
+            );
+        }
+        assert!(
+            sent.as_object().unwrap().get("reasoning_effort").is_none(),
+            "top-level reasoning_effort must be gone after strip: {sent}"
+        );
+        assert!(
+            sent.as_object().unwrap().get("thinking").is_none(),
+            "top-level thinking must be gone after strip: {sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_reasoning_echo_error_surfaces_second_attempt_body() {
+        // C2: both attempts return the reasoning-echo 400. The proxy strips
+        // and retries exactly once (expect(2)), then surfaces the SECOND
+        // attempt's raw body verbatim — not the first, not a friendly
+        // envelope. The retried body is captured and asserted with the same
+        // "only reasoning signals stripped" checks as C1.
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured.clone();
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = counter.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |req: &wiremock::Request| {
+                let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    ResponseTemplate::new(400).set_body_json(json!({
+                        "error": {"message": "The reasoning_content in the thinking mode must be passed back to the API", "attempt": 1}
+                    }))
+                } else {
+                    *captured_for_responder.lock().unwrap() = Some(
+                        serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
+                    );
+                    ResponseTemplate::new(400).set_body_json(json!({
+                        "error": {"message": "The reasoning_content in the thinking mode must be passed back to the API", "attempt": 2}
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new(
+            "p".to_string(),
+            server.uri(),
+            "key".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let err = provider
+            .complete(&thinking_request(false), &HashMap::new())
+            .await
+            .err()
+            .expect("second 400 must surface as Err");
+        let (status, body) = match err {
+            ProxyError::Upstream { status, body } => (status, body),
+            other => panic!("expected Upstream, got: {other:?}"),
+        };
+        assert_eq!(status, 400);
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            parsed["error"]["attempt"], 2,
+            "must surface the SECOND attempt's body, got: {body}"
+        );
+
+        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        let messages = sent["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3, "must not drop/merge messages: {sent}");
+        assert_eq!(messages[0]["content"], "hello");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "previous answer");
+        assert_eq!(messages[2]["content"], "continue");
+        for m in messages {
+            assert!(m.get("reasoning_content").is_none());
+        }
+        assert!(sent.as_object().unwrap().get("reasoning_effort").is_none());
+        assert!(sent.as_object().unwrap().get("thinking").is_none());
+    }
+
+    #[tokio::test]
+    async fn complete_reasoning_echo_error_does_not_strip_non_reasoning_400() {
+        // C3: a non-reasoning 400 ("model not found") on a request that DOES
+        // carry reasoning_effort must NOT trigger strip-and-retry — the
+        // two-substring gate rejects it — so the upstream is hit exactly once
+        // (expect(1)) and the raw body passes through verbatim.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "model not found"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new(
+            "p".to_string(),
+            server.uri(),
+            "key".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let err = provider
+            .complete(&thinking_request(false), &HashMap::new())
+            .await
+            .err()
+            .expect("should fail");
+        assert!(matches!(
+            err,
+            ProxyError::Upstream { status: 400, ref body } if body.contains("model not found")
+        ));
+    }
+
+    #[tokio::test]
+    async fn complete_success_path_with_reasoning_effort_unchanged() {
+        // C4: a plain 200 success on a thinking request keeps the existing
+        // behavior — exactly one request, reasoning_effort present on the
+        // wire, normal response conversion. Strip-and-retry must not fire on
+        // a success.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(json!({
+                "reasoning_effort": "medium",
+                "stream": false
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new(
+            "p".to_string(),
+            server.uri(),
+            "key".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let output = provider
+            .complete(&thinking_request(false), &HashMap::new())
+            .await
+            .unwrap();
+        expect_variant!(output, ProviderOutput::Json(body) => {
+            assert_eq!(body["model"], "claude-model");
+            assert_eq!(body["content"][0]["text"], "world");
+        });
+    }
+
+    // ─── D group: stream() friendly error ─────────────────────────────────
+
+    #[tokio::test]
+    async fn stream_reasoning_echo_error_returns_friendly_envelope() {
+        // D: streaming must NOT retry on the reasoning-echo 400 (expect(1)
+        // pins the single request) — once SSE flows, retrying would
+        // double-emit. Instead it returns the friendly
+        // `reasoning_content_not_passed_back` envelope with
+        // provider/client_model/upstream_model/upstream_body. upstream_model
+        // is the WIRE name after rewrite (openai_req.model), what the
+        // operator looks up in the upstream dashboard.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(REASONING_ECHO_400))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut rewrite = HashMap::new();
+        rewrite.insert("claude-model".to_string(), "rewritten-claude".to_string());
+        let provider = OpenAiCompatProvider::new(
+            "p".to_string(),
+            server.uri(),
+            "key".to_string(),
+            rewrite,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let err = provider
+            .stream(&thinking_request(true), &HashMap::new())
+            .await
+            .err()
+            .expect("reasoning-echo must surface as Err");
+        let (status, body) = match err {
+            ProxyError::Upstream { status, body } => (status, body),
+            other => panic!("expected Upstream, got: {other:?}"),
+        };
+        assert_eq!(status, 400);
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["error"]["type"], "reasoning_content_not_passed_back");
+        assert_eq!(parsed["error"]["provider"], "p");
+        assert_eq!(parsed["error"]["client_model"], "claude-model");
+        assert_eq!(parsed["error"]["upstream_model"], "rewritten-claude");
+        let message = parsed["error"]["message"].as_str().unwrap();
+        assert!(message.contains("reasoning_content"));
+        assert!(message.contains("p"));
+        assert!(message.contains("rewritten-claude"));
     }
 }
