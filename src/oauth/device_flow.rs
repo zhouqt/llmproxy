@@ -183,14 +183,19 @@ pub(crate) async fn device_flow_blocking_at(
     #[cfg(test)]
     pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Acquire `ENV_LOCK`, tolerating poisoning so one panicking test
+    /// doesn't chain-fail every other test that serializes on it.
+    #[cfg(test)]
+    pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    pub(crate) use super::ENV_LOCK;
 
     async fn poll_response(status: u16, body: Value) -> (MockServer, reqwest::Client) {
         let server = MockServer::start().await;
@@ -336,7 +341,7 @@ mod tests {
         // `Box::leak` cache inside `github_base_url`), so we hold
         // ENV_LOCK to serialize against other env-mutating tests in the
         // crate (notably the copilot refresh_token tests).
-        let _env_guard = ENV_LOCK.lock().unwrap();
+        let _env_guard = env_lock();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/login/device/code"))
@@ -399,7 +404,7 @@ mod tests {
         // the env-var override. Both halves mutate the process-wide env var
         // and `Box::leak`-cached pointer, so we hold ENV_LOCK to serialize
         // against other env-mutating tests in the crate.
-        let _env_guard = ENV_LOCK.lock().unwrap();
+        let _env_guard = env_lock();
         let saved = std::env::var_os("LLMPROXY_TEST_GITHUB_BASE_URL");
         std::env::remove_var("LLMPROXY_TEST_GITHUB_BASE_URL");
 

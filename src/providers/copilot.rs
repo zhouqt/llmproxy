@@ -2333,7 +2333,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         // aborting the handle. This exercises the loop body (sleep_secs
         // computation + the refresh_token call inside the loop) without
         // waiting hours of real wall-clock time.
-        let _env_guard = crate::oauth::device_flow::ENV_LOCK.lock().unwrap();
+        let _env_guard = crate::oauth::device_flow::env_lock();
         let server = MockServer::start().await;
         // Mock the copilot token endpoint so refresh_token completes
         // successfully without falling back to device flow.
@@ -2393,7 +2393,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         // before its first refresh attempt. Verify by starting with an
         // empty in-memory cache and a populated on-disk store; after one
         // refresh iteration, memory should reflect the new token.
-        let _env_guard = crate::oauth::device_flow::ENV_LOCK.lock().unwrap();
+        let _env_guard = crate::oauth::device_flow::env_lock();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/copilot_internal/v2/token"))
@@ -2455,7 +2455,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         // body must surface the failure via tracing::error and keep
         // running (not abort). The next iteration will try again. We
         // hit line 442 (tracing::error arm) on the first failed cycle.
-        let _env_guard = crate::oauth::device_flow::ENV_LOCK.lock().unwrap();
+        let _env_guard = crate::oauth::device_flow::env_lock();
         let server = MockServer::start().await;
         // Copilot token endpoint returns 5xx on every call. The loop's
         // refresh_token path classifies this as transient (store stays
@@ -2503,7 +2503,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         // observable contract is just "loop must keep running" and
         // "no credentials got persisted". Hitting the warn path is
         // enough.
-        let _env_guard = crate::oauth::device_flow::ENV_LOCK.lock().unwrap();
+        let _env_guard = crate::oauth::device_flow::env_lock();
         let server = MockServer::start().await;
         // Device code endpoint always 5xx so start_bootstrap fails.
         Mock::given(method("POST"))
@@ -2567,7 +2567,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         // minutes. It must fast-fail with a clear 401 so the fallback
         // chain skips Copilot immediately. Bootstrap is owned by
         // `start_bootstrap`. See fix-R2.
-        let _env_guard = crate::oauth::device_flow::ENV_LOCK.lock().unwrap();
+        let _env_guard = crate::oauth::device_flow::env_lock();
         let server = MockServer::start().await;
         // The device-code endpoint must NOT be hit — refresh_token
         // should bail out before even requesting a device code.
@@ -2630,7 +2630,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         // the warn and fast-fail with 401 so the operator can see why
         // credentials didn't load and the fallback chain skips Copilot.
         // Device flow is owned by `start_bootstrap` now. See fix-R2.
-        let _env_guard = crate::oauth::device_flow::ENV_LOCK.lock().unwrap();
+        let _env_guard = crate::oauth::device_flow::env_lock();
         let server = MockServer::start().await;
         // The device-code endpoint must NOT be hit.
         Mock::given(method("POST"))
@@ -2693,7 +2693,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         // background loop / admin endpoint can re-bootstrap, but it
         // must NOT inline a device flow — that would block the request
         // for up to 10 minutes. Return Err 401 instead. See fix-R2.
-        let _env_guard = crate::oauth::device_flow::ENV_LOCK.lock().unwrap();
+        let _env_guard = crate::oauth::device_flow::env_lock();
         let server = MockServer::start().await;
         // Copilot token endpoint rejects the stored token.
         Mock::given(method("GET"))
@@ -2786,7 +2786,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         // poll loop sleeps on tokio::time::sleep — pausing time would
         // require manually advancing the clock from the test body, but
         // the spawned task needs CPU time too.
-        let _env_guard = crate::oauth::device_flow::ENV_LOCK.lock().unwrap();
+        let _env_guard = crate::oauth::device_flow::env_lock();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/login/device/code"))
@@ -2867,7 +2867,9 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             std::time::Duration::from_secs(30),
             async {
                 loop {
-                    if provider.state.tokens.read().await.is_some() {
+                    if provider.state.tokens.read().await.is_some()
+                        && provider.cached_models().await.is_some()
+                    {
                         break;
                     }
                     tokio::task::yield_now().await;
@@ -2909,7 +2911,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         // already running, the second call must fail fast with a clear
         // "already in progress" error instead of kicking off a second
         // device flow. See fix-R2.
-        let _env_guard = crate::oauth::device_flow::ENV_LOCK.lock().unwrap();
+        let _env_guard = crate::oauth::device_flow::env_lock();
         let server = MockServer::start().await;
         // The device-code endpoint must NOT be hit: the second call's
         // try_lock fails before it ever reaches request_device_code.
@@ -2977,7 +2979,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         // (5xx), refresh_token must NOT clear the store or trigger the
         // device flow. It returns Err so the caller sees the failure,
         // but the stored credentials remain intact for the next attempt.
-        let _env_guard = crate::oauth::device_flow::ENV_LOCK.lock().unwrap();
+        let _env_guard = crate::oauth::device_flow::env_lock();
         let server = MockServer::start().await;
         // Copilot token endpoint always 503 (server error, transient).
         Mock::given(method("GET"))
@@ -3433,7 +3435,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         // called. Also serves as the round-3 deadlock regression test:
         // if complete_bootstrap ever goes back through ensure_token
         // while holding refresh_lock, this hangs until the timeout fires.
-        let _env_guard = crate::oauth::device_flow::ENV_LOCK.lock().unwrap();
+        let _env_guard = crate::oauth::device_flow::env_lock();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/login/device/code"))

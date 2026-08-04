@@ -653,9 +653,7 @@ mod tests {
         async fn admin_copilot_auth_returns_200_with_device_code_when_bootstrap_starts() {
             // Hold the github-base-URL env lock and point it at the
             // wiremock for this test only.
-            let _env_guard = crate::oauth::device_flow::ENV_LOCK
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let _env_guard = crate::oauth::device_flow::env_lock();
 
             let server = MockServer::start().await;
             std::env::set_var("LLMPROXY_TEST_GITHUB_BASE_URL", &server.uri());
@@ -726,9 +724,7 @@ mod tests {
             // arrive during the spawned task's poll sleep, which is why
             // we await request 1 fully and then poll for the 409 with a
             // short retry budget (well under the ~6s hold window).
-            let _env_guard = crate::oauth::device_flow::ENV_LOCK
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let _env_guard = crate::oauth::device_flow::env_lock();
 
             let server = MockServer::start().await;
             std::env::set_var("LLMPROXY_TEST_GITHUB_BASE_URL", &server.uri());
@@ -814,9 +810,7 @@ mod tests {
         /// normal internal error response, not a 409.
         #[tokio::test]
         async fn admin_copilot_auth_returns_internal_error_when_bootstrap_fails_for_other_reason() {
-            let _env_guard = crate::oauth::device_flow::ENV_LOCK
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let _env_guard = crate::oauth::device_flow::env_lock();
 
             let server = MockServer::start().await;
             std::env::set_var("LLMPROXY_TEST_GITHUB_BASE_URL", &server.uri());
