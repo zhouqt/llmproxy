@@ -137,6 +137,42 @@ fn strip_reasoning_echo(req: &mut ChatRequest) {
     }
 }
 
+/// Detect DeepSeek/opencode rejecting `response_format` json_schema, e.g.
+/// "[invalid_request_error] This response_format type is unavailable now".
+/// Two-substring match (mirror of `has_reasoning_echo_error`); upstream
+/// variant-miss (different wording) is accepted — matches litellm-style
+/// matchers. Gated by status==400 upstream.
+fn has_response_format_error(body: &str) -> bool {
+    body.contains("response_format") && body.contains("unavailable")
+}
+
+/// Replace extra.response_format `{type:"json_schema",...}` with
+/// `{"type":"json_object"}`. Best-effort: keeps JSON output
+/// (stop hook must parse it), drops schema enforcement. No-op when
+/// `extra` is Null / non-object / `response_format` is absent or not
+/// `json_schema`. Returns whether a downgrade happened.
+fn downgrade_response_format(req: &mut ChatRequest) -> bool {
+    let Some(obj) = req.extra.as_object_mut() else {
+        return false;
+    };
+    let Some(rf) = obj.get("response_format") else {
+        return false;
+    };
+    let is_json_schema = rf
+        .get("type")
+        .and_then(Value::as_str)
+        .map(|t| t == "json_schema")
+        .unwrap_or(false);
+    if !is_json_schema {
+        return false;
+    }
+    obj.insert(
+        "response_format".to_string(),
+        json!({"type": "json_object"}),
+    );
+    true
+}
+
 /// Detect the OpenAI-style error envelope `{"error": {...}}` returned on
 /// HTTP 200 by some upstreams. Must be a top-level object with a single
 /// `error` key whose value is itself an object (so we don't confuse it
@@ -219,11 +255,17 @@ impl Provider for OpenAiCompatProvider {
         // DeepSeek/opencode in thinking mode reject requests whose assistant
         // history can't echo `reasoning_content` back. On that specific 400
         // we downgrade the SAME request to non-thinking mode and retry once.
+        // DeepSeek/opencode also reject `response_format: {type:"json_schema"}`
+        // with a 400 ("response_format ... unavailable"); we downgrade to
+        // `{"type":"json_object"}` and retry once. Both downgrades are
+        // per-type-gated (each at most once) and can cascade, so the cap is
+        // 3 attempts total: original + reasoning-strip + format-downgrade.
         // The retry reuses the mutated `openai_req` — never rebuilt via
-        // `anthropic_to_openai_request`, which would lose the strip.
+        // `anthropic_to_openai_request`, which would lose the downgrades.
         let mut attempt: u32 = 0;
-        let max_attempts: u32 = 2;
-        let mut stripped = false; // whether a downgrade happened (for the recovery warn)
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut reasoning_stripped = false;
+        let mut format_downgraded = false;
         loop {
             attempt += 1;
             let resp = self
@@ -238,21 +280,34 @@ impl Provider for OpenAiCompatProvider {
             let status = resp.status();
             let body = resp.text().await?;
             if !status.is_success() {
-                // 400 + reasoning-echo wording + not yet retried → strip
-                // reasoning signals and retry once in non-thinking mode.
-                if status.as_u16() == 400
-                    && attempt < max_attempts
-                    && has_reasoning_echo_error(&body)
-                {
-                    tracing::warn!(
-                        provider = %self.name,
-                        client_model = %req.model,
-                        attempt = attempt,
-                        "stripping reasoning echo from request and retrying once (upstream demands reasoning_content be passed back)"
-                    );
-                    strip_reasoning_echo(&mut openai_req);
-                    stripped = true;
-                    continue;
+                if status.as_u16() == 400 && attempt < MAX_ATTEMPTS {
+                    if !reasoning_stripped && has_reasoning_echo_error(&body) {
+                        tracing::warn!(
+                            provider = %self.name,
+                            client_model = %req.model,
+                            attempt = attempt,
+                            "stripping reasoning echo from request and retrying once (upstream demands reasoning_content be passed back)"
+                        );
+                        strip_reasoning_echo(&mut openai_req);
+                        reasoning_stripped = true;
+                        continue;
+                    }
+                    if !format_downgraded
+                        && has_response_format_error(&body)
+                        && downgrade_response_format(&mut openai_req)
+                    {
+                        tracing::warn!(
+                            provider = %self.name,
+                            client_model = %req.model,
+                            attempt = attempt,
+                            "downgrading response_format json_schema -> json_object and retrying"
+                        );
+                        format_downgraded = true;
+                        continue;
+                    }
+                    // downgrade_response_format is a no-op (request had no
+                    // json_schema) or neither subtitle matched — surface
+                    // the 400 verbatim; do NOT spin an identical retry.
                 }
                 return Err(ProxyError::Upstream {
                     status: status.as_u16(),
@@ -274,14 +329,23 @@ impl Provider for OpenAiCompatProvider {
             let chat: crate::openai::ChatResponse = serde_json::from_value(parsed)?;
             let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
             let anthropic_resp = openai_to_anthropic_response(&chat, &req.model, &msg_id)?;
-            // Downgrade is invisible to the client (response shape is
+            // Downgrades are invisible to the client (response shape is
             // unchanged), but operators need observability — only warn on a
-            // success that actually stripped, not on ordinary successes.
-            if stripped {
+            // success that actually triggered a downgrade, not on ordinary
+            // successes. Two independent warns so the log line accurately
+            // describes which downgrade happened.
+            if reasoning_stripped {
                 tracing::warn!(
                     provider = %self.name,
                     client_model = %req.model,
                     "recovered by downgrading request to non-thinking mode after upstream reasoning-echo 400"
+                );
+            }
+            if format_downgraded {
+                tracing::warn!(
+                    provider = %self.name,
+                    client_model = %req.model,
+                    "recovered by downgrading response_format json_schema -> json_object after upstream 400"
                 );
             }
             return Ok(ProviderOutput::Json(serde_json::to_value(anthropic_resp)?));
@@ -299,23 +363,57 @@ impl Provider for OpenAiCompatProvider {
         let mut openai_req = anthropic_to_openai_request(req, &merged);
         openai_req.stream = true;
 
-        let resp = self
-            .http
-            .post(self.chat_url())
-            .bearer_auth(&self.api_key)
-            .header("content-type", "application/json")
-            .json(&openai_req)
-            .send()
-            .await?;
+        // Streaming retry: response_format 400 is safe to retry (the 400 is
+        // a synchronous POST response — it arrives before any SSE byte
+        // flows, so retrying does not double-emit to the client). The
+        // Router's "no retry once streaming" contract is preserved;
+        // reasoning-echo 400 still surfaces as a friendly envelope (no
+        // retry) because by the time we see a 400, the conversion is
+        // already idempotent and the same envelope is friendlier than a
+        // raw retry.
+        let mut attempt: u32 = 0;
+        let mut format_downgraded = false;
+        loop {
+            attempt += 1;
+            let resp = self
+                .http
+                .post(self.chat_url())
+                .bearer_auth(&self.api_key)
+                .header("content-type", "application/json")
+                .json(&openai_req)
+                .send()
+                .await?;
 
-        let status = resp.status();
-        if !status.is_success() {
+            let status = resp.status();
+            if status.is_success() {
+                let byte_stream = resp.bytes_stream();
+                let sse = OpenAiSseToAnthropic::new(byte_stream, &req.model);
+                if format_downgraded {
+                    tracing::warn!(
+                        provider = %self.name,
+                        client_model = %req.model,
+                        "recovered by downgrading response_format json_schema -> json_object after upstream 400"
+                    );
+                }
+                return Ok(ProviderOutput::Stream(Box::new(sse)));
+            }
+
             let text = resp.text().await?;
-            // Streaming keeps the friendly-error path on purpose: once the
-            // SSE byte stream starts flowing, retrying would double-emit
-            // content to the client (see Router::stream "no retry once
-            // streaming" contract). So a reasoning-echo 400 surfaces as a
-            // friendly envelope rather than retrying.
+            if status.as_u16() == 400
+                && attempt < 2
+                && !format_downgraded
+                && has_response_format_error(&text)
+                && downgrade_response_format(&mut openai_req)
+            {
+                tracing::warn!(
+                    provider = %self.name,
+                    client_model = %req.model,
+                    attempt = attempt,
+                    "downgrading response_format json_schema -> json_object and retrying"
+                );
+                format_downgraded = true;
+                continue;
+            }
             if status.as_u16() == 400 && has_reasoning_echo_error(&text) {
                 return Err(self.reasoning_echo_error(
                     &req.model,
@@ -328,10 +426,6 @@ impl Provider for OpenAiCompatProvider {
                 body: text,
             });
         }
-
-        let byte_stream = resp.bytes_stream();
-        let sse = OpenAiSseToAnthropic::new(byte_stream, &req.model);
-        Ok(ProviderOutput::Stream(Box::new(sse)))
     }
 }
 
@@ -1914,4 +2008,595 @@ mod tests {
         assert!(message.contains("p"));
         assert!(message.contains("rewritten-claude"));
     }
+
+    // ─── E group: has_response_format_error ────────────────────────────────
+
+    /// The user-reported upstream body for the DeepSeek/opencode_zen
+    /// json_schema rejection. Wording copied verbatim from the bug
+    /// report — must match `has_response_format_error` so the proxy
+    /// downgrades the SAME request and retries once.
+    const RESPONSE_FORMAT_400: &str = r#"{"error":{"message":"Upstream request failed: [invalid_request_error] This response_format type is unavailable now"}}"#;
+
+    #[test]
+    fn has_response_format_error_matches_user_reported_wording() {
+        // The user-reported body (exact wording) must match.
+        assert!(has_response_format_error(RESPONSE_FORMAT_400));
+        // Bare literal, no JSON envelope — pins that matching is
+        // substring-based, not envelope-dependent.
+        assert!(has_response_format_error(
+            "This response_format type is unavailable now"
+        ));
+        // Neither substring alone matches; bare 400 / model-not-found /
+        // rate-limited / empty bodies never trigger a downgrade.
+        assert!(!has_response_format_error("400 Bad Request"));
+        assert!(!has_response_format_error(r#"{"error":{"message":"model not found"}}"#));
+        assert!(!has_response_format_error("rate limited"));
+        assert!(!has_response_format_error(""));
+        assert!(!has_response_format_error("unavailable"));
+        assert!(!has_response_format_error("response_format"));
+    }
+
+    // ─── F group: downgrade_response_format ────────────────────────────────
+
+    #[test]
+    fn downgrade_response_format_replaces_json_schema_with_json_object() {
+        // The full DeepSeek-stop-hook shape: response_format carries
+        // {type:"json_schema", json_schema:{name, strict, schema}}. The
+        // downgrade must collapse it to {"type":"json_object"} (dropping
+        // name/strict/schema) while preserving other extra keys (e.g.
+        // web_search_options) — a "drop the whole request" false green
+        // is impossible because the sibling key survives.
+        let mut req = ChatRequest {
+            model: "m".to_string(),
+            messages: vec![ChatMessage::User {
+                content: UserContent::Text("hi".to_string()),
+                name: None,
+            }],
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+            stream: false,
+            stream_options: None,
+            tools: None,
+            tool_choice: None,
+            user: None,
+            reasoning_effort: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            extra: json!({
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "my_schema",
+                        "strict": true,
+                        "schema": {"type": "object", "properties": {"q": {"type": "string"}}}
+                    }
+                },
+                "web_search_options": {},
+            }),
+        };
+
+        let downgraded = downgrade_response_format(&mut req);
+        assert!(downgraded, "a json_schema response_format must trigger downgrade");
+
+        let obj = req.extra.as_object().unwrap();
+        assert_eq!(
+            obj.get("response_format"),
+            Some(&json!({"type": "json_object"})),
+            "response_format must be replaced with plain json_object"
+        );
+        assert_eq!(
+            obj.get("web_search_options"),
+            Some(&json!({})),
+            "sibling extra keys must be preserved"
+        );
+    }
+
+    #[test]
+    fn downgrade_response_format_noop_cases() {
+        // json_object — already the target shape, nothing to do.
+        let mut req = ChatRequest {
+            model: "m".to_string(),
+            messages: vec![ChatMessage::User {
+                content: UserContent::Text("hi".to_string()),
+                name: None,
+            }],
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+            stream: false,
+            stream_options: None,
+            tools: None,
+            tool_choice: None,
+            user: None,
+            reasoning_effort: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            extra: json!({"response_format": {"type": "json_object"}}),
+        };
+        assert!(!downgrade_response_format(&mut req));
+        assert_eq!(req.extra, json!({"response_format": {"type": "json_object"}}));
+
+        // text — must pass through verbatim.
+        req.extra = json!({"response_format": {"type": "text"}});
+        assert!(!downgrade_response_format(&mut req));
+        assert_eq!(req.extra, json!({"response_format": {"type": "text"}}));
+
+        // No response_format key at all — no-op.
+        req.extra = json!({"thinking": {"type": "enabled"}});
+        assert!(!downgrade_response_format(&mut req));
+        assert_eq!(req.extra, json!({"thinking": {"type": "enabled"}}));
+
+        // extra is Value::Null — must not panic.
+        req.extra = Value::Null;
+        assert!(!downgrade_response_format(&mut req));
+        assert!(req.extra.is_null());
+    }
+
+    /// Build a MessagesRequest that mirrors the Claude Code stop-hook
+    /// shape: thinking history AND `output_config.format: json_schema`.
+    /// After conversion this carries both `reasoning_effort` and
+    /// `extra.response_format = {type:"json_schema", ...}` — the
+    /// cascade test exercises both downgrade paths against the same
+    /// request.
+    fn thinking_and_format_request(stream: bool) -> MessagesRequest {
+        serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 64,
+            "stream": stream,
+            "thinking": {"type": "enabled", "budget_tokens": 2000},
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {"type": "object", "properties": {"q": {"type": "string"}}}
+                }
+            },
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "let me think", "signature": "sig-1"},
+                    {"type": "text", "text": "previous answer"}
+                ]},
+                {"role": "user", "content": "continue"}
+            ]
+        }))
+        .unwrap()
+    }
+
+    /// Build a MessagesRequest carrying only `output_config.format` (no
+    /// thinking) — isolated response_format downgrade path.
+    fn format_request(stream: bool) -> MessagesRequest {
+        serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 64,
+            "stream": stream,
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {"type": "object", "properties": {"q": {"type": "string"}}}
+                }
+            },
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap()
+    }
+
+    // ─── G group: complete() response_format downgrade ─────────────────────
+
+    #[tokio::test]
+    async fn complete_response_format_error_downgrades_and_retries() {
+        // G1: first 400 (response_format ... unavailable) + second 200 → the
+        // proxy downgrades `response_format` from json_schema to json_object
+        // and retries once (wiremock expect(2)). The retried body must keep
+        // the full message structure and carry the new response_format.
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured.clone();
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = counter.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |req: &wiremock::Request| {
+                let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    ResponseTemplate::new(400).set_body_string(RESPONSE_FORMAT_400)
+                } else {
+                    *captured_for_responder.lock().unwrap() = Some(
+                        serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
+                    );
+                    ResponseTemplate::new(200).set_body_json(chat_response())
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new(
+            "p".to_string(),
+            server.uri(),
+            "key".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let output = provider
+            .complete(&format_request(false), &HashMap::new())
+            .await
+            .unwrap();
+        expect_variant!(output, ProviderOutput::Json(body) => {
+            assert_eq!(body["content"][0]["text"], "world");
+        });
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // Retried body: response_format must be downgraded to json_object;
+        // messages and model must be intact.
+        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        assert_eq!(
+            sent["response_format"],
+            json!({"type": "json_object"}),
+            "downgraded response_format must be json_object: {sent}"
+        );
+        assert_eq!(sent["model"], "claude-model");
+        assert_eq!(sent["stream"], false);
+        let messages = sent["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "hello");
+    }
+
+    #[tokio::test]
+    async fn complete_response_format_error_surfaces_second_attempt_body() {
+        // G2: both attempts return the response_format 400. The proxy
+        // downgrades and retries exactly once (expect(2)), then surfaces
+        // the SECOND attempt's body verbatim — not the first.
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured.clone();
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = counter.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |req: &wiremock::Request| {
+                let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    ResponseTemplate::new(400).set_body_json(json!({
+                        "error": {"message": "This response_format type is unavailable now", "attempt": 1}
+                    }))
+                } else {
+                    *captured_for_responder.lock().unwrap() = Some(
+                        serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
+                    );
+                    ResponseTemplate::new(400).set_body_json(json!({
+                        "error": {"message": "This response_format type is unavailable now", "attempt": 2}
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new(
+            "p".to_string(),
+            server.uri(),
+            "key".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let err = provider
+            .complete(&format_request(false), &HashMap::new())
+            .await
+            .err()
+            .expect("second 400 must surface as Err");
+        let (status, body) = match err {
+            ProxyError::Upstream { status, body } => (status, body),
+            other => panic!("expected Upstream, got: {other:?}"),
+        };
+        assert_eq!(status, 400);
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            parsed["error"]["attempt"], 2,
+            "must surface the SECOND attempt's body, got: {body}"
+        );
+
+        // The second body must already carry the downgraded response_format.
+        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        assert_eq!(
+            sent["response_format"],
+            json!({"type": "json_object"}),
+            "second attempt must carry the downgraded response_format: {sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_response_format_error_does_not_retry_other_400() {
+        // G3: a non-matching 400 (no "response_format" / no "unavailable"
+        // substring) must NOT trigger the downstream retry — the
+        // two-substring gate rejects it. Wiremock counter == 1, raw body
+        // passes through verbatim.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "model not found"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new(
+            "p".to_string(),
+            server.uri(),
+            "key".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let err = provider
+            .complete(&format_request(false), &HashMap::new())
+            .await
+            .err()
+            .expect("should fail");
+        assert!(matches!(
+            err,
+            ProxyError::Upstream { status: 400, ref body } if body.contains("model not found")
+        ));
+    }
+
+    #[tokio::test]
+    async fn complete_both_reasoning_echo_and_format_downgrade_cascade() {
+        // G4: a request carrying BOTH thinking history AND json_schema
+        // format hits a 400 with reasoning_echo wording first, then a
+        // 400 with response_format wording, then 200. The retry loop must
+        // cascade: strip reasoning → downgrade response_format → succeed.
+        // Counter == 3, final body must have no reasoning signals AND
+        // response_format == {"type":"json_object"}.
+        let captured: std::sync::Arc<std::sync::Mutex<Vec<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_responder = captured.clone();
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = counter.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |req: &wiremock::Request| {
+                let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let parsed: Value = serde_json::from_slice(&req.body)
+                    .unwrap_or_else(|_| json!({}));
+                captured_for_responder.lock().unwrap().push(parsed);
+                match n {
+                    0 => ResponseTemplate::new(400).set_body_string(REASONING_ECHO_400),
+                    1 => ResponseTemplate::new(400).set_body_string(RESPONSE_FORMAT_400),
+                    _ => ResponseTemplate::new(200).set_body_json(chat_response()),
+                }
+            })
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new(
+            "p".to_string(),
+            server.uri(),
+            "key".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let output = provider
+            .complete(&thinking_and_format_request(false), &HashMap::new())
+            .await
+            .unwrap();
+        expect_variant!(output, ProviderOutput::Json(body) => {
+            assert_eq!(body["content"][0]["text"], "world");
+        });
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        let history = captured.lock().unwrap().clone();
+        assert_eq!(history.len(), 3, "must capture all 3 attempts");
+
+        // Third body: reasoning signals stripped AND response_format
+        // downgraded — both cascades applied.
+        let sent = &history[2];
+        for m in sent["messages"].as_array().unwrap() {
+            assert!(
+                m.get("reasoning_content").is_none(),
+                "assistant reasoning_content must be gone after strip: {m}"
+            );
+        }
+        assert!(
+            sent.as_object().unwrap().get("reasoning_effort").is_none(),
+            "top-level reasoning_effort must be gone after strip: {sent}"
+        );
+        assert!(
+            sent.as_object().unwrap().get("thinking").is_none(),
+            "top-level thinking must be gone after strip: {sent}"
+        );
+        assert_eq!(
+            sent["response_format"],
+            json!({"type": "json_object"}),
+            "response_format must be downgraded on third attempt: {sent}"
+        );
+    }
+
+    // ─── H group: stream() response_format downgrade ──────────────────────
+
+    #[tokio::test]
+    async fn stream_response_format_error_downgrades_and_retries() {
+        // H1: first 400 (response_format ... unavailable) + second SSE 200
+        // → the proxy downgrades and retries once. Counter == 2, the
+        // retried body must carry the downgraded response_format, and the
+        // stream must convert normally.
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured.clone();
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = counter.clone();
+        let sse = concat!(
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":1,\"total_tokens\":5}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |req: &wiremock::Request| {
+                let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    ResponseTemplate::new(400).set_body_string(RESPONSE_FORMAT_400)
+                } else {
+                    *captured_for_responder.lock().unwrap() = Some(
+                        serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
+                    );
+                    ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream")
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new(
+            "p".to_string(),
+            server.uri(),
+            "key".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let output = provider
+            .stream(&format_request(true), &HashMap::new())
+            .await
+            .unwrap();
+        expect_variant!(output, ProviderOutput::Stream(mut stream) => {
+            let mut encoded = String::new();
+            while let Some(item) = stream.next().await {
+                encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+            }
+            assert!(encoded.contains("event: message_start"));
+            assert!(encoded.contains("event: content_block_delta"));
+            assert!(encoded.contains("\"text\":\"hello\""));
+            assert!(encoded.contains("event: message_stop"));
+        });
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        assert_eq!(
+            sent["response_format"],
+            json!({"type": "json_object"}),
+            "downgraded response_format must be json_object: {sent}"
+        );
+        assert_eq!(sent["stream"], true);
+    }
+
+    #[tokio::test]
+    async fn stream_response_format_error_surfaces_second_attempt_body() {
+        // H2: both attempts return the response_format 400. The proxy
+        // downgrades and retries exactly once (expect(2)), then surfaces
+        // the SECOND attempt's body as Upstream (status 400). Surfaces
+        // the raw body verbatim — NOT a friendly envelope (that's the
+        // reasoning-echo path).
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured.clone();
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = counter.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |req: &wiremock::Request| {
+                let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    ResponseTemplate::new(400).set_body_json(json!({
+                        "error": {"message": "This response_format type is unavailable now", "attempt": 1}
+                    }))
+                } else {
+                    *captured_for_responder.lock().unwrap() = Some(
+                        serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
+                    );
+                    ResponseTemplate::new(400).set_body_json(json!({
+                        "error": {"message": "This response_format type is unavailable now", "attempt": 2}
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new(
+            "p".to_string(),
+            server.uri(),
+            "key".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let err = provider
+            .stream(&format_request(true), &HashMap::new())
+            .await
+            .err()
+            .expect("second 400 must surface as Err");
+        let (status, body) = match err {
+            ProxyError::Upstream { status, body } => (status, body),
+            other => panic!("expected Upstream, got: {other:?}"),
+        };
+        assert_eq!(status, 400);
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            parsed["error"]["attempt"], 2,
+            "must surface the SECOND attempt's body, got: {body}"
+        );
+
+        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        assert_eq!(
+            sent["response_format"],
+            json!({"type": "json_object"}),
+            "second attempt must carry the downgraded response_format: {sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_response_format_error_does_not_retry_other_400() {
+        // H3: a non-matching 400 must NOT trigger the downstream retry
+        // (counter == 1). The raw body passes through verbatim.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "model not found"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new(
+            "p".to_string(),
+            server.uri(),
+            "key".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let err = provider
+            .stream(&format_request(true), &HashMap::new())
+            .await
+            .err()
+            .expect("should fail");
+        assert!(matches!(
+            err,
+            ProxyError::Upstream { status: 400, ref body } if body.contains("model not found")
+        ));
+    }
+
 }
