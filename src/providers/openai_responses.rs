@@ -76,6 +76,15 @@ impl Provider for OpenaiResponsesProvider {
         self.model_rewrite.is_empty() || self.model_rewrite.contains_key(model)
     }
 
+    fn merged_rewrite<'a>(
+        &'a self,
+        runtime: &'a HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        let mut merged = self.model_rewrite.clone();
+        merged.extend(runtime.iter().map(|(k, v)| (k.clone(), v.clone())));
+        merged
+    }
+
     async fn list_models(&self) -> Option<Vec<serde_json::Value>> {
         let url = self.models_url();
         let resp = self
@@ -126,8 +135,7 @@ impl Provider for OpenaiResponsesProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
-        let mut merged = self.model_rewrite.clone();
-        merged.extend(model_rewrite.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let merged = self.merged_rewrite(model_rewrite);
 
         let mut responses_req = anthropic_to_responses_request(req, &merged);
         responses_req.stream = false;
@@ -161,8 +169,7 @@ impl Provider for OpenaiResponsesProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
-        let mut merged = self.model_rewrite.clone();
-        merged.extend(model_rewrite.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let merged = self.merged_rewrite(model_rewrite);
 
         let mut responses_req = anthropic_to_responses_request(req, &merged);
         responses_req.stream = true;
@@ -583,6 +590,23 @@ mod tests {
         assert!(p.can_serve_model("claude-sonnet-4.6"));
         assert!(!p.can_serve_model("gpt-5"));
         assert!(!p.can_serve_model(""));
+    }
+
+    #[test]
+    fn merged_rewrite_combines_configured_and_runtime_maps() {
+        let mut configured = HashMap::new();
+        configured.insert("claude-a".to_string(), "configured-model".to_string());
+        let p = provider_with_rewrite(configured);
+
+        let mut runtime = HashMap::new();
+        runtime.insert("claude-a".to_string(), "runtime-model".to_string());
+        runtime.insert("claude-b".to_string(), "runtime-b".to_string());
+
+        let merged = p.merged_rewrite(&runtime);
+        // runtime wins on key collision; configured-only entries survive.
+        assert_eq!(merged.get("claude-a").map(String::as_str), Some("runtime-model"));
+        assert_eq!(merged.get("claude-b").map(String::as_str), Some("runtime-b"));
+        assert_eq!(merged.len(), 2);
     }
 
     #[test]
