@@ -17,7 +17,7 @@ use futures_util::Stream;
 use serde_json::{json, Value};
 
 use crate::anthropic::{MessagesRequest, StreamEvent};
-use crate::conversion::{anthropic_to_openai_request, openai_to_anthropic_response};
+use crate::conversion::{anthropic_to_openai_request, make_message_id, openai_to_anthropic_response};
 use crate::error::{ProxyError, Result};
 use crate::openai::{looks_like_error_envelope, ChatMessage, ChatRequest};
 use crate::providers::{Provider, ProviderOutput};
@@ -327,7 +327,7 @@ impl Provider for OpenAiCompatProvider {
                 });
             }
             let chat: crate::openai::ChatResponse = serde_json::from_value(parsed)?;
-            let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+            let msg_id = make_message_id();
             let anthropic_resp = openai_to_anthropic_response(&chat, &req.model, &msg_id)?;
             // Downgrades are invisible to the client (response shape is
             // unchanged), but operators need observability — only warn on a
@@ -446,7 +446,7 @@ where
         Self {
             inner,
             translator: Some(crate::conversion::stream::StreamTranslator::new(
-                format!("msg_{}", uuid::Uuid::new_v4().simple()),
+                make_message_id(),
                 model,
             )),
             pending: BytesMut::new(),
