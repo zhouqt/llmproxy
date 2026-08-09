@@ -178,14 +178,24 @@ pub fn anthropic_to_responses_request(
             });
             let tc = req.tool_choice.as_ref().and_then(convert_tool_choice);
             if has_web_search
-                && matches!(req.tool_choice, Some(ToolChoice::Tool { ref name }) if name == "web_search")
+                && matches!(req.tool_choice, Some(ToolChoice::Tool { ref name, .. }) if name == "web_search")
             {
                 Some(json!("auto"))
             } else {
                 tc
             }
         },
-        parallel_tool_calls: None,
+        parallel_tool_calls: match req.tool_choice.as_ref() {
+            // PR-8: Anthropic `tool_choice.disable_parallel_tool_use=true`
+            // → Responses `parallel_tool_calls=false`. Absent/false →
+            // None (OpenAI wire default is true; emitting the field as
+            // explicit `true` would be noisier than necessary).
+            Some(crate::anthropic::ToolChoice::Tool {
+                disable_parallel_tool_use,
+                ..
+            }) if *disable_parallel_tool_use == Some(true) => Some(false),
+            _ => None,
+        },
         user: req
             .metadata
             .as_ref()
@@ -208,8 +218,18 @@ pub fn anthropic_to_responses_request(
         }),
         extra: {
             let mut e = Value::Object(Map::new());
+            // PR-8: Responses API carries verbosity under
+            // `text.verbosity` (same enum as Chat top-level `verbosity`).
+            // Build the text object once and merge in format if any.
+            let mut text_obj = serde_json::Map::new();
+            if let Some(v) = req.output_config.as_ref().and_then(|oc| oc.verbosity.clone()) {
+                text_obj.insert("verbosity".into(), Value::String(v));
+            }
             if let Some(fmt) = req.output_config.as_ref().and_then(|oc| oc.format.as_ref()) {
-                e["text"] = json!({"format": ensure_json_schema_name(fmt)});
+                text_obj.insert("format".into(), ensure_json_schema_name(fmt));
+            }
+            if !text_obj.is_empty() {
+                e["text"] = Value::Object(text_obj);
             }
             e
         },
@@ -397,7 +417,7 @@ fn convert_tool_choice(c: &ToolChoice) -> Option<Value> {
     match c {
         ToolChoice::Auto => Some(json!("auto")),
         ToolChoice::Any => Some(json!("required")),
-        ToolChoice::Tool { name } => Some(json!({
+        ToolChoice::Tool { name, .. } => Some(json!({
             "type": "function",
             "name": name
         })),
@@ -2110,6 +2130,60 @@ mod tests {
             out.service_tier.is_none(),
             "standard_only must drop, got {:?}",
             out.service_tier
+        );
+    }
+
+    // ── PR-8 · Responses parallel_tool_calls + verbosity ────────────────
+
+    /// PR-8: Responses `parallel_tool_calls=false` when Anthropic
+    /// `tool_choice.disable_parallel_tool_use=true`. Same logic as Chat
+    /// path; ResponsesRequest.parallel_tool_calls was modeled in PR-1,
+    /// this PR wires the injection.
+    #[test]
+    fn responses_request_disable_parallel_tool_use_maps_to_parallel_tool_calls_false() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "f", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "tool", "name": "f", "disable_parallel_tool_use": true}
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert_eq!(out.parallel_tool_calls, Some(false));
+    }
+
+    /// PR-8: Responses `text.verbosity` is injected when
+    /// `output_config.verbosity` is set (plan v0.7 P1-3 dual-path).
+    /// Verbatim passthrough.
+    #[test]
+    fn responses_request_verbosity_injected_into_text_extra() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"verbosity": "high"}
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert_eq!(out.extra["text"]["verbosity"], "high");
+    }
+
+    /// PR-8: when no verbosity is set, the wire stays absent under
+    /// `text` (don't inject an empty object either).
+    #[test]
+    fn responses_request_verbosity_absent_when_unset() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert!(
+            out.extra.get("text").is_none(),
+            "no verbosity → text object must be absent; got {}",
+            out.extra
         );
     }
 }

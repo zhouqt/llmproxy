@@ -120,7 +120,7 @@ pub fn anthropic_to_openai_request(
             if non_hosted_count == 0 {
                 None
             } else if has_web_search
-                && matches!(req.tool_choice, Some(ToolChoice::Tool { ref name }) if name == "web_search")
+                && matches!(req.tool_choice, Some(ToolChoice::Tool { ref name, .. }) if name == "web_search")
             {
                 Some(json!("auto"))
             } else {
@@ -151,6 +151,31 @@ pub fn anthropic_to_openai_request(
             // "standard_only" → None (drop the field; documented gap).
             _ => None,
         }),
+        // PR-8: Anthropic `tool_choice.disable_parallel_tool_use=true`
+        // → OpenAI `parallel_tool_calls=false`. Anthropic's
+        // ToolChoice::Tool carries the field; absent/false → None
+        // (OpenAI's wire default is true, so leaving the field absent
+        // is correct — emitting `parallel_tool_calls: true` explicitly
+        // would also work but is noisier).
+        parallel_tool_calls: match req.tool_choice.as_ref() {
+            Some(crate::anthropic::ToolChoice::Tool {
+                disable_parallel_tool_use,
+                ..
+            }) if *disable_parallel_tool_use == Some(true) => Some(false),
+            _ => None,
+        },
+        // PR-8: `safety_identifier` — string passthrough from
+        // `metadata.user_id` (Anthropic's user-identity surface; max
+        // length 64 per spec).
+        safety_identifier: req
+            .metadata
+            .as_ref()
+            .and_then(|m| m.user_id.as_deref())
+            .map(|u| crate::conversion::responses::truncate_user(u)),
+        // PR-8: `verbosity` — string passthrough from
+        // `output_config.verbosity` (Anthropic spec). Same enum on the
+        // Responses path via text.verbosity.
+        verbosity: req.output_config.as_ref().and_then(|oc| oc.verbosity.clone()),
         extra: {
             let mut e = Value::Object(Map::new());
             if let Some(fmt) = req.output_config.as_ref().and_then(|oc| oc.format.as_ref()) {
@@ -416,7 +441,7 @@ fn convert_tool_choice(c: &ToolChoice) -> Value {
     match c {
         ToolChoice::Auto => json!("auto"),
         ToolChoice::Any => json!("required"),
-        ToolChoice::Tool { name } => json!({
+        ToolChoice::Tool { name, .. } => json!({
             "type": "function",
             "function": { "name": name }
         }),
@@ -1112,5 +1137,86 @@ mod tests {
             "standard_only must drop, got {:?}",
             out.service_tier
         );
+    }
+
+    // ── PR-8 · safety_identifier / verbosity / parallel_tool_calls ──
+
+    /// PR-8: Anthropic `tool_choice.disable_parallel_tool_use=true`
+    /// maps to OpenAI `parallel_tool_calls=false`. Absent/false →
+    /// None (OpenAI wire default is true; emitting an explicit true
+    /// would be noisier).
+    #[test]
+    fn chat_request_disable_parallel_tool_use_maps_to_parallel_tool_calls_false() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "f", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "tool", "name": "f", "disable_parallel_tool_use": true}
+        }))
+        .unwrap();
+        let out = anthropic_to_openai_request(&req, &Default::default());
+        assert_eq!(
+            out.parallel_tool_calls,
+            Some(false),
+            "disable_parallel_tool_use=true must map to parallel_tool_calls=false"
+        );
+    }
+
+    /// PR-8: disable_parallel_tool_use=false (or absent) → None on the
+    /// wire (default true at OpenAI is the desired behavior).
+    #[test]
+    fn chat_request_disable_parallel_tool_use_unset_or_false_leaves_field_absent() {
+        for body in [
+            serde_json::json!({
+                "model": "gpt-4o", "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "f", "input_schema": {"type": "object"}}],
+                "tool_choice": {"type": "tool", "name": "f"}
+            }),
+            serde_json::json!({
+                "model": "gpt-4o", "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "f", "input_schema": {"type": "object"}}],
+                "tool_choice": {"type": "tool", "name": "f", "disable_parallel_tool_use": false}
+            }),
+        ] {
+            let req: MessagesRequest = serde_json::from_value(body).unwrap();
+            let out = anthropic_to_openai_request(&req, &Default::default());
+            assert!(
+                out.parallel_tool_calls.is_none(),
+                "unset/false must leave parallel_tool_calls absent; got {:?}",
+                out.parallel_tool_calls
+            );
+        }
+    }
+
+    /// PR-8: `safety_identifier` is sourced from `metadata.user_id`
+    /// (Anthropic's user-identity surface; maxLength 64 enforced by
+    /// `truncate_user`).
+    #[test]
+    fn chat_request_safety_identifier_sourced_from_metadata_user_id() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o", "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"user_id": "user-42"}
+        }))
+        .unwrap();
+        let out = anthropic_to_openai_request(&req, &Default::default());
+        assert_eq!(out.safety_identifier.as_deref(), Some("user-42"));
+    }
+
+    /// PR-8: `verbosity` is sourced from `output_config.verbosity` and
+    /// passes through verbatim.
+    #[test]
+    fn chat_request_verbosity_passes_through() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o", "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"verbosity": "low"}
+        }))
+        .unwrap();
+        let out = anthropic_to_openai_request(&req, &Default::default());
+        assert_eq!(out.verbosity.as_deref(), Some("low"));
     }
 }
