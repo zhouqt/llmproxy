@@ -17,8 +17,8 @@
 use crate::anthropic::{
     BlockDelta, MessageDeltaPayload, MessagesResponse, ResponseBlock, StreamEvent, Usage,
 };
+use crate::conversion::util::build_usage;
 use crate::responses::{OutputItem, ResponsesStreamEvent};
-use serde_json::json;
 
 pub struct ResponsesStreamTranslator {
     message_id: String,
@@ -535,31 +535,18 @@ impl ResponsesStreamTranslator {
         };
         let raw = self.final_usage.take().unwrap_or_default();
         let cached = raw.input_tokens_details.as_ref().map(|d| d.cached_tokens).unwrap_or(0);
-        // PR-6b: forward OpenAI's `reasoning_tokens` as Anthropic's
-        // `thinking_tokens` (different keys on each side of the
-        // conversion). OpenAI reads `reasoning_tokens`, Anthropic writes
-        // `thinking_tokens`; do not leak `reasoning_tokens` into the
-        // Anthropic write payload.
-        let thinking_tokens = raw
+        let reasoning = raw
             .output_tokens_details
             .as_ref()
             .map(|d| d.reasoning_tokens)
-            .filter(|&n| n > 0);
-        let usage = Some(Usage {
-            input_tokens: raw.input_tokens.saturating_sub(cached),
-            output_tokens: raw.output_tokens,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: raw
-                .input_tokens_details
-                .as_ref()
-                .filter(|d| d.cached_tokens > 0)
-                .map(|d| d.cached_tokens),
-            cache_creation: None,
-            server_tool_use: None,
-            output_tokens_details: thinking_tokens.map(|n| json!({"thinking_tokens": n})),
-            service_tier: raw.service_tier,
-            inference_geo: None,
-        });
+            .unwrap_or(0);
+        let usage = Some(build_usage(
+            raw.input_tokens,
+            raw.output_tokens,
+            cached,
+            reasoning,
+            raw.service_tier,
+        ));
         out.push(StreamEvent::MessageDelta {
             delta: MessageDeltaPayload {
                 stop_reason,
