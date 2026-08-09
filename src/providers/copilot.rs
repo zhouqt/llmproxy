@@ -758,7 +758,7 @@ impl CopilotProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
-        let merged = merge_rewrites(&self.model_rewrite, model_rewrite);
+        let merged = self.merged_rewrite(model_rewrite);
         let mut responses_req =
             crate::conversion::anthropic_to_responses_request(req, &merged);
         responses_req.stream = false;
@@ -796,7 +796,7 @@ impl CopilotProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
-        let merged = merge_rewrites(&self.model_rewrite, model_rewrite);
+        let merged = self.merged_rewrite(model_rewrite);
         let mut responses_req =
             crate::conversion::anthropic_to_responses_request(req, &merged);
         responses_req.stream = true;
@@ -826,15 +826,6 @@ impl CopilotProvider {
 /// Combine the configured provider-level rewrite table with the
 /// runtime per-call map. Runtime entries override configured ones
 /// when keys collide (mirrors `OpenAiCompatProvider`).
-fn merge_rewrites(
-    configured: &HashMap<String, String>,
-    runtime: &HashMap<String, String>,
-) -> HashMap<String, String> {
-    let mut merged = configured.clone();
-    merged.extend(runtime.iter().map(|(k, v)| (k.clone(), v.clone())));
-    merged
-}
-
 /// PR-9: strip high-risk fields from a Chat request before sending to
 /// Copilot. Copilot's request-side tolerance is unverified (closed
 /// source, strict validators, unknown models return 200 error
@@ -879,6 +870,15 @@ impl Provider for CopilotProvider {
         &self.name
     }
 
+    fn merged_rewrite<'a>(
+        &'a self,
+        runtime: &'a HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        let mut merged = self.model_rewrite.clone();
+        merged.extend(runtime.iter().map(|(k, v)| (k.clone(), v.clone())));
+        merged
+    }
+
     fn can_serve_model(&self, model: &str) -> bool {
         // Mirrors OpenAiCompatProvider: empty rewrite table accepts any
         // model verbatim (Copilot exposes its own catalog); a non-empty
@@ -909,7 +909,7 @@ impl Provider for CopilotProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
-        let merged = merge_rewrites(&self.model_rewrite, model_rewrite);
+        let merged = self.merged_rewrite(model_rewrite);
         let upstream_model = merged
             .get(&req.model)
             .map(String::as_str)
@@ -949,7 +949,7 @@ impl Provider for CopilotProvider {
             return Err(ProxyError::Upstream { status: 400, body: text });
         }
         let chat: crate::openai::ChatResponse = serde_json::from_value(parsed)?;
-        let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+        let msg_id = crate::conversion::make_message_id();
         let anthropic =
             crate::conversion::openai_to_anthropic_response(&chat, &req.model, &msg_id)?;
         Ok(ProviderOutput::Json(serde_json::to_value(anthropic)?))
@@ -960,7 +960,7 @@ impl Provider for CopilotProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
-        let merged = merge_rewrites(&self.model_rewrite, model_rewrite);
+        let merged = self.merged_rewrite(model_rewrite);
         let upstream_model = merged
             .get(&req.model)
             .map(String::as_str)

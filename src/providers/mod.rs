@@ -13,6 +13,7 @@ pub mod openai_responses;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::Stream;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::anthropic::MessagesRequest;
@@ -55,6 +56,20 @@ pub trait Provider: Send + Sync {
     fn as_any_copilot(self: Arc<Self>) -> Option<Arc<copilot::CopilotProvider>> {
         let _ = self;
         None
+    }
+    /// PR-12: combine the provider's configured `model_rewrite` with a
+    /// runtime request-time override map (runtime wins on key
+    /// collision). Providers that need model rewriting override this
+    /// (AnthropicProvider had a private copy pre-PR-12; Copilot used
+    /// a free function with 4 call sites). The default returns the
+    /// runtime map unchanged for providers that don't configure any
+    /// model rewriting.
+    fn merged_rewrite<'a>(
+        &'a self,
+        runtime: &'a HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        let _ = self;
+        runtime.clone()
     }
     /// Return a best-effort list of models served by this upstream.
     ///
