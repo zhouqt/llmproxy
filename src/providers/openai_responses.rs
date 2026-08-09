@@ -596,6 +596,7 @@ mod tests {
     fn merged_rewrite_combines_configured_and_runtime_maps() {
         let mut configured = HashMap::new();
         configured.insert("claude-a".to_string(), "configured-model".to_string());
+        configured.insert("claude-c".to_string(), "configured-only-model".to_string());
         let p = provider_with_rewrite(configured);
 
         let mut runtime = HashMap::new();
@@ -606,7 +607,11 @@ mod tests {
         // runtime wins on key collision; configured-only entries survive.
         assert_eq!(merged.get("claude-a").map(String::as_str), Some("runtime-model"));
         assert_eq!(merged.get("claude-b").map(String::as_str), Some("runtime-b"));
-        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged.get("claude-c").map(String::as_str),
+            Some("configured-only-model")
+        );
+        assert_eq!(merged.len(), 3);
     }
 
     #[test]
