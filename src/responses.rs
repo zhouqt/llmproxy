@@ -62,6 +62,11 @@ pub struct ResponsesRequest {
     /// inject `Some(_)` without a wire-type change.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<bool>,
+    /// PR-7: OpenAI `service_tier` (top-level Responses-API field).
+    /// Forwarded from Anthropic `service_tier` per plan v0.7 mapping
+    /// (auto→auto same-value passthrough; standard_only dropped).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
     /// Anything we don't model explicitly passes through. Defaults to {}.
     #[serde(default, flatten)]
     pub extra: Value,
@@ -538,6 +543,7 @@ mod tests {
             prompt_cache_retention: None,
             reasoning: None,
             store: None,
+            service_tier: None,
             extra: json!({}),
         };
         let v = serde_json::to_value(&req).unwrap();
@@ -589,6 +595,7 @@ mod tests {
             prompt_cache_retention: None,
             reasoning: None,
             store,
+            service_tier: None,
             extra: json!({}),
         }
     }

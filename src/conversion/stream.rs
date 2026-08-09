@@ -95,6 +95,19 @@ impl StreamTranslator {
                     out.extend(self.push_thinking_delta(reasoning));
                 }
             }
+            // PR-7 (refusal inbound, Chat stream): map ChunkDelta.refusal
+            // (OpenAI spec field, modeled in PR-6a) to the same text-
+            // delta path as `content`. The Anthropic wire has no refusal-
+            // specific delta; clients read it as text, and the
+            // `content_filter → refusal` stop_reason (set by the
+            // terminal event) tells Claude Code to treat it as a refusal
+            // rather than user content. Parity with PR-5 (Responses
+            // refusal inbound).
+            if let Some(refusal) = &choice.delta.refusal {
+                if !refusal.is_empty() {
+                    out.extend(self.push_text_delta(refusal));
+                }
+            }
             if let Some(tool_calls) = &choice.delta.tool_calls {
                 for tc in tool_calls {
                     out.extend(self.push_tool_delta(tc.index as u32, tc));
@@ -1354,6 +1367,83 @@ mod tests {
         assert!(
             delta.output_tokens_details.is_none(),
             "reasoning_tokens==0 → output_tokens_details must be absent"
+        );
+    }
+
+    // ── PR-7 · Chat refusal inbound (streaming) ─────────────────────────
+
+    /// PR-7 (refusal inbound, Chat stream): `ChunkDelta.refusal` (OpenAI
+    /// spec field, modeled in PR-6a) must route through the same
+    /// text-delta path as `content`. The terminal `finish_reason=
+    /// "content_filter"` flips `map_stop_reason` to `"refusal"` (PR-7
+    /// content_filter→refusal change), so Claude Code sees the
+    /// combined signal: text body containing the refusal + stop_reason
+    /// `refusal`.
+    #[test]
+    fn chat_stream_refusal_routes_through_text_delta() {
+        use crate::openai::{ChunkChoice, ChunkDelta};
+
+        let mut t = crate::conversion::stream::StreamTranslator::new("msg_rf", "gpt-4o");
+        // Delta carries refusal text.
+        let chunk = crate::openai::ChatChunk {
+            id: Some("chatcmpl-rf".into()),
+            object: "chat.completion.chunk".into(),
+            created: 0,
+            model: Some("gpt-4o".into()),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta {
+                    role: Some("assistant".into()),
+                    content: None,
+                    tool_calls: None,
+                    reasoning_content: None,
+                    refusal: Some("blocked".into()),
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+            extra: serde_json::json!({}),
+        };
+        let evs = t.push_chunk(&chunk);
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                StreamEvent::ContentBlockDelta {
+                    delta: BlockDelta::TextDelta { text },
+                    ..
+                } if text == "blocked"
+            )),
+            "refusal must emit a TextDelta with the refusal text; got {evs:?}"
+        );
+
+        // A terminal chunk with finish_reason=content_filter flips the
+        // stop_reason to `refusal` (PR-7 content_filter → refusal).
+        let term = crate::openai::ChatChunk {
+            id: Some("chatcmpl-rf2".into()),
+            object: "chat.completion.chunk".into(),
+            created: 0,
+            model: Some("gpt-4o".into()),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta::default(),
+                finish_reason: Some("content_filter".into()),
+            }],
+            usage: None,
+            extra: serde_json::json!({}),
+        };
+        let _ = t.push_chunk(&term);
+        let tail = t.finalize();
+        let delta = tail
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { delta, .. } => Some(delta),
+                _ => None,
+            })
+            .expect("finalize must emit MessageDelta");
+        assert_eq!(
+            delta.stop_reason.as_deref(),
+            Some("refusal"),
+            "content_filter finish_reason must finalize as refusal"
         );
     }
 }
