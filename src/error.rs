@@ -4,6 +4,7 @@ use axum::Json;
 use serde_json::json;
 use thiserror::Error;
 
+use crate::conversion::util::SchemaError;
 use crate::router::RouteAttempt;
 
 #[derive(Debug, Error)]
@@ -48,6 +49,13 @@ pub enum ProxyError {
     #[error("bad request: {0}")]
     BadRequest(String),
 
+    /// PR-13: a schema that cannot be strictified for OpenAI strict mode
+    /// (external URI `$ref`, circular `$ref`) is a client-side request
+    /// problem — surface it as a 400 rather than forwarding a schema the
+    /// upstream will reject.
+    #[error(transparent)]
+    Schema(#[from] SchemaError),
+
     #[error("internal error: {0}")]
     Internal(String),
 
@@ -78,6 +86,7 @@ impl ProxyError {
             ProxyError::Upstream { status, .. } => {
                 StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
             }
+            ProxyError::Schema(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -201,6 +210,15 @@ mod tests {
         assert_eq!(
             ProxyError::Config("x".into()).status_code(),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+        // PR-13: an un-strictifiable schema (external/circular $ref) is a
+        // client request problem → 400.
+        assert_eq!(
+            ProxyError::Schema(crate::conversion::util::SchemaError {
+                message: "strictify_schema: external $ref at $ not supported".into(),
+            })
+            .status_code(),
+            StatusCode::BAD_REQUEST
         );
         assert_eq!(
             ProxyError::Upstream {

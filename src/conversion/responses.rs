@@ -48,7 +48,7 @@ pub(crate) fn truncate_user(user: &str) -> String {
 pub fn anthropic_to_responses_request(
     req: &MessagesRequest,
     model_rewrite: &std::collections::HashMap<String, String>,
-) -> ResponsesRequest {
+) -> crate::error::Result<ResponsesRequest> {
     let model = model_rewrite
         .get(&req.model)
         .cloned()
@@ -161,7 +161,7 @@ pub fn anthropic_to_responses_request(
         }
     });
 
-    ResponsesRequest {
+    Ok(ResponsesRequest {
         model,
         input,
         instructions,
@@ -226,36 +226,38 @@ pub fn anthropic_to_responses_request(
                 text_obj.insert("verbosity".into(), Value::String(v));
             }
             if let Some(fmt) = req.output_config.as_ref().and_then(|oc| oc.format.as_ref()) {
-                text_obj.insert("format".into(), ensure_json_schema_name(fmt));
+                text_obj.insert("format".into(), ensure_json_schema_name(fmt)?);
             }
             if !text_obj.is_empty() {
                 e["text"] = Value::Object(text_obj);
             }
             e
         },
-    }
+    })
 }
 
 /// OpenAI Responses API requires `text.format.name` on `json_schema` shapes;
 /// Anthropic's `output_config.format` doesn't carry one. Synthesize a stable
 /// default so the schema constraint round-trips, and pin `strict: true` so the
 /// model is held to the schema (matches Anthropic's enforcement semantics).
-fn ensure_json_schema_name(fmt: &Value) -> Value {
+fn ensure_json_schema_name(
+    fmt: &Value,
+) -> std::result::Result<Value, crate::conversion::util::SchemaError> {
     if fmt.get("type").and_then(|v| v.as_str()) != Some("json_schema") {
-        return fmt.clone();
+        return Ok(fmt.clone());
     }
     let Some(obj) = fmt.as_object() else {
-        return fmt.clone();
+        return Ok(fmt.clone());
     };
     let mut out = obj.clone();
     if let Some(mut schema) = out.get("schema").cloned() {
-        strictify_schema(&mut schema);
+        strictify_schema(&mut schema)?;
         out.insert("schema".to_string(), schema);
     }
     out.entry("name".to_string())
         .or_insert(json!("structured_output"));
     out.entry("strict".to_string()).or_insert(json!(true));
-    Value::Object(out)
+    Ok(Value::Object(out))
 }
 
 fn convert_message(m: &crate::anthropic::Message) -> Vec<ResponseInputItem> {
@@ -640,7 +642,7 @@ mod tests {
     #[test]
     fn request_maps_system_to_instructions() {
         let req = req_with_text();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.model, "gpt-5");
         assert_eq!(out.instructions.as_deref(), Some("be brief"));
         assert_eq!(out.max_output_tokens, Some(256));
@@ -673,7 +675,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         // user msg → assistant function_call → user tool_result (function_call_output)
         assert_eq!(out.input.len(), 3);
         match &out.input[1] {
@@ -709,7 +711,7 @@ mod tests {
             "thinking": {"type": "enabled", "budget_tokens": 4000}
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(
             out.tool_choice.as_ref().unwrap(),
             &json!("required")
@@ -1076,7 +1078,7 @@ mod tests {
             "thinking": {"type": "disabled", "budget_tokens": 8000}
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert!(out.reasoning.is_none());
     }
 
@@ -1094,7 +1096,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.input.len(), 1);
         // Note: this only drops when there's no top-level system — we
         // accept the silent drop as the lesser evil (no instruction
@@ -1168,7 +1170,7 @@ mod tests {
             }]
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.input.len(), 1);
         match &out.input[0] {
             ResponseInputItem::Message { role, content } => {
@@ -1205,7 +1207,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.instructions.as_deref(), Some("first half\n\nsecond half"));
     }
 
@@ -1220,7 +1222,7 @@ mod tests {
             "system": ""
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert!(out.instructions.is_none());
     }
 
@@ -1236,7 +1238,7 @@ mod tests {
             "tool_choice": {"type": "tool", "name": "get_weather"}
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(
             out.tool_choice.as_ref().unwrap(),
             &json!({"type": "function", "name": "get_weather"})
@@ -1252,7 +1254,7 @@ mod tests {
             "tool_choice": {"type": "none"}
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.tool_choice.as_ref().unwrap(), &json!("none"));
     }
 
@@ -1269,7 +1271,7 @@ mod tests {
             "stream": true
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.temperature, Some(0.7));
         assert_eq!(out.top_p, Some(0.9));
         assert!(out.stream);
@@ -1287,7 +1289,7 @@ mod tests {
         .unwrap();
         let mut rewrite = HashMap::new();
         rewrite.insert("claude-sonnet-4.6".to_string(), "gpt-5-mini".to_string());
-        let out = anthropic_to_responses_request(&req, &rewrite);
+        let out = anthropic_to_responses_request(&req, &rewrite).unwrap();
         assert_eq!(out.model, "gpt-5-mini");
         assert_eq!(out.input.len(), 1);
     }
@@ -1311,7 +1313,7 @@ mod tests {
             "metadata": {"user_id": "u-1"}
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.prompt_cache_retention.as_deref(), Some("24h"));
     }
 
@@ -1330,7 +1332,7 @@ mod tests {
             }]
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.prompt_cache_retention.as_deref(), Some("24h"));
     }
 
@@ -1351,7 +1353,7 @@ mod tests {
             }]
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.prompt_cache_retention.as_deref(), Some("in_memory"));
     }
 
@@ -1365,7 +1367,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.prompt_cache_retention, None);
     }
 
@@ -1379,7 +1381,7 @@ mod tests {
             "messages": []
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert!(out.input.is_empty());
     }
 
@@ -1551,7 +1553,7 @@ mod tests {
             "system": []
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert!(out.instructions.is_none());
     }
 
@@ -1572,12 +1574,38 @@ mod tests {
             ]
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert!(
             out.instructions.is_none(),
             "all-empty-text system blocks must yield None, got {:?}",
             out.instructions
         );
+    }
+
+    /// PR-13 v0.13 P2-G: when every system block is empty *text* but
+    /// still carries a `cache_control` marker, `instructions` must stay
+    /// absent (empty text → None) while the cache hint still fires (the
+    /// marker lives on the block, not the text). Regression for the
+    /// boundary where "no instructions" and "cache wanted" coexist.
+    #[test]
+    fn cache_hint_escalates_when_all_system_blocks_empty() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "system": [
+                {"type": "text", "text": "", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "", "cache_control": {"type": "ephemeral_1h"}}
+            ],
+            "metadata": {"user_id": "u-edge"}
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
+        assert!(out.instructions.is_none());
+        // 24h marker present → retention escalates; cache key from
+        // metadata.user_id flows through despite empty system text.
+        assert_eq!(out.prompt_cache_retention.as_deref(), Some("24h"));
+        assert_eq!(out.prompt_cache_key.as_deref(), Some("u-edge"));
     }
 
     #[test]
@@ -1597,7 +1625,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(
             out.instructions.as_deref(),
             Some("first real instruction\n\nsecond real instruction"),
@@ -1746,7 +1774,7 @@ mod tests {
             "tool_choice": {"type": "auto"}
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.tool_choice.as_ref().unwrap(), &json!("auto"));
     }
 
@@ -1762,7 +1790,7 @@ mod tests {
                 "thinking": {"type": "enabled", "budget_tokens": budget}
             }))
             .unwrap();
-            let out = anthropic_to_responses_request(&req, &Default::default());
+            let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
             match out.reasoning.as_ref().unwrap() {
                 ReasoningConfig {
                     effort,
@@ -1798,7 +1826,7 @@ mod tests {
         }))
         .unwrap();
         for (req, expected) in [(via_output_config, Some("xhigh")), (via_thinking, Some("medium"))] {
-            let out = anthropic_to_responses_request(&req, &Default::default());
+            let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
             match out.reasoning.as_ref() {
                 Some(ReasoningConfig {
                     effort,
@@ -1994,7 +2022,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         let text_format = out.extra.get("text").and_then(|v| v.get("format")).unwrap();
         assert_eq!(text_format.get("type").and_then(|v| v.as_str()), Some("json_schema"));
         // Anthropic doesn't carry a schema name; OpenAI requires one. The
@@ -2014,6 +2042,37 @@ mod tests {
         ));
     }
 
+    /// PR-13: an external URI `$ref` inside `output_config.format.schema`
+    /// cannot be strictified — the conversion must fail with a `Schema`
+    /// error rather than forwarding a schema the upstream will reject.
+    #[test]
+    fn external_ref_in_format_schema_surfaces_schema_error() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "respond in json"}],
+            "output_config": {
+                "format": {"type": "json_schema", "schema": {
+                    "type": "object",
+                    "properties": {
+                        "shared": {"$ref": "https://schemas.example/common.json"}
+                    }
+                }}
+            }
+        }))
+        .unwrap();
+        let err = anthropic_to_responses_request(&req, &Default::default())
+            .expect_err("external $ref must propagate as an error");
+        assert!(
+            matches!(err, ProxyError::Schema(_)),
+            "expected ProxyError::Schema, got {err:?}"
+        );
+        assert_eq!(
+            err.status_code(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+    }
+
     #[test]
     fn output_config_with_only_format_does_not_set_reasoning() {
         let req: MessagesRequest = serde_json::from_value(json!({
@@ -2025,7 +2084,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert!(out.extra.get("text").is_some());
         assert!(out.reasoning.is_none());
     }
@@ -2038,7 +2097,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert!(out.extra.as_object().unwrap().is_empty());
         assert!(out.reasoning.is_none());
     }
@@ -2055,7 +2114,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert!(matches!(
             out.reasoning.as_ref(),
             Some(ReasoningConfig { effort: Some(e), summary: Some(ReasoningSummary::Auto) }) if e == "low"
@@ -2068,11 +2127,11 @@ mod tests {
         // "json_schema" — the Responses API's text.format only requires
         // the `name`+`strict` shim for json_schema shapes.
         let input = json!({"type": "json_object"});
-        let out = ensure_json_schema_name(&input);
+        let out = ensure_json_schema_name(&input).unwrap();
         assert_eq!(out, input);
 
         let input = json!({"type": "text"});
-        let out = ensure_json_schema_name(&input);
+        let out = ensure_json_schema_name(&input).unwrap();
         assert_eq!(out, input);
     }
 
@@ -2087,7 +2146,7 @@ mod tests {
             "name": "my_response",
             "schema": {"type": "object", "properties": {"x": {"type": "integer"}}}
         });
-        let out = ensure_json_schema_name(&input);
+        let out = ensure_json_schema_name(&input).unwrap();
         assert_eq!(out.get("name").and_then(|v| v.as_str()), Some("my_response"));
         assert_eq!(out.get("strict").and_then(|v| v.as_bool()), Some(true));
     }
@@ -2105,7 +2164,7 @@ mod tests {
             "service_tier": "auto"
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.service_tier.as_deref(), Some("auto"));
     }
 
@@ -2120,7 +2179,7 @@ mod tests {
             "service_tier": "standard_only"
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert!(
             out.service_tier.is_none(),
             "standard_only must drop, got {:?}",
@@ -2144,7 +2203,7 @@ mod tests {
             "tool_choice": {"type": "tool", "name": "f", "disable_parallel_tool_use": true}
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.parallel_tool_calls, Some(false));
     }
 
@@ -2160,7 +2219,7 @@ mod tests {
             "output_config": {"verbosity": "high"}
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.extra["text"]["verbosity"], "high");
     }
 
@@ -2174,7 +2233,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert!(
             out.extra.get("text").is_none(),
             "no verbosity → text object must be absent; got {}",

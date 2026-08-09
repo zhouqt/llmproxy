@@ -137,7 +137,7 @@ impl Provider for OpenaiResponsesProvider {
     ) -> Result<ProviderOutput> {
         let merged = self.merged_rewrite(model_rewrite);
 
-        let mut responses_req = anthropic_to_responses_request(req, &merged);
+        let mut responses_req = anthropic_to_responses_request(req, &merged)?;
         responses_req.stream = false;
 
         let resp = self
@@ -171,7 +171,7 @@ impl Provider for OpenaiResponsesProvider {
     ) -> Result<ProviderOutput> {
         let merged = self.merged_rewrite(model_rewrite);
 
-        let mut responses_req = anthropic_to_responses_request(req, &merged);
+        let mut responses_req = anthropic_to_responses_request(req, &merged)?;
         responses_req.stream = true;
 
         let resp = self

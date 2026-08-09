@@ -255,7 +255,7 @@ impl Provider for OpenAiCompatProvider {
     ) -> Result<ProviderOutput> {
         let merged = self.merged_rewrite(model_rewrite);
 
-        let mut openai_req = anthropic_to_openai_request(req, &merged);
+        let mut openai_req = anthropic_to_openai_request(req, &merged)?;
         openai_req.stream = false;
         openai_req.stream_options = None;
 
@@ -367,7 +367,7 @@ impl Provider for OpenAiCompatProvider {
     ) -> Result<ProviderOutput> {
         let merged = self.merged_rewrite(model_rewrite);
 
-        let mut openai_req = anthropic_to_openai_request(req, &merged);
+        let mut openai_req = anthropic_to_openai_request(req, &merged)?;
         openai_req.stream = true;
 
         // Streaming retry: response_format 400 is safe to retry (the 400 is
@@ -1661,7 +1661,8 @@ mod tests {
     fn strip_reasoning_echo_is_noop_without_reasoning_signals() {
         // A plain request converted from `request(false)` has no reasoning
         // signals — stripping must leave it untouched (a pure no-op).
-        let mut req = anthropic_to_openai_request(&request(false), &HashMap::new());
+        let mut req = anthropic_to_openai_request(&request(false), &HashMap::new())
+            .expect("conversion must succeed");
         strip_reasoning_echo(&mut req);
         assert!(req.reasoning_effort.is_none());
         assert!(req.extra.as_object().unwrap().is_empty());
