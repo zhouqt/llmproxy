@@ -1642,6 +1642,15 @@ mod tests {
             parallel_tool_calls: None,
             safety_identifier: None,
             verbosity: None,
+            n: None,
+            logit_bias: None,
+            logprobs: None,
+            top_logprobs: None,
+            prediction: None,
+            metadata: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
             extra: json!({"thinking": {"type": "enabled"}}),
         };
 
@@ -1728,6 +1737,15 @@ mod tests {
             parallel_tool_calls: None,
             safety_identifier: None,
             verbosity: None,
+            n: None,
+            logit_bias: None,
+            logprobs: None,
+            top_logprobs: None,
+            prediction: None,
+            metadata: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
             extra: Value::Null,
         };
 
