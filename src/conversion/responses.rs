@@ -28,8 +28,8 @@ use crate::conversion::derive_cache_hints;
 use crate::conversion::util::strictify_schema;
 use crate::error::{ProxyError, Result};
 use crate::responses::{
-    OutputContentPart, OutputItem, ReasoningConfig, ResponseInputContent, ResponseInputItem,
-    ResponseInputPart, ResponsesRequest, ResponsesResponse, ResponsesTool,
+    OutputContentPart, OutputItem, ReasoningConfig, ReasoningSummary, ResponseInputContent,
+    ResponseInputItem, ResponseInputPart, ResponsesRequest, ResponsesResponse, ResponsesTool,
 };
 
 /// Truncate the `user` identifier to the 64-character limit enforced by
@@ -195,7 +195,7 @@ pub fn anthropic_to_responses_request(
         prompt_cache_retention,
         reasoning: req.output_config.as_ref()
             .and_then(|oc| oc.effort.clone())
-            .map(|e| ReasoningConfig { effort: Some(e), summary: None })
+            .map(|e| ReasoningConfig { effort: Some(e), summary: Some(ReasoningSummary::Auto) })
             .or_else(|| req.thinking.as_ref().and_then(convert_thinking)),
         // PR-3: keep OpenAI's default (Responses `store: true`) — do not
         // send the field. See `ResponsesRequest.store` doc.
@@ -413,7 +413,12 @@ fn convert_thinking(t: &crate::anthropic::ThinkingConfig) -> Option<ReasoningCon
                 }
             })
             .unwrap_or_else(|| "medium".to_string());
-        Some(ReasoningConfig { effort: Some(effort), summary: None })
+        Some(ReasoningConfig {
+            effort: Some(effort),
+            // PR-4: request the reasoning summary so the upstream emits
+            // `reasoning_summary_text` alongside `reasoning_text`.
+            summary: Some(ReasoningSummary::Auto),
+        })
     } else {
         None
     }
@@ -660,10 +665,13 @@ mod tests {
             &json!("required")
         );
         match out.reasoning.as_ref().unwrap() {
-            ReasoningConfig { effort, summary: None } => {
+            ReasoningConfig {
+                effort,
+                summary: Some(ReasoningSummary::Auto),
+            } => {
                 assert_eq!(effort.as_deref(), Some("medium"));
             }
-            other => panic!("expected struct with summary None, got {other:?}"),
+            other => panic!("expected struct with summary Auto, got {other:?}"),
         }
         let tools = out.tools.as_ref().unwrap();
         assert_eq!(tools.len(), 1);
@@ -1615,21 +1623,25 @@ mod tests {
             .unwrap();
             let out = anthropic_to_responses_request(&req, &Default::default());
             match out.reasoning.as_ref().unwrap() {
-                ReasoningConfig { effort, summary: None } => {
+                ReasoningConfig {
+                    effort,
+                    summary: Some(ReasoningSummary::Auto),
+                } => {
                     assert_eq!(effort.as_deref(), Some(expected), "budget {budget}");
                 }
-                other => panic!("expected struct with summary None, got {other:?}"),
+                other => panic!("expected struct with summary Auto, got {other:?}"),
             }
         }
     }
 
     #[test]
     fn convert_thinking_still_produces_effort_after_struct_migration() {
-        // Regression sentinel (PR-1): ReasoningConfig changed from tagged enum
-        // `ReasoningConfig::Enabled { effort }` to plain struct
+        // Regression sentinel (PR-1 + PR-4): ReasoningConfig changed from
+        // tagged enum `ReasoningConfig::Enabled { effort }` to plain struct
         // `ReasoningConfig { effort, summary }`. Both construction paths
-        // (output_config.effort and thinking.budget_tokens) must still produce
-        // a struct with the expected effort and summary unset.
+        // (output_config.effort and thinking.budget_tokens) must still
+        // produce a struct with the expected effort and summary Auto (PR-4
+        // requests the reasoning summary on the wire).
         let via_output_config: MessagesRequest = serde_json::from_value(json!({
             "model": "gpt-5",
             "max_tokens": 64,
@@ -1647,7 +1659,10 @@ mod tests {
         for (req, expected) in [(via_output_config, Some("xhigh")), (via_thinking, Some("medium"))] {
             let out = anthropic_to_responses_request(&req, &Default::default());
             match out.reasoning.as_ref() {
-                Some(ReasoningConfig { effort, summary: None }) => {
+                Some(ReasoningConfig {
+                    effort,
+                    summary: Some(ReasoningSummary::Auto),
+                }) => {
                     assert_eq!(effort.as_deref(), expected);
                 }
                 other => panic!("expected ReasoningConfig struct with effort {expected:?}, got {other:?}"),
@@ -1789,7 +1804,7 @@ mod tests {
         assert!(required.iter().any(|v| v.as_str() == Some("impossible")));
         assert!(matches!(
             out.reasoning.as_ref(),
-            Some(ReasoningConfig { effort: Some(e), summary: None }) if e == "medium"
+            Some(ReasoningConfig { effort: Some(e), summary: Some(ReasoningSummary::Auto) }) if e == "medium"
         ));
     }
 
@@ -1837,7 +1852,7 @@ mod tests {
         let out = anthropic_to_responses_request(&req, &Default::default());
         assert!(matches!(
             out.reasoning.as_ref(),
-            Some(ReasoningConfig { effort: Some(e), summary: None }) if e == "low"
+            Some(ReasoningConfig { effort: Some(e), summary: Some(ReasoningSummary::Auto) }) if e == "low"
         ));
     }
 
