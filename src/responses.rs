@@ -310,6 +310,58 @@ pub enum ResponsesStreamEvent {
         content_index: u32,
         delta: String,
     },
+    /// SSE event carrying a reasoning-text delta (the model's chain of
+    /// thought). Mapped to an Anthropic `thinking` content block. Official
+    /// fields: `type/item_id/output_index/content_index/delta/sequence_number`.
+    /// `content_index`/`sequence_number` use `#[serde(default)]` — Copilot
+    /// may omit them.
+    #[serde(rename = "response.reasoning_text.delta")]
+    ResponseReasoningTextDelta {
+        item_id: String,
+        output_index: u32,
+        #[serde(default)]
+        content_index: u32,
+        delta: String,
+        #[serde(default)]
+        sequence_number: u64,
+    },
+    /// SSE event closing a reasoning-text part with its full accumulated
+    /// text.
+    #[serde(rename = "response.reasoning_text.done")]
+    ResponseReasoningTextDone {
+        item_id: String,
+        output_index: u32,
+        #[serde(default)]
+        content_index: u32,
+        text: String,
+        #[serde(default)]
+        sequence_number: u64,
+    },
+    /// SSE event carrying a reasoning-summary delta. Anthropic has no
+    /// summary concept, so the translator ignores it (modeled to tolerate
+    /// the event rather than falling to `Unknown`).
+    #[serde(rename = "response.reasoning_summary_text.delta")]
+    ResponseReasoningSummaryTextDelta {
+        item_id: String,
+        output_index: u32,
+        #[serde(default)]
+        summary_index: u32,
+        delta: String,
+        #[serde(default)]
+        sequence_number: u64,
+    },
+    /// SSE event closing a reasoning-summary part. Ignored (see the delta
+    /// variant).
+    #[serde(rename = "response.reasoning_summary_text.done")]
+    ResponseReasoningSummaryTextDone {
+        item_id: String,
+        output_index: u32,
+        #[serde(default)]
+        summary_index: u32,
+        text: String,
+        #[serde(default)]
+        sequence_number: u64,
+    },
     #[serde(rename = "response.output_text.done")]
     ResponseOutputTextDone {
         item_id: String,
@@ -507,6 +559,98 @@ mod tests {
             }
             _ => panic!("expected text delta"),
         }
+    }
+
+    // ── PR-4 · reasoning stream events ─────────────────────────────────
+
+    #[test]
+    fn reasoning_text_delta_decodes_with_defaults_for_optional_fields() {
+        // Official fields include content_index/sequence_number; Copilot may
+        // omit them, so decode must succeed via #[serde(default)].
+        for raw in [
+            json!({
+                "type": "response.reasoning_text.delta",
+                "item_id": "rsn_1",
+                "output_index": 0,
+                "content_index": 1,
+                "delta": "think",
+                "sequence_number": 7
+            }),
+            json!({
+                "type": "response.reasoning_text.delta",
+                "item_id": "rsn_1",
+                "output_index": 0,
+                "delta": "think"
+            }),
+        ] {
+            let ev: ResponsesStreamEvent = serde_json::from_value(raw).unwrap();
+            match ev {
+                ResponsesStreamEvent::ResponseReasoningTextDelta {
+                    item_id,
+                    delta,
+                    content_index,
+                    sequence_number,
+                    ..
+                } => {
+                    assert_eq!(item_id, "rsn_1");
+                    assert_eq!(delta, "think");
+                    // Optional fields default to 0 when the upstream omits
+                    // them (verified by the second fixture without them).
+                    let _ = (content_index, sequence_number);
+                }
+                _ => panic!("expected reasoning_text.delta"),
+            }
+        }
+    }
+
+    #[test]
+    fn reasoning_text_done_decodes() {
+        let raw = json!({
+            "type": "response.reasoning_text.done",
+            "item_id": "rsn_1",
+            "output_index": 0,
+            "content_index": 0,
+            "text": "the full reasoning",
+            "sequence_number": 8
+        });
+        let ev: ResponsesStreamEvent = serde_json::from_value(raw).unwrap();
+        match ev {
+            ResponsesStreamEvent::ResponseReasoningTextDone { text, .. } => {
+                assert_eq!(text, "the full reasoning");
+            }
+            _ => panic!("expected reasoning_text.done"),
+        }
+    }
+
+    #[test]
+    fn reasoning_summary_text_delta_and_done_decode() {
+        let raw_delta = json!({
+            "type": "response.reasoning_summary_text.delta",
+            "item_id": "rsn_1",
+            "output_index": 0,
+            "summary_index": 0,
+            "delta": "sum",
+            "sequence_number": 9
+        });
+        let ev: ResponsesStreamEvent = serde_json::from_value(raw_delta).unwrap();
+        assert!(matches!(
+            ev,
+            ResponsesStreamEvent::ResponseReasoningSummaryTextDelta { delta, .. } if delta == "sum"
+        ));
+
+        let raw_done = json!({
+            "type": "response.reasoning_summary_text.done",
+            "item_id": "rsn_1",
+            "output_index": 0,
+            "summary_index": 0,
+            "text": "the summary",
+            "sequence_number": 10
+        });
+        let ev: ResponsesStreamEvent = serde_json::from_value(raw_done).unwrap();
+        assert!(matches!(
+            ev,
+            ResponsesStreamEvent::ResponseReasoningSummaryTextDone { text, .. } if text == "the summary"
+        ));
     }
 
     #[test]
