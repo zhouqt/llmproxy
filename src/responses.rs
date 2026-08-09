@@ -118,13 +118,27 @@ pub enum ResponsesTool {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ReasoningConfig {
-    Enabled {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        effort: Option<String>, // "low" | "medium" | "high"
-    },
+/// Reasoning configuration for the Responses API.
+///
+/// **Serialization**: plain struct — no `type` field (OpenAI official `reasoning`
+/// is `{effort, summary}` only; a `type` field would 400 on the official endpoint).
+/// Copilot historically tolerated the old `{"type":"enabled",...}` shape; serde
+/// silently ignores the unknown `type` key (wire types do not use `deny_unknown_fields`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReasoningConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>, // "low" | "medium" | "high" | "xhigh" | "max" | ...
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<ReasoningSummary>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningSummary {
+    Auto,
+    Concise,
+    Detailed,
 }
 
 // ─── Response ────────────────────────────────────────────────────────────
@@ -447,5 +461,55 @@ mod tests {
         let raw = json!({"type": "response.some_future_thing", "x": 1});
         let ev: ResponsesStreamEvent = serde_json::from_value(raw).unwrap();
         assert!(matches!(ev, ResponsesStreamEvent::Unknown));
+    }
+
+    #[test]
+    fn reasoning_config_serializes_without_type_field() {
+        // OpenAI official `reasoning` object is `{effort, summary}` — a `type`
+        // field would 400 on the official /v1/responses endpoint.
+        let cfg = ReasoningConfig {
+            effort: Some("medium".into()),
+            summary: None,
+        };
+        let v = serde_json::to_value(&cfg).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("type"), "type field must not appear; got {}", v);
+        assert_eq!(obj["effort"], "medium");
+        assert!(!obj.contains_key("summary"));
+    }
+
+    #[test]
+    fn reasoning_config_deserializes_copilot_type_field() {
+        // Copilot historically sent `{"type":"enabled",...}`. Wire types don't
+        // deny unknown fields, so the stray `type` key is silently ignored.
+        let raw = json!({"type": "enabled", "effort": "medium"});
+        let cfg: ReasoningConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(cfg.effort.as_deref(), Some("medium"));
+        assert!(cfg.summary.is_none());
+    }
+
+    #[test]
+    fn reasoning_config_default_serializes_as_empty_object() {
+        let cfg = ReasoningConfig::default();
+        let v = serde_json::to_value(&cfg).unwrap();
+        assert!(v.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reasoning_config_roundtrips_with_summary() {
+        // Cover every ReasoningSummary variant so the enum's serialize/
+        // deserialize regions stay hit.
+        for (name, variant) in [
+            ("auto", ReasoningSummary::Auto),
+            ("concise", ReasoningSummary::Concise),
+            ("detailed", ReasoningSummary::Detailed),
+        ] {
+            let raw = json!({"effort": "high", "summary": name});
+            let cfg: ReasoningConfig = serde_json::from_value(raw).unwrap();
+            assert_eq!(cfg.effort.as_deref(), Some("high"));
+            assert!(matches!(cfg.summary, Some(v) if matches!(v, ReasoningSummary::Auto) == (name == "auto")));
+            let v = serde_json::to_value(&cfg).unwrap();
+            assert_eq!(v["summary"], name);
+        }
     }
 }
