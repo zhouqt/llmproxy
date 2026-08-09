@@ -66,6 +66,12 @@ pub struct ChatRequest {
     /// `cache_control` markers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_retention: Option<String>,
+    /// PR-7: OpenAI `service_tier`. Forwarded from Anthropic
+    /// `service_tier` per plan v0.7 mapping (auto→auto same-value
+    /// passthrough; standard_only is dropped — no OpenAI equivalent).
+    /// Valid OpenAI values: auto/default/flex/scale/priority/fast.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
     #[serde(flatten)]
     pub extra: Value,
 }
