@@ -197,6 +197,9 @@ pub fn anthropic_to_responses_request(
             .and_then(|oc| oc.effort.clone())
             .map(|e| ReasoningConfig { effort: Some(e), summary: None })
             .or_else(|| req.thinking.as_ref().and_then(convert_thinking)),
+        // PR-3: keep OpenAI's default (Responses `store: true`) — do not
+        // send the field. See `ResponsesRequest.store` doc.
+        store: None,
         extra: {
             let mut e = Value::Object(Map::new());
             if let Some(fmt) = req.output_config.as_ref().and_then(|oc| oc.format.as_ref()) {
