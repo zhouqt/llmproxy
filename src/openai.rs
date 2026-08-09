@@ -211,6 +211,11 @@ pub struct AssistantMessage {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(default)]
     pub reasoning_content: Option<String>,
+    /// PR-6a: spec `AssistantMessage.refusal` — surfaces when the model
+    /// refuses to comply. Plan v0.11: this proxy never emits audio, so
+    /// `audio` is deliberately not modeled (PR-6a scope, v0.11 P0-5).
+    #[serde(default)]
+    pub refusal: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -440,6 +445,12 @@ pub struct ChunkDelta {
     pub tool_calls: Option<Vec<ChunkToolCall>>,
     #[serde(default)]
     pub reasoning_content: Option<String>,
+    /// PR-6a: spec `ChatCompletionStreamResponseDelta.refusal`. Plan
+    /// v0.7 + v0.11 confirm `audio`/`annotations` are NOT in spec for
+    /// the delta — only `content/function_call/tool_calls/role/refusal`.
+    /// `audio`/`annotations` deliberately not modeled.
+    #[serde(default)]
+    pub refusal: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -508,5 +519,50 @@ mod looks_like_error_envelope_tests {
             "error": {"message": "rate limited", "type": "rate_limit"}
         });
         assert!(looks_like_error_envelope(&body));
+    }
+
+    // ── PR-6a · Chat refusal wire field ───────────────────────────────
+
+    /// PR-6a: spec `ChatCompletionStreamResponseDelta.refusal` decodes
+    /// to `ChunkDelta.refusal: Option<String>`. Other delta fields
+    /// (`role`/`content`/`tool_calls`) absent in this fixture must default
+    /// to `None`.
+    #[test]
+    fn chunk_delta_decodes_refusal_field() {
+        let raw = serde_json::json!({
+            "role": "assistant",
+            "refusal": "I cannot help with that."
+        });
+        let delta: ChunkDelta = serde_json::from_value(raw).unwrap();
+        assert_eq!(delta.refusal.as_deref(), Some("I cannot help with that."));
+        assert!(delta.role.as_deref() == Some("assistant"));
+        assert!(delta.content.is_none());
+        assert!(delta.tool_calls.is_none());
+        assert!(delta.reasoning_content.is_none());
+    }
+
+    /// PR-6a: a delta with no `refusal` field decodes with `refusal: None`
+    /// — confirms `#[serde(default)]` is in place so tolerant upstreams
+    /// (Copilot) that omit the field don't 400.
+    #[test]
+    fn chunk_delta_decodes_without_refusal_field() {
+        let raw = serde_json::json!({"role": "assistant", "content": "hi"});
+        let delta: ChunkDelta = serde_json::from_value(raw).unwrap();
+        assert!(delta.refusal.is_none());
+    }
+
+    /// PR-6a: spec `AssistantMessage.refusal` decodes alongside the
+    /// existing `content`/`tool_calls`/`reasoning_content` fields.
+    #[test]
+    fn assistant_message_decodes_refusal_field() {
+        let raw = serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "refusal": "blocked by policy"
+        });
+        let msg: AssistantMessage = serde_json::from_value(raw).unwrap();
+        assert_eq!(msg.role, "assistant");
+        assert!(msg.content.is_none());
+        assert_eq!(msg.refusal.as_deref(), Some("blocked by policy"));
     }
 }
