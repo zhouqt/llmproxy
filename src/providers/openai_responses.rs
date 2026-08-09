@@ -354,18 +354,10 @@ mod tests {
     /// presence; we need this complement to verify that the proxy
     /// doesn't pollute requests with `prompt_cache_key` /
     /// `prompt_cache_retention` when the Anthropic client didn't ask
-    /// for caching.
-    struct JsonFieldAbsent(&'static str);
-
-    impl Match for JsonFieldAbsent {
-        fn matches(&self, request: &Request) -> bool {
-            let body: serde_json::Value = match serde_json::from_slice(&request.body) {
-                Ok(v) => v,
-                Err(_) => return false,
-            };
-            body.get(self.0).is_none()
-        }
-    }
+    /// for caching. See `crate::test_support::JsonFieldAbsent`
+    /// (PR-10 moved the implementation into the shared test_support
+    /// module).
+    use crate::test_support::JsonFieldAbsent;
 
     fn cache_request_with(cache_type: &str, user_id: Option<&str>) -> MessagesRequest {
         let mut v = json!({

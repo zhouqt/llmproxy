@@ -659,7 +659,7 @@ mod schema_tests {
             "content": [{"type": "text", "text": "hi"}],
             "model": "claude-sonnet-4-6",
             "stop_reason": "end_turn",
-            "stop_details": {"reason": "policy"},
+            "stop_details": {"type": "refusal", "category": null, "explanation": null},
             "container": {"id": "container_x"},
             "usage": {
                 "input_tokens": 10,
@@ -729,7 +729,7 @@ mod schema_tests {
             "type": "message_delta",
             "delta": {
                 "stop_reason": "end_turn",
-                "stop_details": {"reason": "policy"},
+                "stop_details": {"type": "refusal", "category": null, "explanation": null},
                 "container": {"id": "x"}
             },
             "usage": {
@@ -754,7 +754,7 @@ mod schema_tests {
         let payload = MessageDeltaPayload {
             stop_reason: Some("end_turn".into()),
             stop_sequence: None,
-            stop_details: Some(json!({"reason": "policy"})),
+            stop_details: Some(json!({"type": "refusal", "category": null, "explanation": null})),
             container: Some(json!({"id": "x"})),
         };
         let ev = StreamEvent::MessageDelta {

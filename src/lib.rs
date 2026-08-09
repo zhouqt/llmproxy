@@ -13,6 +13,8 @@ pub mod proxy_client;
 pub mod providers;
 pub mod responses;
 pub mod router;
+#[cfg(test)]
+pub mod test_support;
 pub mod server;
 pub mod state;
 pub mod tokenize;
