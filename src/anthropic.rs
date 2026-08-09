@@ -257,7 +257,15 @@ pub struct Tool {
 pub enum ToolChoice {
     Auto,
     Any,
-    Tool { name: String },
+    Tool {
+        name: String,
+        /// PR-8: when set, the model is disallowed from calling the
+        /// named tool in parallel. Maps to OpenAI
+        /// `parallel_tool_calls: false`; absent/unset → None (OpenAI's
+        /// wire default is true, so leaving it absent is correct).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
     #[serde(other)]
     None,
 }
@@ -297,6 +305,11 @@ pub struct OutputConfig {
     pub effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<Value>,
+    /// PR-8: spec `Verbosity` (low/medium/high, default medium).
+    /// Forwarded to OpenAI Chat `verbosity` and Responses
+    /// `text.verbosity`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verbosity: Option<String>,
 }
 
 // ─── Response ────────────────────────────────────────────────────────────

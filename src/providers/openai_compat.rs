@@ -1639,6 +1639,9 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             service_tier: None,
+            parallel_tool_calls: None,
+            safety_identifier: None,
+            verbosity: None,
             extra: json!({"thinking": {"type": "enabled"}}),
         };
 
@@ -1722,6 +1725,9 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             service_tier: None,
+            parallel_tool_calls: None,
+            safety_identifier: None,
+            verbosity: None,
             extra: Value::Null,
         };
 

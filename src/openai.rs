@@ -72,6 +72,21 @@ pub struct ChatRequest {
     /// Valid OpenAI values: auto/default/flex/scale/priority/fast.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
+    /// PR-8: OpenAI `parallel_tool_calls`. Maps from Anthropic
+    /// `tool_choice.disable_parallel_tool_use` (true → false, default
+    /// → None; OpenAI's wire default is true so leaving this absent
+    /// when disable_parallel_tool_use is unset/false is correct).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    /// PR-8: OpenAI `safety_identifier` (maxLength 64 per spec).
+    /// String passthrough from Anthropic's user identity, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety_identifier: Option<String>,
+    /// PR-8: OpenAI `verbosity` (low/medium/high, default medium).
+    /// Spec enum `Verbosity`. Same enum on the Responses path
+    /// (text.verbosity) per plan v0.7 P1-3.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verbosity: Option<String>,
     #[serde(flatten)]
     pub extra: Value,
 }
