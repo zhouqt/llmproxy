@@ -133,7 +133,7 @@ pub struct ReasoningConfig {
     pub summary: Option<ReasoningSummary>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningSummary {
     Auto,
@@ -507,7 +507,10 @@ mod tests {
             let raw = json!({"effort": "high", "summary": name});
             let cfg: ReasoningConfig = serde_json::from_value(raw).unwrap();
             assert_eq!(cfg.effort.as_deref(), Some("high"));
-            assert!(matches!(cfg.summary, Some(v) if matches!(v, ReasoningSummary::Auto) == (name == "auto")));
+            // The roundtripped summary must be exactly the loop's variant
+            // (a plain `matches!` Auto-check would let Concise/Detailed
+            // swap silently).
+            assert_eq!(cfg.summary, Some(variant));
             let v = serde_json::to_value(&cfg).unwrap();
             assert_eq!(v["summary"], name);
         }

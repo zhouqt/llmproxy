@@ -452,6 +452,16 @@ pub fn responses_to_anthropic_response(
                 arguments,
                 ..
             } => {
+                // B3: inside an *incomplete* response, a function_call
+                // whose arguments don't parse (truncated mid-JSON) must not
+                // surface as an empty-input ToolUse — that would hand the
+                // client a phantom tool call. Skip it; the `max_tokens`
+                // stop_reason below already signals the turn was cut off.
+                if resp.status == "incomplete"
+                    && serde_json::from_str::<Value>(arguments).is_err()
+                {
+                    continue;
+                }
                 let input: Value = serde_json::from_str(arguments)
                     .unwrap_or_else(|_| Value::Object(Default::default()));
                 content.push(ResponseBlock::ToolUse {
@@ -470,30 +480,49 @@ pub fn responses_to_anthropic_response(
         }
     }
 
-    let stop_reason = if has_tool_calls {
-        Some("tool_use".to_string())
-    } else {
-        match resp.status.as_str() {
-            "incomplete" => Some("max_tokens".to_string()),
-            "completed" => Some("end_turn".to_string()),
-            "failed" => {
-                // If the response carries error details in extra, surface
-                // them as an upstream error rather than silently mapping
-                // to end_turn.
-                let err_msg = resp
-                    .extra
-                    .get("error")
-                    .and_then(|v| v.get("message"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_owned())
-                    .unwrap_or_else(|| "upstream error".to_string());
-                return Err(ProxyError::Upstream {
-                    status: 502,
-                    body: err_msg,
-                });
+    // B2 (spec-confirmed): `incomplete_details.reason` is a two-value enum
+    // (`max_output_tokens` / `content_filter`). Read it to map a content
+    // filter refusal to `refusal` instead of the old blanket `max_tokens`.
+    // B3: `status == "incomplete"` takes priority over `has_tool_calls` — a
+    // truncated function_call must read as `max_tokens`, never `tool_use`.
+    let stop_reason = match resp.status.as_str() {
+        "incomplete" => Some(
+            match resp.incomplete_details.as_ref().and_then(|d| d.reason.as_deref()) {
+                Some("content_filter") => "refusal".to_string(),
+                _ => "max_tokens".to_string(),
+            },
+        ),
+        "completed" => {
+            if has_tool_calls {
+                Some("tool_use".to_string())
+            } else {
+                Some("end_turn".to_string())
             }
-            _ => None,
         }
+        // Official `cancelled` status (spec-confirmed) carries no usable
+        // output — present it as a clean end_turn with empty content
+        // (deliberate Anthropic-compat choice, not OpenAI semantics).
+        "cancelled" => {
+            content.clear();
+            Some("end_turn".to_string())
+        }
+        "failed" => {
+            // If the response carries error details in extra, surface
+            // them as an upstream error rather than silently mapping
+            // to end_turn.
+            let err_msg = resp
+                .extra
+                .get("error")
+                .and_then(|v| v.get("message"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned())
+                .unwrap_or_else(|| "upstream error".to_string());
+            return Err(ProxyError::Upstream {
+                status: 502,
+                body: err_msg,
+            });
+        }
+        _ => None,
     };
 
     let usage = resp.usage.clone().unwrap_or_default();
@@ -689,6 +718,136 @@ mod tests {
         let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
         let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_1").unwrap();
         assert_eq!(out.stop_reason.as_deref(), Some("max_tokens"));
+    }
+
+    // ── PR-2 · B2 + B3 ──────────────────────────────────────────────────
+
+    /// B2 (spec-confirmed): `incomplete_details.reason == "content_filter"`
+    /// must map to stop_reason `refusal`, not the old blanket `max_tokens`.
+    #[test]
+    fn incomplete_with_content_filter_reason_returns_refusal() {
+        let raw = json!({
+            "id": "resp_cf",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "content_filter"},
+            "output": [{"type": "message", "id": "m", "role": "assistant", "status": "incomplete",
+                        "content": [{"type": "output_text", "text": ""}]}],
+            "usage": {"input_tokens": 5, "output_tokens": 0, "total_tokens": 5}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_cf").unwrap();
+        assert_eq!(
+            out.stop_reason.as_deref(),
+            Some("refusal"),
+            "content_filter must map to refusal, got {:?}",
+            out.stop_reason
+        );
+    }
+
+    /// B2 regression: `reason == "max_output_tokens"` (or absent) keeps the
+    /// old `max_tokens` mapping.
+    #[test]
+    fn incomplete_with_max_tokens_returns_max_tokens_stop_reason() {
+        for details in [json!({"reason": "max_output_tokens"}), json!({})] {
+            let raw = json!({
+                "id": "resp_mt",
+                "object": "response",
+                "created_at": 0,
+                "model": "gpt-5",
+                "status": "incomplete",
+                "incomplete_details": details,
+                "output": [{"type": "message", "id": "m", "role": "assistant", "status": "incomplete",
+                            "content": [{"type": "output_text", "text": "partial"}]}],
+                "usage": {"input_tokens": 5, "output_tokens": 1, "total_tokens": 6}
+            });
+            let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+            let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_mt").unwrap();
+            assert_eq!(out.stop_reason.as_deref(), Some("max_tokens"));
+        }
+    }
+
+    /// B3 core (non-streaming): status="incomplete" takes priority over
+    /// has_tool_calls. A truncated function_call must yield `max_tokens`
+    /// (never `tool_use`) and its unparseable arguments must NOT surface
+    /// as an empty-input ToolUse block.
+    #[test]
+    fn incomplete_with_truncated_function_call_returns_max_tokens_not_tool_use() {
+        let raw = json!({
+            "id": "resp_tfc",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [
+                {"type": "function_call", "id": "fc_1", "call_id": "c_1",
+                 "name": "get_weather", "arguments": "{\"city\":", "status": "incomplete"}
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_tfc").unwrap();
+        assert_eq!(
+            out.stop_reason.as_deref(),
+            Some("max_tokens"),
+            "incomplete + truncated function_call must be max_tokens, got {:?}",
+            out.stop_reason
+        );
+        assert!(
+            !out.content.iter().any(|b| matches!(b, ResponseBlock::ToolUse { .. })),
+            "truncated function_call must not produce an empty-input ToolUse; got {:?}",
+            out.content
+        );
+    }
+
+    /// B3 positive regression (non-streaming): a *completed* response with
+    /// a function_call still maps to `tool_use`.
+    #[test]
+    fn completed_with_function_call_returns_tool_use() {
+        let raw = json!({
+            "id": "resp_cfc",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [
+                {"type": "function_call", "id": "fc_1", "call_id": "c_1",
+                 "name": "get_weather", "arguments": "{\"city\":\"SF\"}", "status": "completed"}
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_cfc").unwrap();
+        assert_eq!(out.stop_reason.as_deref(), Some("tool_use"));
+        assert!(out.content.iter().any(|b| matches!(b, ResponseBlock::ToolUse { .. })));
+    }
+
+    /// Official `cancelled` status → end_turn + empty content (deliberate
+    /// Anthropic-compat choice). The test feeds partial output to prove
+    /// the content is actively cleared, not merely empty by construction.
+    #[test]
+    fn non_stream_cancelled_status_maps_to_end_turn_empty() {
+        let raw = json!({
+            "id": "resp_canc",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "cancelled",
+            "output": [{"type": "message", "id": "m", "role": "assistant", "status": "incomplete",
+                        "content": [{"type": "output_text", "text": "partial reply"}]}],
+            "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_canc").unwrap();
+        assert_eq!(out.stop_reason.as_deref(), Some("end_turn"));
+        assert!(
+            out.content.is_empty(),
+            "cancelled response must present empty content, got {:?}",
+            out.content
+        );
     }
 
     #[test]

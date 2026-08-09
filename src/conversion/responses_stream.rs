@@ -32,6 +32,12 @@ pub struct ResponsesStreamTranslator {
     /// for them.
     closed_blocks: std::collections::HashSet<u32>,
     final_stop_reason: Option<String>,
+    /// `incomplete_details.reason` captured from the terminal
+    /// `response.incomplete` event. `finalize` uses it to distinguish a
+    /// content-filter refusal (`refusal`, B2) and to let an incomplete
+    /// stream's stop reason override mid-stream function_call items
+    /// (`max_tokens`, B3).
+    incomplete_reason: Option<String>,
     final_usage: Option<crate::responses::ResponsesUsage>,
     /// Set to true when the stream contains at least one function_call
     /// output item. Forces the final stop_reason to `tool_use` so Claude
@@ -87,6 +93,7 @@ impl ResponsesStreamTranslator {
             block_map: std::collections::HashMap::new(),
             closed_blocks: std::collections::HashSet::new(),
             final_stop_reason: None,
+            incomplete_reason: None,
             final_usage: None,
             has_tool_calls: false,
             fc_item_index: std::collections::HashMap::new(),
@@ -265,6 +272,10 @@ impl ResponsesStreamTranslator {
                     "completed" => "end_turn".to_string(),
                     _ => "end_turn".to_string(),
                 });
+                self.incomplete_reason = response
+                    .incomplete_details
+                    .as_ref()
+                    .and_then(|d| d.reason.clone());
             }
             ResponsesStreamEvent::ResponseFailed { response } => {
                 self.ensure_started(&mut out);
@@ -345,12 +356,21 @@ impl ResponsesStreamTranslator {
             out.push(StreamEvent::ContentBlockStop { index: block_idx });
         }
         let stop_reason = self.final_stop_reason.take();
-        // If the stream produced function_call items, the stop reason
-        // must be "tool_use" regardless of response.status. Claude Code
-        // uses stop_reason to decide whether to execute tools; an
-        // "end_turn" when tools are present causes the client to discard
-        // the tool_use blocks.
-        let stop_reason = if self.has_tool_calls {
+        let incomplete_reason = self.incomplete_reason.take();
+        // B2 + B3 stop-reason priority:
+        //  1. content_filter → refusal (spec-confirmed reason value)
+        //  2. an incomplete stream keeps max_tokens — overriding any
+        //     function_call items seen mid-stream, so a truncated tool
+        //     call does not read as a completed tool_use request
+        //  3. only a *completed* stream lets has_tool_calls force tool_use
+        //     (Claude Code uses stop_reason to decide whether to execute
+        //     tools; an "end_turn" with tools present causes the client
+        //     to discard the tool_use blocks)
+        let stop_reason = if incomplete_reason.as_deref() == Some("content_filter") {
+            Some("refusal".to_string())
+        } else if stop_reason.as_deref() == Some("max_tokens") {
+            stop_reason
+        } else if self.has_tool_calls {
             Some("tool_use".to_string())
         } else {
             stop_reason
@@ -427,7 +447,8 @@ fn output_item_to_block(item: &OutputItem) -> ResponseBlock {
 mod tests {
     use super::*;
     use crate::responses::{
-        InputTokensDetails, OutputContentPart, ResponsesResponse, ResponsesUsage,
+        IncompleteDetails, InputTokensDetails, OutputContentPart, ResponsesResponse,
+        ResponsesUsage,
     };
     use serde_json::json;
 
@@ -691,6 +712,147 @@ mod tests {
         );
         assert_eq!(usage.cache_read_input_tokens, Some(60));
         assert_eq!(usage.output_tokens, 10);
+    }
+
+    // ── PR-2 · B2 + B3 (streaming) ─────────────────────────────────────
+
+    /// B2 (streaming): a terminal `response.incomplete` with
+    /// `incomplete_details.reason == "content_filter"` must finalize with
+    /// stop_reason `refusal`.
+    #[test]
+    fn stream_incomplete_with_content_filter_emits_refusal_message_delta() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let mut resp = placeholder_response("incomplete");
+        resp.incomplete_details = Some(IncompleteDetails {
+            reason: Some("content_filter".into()),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseIncomplete {
+            response: Box::new(resp),
+        });
+        let tail = t.finalize();
+        let delta = tail
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { delta, .. } => Some(delta),
+                _ => None,
+            })
+            .expect("finalize must emit a MessageDelta");
+        assert_eq!(
+            delta.stop_reason.as_deref(),
+            Some("refusal"),
+            "content_filter must finalize as refusal, got {:?}",
+            delta.stop_reason
+        );
+    }
+
+    /// B3 core (streaming): an incomplete stream that emitted a
+    /// function_call item mid-stream must finalize with `max_tokens`, NOT
+    /// `tool_use` — a truncated tool call must not read as a completed
+    /// tool_use request.
+    #[test]
+    fn stream_incomplete_with_function_call_returns_max_tokens_not_tool_use() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        // A function_call output item arrives mid-stream (sets has_tool_calls).
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::FunctionCall {
+                id: "fc_1".into(),
+                call_id: "c_1".into(),
+                name: "get_weather".into(),
+                arguments: "{\"city\":".into(),
+                status: "incomplete".into(),
+            },
+        });
+        let mut resp = placeholder_response("incomplete");
+        resp.incomplete_details = Some(IncompleteDetails {
+            reason: Some("max_output_tokens".into()),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseIncomplete {
+            response: Box::new(resp),
+        });
+        let tail = t.finalize();
+        let delta = tail
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { delta, .. } => Some(delta),
+                _ => None,
+            })
+            .expect("finalize must emit a MessageDelta");
+        assert_eq!(
+            delta.stop_reason.as_deref(),
+            Some("max_tokens"),
+            "incomplete stream with function_call must finalize max_tokens, got {:?}",
+            delta.stop_reason
+        );
+    }
+
+    /// B3 positive regression (streaming): a *completed* stream with a
+    /// function_call still finalizes with `tool_use`.
+    #[test]
+    fn stream_completed_with_function_call_returns_tool_use() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::FunctionCall {
+                id: "fc_1".into(),
+                call_id: "c_1".into(),
+                name: "get_weather".into(),
+                arguments: "{\"city\":\"SF\"}".into(),
+                status: "completed".into(),
+            },
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(placeholder_response("completed")),
+        });
+        let tail = t.finalize();
+        let delta = tail
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { delta, .. } => Some(delta),
+                _ => None,
+            })
+            .expect("finalize must emit a MessageDelta");
+        assert_eq!(delta.stop_reason.as_deref(), Some("tool_use"));
+    }
+
+    /// v0.11: a terminal event with an unknown status (including the
+    /// official `cancelled`, which has no dedicated SSE event) falls through
+    /// to the `_ => end_turn` fallback — it must NOT be misread as
+    /// `max_tokens` and must not read as `tool_use` without a completed item.
+    #[test]
+    fn stream_terminal_event_with_unknown_status_maps_to_end_turn() {
+        for status in ["cancelled", "some_future_status"] {
+            let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+            let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+                response: Box::new(placeholder_response("in_progress")),
+            });
+            let _ = t.push_event(&ResponsesStreamEvent::ResponseIncomplete {
+                response: Box::new(placeholder_response(status)),
+            });
+            let tail = t.finalize();
+            let delta = tail
+                .iter()
+                .find_map(|e| match e {
+                    StreamEvent::MessageDelta { delta, .. } => Some(delta),
+                    _ => None,
+                })
+                .expect("finalize must emit a MessageDelta");
+            assert_eq!(
+                delta.stop_reason.as_deref(),
+                Some("end_turn"),
+                "unknown terminal status {status} must map to end_turn, got {:?}",
+                delta.stop_reason
+            );
+        }
     }
 
     #[test]
