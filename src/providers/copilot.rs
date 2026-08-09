@@ -762,6 +762,13 @@ impl CopilotProvider {
         let mut responses_req =
             crate::conversion::anthropic_to_responses_request(req, &merged);
         responses_req.stream = false;
+        // PR-9: Copilot strips high-risk fields before serialization.
+        // Copilot's request-side tolerance is unverified (closed source,
+        // strict validators, unknown models return 200 error envelopes);
+        // sending these would risk 400 errors. service_tier is the most
+        // likely to 400; prediction/logit_bias/logprobs/metadata/
+        // safety_identifier/verbosity are scrubbed defensively.
+        strip_high_risk_fields_responses(&mut responses_req);
         let body = serde_json::to_value(responses_req)?;
 
         let resp = self.send_with_token(&self.responses_url(), &body).await?;
@@ -793,6 +800,9 @@ impl CopilotProvider {
         let mut responses_req =
             crate::conversion::anthropic_to_responses_request(req, &merged);
         responses_req.stream = true;
+        // PR-9: strip high-risk fields before serialization (see
+        // complete_responses for rationale).
+        strip_high_risk_fields_responses(&mut responses_req);
         let body = serde_json::to_value(responses_req)?;
 
         let resp = self.send_with_token(&self.responses_url(), &body).await?;
@@ -823,6 +833,44 @@ fn merge_rewrites(
     let mut merged = configured.clone();
     merged.extend(runtime.iter().map(|(k, v)| (k.clone(), v.clone())));
     merged
+}
+
+/// PR-9: strip high-risk fields from a Chat request before sending to
+/// Copilot. Copilot's request-side tolerance is unverified (closed
+/// source, strict validators, unknown models return 200 error
+/// envelopes); these fields have the highest 400 risk on Copilot.
+///
+/// Stripped (all PR-9 P2 high-risk):
+/// - `service_tier` — OpenAI tier hint; would 400 on Copilot
+/// - `prediction` — speculative content
+/// - `logit_bias` — token-bias map
+/// - `logprobs` / `top_logprobs` — log probability outputs
+/// - `metadata` — request tags (Copilot doesn't accept)
+/// - `safety_identifier` — user identity, Copilot may differ
+/// - `verbosity` — text verbosity
+fn strip_high_risk_fields_chat(req: &mut crate::openai::ChatRequest) {
+    req.service_tier = None;
+    req.prediction = None;
+    req.logit_bias = None;
+    req.logprobs = None;
+    req.top_logprobs = None;
+    req.metadata = None;
+    req.safety_identifier = None;
+    req.verbosity = None;
+}
+
+/// PR-9: strip high-risk fields from a Responses request before sending
+/// to Copilot. The Responses path puts some fields under `extra.text`
+/// (verbosity), so we have to clear both the typed field and the
+/// nested text object.
+fn strip_high_risk_fields_responses(req: &mut crate::responses::ResponsesRequest) {
+    req.service_tier = None;
+    // verbosity lives under `extra.text.verbosity` on Responses; clear
+    // it there too. `extra.text.format` is preserved (Copilot accepts
+    // json_schema shaping).
+    if let Some(text_obj) = req.extra.get_mut("text").and_then(|v| v.as_object_mut()) {
+        text_obj.remove("verbosity");
+    }
 }
 
 #[async_trait]
@@ -875,6 +923,9 @@ impl Provider for CopilotProvider {
             crate::conversion::anthropic_to_openai_request(req, &merged);
         openai_req.stream = false;
         openai_req.stream_options = None;
+        // PR-9: strip high-risk fields before serialization (see
+        // complete_responses for rationale).
+        strip_high_risk_fields_chat(&mut openai_req);
         let body = serde_json::to_value(openai_req)?;
 
         let resp = self.send_with_token(&self.chat_url(), &body).await?;
@@ -925,6 +976,9 @@ impl Provider for CopilotProvider {
         openai_req.stream_options = Some(crate::openai::StreamOptions {
             include_usage: true,
         });
+        // PR-9: strip high-risk fields before serialization (see
+        // complete_responses for rationale).
+        strip_high_risk_fields_chat(&mut openai_req);
         let body = serde_json::to_value(openai_req)?;
 
         let resp = self.send_with_token(&self.chat_url(), &body).await?;
@@ -958,6 +1012,111 @@ mod tests {
     use serde_json::json;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // ── PR-9 · high-risk field stripping ────────────────────────────────
+
+    /// PR-9: `strip_high_risk_fields_chat` clears every P2 high-risk
+    /// field Copilot's strict validators are most likely to 400 on.
+    /// The Anthropic→OpenAI translator may set some of these fields
+    /// (service_tier, verbosity, safety_identifier); the Copilot path
+    /// must drop them before serialization.
+    #[test]
+    fn strip_high_risk_fields_chat_clears_all_listed_fields() {
+        let mut req = crate::openai::ChatRequest {
+            model: "gpt-4o".into(),
+            messages: vec![],
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+            stream: false,
+            stream_options: None,
+            tools: None,
+            tool_choice: None,
+            user: None,
+            reasoning_effort: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            service_tier: Some("auto".into()),
+            parallel_tool_calls: Some(false),
+            safety_identifier: Some("user-42".into()),
+            verbosity: Some("low".into()),
+            n: Some(2),
+            logit_bias: Some(std::collections::HashMap::from([("x".into(), 1)])),
+            logprobs: Some(true),
+            top_logprobs: Some(5),
+            prediction: Some(json!({"type": "content", "content": "x"})),
+            metadata: Some(json!({"trace": "abc"})),
+            presence_penalty: Some(0.5),
+            frequency_penalty: Some(-0.5),
+            seed: Some(12345),
+            extra: json!({}),
+        };
+        strip_high_risk_fields_chat(&mut req);
+        assert!(req.service_tier.is_none());
+        assert!(req.prediction.is_none());
+        assert!(req.logit_bias.is_none());
+        assert!(req.logprobs.is_none());
+        assert!(req.top_logprobs.is_none());
+        assert!(req.metadata.is_none());
+        assert!(req.safety_identifier.is_none());
+        assert!(req.verbosity.is_none());
+        // Non-stripped fields are preserved (Copilot accepts these).
+        assert_eq!(req.parallel_tool_calls, Some(false));
+        assert_eq!(req.presence_penalty, Some(0.5));
+        assert_eq!(req.frequency_penalty, Some(-0.5));
+        assert_eq!(req.seed, Some(12345));
+    }
+
+    /// PR-9: `strip_high_risk_fields_responses` clears service_tier and
+    /// the nested `extra.text.verbosity`. `extra.text.format` is
+    /// preserved (Copilot accepts json_schema shaping).
+    #[test]
+    fn strip_high_risk_fields_responses_clears_service_tier_and_text_verbosity() {
+        use serde_json::Value;
+        let mut req = crate::responses::ResponsesRequest {
+            model: "gpt-5".into(),
+            input: vec![],
+            instructions: None,
+            max_output_tokens: None,
+            temperature: None,
+            top_p: None,
+            stream: false,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: Some(false),
+            user: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            reasoning: None,
+            store: None,
+            service_tier: Some("auto".into()),
+            extra: Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert(
+                    "text".into(),
+                    json!({"verbosity": "high", "format": {"type": "json_schema"}}),
+                );
+                m
+            }),
+        };
+        strip_high_risk_fields_responses(&mut req);
+        assert!(req.service_tier.is_none());
+        // format is preserved.
+        assert_eq!(
+            req.extra["text"]["format"]["type"],
+            "json_schema",
+            "format must survive the strip; got {}",
+            req.extra
+        );
+        // verbosity is gone.
+        assert!(
+            req.extra["text"].get("verbosity").is_none(),
+            "verbosity must be cleared from text; got {}",
+            req.extra["text"]
+        );
+    }
 
     fn now() -> i64 {
         SystemTime::now()

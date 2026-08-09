@@ -176,6 +176,21 @@ pub fn anthropic_to_openai_request(
         // `output_config.verbosity` (Anthropic spec). Same enum on the
         // Responses path via text.verbosity.
         verbosity: req.output_config.as_ref().and_then(|oc| oc.verbosity.clone()),
+        // PR-9 P2 fields. Anthropic has no direct equivalent for any of
+        // these — pass through only if the client somehow attached
+        // them. We don't synthesize them; their defaults are None so the
+        // wire stays absent unless a future PR injects from a Claude
+        // Code extension surface (currently no source on the Anthropic
+        // schema side, hence not wired into request translation yet).
+        n: None,
+        logit_bias: None,
+        logprobs: None,
+        top_logprobs: None,
+        prediction: None,
+        metadata: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        seed: None,
         extra: {
             let mut e = Value::Object(Map::new());
             if let Some(fmt) = req.output_config.as_ref().and_then(|oc| oc.format.as_ref()) {
