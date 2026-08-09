@@ -6,7 +6,8 @@ use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
-use crate::anthropic::{MessagesResponse, ResponseBlock, Usage};
+use crate::anthropic::{MessagesResponse, ResponseBlock};
+use crate::conversion::util::build_usage;
 use crate::error::{ProxyError, Result};
 use crate::openai::ChatResponse;
 
@@ -76,35 +77,28 @@ pub fn openai_to_anthropic_response(
         .usage
         .as_ref()
         .map(|u| {
+            // PR-11: build_usage consolidates the cached_tokens +
+            // reasoning_tokens (OpenAI read key) → Anthropic write
+            // keys (cache_read_input_tokens / output_tokens_details
+            // .thinking_tokens) construction that used to be inline
+            // here.
             let cached = u
                 .prompt_tokens_details
                 .as_ref()
                 .and_then(|d| d.cached_tokens)
                 .unwrap_or(0);
-            // PR-6b: forward reasoning_tokens to the Anthropic client as
-            // `output_tokens_details.thinking_tokens` (Anthropic's
-            // official OutputTokensDetails field name per
-            // anthropic-sdk-python — `anthropic.rs:658` test pins it).
-            // The OpenAI-side key is `reasoning_tokens`; the Anthropic-
-            // side key is `thinking_tokens` (different keys on each
-            // side of the conversion, never leak `reasoning_tokens`
-            // into the Anthropic write payload).
-            let thinking_tokens = u
+            let reasoning = u
                 .completion_tokens_details
                 .as_ref()
                 .and_then(|d| d.reasoning_tokens)
-                .filter(|&n| n > 0);
-            Usage {
-                input_tokens: u.prompt_tokens.saturating_sub(cached),
-                output_tokens: u.completion_tokens,
-                cache_creation_input_tokens: None,
-                cache_read_input_tokens: if cached > 0 { Some(cached) } else { None },
-                cache_creation: None,
-                server_tool_use: None,
-                output_tokens_details: thinking_tokens.map(|n| json!({"thinking_tokens": n})),
-                service_tier: u.service_tier.clone(),
-                inference_geo: None,
-            }
+                .unwrap_or(0);
+            build_usage(
+                u.prompt_tokens,
+                u.completion_tokens,
+                cached,
+                reasoning,
+                u.service_tier.clone(),
+            )
         })
         .unwrap_or_default();
 

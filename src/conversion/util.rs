@@ -7,9 +7,9 @@
 //! cross-module imports between them (e.g. `responses.rs` reaching into
 //! `request.rs`).
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
-use crate::anthropic::Tool;
+use crate::anthropic::{Tool, Usage};
 
 /// Detect whether a `Tool` is an Anthropic-native hosted web search tool.
 ///
@@ -130,6 +130,46 @@ pub fn strictify_schema(schema: &mut Value) {
         if let Some(sub) = obj.get_mut(key) {
             strictify_schema(sub);
         }
+    }
+}
+
+/// PR-11: shared Anthropic `Usage` constructor for all four conversion
+/// paths (Chat NS / Chat S / Responses NS / Responses S). Plan v0.11
+/// R6 + v0.10 键名:
+/// - `cached_tokens` (Anthropic read key) → `cache_read_input_tokens`
+///   (None when 0 so wire stays absent — Some(0) would change shape).
+/// - `reasoning_tokens` (OpenAI read key) → `output_tokens_details
+///   .thinking_tokens` (Anthropic write key, different from the
+///   OpenAI read key).
+/// - `reasoning_tokens` is clamped to `[0, output_tokens]` —
+///   Anthropic spec guarantees `thinking_tokens ≤ output_tokens`,
+///   so we never emit a wire shape that violates the invariant.
+///   This may suppress the R6 "reasoning_tokens >= completion_tokens"
+///   warning (plan v0.11 R6 注记: semantics unchanged, only the warn
+///   condition shifts; relevant tests adjusted to clamp consistently).
+pub fn build_usage(
+    input_tokens: u32,
+    output_tokens: u32,
+    cached_tokens: u32,
+    reasoning_tokens: u32,
+    service_tier: Option<String>,
+) -> Usage {
+    let cached = cached_tokens;
+    let reasoning = reasoning_tokens.min(output_tokens);
+    Usage {
+        input_tokens: input_tokens.saturating_sub(cached),
+        output_tokens,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: if cached > 0 { Some(cached) } else { None },
+        cache_creation: None,
+        server_tool_use: None,
+        output_tokens_details: if reasoning > 0 {
+            Some(json!({"thinking_tokens": reasoning}))
+        } else {
+            None
+        },
+        service_tier,
+        inference_geo: None,
     }
 }
 
@@ -747,5 +787,51 @@ mod tests {
             schema, original,
             "schema with properties but no `type: object` must pass through"
         );
+    }
+
+    // ── PR-11 · build_usage tests ─────────────────────────────────────
+
+    /// PR-11: `build_usage` with non-zero cached + non-zero reasoning
+    /// populates both Anthropic write keys, uses `thinking_tokens` for
+    /// the OpenAI→Anthropic key translation, and excludes cached from
+    /// `input_tokens` (Anthropic convention).
+    #[test]
+    fn build_usage_with_cached_and_reasoning() {
+        let u = build_usage(100, 50, 30, 20, None);
+        assert_eq!(u.input_tokens, 70, "100 - 30 cached = 70");
+        assert_eq!(u.output_tokens, 50);
+        assert_eq!(u.cache_read_input_tokens, Some(30));
+        assert_eq!(
+            u.output_tokens_details.expect("reasoning>0 → present")["thinking_tokens"],
+            20
+        );
+    }
+
+    /// PR-11: zero cached → `cache_read_input_tokens` is None (Some(0)
+    /// would change the wire shape from absent to zero).
+    #[test]
+    fn build_usage_zero_cached_keeps_field_absent() {
+        let u = build_usage(10, 50, 0, 20, None);
+        assert!(u.cache_read_input_tokens.is_none());
+    }
+
+    /// PR-11: zero reasoning → `output_tokens_details` is None.
+    #[test]
+    fn build_usage_zero_reasoning_keeps_field_absent() {
+        let u = build_usage(10, 50, 30, 0, None);
+        assert!(u.output_tokens_details.is_none());
+    }
+
+    /// PR-11 (clamp invariant): reasoning_tokens > output_tokens is
+    /// clamped to output_tokens so the wire shape never violates
+    /// Anthropic's `thinking_tokens ≤ output_tokens` invariant.
+    #[test]
+    fn build_usage_clamps_reasoning_to_output_tokens() {
+        // 30 reasoning > 20 output → clamp to 20.
+        let u = build_usage(10, 20, 0, 30, None);
+        let details = u.output_tokens_details.expect("clamped 20 > 0");
+        assert_eq!(details["thinking_tokens"], 20);
+        // The wire never sees `30 > 20`, so the Anthropic invariant
+        // is preserved.
     }
 }
