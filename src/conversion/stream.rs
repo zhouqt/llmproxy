@@ -146,6 +146,14 @@ impl StreamTranslator {
                 .as_ref()
                 .and_then(|d| d.cached_tokens)
                 .unwrap_or(0);
+            // PR-6b: forward reasoning_tokens as thinking_tokens (Anthropic
+            // write key). OpenAI reads `reasoning_tokens`, Anthropic writes
+            // `thinking_tokens` — different keys, no cross-contamination.
+            let thinking_tokens = u
+                .completion_tokens_details
+                .as_ref()
+                .and_then(|d| d.reasoning_tokens)
+                .filter(|&n| n > 0);
             Usage {
                 input_tokens: u.prompt_tokens.saturating_sub(cached),
                 output_tokens: u.completion_tokens,
@@ -157,7 +165,7 @@ impl StreamTranslator {
                     .filter(|&n| n > 0),
                 cache_creation: None,
                 server_tool_use: None,
-                output_tokens_details: None,
+                output_tokens_details: thinking_tokens.map(|n| json!({"thinking_tokens": n})),
                 service_tier: None,
                 inference_geo: None,
             }
@@ -1234,5 +1242,118 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, StreamEvent::ContentBlockDelta { .. })));
         // Second push (metadata with empty choices) emits nothing
         assert!(second.is_empty());
+    }
+
+    // ── PR-6b · output_tokens_details.thinking_tokens (Chat stream) ──
+
+    /// PR-6b: chat-stream finalize() must forward `reasoning_tokens` as
+    /// `thinking_tokens` (Anthropic write key) when the chunk carries
+    /// it, and omit the field entirely when absent or zero.
+    #[test]
+    fn chat_stream_propagates_reasoning_tokens_as_thinking_tokens() {
+        use crate::openai::{ChatChunk, ChatUsage, CompletionTokensDetails};
+
+        // (a) reasoning_tokens present → thinking_tokens surfaced.
+        let mut t = crate::conversion::stream::StreamTranslator::new("msg_s", "gpt-4o");
+        // Prime with a chat.completion.chunk carrying usage.
+        let chunk_with = ChatChunk {
+            id: Some("chatcmpl-s".into()),
+            object: "chat.completion.chunk".into(),
+            created: 0,
+            model: Some("gpt-4o".into()),
+            choices: vec![],
+            usage: Some(ChatUsage {
+                prompt_tokens: 10,
+                completion_tokens: 50,
+                total_tokens: 60,
+                prompt_tokens_details: None,
+                completion_tokens_details: Some(CompletionTokensDetails {
+                    reasoning_tokens: Some(15),
+                }),
+            }),
+            extra: serde_json::json!({}),
+        };
+        let _ = t.push_chunk(&chunk_with);
+        let tail = t.finalize();
+        let delta = tail
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { usage, .. } => usage.as_ref(),
+                _ => None,
+            })
+            .expect("finalize must emit MessageDelta with usage");
+        let details = delta
+            .output_tokens_details
+            .as_ref()
+            .expect("reasoning_tokens>0 must surface output_tokens_details");
+        assert_eq!(details["thinking_tokens"], 15);
+        assert!(
+            details.get("reasoning_tokens").is_none(),
+            "OpenAI read key `reasoning_tokens` must not leak into Anthropic write payload"
+        );
+
+        // (b) reasoning_tokens absent → output_tokens_details absent.
+        let mut t = crate::conversion::stream::StreamTranslator::new("msg_s", "gpt-4o");
+        let chunk_no = ChatChunk {
+            id: Some("chatcmpl-s2".into()),
+            object: "chat.completion.chunk".into(),
+            created: 0,
+            model: Some("gpt-4o".into()),
+            choices: vec![],
+            usage: Some(ChatUsage {
+                prompt_tokens: 10,
+                completion_tokens: 50,
+                total_tokens: 60,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
+            extra: serde_json::json!({}),
+        };
+        let _ = t.push_chunk(&chunk_no);
+        let tail = t.finalize();
+        let delta = tail
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { usage, .. } => usage.as_ref(),
+                _ => None,
+            })
+            .expect("finalize must emit MessageDelta");
+        assert!(
+            delta.output_tokens_details.is_none(),
+            "no reasoning_tokens → output_tokens_details must be absent"
+        );
+
+        // (c) reasoning_tokens == 0 → output_tokens_details absent.
+        let mut t = crate::conversion::stream::StreamTranslator::new("msg_s", "gpt-4o");
+        let chunk_zero = ChatChunk {
+            id: Some("chatcmpl-s3".into()),
+            object: "chat.completion.chunk".into(),
+            created: 0,
+            model: Some("gpt-4o".into()),
+            choices: vec![],
+            usage: Some(ChatUsage {
+                prompt_tokens: 10,
+                completion_tokens: 50,
+                total_tokens: 60,
+                prompt_tokens_details: None,
+                completion_tokens_details: Some(CompletionTokensDetails {
+                    reasoning_tokens: Some(0),
+                }),
+            }),
+            extra: serde_json::json!({}),
+        };
+        let _ = t.push_chunk(&chunk_zero);
+        let tail = t.finalize();
+        let delta = tail
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { usage, .. } => usage.as_ref(),
+                _ => None,
+            })
+            .expect("finalize must emit MessageDelta");
+        assert!(
+            delta.output_tokens_details.is_none(),
+            "reasoning_tokens==0 → output_tokens_details must be absent"
+        );
     }
 }

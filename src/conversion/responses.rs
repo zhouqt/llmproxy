@@ -561,6 +561,13 @@ pub fn responses_to_anthropic_response(
         .as_ref()
         .map(|d| d.cached_tokens)
         .unwrap_or(0);
+    // PR-6b: forward OpenAI's `reasoning_tokens` as Anthropic's
+    // `thinking_tokens` (different keys on each side of the conversion).
+    let thinking_tokens = usage
+        .output_tokens_details
+        .as_ref()
+        .map(|d| d.reasoning_tokens)
+        .filter(|&n| n > 0);
 
     Ok(MessagesResponse {
         id: message_id.to_string(),
@@ -579,7 +586,7 @@ pub fn responses_to_anthropic_response(
             cache_read_input_tokens: if cached > 0 { Some(cached) } else { None },
             cache_creation: None,
             server_tool_use: None,
-            output_tokens_details: None,
+            output_tokens_details: thinking_tokens.map(|n| json!({"thinking_tokens": n})),
             service_tier: None,
             inference_geo: None,
         },
@@ -939,6 +946,70 @@ mod tests {
             out.usage.input_tokens
         );
         assert_eq!(out.usage.cache_read_input_tokens, Some(60));
+    }
+
+    // ── PR-6b · output_tokens_details.thinking_tokens (Responses non-stream) ──
+
+    /// PR-6b (Responses non-stream): forward `output_tokens_details.
+    /// reasoning_tokens` (OpenAI read key) as `output_tokens_details.
+    /// thinking_tokens` (Anthropic write key). Different keys on each
+    /// side — never leak `reasoning_tokens` into the Anthropic write
+    /// payload. Absent and zero both produce a fully-absent field.
+    #[test]
+    fn responses_non_stream_propagates_reasoning_tokens_as_thinking_tokens() {
+        use crate::responses::OutputTokensDetails;
+        // (a) reasoning_tokens present → thinking_tokens surfaced.
+        let raw = json!({
+            "id": "resp_t", "object": "response", "created_at": 0,
+            "model": "gpt-5", "status": "completed",
+            "output": [{"type": "message", "id": "m", "role": "assistant", "status": "completed",
+                        "content": [{"type": "output_text", "text": "ok"}]}],
+            "usage": {"input_tokens": 10, "output_tokens": 50, "total_tokens": 60,
+                      "output_tokens_details": {"reasoning_tokens": 18}}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_t").unwrap();
+        let details = out.usage.output_tokens_details.expect(
+            "reasoning_tokens>0 must surface output_tokens_details",
+        );
+        assert_eq!(details["thinking_tokens"], 18);
+        assert!(
+            details.get("reasoning_tokens").is_none(),
+            "OpenAI read key must not leak; got {details}"
+        );
+
+        // (b) output_tokens_details absent → field absent.
+        let raw_no = json!({
+            "id": "resp_t2", "object": "response", "created_at": 0,
+            "model": "gpt-5", "status": "completed",
+            "output": [{"type": "message", "id": "m", "role": "assistant", "status": "completed",
+                        "content": [{"type": "output_text", "text": "ok"}]}],
+            "usage": {"input_tokens": 10, "output_tokens": 50, "total_tokens": 60}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw_no).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_t").unwrap();
+        assert!(
+            out.usage.output_tokens_details.is_none(),
+            "no output_tokens_details → must be absent"
+        );
+
+        // (c) reasoning_tokens == 0 → field absent (Some(0) changes wire shape).
+        let raw_zero = json!({
+            "id": "resp_t3", "object": "response", "created_at": 0,
+            "model": "gpt-5", "status": "completed",
+            "output": [{"type": "message", "id": "m", "role": "assistant", "status": "completed",
+                        "content": [{"type": "output_text", "text": "ok"}]}],
+            "usage": {"input_tokens": 10, "output_tokens": 50, "total_tokens": 60,
+                      "output_tokens_details": {"reasoning_tokens": 0}}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw_zero).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_t").unwrap();
+        assert!(
+            out.usage.output_tokens_details.is_none(),
+            "reasoning_tokens==0 → must be absent"
+        );
+        // Sanity: the OutputTokensDetails struct still reads reasoning_tokens.
+        let _ = OutputTokensDetails { reasoning_tokens: 0 };
     }
 
     // silence unused warnings for the helper kept to ensure imports stay live
