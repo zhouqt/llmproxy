@@ -87,6 +87,48 @@ pub struct ChatRequest {
     /// (text.verbosity) per plan v0.7 P1-3.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verbosity: Option<String>,
+    /// PR-9: OpenAI `n` — number of chat completion choices to
+    /// generate. Anthropic has no equivalent (single-choice API);
+    /// clients that need `n>1` would have to use OpenAI directly.
+    /// Default = 1 upstream; not surfaced to clients, hence None
+    /// unless explicitly set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
+    /// PR-9: OpenAI `logit_bias` — token-id → bias map (-100..100).
+    /// Map<String, i32> per spec. Anthropic has no equivalent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logit_bias: Option<std::collections::HashMap<String, i32>>,
+    /// PR-9: OpenAI `logprobs` — whether to return log probabilities.
+    /// Anthropic has no equivalent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<bool>,
+    /// PR-9: OpenAI `top_logprobs` — number of most-likely tokens to
+    /// return at each position (0..=20). Requires `logprobs=true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<u32>,
+    /// PR-9: OpenAI `prediction` — speculative content for faster
+    /// responses (`content`/`type`). Anthropic has no equivalent.
+    /// `Value` here to keep the wire shape tolerant of all spec
+    /// sub-fields without a full enum model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prediction: Option<Value>,
+    /// PR-9: OpenAI `metadata` — arbitrary key-value tags attached to
+    /// the request for billing/analytics. Anthropic has no equivalent.
+    /// `Value` keeps the field shape-tolerant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+    /// PR-9: OpenAI `presence_penalty` (-2.0..=2.0). Distinct from
+    /// `frequency_penalty`. Anthropic has no equivalent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    /// PR-9: OpenAI `frequency_penalty` (-2.0..=2.0). Distinct from
+    /// `presence_penalty`. Anthropic has no equivalent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    /// PR-9: OpenAI `seed` — best-effort deterministic sampling seed.
+    /// Anthropic has no equivalent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
     #[serde(flatten)]
     pub extra: Value,
 }
