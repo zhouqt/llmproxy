@@ -22,10 +22,10 @@ use uuid::Uuid;
 
 use crate::anthropic::{
     ContentBlock, MessageContent, MessagesRequest, MessagesResponse, ResponseBlock, SystemPrompt,
-    ToolChoice, Usage,
+    ToolChoice,
 };
 use crate::conversion::derive_cache_hints;
-use crate::conversion::util::strictify_schema;
+use crate::conversion::util::{build_usage, strictify_schema};
 use crate::error::{ProxyError, Result};
 use crate::responses::{
     OutputContentPart, OutputItem, ReasoningConfig, ReasoningSummary, ResponseInputContent,
@@ -581,19 +581,24 @@ pub fn responses_to_anthropic_response(
         _ => None,
     };
 
-    let usage = resp.usage.clone().unwrap_or_default();
-    let cached = usage
+    let usage_raw = resp.usage.clone().unwrap_or_default();
+    let cached = usage_raw
         .input_tokens_details
         .as_ref()
         .map(|d| d.cached_tokens)
         .unwrap_or(0);
-    // PR-6b: forward OpenAI's `reasoning_tokens` as Anthropic's
-    // `thinking_tokens` (different keys on each side of the conversion).
-    let thinking_tokens = usage
+    let reasoning = usage_raw
         .output_tokens_details
         .as_ref()
         .map(|d| d.reasoning_tokens)
-        .filter(|&n| n > 0);
+        .unwrap_or(0);
+    let usage = build_usage(
+        usage_raw.input_tokens,
+        usage_raw.output_tokens,
+        cached,
+        reasoning,
+        usage_raw.service_tier,
+    );
 
     Ok(MessagesResponse {
         id: message_id.to_string(),
@@ -605,17 +610,7 @@ pub fn responses_to_anthropic_response(
         stop_sequence: None,
         stop_details: None,
         container: None,
-        usage: Usage {
-            input_tokens: usage.input_tokens.saturating_sub(cached),
-            output_tokens: usage.output_tokens,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: if cached > 0 { Some(cached) } else { None },
-            cache_creation: None,
-            server_tool_use: None,
-            output_tokens_details: thinking_tokens.map(|n| json!({"thinking_tokens": n})),
-            service_tier: usage.service_tier,
-            inference_geo: None,
-        },
+        usage,
         extra: HashMap::new(),
     })
 }
