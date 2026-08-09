@@ -200,6 +200,12 @@ pub fn anthropic_to_responses_request(
         // PR-3: keep OpenAI's default (Responses `store: true`) — do not
         // send the field. See `ResponsesRequest.store` doc.
         store: None,
+        // PR-7: same mapping as Chat (auto→auto, standard_only→drop).
+        // See `conversion/request.rs` for the full rationale.
+        service_tier: req.service_tier.as_deref().and_then(|tier| match tier {
+            "auto" => Some("auto".to_string()),
+            _ => None,
+        }),
         extra: {
             let mut e = Value::Object(Map::new());
             if let Some(fmt) = req.output_config.as_ref().and_then(|oc| oc.format.as_ref()) {
@@ -2042,5 +2048,41 @@ mod tests {
         let out = ensure_json_schema_name(&input);
         assert_eq!(out.get("name").and_then(|v| v.as_str()), Some("my_response"));
         assert_eq!(out.get("strict").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    // ── PR-7 · service_tier request mapping (Responses) ──────────────────
+
+    /// PR-7: Anthropic `service_tier: "auto"` → Responses `service_tier:
+    /// "auto"` (same-value passthrough, parity with Chat path).
+    #[test]
+    fn responses_request_service_tier_auto_passes_through() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "service_tier": "auto"
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert_eq!(out.service_tier.as_deref(), Some("auto"));
+    }
+
+    /// PR-7: Anthropic `service_tier: "standard_only"` → Responses
+    /// drops the field (no OpenAI equivalent). Parity with Chat path.
+    #[test]
+    fn responses_request_service_tier_standard_only_is_dropped() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "service_tier": "standard_only"
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default());
+        assert!(
+            out.service_tier.is_none(),
+            "standard_only must drop, got {:?}",
+            out.service_tier
+        );
     }
 }

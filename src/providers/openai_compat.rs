@@ -1638,6 +1638,7 @@ mod tests {
             reasoning_effort: Some("medium".to_string()),
             prompt_cache_key: None,
             prompt_cache_retention: None,
+            service_tier: None,
             extra: json!({"thinking": {"type": "enabled"}}),
         };
 
@@ -1720,6 +1721,7 @@ mod tests {
             reasoning_effort: Some("medium".to_string()),
             prompt_cache_key: None,
             prompt_cache_retention: None,
+            service_tier: None,
             extra: Value::Null,
         };
 

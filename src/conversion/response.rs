@@ -43,6 +43,22 @@ pub fn openai_to_anthropic_response(
         }
     }
 
+    // PR-7 (refusal inbound, Chat non-stream): surface `AssistantMessage
+    // .refusal` (OpenAI spec field, modeled in PR-6a) as an Anthropic
+    // Text block. The Anthropic wire has no refusal-specific block;
+    // clients read it as text and the stop_reason (set by the
+    // `content_filter` arm above) tells Claude Code to treat it as a
+    // refusal rather than user content. Parity with PR-5 (Responses
+    // refusal inbound).
+    if let Some(refusal) = &choice.message.refusal {
+        if !refusal.is_empty() {
+            content.push(ResponseBlock::Text {
+                text: refusal.clone(),
+                citations: None,
+            });
+        }
+    }
+
     if let Some(tool_calls) = &choice.message.tool_calls {
         for tc in tool_calls {
             let input: Value = serde_json::from_str(&tc.function.arguments)
@@ -146,7 +162,14 @@ pub fn map_stop_reason(reason: &str) -> Result<Option<String>> {
         "stop" => "end_turn",
         "length" => "max_tokens",
         "tool_calls" | "function_call" => "tool_use",
-        "content_filter" => "end_turn", // Anthropic has no exact equivalent
+        // PR-7: content_filter → refusal (was "end_turn"). Anthropic has
+        // `stop_reason:"refusal"` (litellm commit 8b4a74a69c / PR
+        // #23899 confirms `refusal ≡ content_filter`). Anthropic's own
+        // API emits refusal when content filtering fires, so compliant
+        // clients (Claude Code) already handle this stop reason.
+        // Mapping to `end_turn` would silently hide the refusal from
+        // the client (litellm's prior bug).
+        "content_filter" => "refusal",
         other => {
             tracing::debug!("unknown finish_reason: {other}");
             return Ok(None);
@@ -198,6 +221,9 @@ mod tests {
         assert_eq!(map_stop_reason("stop").unwrap(), Some("end_turn".into()));
         assert_eq!(map_stop_reason("length").unwrap(), Some("max_tokens".into()));
         assert_eq!(map_stop_reason("tool_calls").unwrap(), Some("tool_use".into()));
+        // PR-7: content_filter → refusal (was "end_turn"). See the
+        // `map_stop_reason` doc comment and litellm PR #23899.
+        assert_eq!(map_stop_reason("content_filter").unwrap(), Some("refusal".into()));
     }
 
     #[test]
@@ -212,7 +238,11 @@ mod tests {
 
     #[test]
     fn maps_unknown_finish_reason_to_none() {
-        assert_eq!(map_stop_reason("content_filter").unwrap(), Some("end_turn".into()));
+        // PR-7 regression: `content_filter` is a *known* finish reason
+        // (mapped to refusal), not unknown — the unknown arm is reserved
+        // for spec values the converter has never seen. Asserting on a
+        // truly-unknown value here keeps the unknown→None behavior
+        // separately covered.
         assert_eq!(
             map_stop_reason("totally_unknown_reason").unwrap(),
             None
@@ -562,5 +592,89 @@ mod tests {
             out.usage.output_tokens_details.is_none(),
             "reasoning_tokens==0 → output_tokens_details must be absent"
         );
+    }
+
+    // ── PR-7 · content_filter → refusal + Chat refusal inbound ─────────
+
+    /// PR-7: `finish_reason: "content_filter"` from an OpenAI Chat
+    /// completion must map to Anthropic `stop_reason: "refusal"` (was
+    /// `end_turn` before PR-7). The Anthropic API itself emits
+    /// `refusal` when content filtering fires; Claude Code already
+    /// handles it. Mapping to `end_turn` would silently hide the
+    /// refusal — litellm PR #23899 documents the same fix.
+    #[test]
+    fn content_filter_finish_reason_maps_to_refusal_stop_reason() {
+        let raw = serde_json::json!({
+            "id": "chatcmpl-cf",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "content_filter",
+                "message": {"role": "assistant", "content": ""}
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 0, "total_tokens": 10}
+        });
+        let resp: ChatResponse = serde_json::from_value(raw).unwrap();
+        let out = openai_to_anthropic_response(&resp, "gpt-4o", "msg_cf").unwrap();
+        assert_eq!(
+            out.stop_reason.as_deref(),
+            Some("refusal"),
+            "content_filter must map to refusal, got {:?}",
+            out.stop_reason
+        );
+    }
+
+    /// PR-7 (refusal inbound, Chat non-stream): `AssistantMessage.refusal`
+    /// (OpenAI spec field, modeled in PR-6a) must surface as an
+    /// Anthropic Text block. Empty refusal is filtered out (parity with
+    /// `content`).
+    #[test]
+    fn chat_non_stream_refusal_content_part_maps_to_text_block() {
+        let raw = serde_json::json!({
+            "id": "chatcmpl-rf",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "content_filter",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "refusal": "blocked by policy"
+                }
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        });
+        let resp: ChatResponse = serde_json::from_value(raw).unwrap();
+        let out = openai_to_anthropic_response(&resp, "gpt-4o", "msg_rf").unwrap();
+        assert_eq!(out.content.len(), 1);
+        assert!(matches!(&out.content[0], ResponseBlock::Text { text, .. } if text == "blocked by policy"));
+        // And stop_reason is refusal because finish_reason=content_filter.
+        assert_eq!(out.stop_reason.as_deref(), Some("refusal"));
+    }
+
+    /// PR-7: empty refusal strings are filtered out (parity with how
+    /// `content: ""` is filtered) — Anthropic clients don't expect
+    /// empty Text blocks.
+    #[test]
+    fn chat_non_stream_empty_refusal_is_dropped() {
+        let raw = serde_json::json!({
+            "id": "chatcmpl-rf2",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": null, "refusal": ""}
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 0, "total_tokens": 5}
+        });
+        let resp: ChatResponse = serde_json::from_value(raw).unwrap();
+        let out = openai_to_anthropic_response(&resp, "gpt-4o", "msg_rf").unwrap();
+        assert!(out.content.is_empty());
     }
 }

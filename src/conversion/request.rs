@@ -137,6 +137,20 @@ pub fn anthropic_to_openai_request(
             .or_else(|| extract_reasoning_effort(req)),
         prompt_cache_key: hints.prompt_cache_key,
         prompt_cache_retention,
+        // PR-7: Anthropic `service_tier` → OpenAI `service_tier`.
+        // Anthropic enum: `auto` / `standard_only`. OpenAI enum:
+        // `auto` / `default` / `flex` / `scale` / `priority` / `fast`.
+        // Map:
+        //   Anthropic `auto` → OpenAI `auto` (same-value passthrough;
+        //     `auto` is a spec-legal OpenAI value, v0.7 correction).
+        //   Anthropic `standard_only` → drop — OpenAI has no equivalent
+        //     (standard_only is a routing preference; scale/flex/priority
+        //     are pricing tiers). Sending it would 400.
+        service_tier: req.service_tier.as_deref().and_then(|tier| match tier {
+            "auto" => Some("auto".to_string()),
+            // "standard_only" → None (drop the field; documented gap).
+            _ => None,
+        }),
         extra: {
             let mut e = Value::Object(Map::new());
             if let Some(fmt) = req.output_config.as_ref().and_then(|oc| oc.format.as_ref()) {
@@ -1057,5 +1071,46 @@ mod tests {
         let input = serde_json::json!({"type": "text"});
         let out = ensure_chat_json_schema_name(&input);
         assert_eq!(out, input);
+    }
+
+    // ── PR-7 · service_tier request mapping ─────────────────────────────
+
+    /// PR-7: Anthropic `service_tier: "auto"` must pass through to
+    /// OpenAI `service_tier: "auto"` (same-value passthrough — `auto`
+    /// is a spec-legal OpenAI value per plan v0.7 correction; v0.2
+    /// erroneously listed only default/priority/flex and was missing
+    /// auto/scale/fast).
+    #[test]
+    fn chat_request_service_tier_auto_passes_through() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "service_tier": "auto"
+        }))
+        .unwrap();
+        let out = anthropic_to_openai_request(&req, &Default::default());
+        assert_eq!(out.service_tier.as_deref(), Some("auto"));
+    }
+
+    /// PR-7: Anthropic `service_tier: "standard_only"` has no OpenAI
+    /// equivalent (Anthropic routing preference ≠ OpenAI pricing tier)
+    /// — must be dropped, not coerced to a default. Coercing would 400
+    /// on tier-strict upstreams.
+    #[test]
+    fn chat_request_service_tier_standard_only_is_dropped() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "service_tier": "standard_only"
+        }))
+        .unwrap();
+        let out = anthropic_to_openai_request(&req, &Default::default());
+        assert!(
+            out.service_tier.is_none(),
+            "standard_only must drop, got {:?}",
+            out.service_tier
+        );
     }
 }
