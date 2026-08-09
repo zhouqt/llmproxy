@@ -65,6 +65,19 @@ pub fn openai_to_anthropic_response(
                 .as_ref()
                 .and_then(|d| d.cached_tokens)
                 .unwrap_or(0);
+            // PR-6b: forward reasoning_tokens to the Anthropic client as
+            // `output_tokens_details.thinking_tokens` (Anthropic's
+            // official OutputTokensDetails field name per
+            // anthropic-sdk-python — `anthropic.rs:658` test pins it).
+            // The OpenAI-side key is `reasoning_tokens`; the Anthropic-
+            // side key is `thinking_tokens` (different keys on each
+            // side of the conversion, never leak `reasoning_tokens`
+            // into the Anthropic write payload).
+            let thinking_tokens = u
+                .completion_tokens_details
+                .as_ref()
+                .and_then(|d| d.reasoning_tokens)
+                .filter(|&n| n > 0);
             Usage {
                 input_tokens: u.prompt_tokens.saturating_sub(cached),
                 output_tokens: u.completion_tokens,
@@ -72,7 +85,7 @@ pub fn openai_to_anthropic_response(
                 cache_read_input_tokens: if cached > 0 { Some(cached) } else { None },
                 cache_creation: None,
                 server_tool_use: None,
-                output_tokens_details: None,
+                output_tokens_details: thinking_tokens.map(|n| json!({"thinking_tokens": n})),
                 service_tier: None,
                 inference_geo: None,
             }
@@ -468,5 +481,86 @@ mod tests {
         // usage still reports the full 20 (we don't surface reasoning
         // separately — Anthropic's schema has no field for it).
         assert_eq!(out.usage.output_tokens, 20);
+    }
+
+    // ── PR-6b · output_tokens_details.thinking_tokens (Chat non-stream) ──
+
+    /// PR-6b: when the upstream returns `completion_tokens_details.
+    /// reasoning_tokens` (OpenAI read key), the Anthropic write key is
+    /// `output_tokens_details.thinking_tokens` (different key on the
+    /// other side — never leak `reasoning_tokens` into the Anthropic
+    /// write payload). When reasoning is present, the field is
+    /// emitted; when absent (None) or zero, the field is absent too
+    /// (Some(0) would change the wire shape from absent to present-
+    /// zero, which Anthropic's Usage schema treats as "not provided").
+    #[test]
+    fn chat_non_stream_propagates_reasoning_tokens_as_thinking_tokens() {
+        // (a) reasoning_tokens present → field present, key is thinking_tokens.
+        let with_reasoning = serde_json::from_value::<ChatResponse>(serde_json::json!({
+            "id": "chatcmpl-t1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0, "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "ok"}
+            }],
+            "usage": {
+                "prompt_tokens": 10, "completion_tokens": 50, "total_tokens": 60,
+                "completion_tokens_details": {"reasoning_tokens": 12}
+            }
+        }))
+        .unwrap();
+        let out = openai_to_anthropic_response(&with_reasoning, "gpt-4o", "msg_t").unwrap();
+        let details = out.usage.output_tokens_details.expect(
+            "reasoning_tokens>0 must surface output_tokens_details",
+        );
+        assert_eq!(details["thinking_tokens"], 12);
+        // The OpenAI-side key must NOT leak into the Anthropic write payload.
+        assert!(
+            details.get("reasoning_tokens").is_none(),
+            "OpenAI read key `reasoning_tokens` must not appear in Anthropic write payload; got {details}"
+        );
+
+        // (b) reasoning_tokens absent (None) → field absent entirely.
+        let no_details = serde_json::from_value::<ChatResponse>(serde_json::json!({
+            "id": "chatcmpl-t2",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0, "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "ok"}
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 50, "total_tokens": 60}
+        }))
+        .unwrap();
+        let out = openai_to_anthropic_response(&no_details, "gpt-4o", "msg_t").unwrap();
+        assert!(
+            out.usage.output_tokens_details.is_none(),
+            "no reasoning_tokens → output_tokens_details must be absent"
+        );
+
+        // (c) reasoning_tokens == 0 → field absent (Some(0) would change shape).
+        let zero = serde_json::from_value::<ChatResponse>(serde_json::json!({
+            "id": "chatcmpl-t3",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0, "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "ok"}
+            }],
+            "usage": {
+                "prompt_tokens": 10, "completion_tokens": 50, "total_tokens": 60,
+                "completion_tokens_details": {"reasoning_tokens": 0}
+            }
+        }))
+        .unwrap();
+        let out = openai_to_anthropic_response(&zero, "gpt-4o", "msg_t").unwrap();
+        assert!(
+            out.usage.output_tokens_details.is_none(),
+            "reasoning_tokens==0 → output_tokens_details must be absent"
+        );
     }
 }
