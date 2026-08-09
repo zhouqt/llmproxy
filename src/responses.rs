@@ -83,6 +83,24 @@ pub enum ResponseInputItem {
         call_id: String,
         output: String,
     },
+    /// Past reasoning emitted by the model, replayed into a subsequent
+    /// turn's `input[]`. Spec fields: `id` (required), `summary` array
+    /// (default `[]`), `content` array (default `[]`), `status`
+    /// (optional). Empty/missing arrays decode cleanly via
+    /// `#[serde(default)]` so partial payloads round-trip.
+    Reasoning {
+        id: String,
+        #[serde(default)]
+        summary: Vec<SummaryTextContent>,
+        #[serde(default)]
+        content: Vec<ReasoningTextContent>,
+        #[serde(default)]
+        status: Option<String>,
+    },
+    /// Reference to a previously-produced item (reasoning, message,
+    /// function_call, etc.) by id. Spec `ItemReferenceParam.id` (v0.11
+    /// correction — earlier plan draft used `reference`; spec is `id`).
+    ItemReference { id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,17 +130,33 @@ pub enum ResponsesTool {
         strict: Option<bool>,
     },
     /// OpenAI Responses API hosted web search tool declared as a tool
-    /// entry with `{"type": "web_search_preview", ...}`.
+    /// entry with `{"type": "web_search", ...}`.
     /// References:
     /// - https://platform.openai.com/docs/guides/tools-web-search
-    /// - litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py:186-188
-    #[serde(rename = "web_search_preview")]
+    #[serde(rename = "web_search")]
     WebSearch {
         #[serde(skip_serializing_if = "Option::is_none")]
         search_context_size: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         user_location: Option<Value>,
     },
+    /// OpenAI Responses API hosted web search tool declared as a tool
+    /// entry with `{"type": "web_search_preview", ...}`.
+    /// References:
+    /// - https://platform.openai.com/docs/guides/tools-web-search
+    /// - litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py:186-188
+    #[serde(rename = "web_search_preview")]
+    WebSearchPreview {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        search_context_size: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user_location: Option<Value>,
+    },
+    /// Catch-all for tool types we don't model (28 Responses tool/item
+    /// variants exist; only a handful are common). Round-trips without
+    /// panicking — the converter treats this as a no-op.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Reasoning configuration for the Responses API.
@@ -226,9 +260,40 @@ pub enum OutputItem {
         id: String,
         status: String, // "in_progress" | "searching" | "completed"
     },
+    /// Reasoning item produced by the model (one per reasoning turn).
+    /// Spec `ReasoningItem` fields: `id` (required), `summary` array
+    /// (default `[]`), `content` array (default `[]`), `status`
+    /// (optional). Empty/missing arrays decode cleanly via
+    /// `#[serde(default)]`.
+    Reasoning {
+        id: String,
+        #[serde(default)]
+        summary: Vec<SummaryTextContent>,
+        #[serde(default)]
+        content: Vec<ReasoningTextContent>,
+        #[serde(default)]
+        status: Option<String>,
+    },
     /// Unknown item type — kept for forward compatibility.
     #[serde(other)]
     Unknown,
+}
+
+/// Content of a `ReasoningItem.content[]` array — currently only a single
+/// `reasoning_text` variant exists per spec, modeled so the wire can be
+/// extended without a type churn. Tagged with `type="reasoning_text"`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReasoningTextContent {
+    ReasoningText { text: String },
+}
+
+/// Content of a `ReasoningItem.summary[]` array — spec ships a single
+/// `summary_text` variant today. Tagged with `type="summary_text"`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SummaryTextContent {
+    SummaryText { text: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,6 +304,10 @@ pub enum OutputContentPart {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         annotations: Option<Vec<Value>>,
     },
+    /// Refusal content part. Spec: `output[].content[].type="refusal"`,
+    /// carries a `refusal` string with the refusal text. Empty string is
+    /// permitted (the field is required but may be empty).
+    Refusal { refusal: String },
     /// Catch-all for output content parts we don't model.
     #[serde(other)]
     Unknown,
@@ -358,6 +427,31 @@ pub enum ResponsesStreamEvent {
         output_index: u32,
         #[serde(default)]
         summary_index: u32,
+        text: String,
+        #[serde(default)]
+        sequence_number: u64,
+    },
+    /// SSE event carrying a refusal delta. Mapped to a text delta on a
+    /// text block (the Anthropic wire has no refusal delta primitive;
+    /// the client sees the refusal as a text block, with `stop_reason`
+    /// finalized as `refusal`).
+    #[serde(rename = "response.refusal.delta")]
+    ResponseRefusalDelta {
+        item_id: String,
+        output_index: u32,
+        #[serde(default)]
+        content_index: u32,
+        delta: String,
+        #[serde(default)]
+        sequence_number: u64,
+    },
+    /// SSE event closing a refusal part with its full text.
+    #[serde(rename = "response.refusal.done")]
+    ResponseRefusalDone {
+        item_id: String,
+        output_index: u32,
+        #[serde(default)]
+        content_index: u32,
         text: String,
         #[serde(default)]
         sequence_number: u64,
@@ -711,6 +805,234 @@ mod tests {
             assert_eq!(cfg.summary, Some(variant));
             let v = serde_json::to_value(&cfg).unwrap();
             assert_eq!(v["summary"], name);
+        }
+    }
+
+    // ── PR-5 · refusal + ResponseInputItem + ResponsesTool ─────────────
+
+    /// PR-5: `Refusal {refusal}` content part deserializes from spec
+    /// shape `{"type":"refusal","refusal":"..."}`. Empty string is
+    /// permitted (field is required but may be empty — see plan v0.11).
+    #[test]
+    fn output_content_refusal_decodes_with_text() {
+        let raw = json!({"type": "refusal", "refusal": "I cannot comply."});
+        let part: OutputContentPart = serde_json::from_value(raw).unwrap();
+        match part {
+            OutputContentPart::Refusal { refusal } => {
+                assert_eq!(refusal, "I cannot comply.");
+            }
+            other => panic!("expected Refusal, got {other:?}"),
+        }
+    }
+
+    /// PR-5: an empty refusal string still decodes (the spec requires
+    /// the field but allows empty content).
+    #[test]
+    fn output_content_refusal_with_empty_string_deserializes() {
+        let raw = json!({"type": "refusal", "refusal": ""});
+        let part: OutputContentPart = serde_json::from_value(raw).unwrap();
+        match part {
+            OutputContentPart::Refusal { refusal } => assert_eq!(refusal, ""),
+            other => panic!("expected Refusal, got {other:?}"),
+        }
+    }
+
+    /// PR-5: `ResponseInputItem::Reasoning` round-trips with id + status;
+    /// missing `summary` and `content` default to empty Vec.
+    #[test]
+    fn response_input_reasoning_round_trip() {
+        let item = ResponseInputItem::Reasoning {
+            id: "rsn_1".into(),
+            summary: vec![],
+            content: vec![ReasoningTextContent::ReasoningText {
+                text: "thought".into(),
+            }],
+            status: Some("completed".into()),
+        };
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["type"], "reasoning");
+        assert_eq!(v["id"], "rsn_1");
+        assert_eq!(v["content"][0]["type"], "reasoning_text");
+        assert_eq!(v["content"][0]["text"], "thought");
+        let back: ResponseInputItem = serde_json::from_value(v).unwrap();
+        match back {
+            ResponseInputItem::Reasoning { id, status, .. } => {
+                assert_eq!(id, "rsn_1");
+                assert_eq!(status.as_deref(), Some("completed"));
+            }
+            other => panic!("expected Reasoning, got {other:?}"),
+        }
+    }
+
+    /// PR-5: `Reasoning` with no `summary` / `content` / `status` fields
+    /// decodes (all are `#[serde(default)]`). Pin: this is what makes the
+    /// wire tolerant to partial reasoning items.
+    #[test]
+    fn response_input_reasoning_decodes_with_missing_arrays() {
+        let raw = json!({"type": "reasoning", "id": "rsn_min"});
+        let item: ResponseInputItem = serde_json::from_value(raw).unwrap();
+        match item {
+            ResponseInputItem::Reasoning {
+                id,
+                summary,
+                content,
+                status,
+            } => {
+                assert_eq!(id, "rsn_min");
+                assert!(summary.is_empty());
+                assert!(content.is_empty());
+                assert!(status.is_none());
+            }
+            other => panic!("expected Reasoning, got {other:?}"),
+        }
+    }
+
+    /// PR-5: `ItemReference {id}` round-trips — v0.11 spec field is `id`,
+    /// not `reference`.
+    #[test]
+    fn response_input_item_reference_round_trip() {
+        let item = ResponseInputItem::ItemReference { id: "msg_x".into() };
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["type"], "item_reference");
+        assert_eq!(v["id"], "msg_x");
+        let back: ResponseInputItem = serde_json::from_value(v).unwrap();
+        match back {
+            ResponseInputItem::ItemReference { id } => assert_eq!(id, "msg_x"),
+            other => panic!("expected ItemReference, got {other:?}"),
+        }
+    }
+
+    /// PR-5: `ResponsesTool::Unknown` catches all tool types we don't
+    /// explicitly model (e.g. `code_interpreter`, `mcp`, `image_gen`).
+    #[test]
+    fn responses_tool_unknown_round_trip() {
+        let raw = json!({"type": "code_interpreter", "container": {"type": "auto"}});
+        let tool: ResponsesTool = serde_json::from_value(raw).unwrap();
+        assert!(matches!(tool, ResponsesTool::Unknown));
+        // Unknown is a unit variant — under the outer `tag="type"` enum,
+        // it serializes as `{"type":"unknown"}`. The translator treats
+        // this as a no-op (it only forwards ResponsesTool::Function /
+        // WebSearch / WebSearchPreview to the wire); documented here so
+        // a future change to the enum shape knows the expected shape.
+        let v = serde_json::to_value(&tool).unwrap();
+        assert_eq!(v, json!({"type": "unknown"}));
+    }
+
+    /// PR-5: known `Function` tool round-trips; does NOT fall to `Unknown`.
+    #[test]
+    fn responses_tool_function_round_trip_does_not_fall_to_unknown() {
+        let raw = json!({
+            "type": "function",
+            "name": "f",
+            "description": "d",
+            "parameters": {"type": "object"}
+        });
+        let tool: ResponsesTool = serde_json::from_value(raw).unwrap();
+        match tool {
+            ResponsesTool::Function { name, .. } => assert_eq!(name, "f"),
+            other => panic!("expected Function, got {other:?}"),
+        }
+    }
+
+    /// PR-5: `web_search` (no `_preview` suffix) is now a first-class
+    /// variant — plan v0.11 acceptance target.
+    #[test]
+    fn responses_tool_web_search_round_trip() {
+        let raw = json!({"type": "web_search", "search_context_size": "high"});
+        let tool: ResponsesTool = serde_json::from_value(raw).unwrap();
+        match &tool {
+            ResponsesTool::WebSearch { search_context_size, .. } => {
+                assert_eq!(search_context_size.as_deref(), Some("high"));
+            }
+            other => panic!("expected WebSearch, got {other:?}"),
+        }
+        // Serializes back to `web_search` (the rename target).
+        let v = serde_json::to_value(&tool).unwrap();
+        assert_eq!(v["type"], "web_search");
+    }
+
+    /// PR-5: `web_search_preview` still parses as the `WebSearchPreview`
+    /// variant — keep both names supported per plan.
+    #[test]
+    fn responses_tool_web_search_preview_round_trip() {
+        let raw = json!({"type": "web_search_preview"});
+        let tool: ResponsesTool = serde_json::from_value(raw).unwrap();
+        assert!(matches!(tool, ResponsesTool::WebSearchPreview { .. }));
+        let v = serde_json::to_value(&tool).unwrap();
+        assert_eq!(v["type"], "web_search_preview");
+    }
+
+    /// PR-5: `OutputItem::Reasoning` decodes with the same wire shape as
+    /// `ResponseInputItem::Reasoning` — spec is symmetric. Missing arrays
+    /// default to empty.
+    #[test]
+    fn output_item_reasoning_decodes_with_missing_arrays() {
+        let raw = json!({
+            "type": "reasoning",
+            "id": "rsn_out",
+            "summary": [],
+            "content": [{"type": "reasoning_text", "text": "thought"}],
+            "status": "completed"
+        });
+        let item: OutputItem = serde_json::from_value(raw).unwrap();
+        match item {
+            OutputItem::Reasoning {
+                id,
+                summary,
+                content,
+                status,
+            } => {
+                assert_eq!(id, "rsn_out");
+                assert!(summary.is_empty());
+                assert_eq!(content.len(), 1);
+                assert_eq!(status.as_deref(), Some("completed"));
+            }
+            other => panic!("expected OutputItem::Reasoning, got {other:?}"),
+        }
+    }
+
+    /// PR-5: refusal SSE events decode with default-tolerant fields
+    /// (Copilot may omit `content_index` / `sequence_number`).
+    #[test]
+    fn refusal_delta_event_decodes_with_defaults_for_optional_fields() {
+        for raw in [
+            json!({
+                "type": "response.refusal.delta",
+                "item_id": "msg_r",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "no",
+                "sequence_number": 1
+            }),
+            json!({
+                "type": "response.refusal.delta",
+                "item_id": "msg_r",
+                "output_index": 0,
+                "delta": "no"
+            }),
+        ] {
+            let ev: ResponsesStreamEvent = serde_json::from_value(raw).unwrap();
+            assert!(matches!(
+                ev,
+                ResponsesStreamEvent::ResponseRefusalDelta { ref delta, .. } if delta == "no"
+            ));
+        }
+    }
+
+    #[test]
+    fn refusal_done_event_decodes() {
+        let raw = json!({
+            "type": "response.refusal.done",
+            "item_id": "msg_r",
+            "output_index": 0,
+            "content_index": 0,
+            "text": "no thanks",
+            "sequence_number": 2
+        });
+        let ev: ResponsesStreamEvent = serde_json::from_value(raw).unwrap();
+        match ev {
+            ResponsesStreamEvent::ResponseRefusalDone { text, .. } => assert_eq!(text, "no thanks"),
+            other => panic!("expected refusal.done, got {other:?}"),
         }
     }
 }

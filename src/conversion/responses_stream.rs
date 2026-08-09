@@ -197,10 +197,16 @@ impl ResponsesStreamTranslator {
             }
             ResponsesStreamEvent::ResponseOutputItemAdded { output_index, item } => {
                 self.ensure_started(&mut out);
-                // Hosted tools (web_search_call) and unknown items don't
-                // produce content blocks — skip them here so the caller
-                // doesn't hit unreachable! in output_item_to_block.
-                if matches!(item, OutputItem::Unknown | OutputItem::WebSearchCall { .. }) {
+                // Hosted tools (web_search_call) and unknown/reasoning
+                // items don't produce content blocks — skip them here so
+                // the caller doesn't hit unreachable! in
+                // output_item_to_block. Reasoning reasoning_* delta/done
+                // events arrive independently (response.reasoning_text.*)
+                // and own the Thinking block themselves.
+                if matches!(
+                    item,
+                    OutputItem::Unknown | OutputItem::WebSearchCall { .. } | OutputItem::Reasoning { .. }
+                ) {
                     return out;
                 }
                 if let OutputItem::FunctionCall { id, .. } = item {
@@ -307,6 +313,56 @@ impl ResponsesStreamTranslator {
             // are tolerated (modeled) but produce no output.
             ResponsesStreamEvent::ResponseReasoningSummaryTextDelta { .. }
             | ResponsesStreamEvent::ResponseReasoningSummaryTextDone { .. } => {}
+            ResponsesStreamEvent::ResponseRefusalDelta {
+                output_index,
+                delta,
+                ..
+            } => {
+                // PR-5 (G3/G4 streaming): map refusal deltas to text deltas
+                // on the same text block the upstream will use. We open a
+                // text block if needed (mirrors text_delta path) and route
+                // the delta through the same block. finalize() will land
+                // stop_reason="refusal" because the request-side refusal
+                // (output_text emission + no tool calls) plus any
+                // incomplete_details.reason="content_filter" turn this into
+                // a refusal-shape stop reason.
+                self.ensure_started(&mut out);
+                let Some(&block_idx) = self.block_map.get(output_index) else {
+                    tracing::warn!(?output_index, "refusal delta for unseen block; ignoring");
+                    return out;
+                };
+                self.deltas_seen.insert(block_idx);
+                out.push(StreamEvent::ContentBlockDelta {
+                    index: block_idx,
+                    delta: BlockDelta::TextDelta { text: delta.clone() },
+                });
+            }
+            ResponsesStreamEvent::ResponseRefusalDone {
+                output_index,
+                text,
+                ..
+            } => {
+                // Close the refusal/text block. If no delta was seen (rare:
+                // upstream sends the full refusal only on .done), emit the
+                // full text as a fallback delta so the client doesn't see
+                // an empty block.
+                let Some(&block_idx) = self.block_map.get(output_index) else {
+                    tracing::warn!(?output_index, "refusal.done for unseen block; ignoring");
+                    return out;
+                };
+                if !self.deltas_seen.contains(&block_idx) {
+                    out.push(StreamEvent::ContentBlockDelta {
+                        index: block_idx,
+                        delta: BlockDelta::TextDelta { text: text.clone() },
+                    });
+                }
+                if self.closed_blocks.insert(block_idx) {
+                    out.push(StreamEvent::ContentBlockStop { index: block_idx });
+                }
+                if self.text_block_index == Some(block_idx) {
+                    self.text_block_index = None;
+                }
+            }
             ResponsesStreamEvent::ResponseFunctionCallArgumentsDelta {
                 output_index,
                 delta,
@@ -533,13 +589,18 @@ fn output_item_to_block(item: &OutputItem) -> ResponseBlock {
             }
         }
         // Caller (`ResponseOutputItemAdded` arm) early-returns on
-        // `OutputItem::Unknown` and `OutputItem::WebSearchCall`, so this
+        // `OutputItem::Unknown`, `WebSearchCall`, and `Reasoning`, so this
         // variant is unreachable here.
         OutputItem::Unknown => unreachable!("OutputItem::Unknown is filtered before output_item_to_block"),
         // Caller early-returns on WebSearchCall (same as Unknown) — this
         // arm is a compile-time safety net.
         OutputItem::WebSearchCall { .. } => unreachable!(
             "OutputItem::WebSearchCall is filtered before output_item_to_block"
+        ),
+        // Caller early-returns on Reasoning — reasoning_* delta/done
+        // events own the Thinking block themselves.
+        OutputItem::Reasoning { .. } => unreachable!(
+            "OutputItem::Reasoning is filtered before output_item_to_block"
         ),
     }
 }
@@ -2194,6 +2255,108 @@ mod tests {
             !out.iter().any(|e| matches!(e, StreamEvent::ContentBlockDelta { .. })),
             "must not emit a content_block_delta for unknown item_id; got {out:?}"
         );
+    }
+
+    // ── PR-5 · refusal (streaming) ───────────────────────────────────
+
+    /// PR-5 (G3/G4 streaming): a `response.refusal.delta` stream must
+    /// land on the same text block as the message item that opens it,
+    /// delivered as a TextDelta (Anthropic has no refusal-specific
+    /// delta type). The downstream stop_reason is decided by the
+    /// `response.incomplete` event's `incomplete_details.reason` —
+    /// `content_filter` flips finalize to `refusal`.
+    #[test]
+    fn refusal_delta_routes_through_text_block_as_text_delta() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        // Message item opens a text block.
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::Message {
+                id: "msg_r".into(),
+                role: "assistant".into(),
+                status: "in_progress".into(),
+                content: vec![],
+            },
+        });
+        // Refusal delta lands on the same block as text delta.
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseRefusalDelta {
+            item_id: "msg_r".into(),
+            output_index: 0,
+            content_index: 0,
+            delta: "no".into(),
+            sequence_number: 1,
+        });
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(
+            evs[0],
+            StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: BlockDelta::TextDelta { ref text }
+            } if text == "no"
+        ));
+    }
+
+    /// PR-5: `response.refusal.done` closes the text block; if no delta
+    /// preceded it, the done text is emitted as a fallback delta so the
+    /// client doesn't see an empty block (parity with `output_text.done`).
+    #[test]
+    fn refusal_done_with_no_delta_emits_fallback_then_stop() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::Message {
+                id: "msg_r".into(),
+                role: "assistant".into(),
+                status: "in_progress".into(),
+                content: vec![],
+            },
+        });
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseRefusalDone {
+            item_id: "msg_r".into(),
+            output_index: 0,
+            content_index: 0,
+            text: "I cannot help with that.".into(),
+            sequence_number: 1,
+        });
+        assert_eq!(evs.len(), 2, "expected fallback delta + stop, got {evs:?}");
+        assert!(matches!(
+            evs[0],
+            StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: BlockDelta::TextDelta { ref text }
+            } if text == "I cannot help with that."
+        ));
+        assert!(matches!(evs[1], StreamEvent::ContentBlockStop { index: 0 }));
+        // finalize must not double-close.
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseIncomplete {
+            response: Box::new({
+                let mut r = placeholder_response("incomplete");
+                r.incomplete_details = Some(IncompleteDetails {
+                    reason: Some("content_filter".into()),
+                });
+                r
+            }),
+        });
+        let tail = t.finalize();
+        assert!(
+            !tail.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { .. })),
+            "finalize must not re-close the refusal block"
+        );
+        // refusal stop_reason comes from the incomplete_details path.
+        let delta = tail
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { delta, .. } => Some(delta),
+                _ => None,
+            })
+            .expect("finalize must emit MessageDelta");
+        assert_eq!(delta.stop_reason.as_deref(), Some("refusal"));
     }
 }
 

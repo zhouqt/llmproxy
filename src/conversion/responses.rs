@@ -112,7 +112,7 @@ pub fn anthropic_to_responses_request(
         // upstream lists web_search_preview separately.
         for t in ts {
             if crate::conversion::util::is_web_search_tool(t) {
-                result.push(ResponsesTool::WebSearch {
+                result.push(ResponsesTool::WebSearchPreview {
                     search_context_size: t
                         .extra
                         .get("search_context_size")
@@ -450,6 +450,21 @@ pub fn responses_to_anthropic_response(
                                 content.push(ResponseBlock::Text { text: text.clone(), citations: None });
                             }
                         }
+                        // PR-5 (G3/G4 inbound): a refusal content part maps
+                        // to an Anthropic Text block (the wire has no
+                        // refusal-specific block type). The refusal text
+                        // surfaces to the client as text; the upstream
+                        // `stop_reason=refusal` (PR-7 outbound, picked up
+                        // via the incomplete_details path) tells Claude
+                        // Code to treat it as a refusal, not user content.
+                        OutputContentPart::Refusal { refusal } => {
+                            if !refusal.is_empty() {
+                                content.push(ResponseBlock::Text {
+                                    text: refusal.clone(),
+                                    citations: None,
+                                });
+                            }
+                        }
                         OutputContentPart::Unknown => {}
                     }
                 }
@@ -480,6 +495,13 @@ pub fn responses_to_anthropic_response(
                 });
                 has_tool_calls = true;
             }
+            // PR-5: OutputItem::Reasoning is the response-side mirror of
+            // ResponseInputItem::Reasoning. We don't fold reasoning into
+            // Anthropic `ContentBlock::Thinking` here (the streaming
+            // translator owns that surface; non-streaming responses that
+            // arrive with a `reasoning` item but no text/tool blocks are
+            // reported as end_turn with empty content).
+            OutputItem::Reasoning { .. } => {}
             // WebSearchCall doesn't carry result text directly —
             // search results appear as url_citation annotations on
             // the subsequent output_text block. No block to emit.
@@ -1718,6 +1740,71 @@ mod tests {
         let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_ui").unwrap();
         assert_eq!(out.content.len(), 1);
         assert!(matches!(out.content[0], ResponseBlock::Text { .. }));
+    }
+
+    // ── PR-5 · refusal (non-streaming) ────────────────────────────────
+
+    /// PR-5 (G3/G4 inbound): a `refusal` content part in a completed
+    /// response must surface as an Anthropic Text block. The Anthropic
+    /// wire has no refusal-specific block; clients read it as text and
+    /// the stop_reason (set by incomplete_details.content_filter on the
+    /// upstream path, PR-7 outbound) tells Claude Code to treat it as
+    /// a refusal rather than user content.
+    #[test]
+    fn response_with_refusal_content_part_maps_to_text_block() {
+        let raw = json!({
+            "id": "resp_rf",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [{
+                "type": "message", "id": "m", "role": "assistant", "status": "completed",
+                "content": [
+                    {"type": "output_text", "text": ""},
+                    {"type": "refusal", "refusal": "I cannot comply with this request."}
+                ]
+            }],
+            "usage": {"input_tokens": 5, "output_tokens": 6, "total_tokens": 11}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_rf").unwrap();
+        assert_eq!(out.content.len(), 1, "refusal must surface as one text block");
+        match &out.content[0] {
+            ResponseBlock::Text { text, .. } => {
+                assert_eq!(text, "I cannot comply with this request.");
+            }
+            other => panic!("expected Text block, got {other:?}"),
+        }
+    }
+
+    /// PR-5: a refusal in an `incomplete` response whose reason is
+    /// `content_filter` carries both the refusal text (PR-5) and the
+    /// `refusal` stop_reason (B2 from PR-2). Both must be honored.
+    #[test]
+    fn response_with_refusal_and_content_filter_reason_surfaces_refusal() {
+        let raw = json!({
+            "id": "resp_cfr",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "content_filter"},
+            "output": [{
+                "type": "message", "id": "m", "role": "assistant", "status": "incomplete",
+                "content": [{"type": "refusal", "refusal": "blocked by content policy"}]
+            }],
+            "usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_cfr").unwrap();
+        assert_eq!(
+            out.stop_reason.as_deref(),
+            Some("refusal"),
+            "content_filter + refusal must finalize as refusal"
+        );
+        assert_eq!(out.content.len(), 1);
+        assert!(matches!(&out.content[0], ResponseBlock::Text { text, .. } if text == "blocked by content policy"));
     }
 
     #[test]
