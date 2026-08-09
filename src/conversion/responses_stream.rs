@@ -18,6 +18,7 @@ use crate::anthropic::{
     BlockDelta, MessageDeltaPayload, MessagesResponse, ResponseBlock, StreamEvent, Usage,
 };
 use crate::responses::{OutputItem, ResponsesStreamEvent};
+use serde_json::json;
 
 pub struct ResponsesStreamTranslator {
     message_id: String,
@@ -534,6 +535,16 @@ impl ResponsesStreamTranslator {
         };
         let raw = self.final_usage.take().unwrap_or_default();
         let cached = raw.input_tokens_details.as_ref().map(|d| d.cached_tokens).unwrap_or(0);
+        // PR-6b: forward OpenAI's `reasoning_tokens` as Anthropic's
+        // `thinking_tokens` (different keys on each side of the
+        // conversion). OpenAI reads `reasoning_tokens`, Anthropic writes
+        // `thinking_tokens`; do not leak `reasoning_tokens` into the
+        // Anthropic write payload.
+        let thinking_tokens = raw
+            .output_tokens_details
+            .as_ref()
+            .map(|d| d.reasoning_tokens)
+            .filter(|&n| n > 0);
         let usage = Some(Usage {
             input_tokens: raw.input_tokens.saturating_sub(cached),
             output_tokens: raw.output_tokens,
@@ -545,7 +556,7 @@ impl ResponsesStreamTranslator {
                 .map(|d| d.cached_tokens),
             cache_creation: None,
             server_tool_use: None,
-            output_tokens_details: None,
+            output_tokens_details: thinking_tokens.map(|n| json!({"thinking_tokens": n})),
             service_tier: None,
             inference_geo: None,
         });
@@ -2357,6 +2368,109 @@ mod tests {
             })
             .expect("finalize must emit MessageDelta");
         assert_eq!(delta.stop_reason.as_deref(), Some("refusal"));
+    }
+
+    // ── PR-6b · output_tokens_details.thinking_tokens (Responses stream) ──
+
+    /// PR-6b (Responses stream): the final MessageDelta's usage must
+    /// carry `output_tokens_details.thinking_tokens` when the upstream
+    /// returned `output_tokens_details.reasoning_tokens`, and must
+    /// omit the field entirely when absent or zero.
+    #[test]
+    fn responses_stream_propagates_reasoning_tokens_as_thinking_tokens() {
+        use crate::responses::OutputTokensDetails;
+
+        // (a) reasoning_tokens present → thinking_tokens surfaced.
+        let mut t = ResponsesStreamTranslator::new("msg_s", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let mut resp = placeholder_response("completed");
+        resp.usage = Some(ResponsesUsage {
+            input_tokens: 10,
+            output_tokens: 50,
+            total_tokens: 60,
+            input_tokens_details: None,
+            output_tokens_details: Some(OutputTokensDetails { reasoning_tokens: 21 }),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(resp),
+        });
+        let tail = t.finalize();
+        let delta = tail
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { usage, .. } => usage.as_ref(),
+                _ => None,
+            })
+            .expect("finalize must emit MessageDelta with usage");
+        let details = delta
+            .output_tokens_details
+            .as_ref()
+            .expect("reasoning_tokens>0 must surface output_tokens_details");
+        assert_eq!(details["thinking_tokens"], 21);
+        assert!(
+            details.get("reasoning_tokens").is_none(),
+            "OpenAI read key must not leak; got {details}"
+        );
+
+        // (b) output_tokens_details absent → field absent.
+        let mut t = ResponsesStreamTranslator::new("msg_s", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let mut resp = placeholder_response("completed");
+        resp.usage = Some(ResponsesUsage {
+            input_tokens: 10,
+            output_tokens: 50,
+            total_tokens: 60,
+            input_tokens_details: None,
+            output_tokens_details: None,
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(resp),
+        });
+        let tail = t.finalize();
+        let delta = tail
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { usage, .. } => usage.as_ref(),
+                _ => None,
+            })
+            .expect("finalize must emit MessageDelta");
+        assert!(
+            delta.output_tokens_details.is_none(),
+            "no output_tokens_details → must be absent"
+        );
+
+        // (c) reasoning_tokens == 0 → field absent (Some(0) changes wire shape).
+        let mut t = ResponsesStreamTranslator::new("msg_s", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let mut resp = placeholder_response("completed");
+        resp.usage = Some(ResponsesUsage {
+            input_tokens: 10,
+            output_tokens: 50,
+            total_tokens: 60,
+            input_tokens_details: None,
+            output_tokens_details: Some(OutputTokensDetails { reasoning_tokens: 0 }),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(resp),
+        });
+        let tail = t.finalize();
+        let delta = tail
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { usage, .. } => usage.as_ref(),
+                _ => None,
+            })
+            .expect("finalize must emit MessageDelta");
+        assert!(
+            delta.output_tokens_details.is_none(),
+            "reasoning_tokens==0 → must be absent"
+        );
     }
 }
 
