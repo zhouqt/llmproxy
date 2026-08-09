@@ -55,6 +55,13 @@ pub struct ResponsesRequest {
     pub prompt_cache_retention: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ReasoningConfig>,
+    /// OpenAI Responses-API `store` flag. **Deliberately never set by the
+    /// request translator** (PR-3: keep OpenAI's default `store: true`
+    /// rather than opt the user out) — `None` keeps the field absent from
+    /// the wire. Modeled so a future `provider.store_default` knob can
+    /// inject `Some(_)` without a wire-type change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store: Option<bool>,
     /// Anything we don't model explicitly passes through. Defaults to {}.
     #[serde(default, flatten)]
     pub extra: Value,
@@ -384,6 +391,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             reasoning: None,
+            store: None,
             extra: json!({}),
         };
         let v = serde_json::to_value(&req).unwrap();
@@ -391,6 +399,52 @@ mod tests {
         assert_eq!(v["input"][0]["role"], "user");
         assert_eq!(v["max_output_tokens"], 1024);
         assert_eq!(v["stream"], false);
+    }
+
+    /// PR-3: the request translator never sets `store`, so the wire must
+    /// not carry the field — OpenAI's default `store: true` is preserved.
+    #[test]
+    fn responses_request_omits_store_field_by_default() {
+        let v = serde_json::to_value(base_request_with_store(None)).unwrap();
+        assert!(
+            !v.as_object().unwrap().contains_key("store"),
+            "store must be absent from the wire when None; got {v}"
+        );
+    }
+
+    /// PR-3 wire-only: an explicit `store: Some(true)` serializes the
+    /// field. No code path injects `Some` yet (translator keeps None), so
+    /// this is a wire-layer test, not an end-to-end injection test.
+    #[test]
+    fn store_field_serializes_when_explicitly_set() {
+        let v = serde_json::to_value(base_request_with_store(Some(true))).unwrap();
+        assert_eq!(v["store"], true);
+        let v_false = serde_json::to_value(base_request_with_store(Some(false))).unwrap();
+        assert_eq!(v_false["store"], false);
+    }
+
+    fn base_request_with_store(store: Option<bool>) -> ResponsesRequest {
+        ResponsesRequest {
+            model: "gpt-5".into(),
+            input: vec![ResponseInputItem::Message {
+                role: "user".into(),
+                content: ResponseInputContent::Text("hello".into()),
+            }],
+            instructions: None,
+            max_output_tokens: Some(1024),
+            temperature: None,
+            top_p: None,
+            stream: false,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            user: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            reasoning: None,
+            store,
+            extra: json!({}),
+        }
     }
 
     #[test]
