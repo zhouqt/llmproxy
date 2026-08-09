@@ -8,6 +8,7 @@
 //! `request.rs`).
 
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 use crate::anthropic::{Tool, Usage};
 
@@ -83,15 +84,151 @@ pub fn is_web_search_tool(t: &Tool) -> bool {
 /// - Conditional: `not`, `if`, `then`, `else`
 /// - Object validation: `propertyNames`
 ///
-/// # Limitations
+/// # `$ref` handling (PR-13)
 ///
-/// - Does NOT resolve `$ref` — a schema referencing `#/$defs/Foo` will
-///   have the referenced definition strictified (via the `$defs` pass),
-///   but the `$ref` reference itself is left untouched. OpenAI strict
-///   mode rejects `$ref` in schemas, so callers with `$ref`-based
-///   schemas must flatten them first.
-pub fn strictify_schema(schema: &mut Value) {
-    let Value::Object(obj) = schema else { return };
+/// - Same-schema fragment refs (`#/$defs/Foo`, `#/definitions/Foo`) are
+///   **kept verbatim** — OpenAI strict mode supports non-recursive
+///   same-schema refs — and their target definitions are still
+///   strictified via the `$defs`/`definitions` pass. A definition chain
+///   that loops back on itself (`$defs.A` → `$defs.B` → `$defs.A`) is
+///   rejected as circular.
+/// - External URI refs (`https://…`, `file://…`, bare paths) are
+///   **rejected** with [`SchemaError`]: the upstream can't resolve them
+///   under strict mode, so forwarding them would 400. Callers with such
+///   schemas must inline the referenced schema first.
+pub fn strictify_schema(schema: &mut Value) -> Result<(), SchemaError> {
+    // PR-13: snapshot the top-level definition tables once so same-schema
+    // `$ref` targets can be resolved for cycle detection without a second
+    // mutable borrow of `schema`.
+    let defs = collect_defs(schema);
+    strictify_inner(schema, "$", &defs)
+}
+
+/// Error surfaced when a JSON Schema cannot be strictified.
+///
+/// Returned by [`strictify_schema`] when a `$ref` can't be honored under
+/// OpenAI strict mode (see the `$ref` handling section above).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaError {
+    /// Human-readable message; follows the
+    /// `strictify_schema: <kind> $ref at <path> not supported` template.
+    pub message: String,
+}
+
+impl SchemaError {
+    fn external_ref(path: &str) -> Self {
+        Self {
+            message: format!("strictify_schema: external $ref at {path} not supported"),
+        }
+    }
+    fn circular_ref(path: &str) -> Self {
+        Self {
+            message: format!("strictify_schema: circular $ref at {path} not supported"),
+        }
+    }
+}
+
+impl std::fmt::Display for SchemaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SchemaError {}
+
+/// Snapshot of the top-level `$defs`/`definitions` tables (name → value),
+/// used to resolve same-schema `$ref` targets during cycle detection.
+/// `$defs` wins over `definitions` on a name collision.
+fn collect_defs(schema: &Value) -> HashMap<String, Value> {
+    let mut defs = HashMap::new();
+    for key in ["$defs", "definitions"] {
+        if let Some(Value::Object(map)) = schema.get(key) {
+            for (name, v) in map {
+                defs.insert(name.clone(), v.clone());
+            }
+        }
+    }
+    defs
+}
+
+/// Resolve `#/$defs/Name` / `#/definitions/Name` fragment refs to a bare
+/// definition name. Returns `None` for other fragments (e.g.
+/// `#/properties/foo`) — those are kept verbatim with no cycle check.
+fn resolve_def_name(fragment: &str) -> Option<String> {
+    for prefix in ["/$defs/", "/definitions/"] {
+        if let Some(name) = fragment.strip_prefix(prefix) {
+            if !name.is_empty() && !name.contains('/') {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Follow a definition's `$ref` chain inside the in-schema `$defs` table
+/// and fail if it loops back on itself. This is the same guard litellm's
+/// `unpack_defs` applies via its `ref_chain` bookkeeping
+/// (`common_utils.py:877+`): a cycle is unrepresentable and must be
+/// surfaced rather than forwarded. Non-definition targets and definitions
+/// that don't start with a `$ref` are benign (the ref is kept verbatim).
+fn check_def_cycle(
+    name: &str,
+    defs: &HashMap<String, Value>,
+    path: &str,
+) -> Result<(), SchemaError> {
+    let mut visited: Vec<String> = vec![name.to_string()];
+    let mut current = name.to_string();
+    let mut steps = 0;
+    while steps <= defs.len() {
+        let Some(value) = defs.get(&current) else {
+            return Ok(());
+        };
+        let Some(value_obj) = value.as_object() else {
+            return Ok(());
+        };
+        let Some(next) = value_obj.get("$ref").and_then(|v| v.as_str()) else {
+            return Ok(());
+        };
+        let Some(next_name) = resolve_def_name(next.strip_prefix('#').unwrap_or(next)) else {
+            return Ok(());
+        };
+        if visited.iter().any(|v| v == &next_name) {
+            return Err(SchemaError::circular_ref(path));
+        }
+        visited.push(next_name.clone());
+        current = next_name;
+        steps += 1;
+    }
+    // A chain longer than the definition table must have repeated a node.
+    Err(SchemaError::circular_ref(path))
+}
+
+fn strictify_inner(
+    schema: &mut Value,
+    path: &str,
+    defs: &HashMap<String, Value>,
+) -> Result<(), SchemaError> {
+    let Value::Object(obj) = schema else {
+        return Ok(());
+    };
+
+    // PR-13: a `$ref` key makes this node a reference, not an inline
+    // schema. Same-schema fragment refs are kept verbatim (and checked
+    // for cycles); external URIs are an error.
+    if let Some(ref_val) = obj.get("$ref") {
+        if let Some(ref_str) = ref_val.as_str() {
+            if let Some(fragment) = ref_str.strip_prefix('#') {
+                if let Some(name) = resolve_def_name(fragment) {
+                    check_def_cycle(&name, defs, path)?;
+                }
+            } else {
+                return Err(SchemaError::external_ref(path));
+            }
+        }
+        // Non-string `$ref` (malformed) — treat as inert, keep verbatim.
+        return Ok(());
+    }
+
     let is_object = obj.get("type").and_then(|v| v.as_str()) == Some("object")
         && obj.contains_key("properties");
     if is_object {
@@ -104,33 +241,34 @@ pub fn strictify_schema(schema: &mut Value) {
             obj.insert("required".to_string(), Value::Array(keys));
         }
         if let Some(Value::Object(p)) = obj.get_mut("properties") {
-            for (_, v) in p.iter_mut() {
-                strictify_schema(v);
+            for (name, v) in p.iter_mut() {
+                strictify_inner(v, &format!("{path}.properties.{name}"), defs)?;
             }
         }
     }
     if let Some(items) = obj.get_mut("items") {
-        strictify_schema(items);
+        strictify_inner(items, &format!("{path}.items"), defs)?;
     }
     for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
         if let Some(Value::Array(arr)) = obj.get_mut(key) {
-            for sub in arr.iter_mut() {
-                strictify_schema(sub);
+            for (i, sub) in arr.iter_mut().enumerate() {
+                strictify_inner(sub, &format!("{path}.{key}[{i}]"), defs)?;
             }
         }
     }
     for key in ["$defs", "definitions", "dependentSchemas"] {
         if let Some(Value::Object(map)) = obj.get_mut(key) {
-            for (_, v) in map.iter_mut() {
-                strictify_schema(v);
+            for (name, v) in map.iter_mut() {
+                strictify_inner(v, &format!("{path}.{key}.{name}"), defs)?;
             }
         }
     }
     for key in ["not", "if", "then", "else", "contains", "propertyNames", "unevaluatedItems"] {
         if let Some(sub) = obj.get_mut(key) {
-            strictify_schema(sub);
+            strictify_inner(sub, &format!("{path}.{key}"), defs)?;
         }
     }
+    Ok(())
 }
 
 /// PR-11: shared Anthropic `Usage` constructor for all four conversion
@@ -205,7 +343,7 @@ mod tests {
                 }
             }
         });
-        strictify_schema(&mut schema);
+        strictify_schema(&mut schema).expect("strictify must succeed");
 
         // Top-level: all keys promoted to required, additionalProperties: false.
         let top_required = schema.get("required").and_then(|v| v.as_array()).unwrap();
@@ -271,7 +409,7 @@ mod tests {
                 }
             }
         });
-        strictify_schema(&mut schema);
+        strictify_schema(&mut schema).expect("strictify must succeed");
         let result = schema.get("properties").and_then(|p| p.get("result")).unwrap();
         let branches = result.get("anyOf").and_then(|v| v.as_array()).unwrap();
         assert_eq!(branches.len(), 2);
@@ -312,7 +450,7 @@ mod tests {
                 }
             }
         });
-        strictify_schema(&mut schema);
+        strictify_schema(&mut schema).expect("strictify must succeed");
         let value = schema.get("properties").and_then(|p| p.get("value")).unwrap();
         let branch = &value.get("oneOf").and_then(|v| v.as_array()).unwrap()[0];
         assert_eq!(
@@ -350,7 +488,7 @@ mod tests {
                 }
             }
         });
-        strictify_schema(&mut schema);
+        strictify_schema(&mut schema).expect("strictify must succeed");
         let defs = schema.get("$defs").and_then(|v| v.as_object()).unwrap();
         let addr = defs.get("Address").unwrap();
         assert_eq!(
@@ -368,6 +506,129 @@ mod tests {
         assert!(required.contains(&"city"));
     }
 
+    /// PR-13: a same-schema `#/$defs/Foo` ref is kept verbatim (OpenAI
+    /// strict mode supports non-recursive same-schema refs) while the
+    /// referenced definition is strictified.
+    #[test]
+    fn strictify_schema_keeps_same_schema_ref_verbatim() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "user": {"$ref": "#/$defs/User"}
+            },
+            "$defs": {
+                "User": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"}
+                    }
+                }
+            }
+        });
+        strictify_schema(&mut schema).expect("same-schema ref must be accepted");
+        // The `$ref` itself is untouched on the wire.
+        let user = schema
+            .get("properties")
+            .and_then(|p| p.get("user"))
+            .expect("user property must remain");
+        assert_eq!(
+            user.get("$ref").and_then(|v| v.as_str()),
+            Some("#/$defs/User"),
+            "same-schema ref must be kept verbatim, not flattened"
+        );
+        // The referenced definition is still strictified.
+        let def_user = schema
+            .get("$defs")
+            .and_then(|d| d.get("User"))
+            .expect("User definition must remain");
+        assert_eq!(
+            def_user.get("additionalProperties").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+    }
+
+    /// PR-13: an external URI `$ref` (`https://…`, bare path) cannot be
+    /// honored under OpenAI strict mode — the upstream can't resolve it —
+    /// so strictification fails with the documented message template.
+    #[test]
+    fn strictify_schema_errors_on_external_uri_ref() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "shared": {"$ref": "https://schemas.example/common.json"}
+            }
+        });
+        let err = strictify_schema(&mut schema)
+            .expect_err("external $ref must be rejected, not forwarded");
+        assert_eq!(
+            err.message,
+            "strictify_schema: external $ref at $.properties.shared not supported"
+        );
+    }
+
+    /// PR-13: a `$defs` chain that loops back on itself (`A` → `B` → `A`)
+    /// is unrepresentable and must be rejected rather than forwarded to
+    /// the upstream.
+    #[test]
+    fn strictify_schema_errors_on_circular_ref() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "loop": {"$ref": "#/$defs/A"}
+            },
+            "$defs": {
+                "A": {"$ref": "#/$defs/B"},
+                "B": {"$ref": "#/$defs/A"}
+            }
+        });
+        let err = strictify_schema(&mut schema)
+            .expect_err("circular $ref chain must be rejected");
+        assert!(
+            err.message.starts_with("strictify_schema: circular $ref at "),
+            "unexpected message: {}",
+            err.message
+        );
+        assert!(err.message.ends_with(" not supported"));
+    }
+
+    /// PR-13: benign `$ref` cases must pass. A ref to a missing
+    /// definition, a ref to a non-`$defs` fragment (`#/properties/foo`),
+    /// and a definition whose target isn't an object are all kept
+    /// verbatim without a cycle error.
+    #[test]
+    fn strictify_schema_accepts_benign_refs() {
+        let mut missing = json!({
+            "type": "object",
+            "properties": {"x": {"$ref": "#/$defs/DoesNotExist"}}
+        });
+        strictify_schema(&mut missing).expect("missing def target must not error");
+
+        let mut non_defs_fragment = json!({
+            "type": "object",
+            "properties": {
+                "y": {"$ref": "#/properties/y"},
+                "nested": {"$ref": "#/properties/y"}
+            }
+        });
+        strictify_schema(&mut non_defs_fragment)
+            .expect("non-defs fragment ref must be kept verbatim");
+
+        let mut non_object_target = json!({
+            "type": "object",
+            "properties": {"z": {"$ref": "#/$defs/Z"}},
+            "$defs": {"Z": "just a string"}
+        });
+        strictify_schema(&mut non_object_target)
+            .expect("non-object def target must be accepted");
+
+        let mut malformed_ref = json!({
+            "type": "object",
+            "properties": {"w": {"$ref": 42}}
+        });
+        strictify_schema(&mut malformed_ref)
+            .expect("malformed (non-string) $ref must be treated as inert");
+    }
+
     #[test]
     fn strictify_schema_non_object_returns_early() {
         // A schema whose top-level type is not "object" (e.g. "string")
@@ -376,7 +637,7 @@ mod tests {
         // we assert the schema is unchanged.
         let mut schema = json!({"type": "string"});
         let original = schema.clone();
-        strictify_schema(&mut schema);
+        strictify_schema(&mut schema).expect("strictify must succeed");
         assert_eq!(schema, original);
         assert!(schema.get("additionalProperties").is_none());
         assert!(schema.get("required").is_none());
@@ -389,7 +650,7 @@ mod tests {
         // additionalProperties field.
         let mut schema = json!({"type": "object"});
         let original = schema.clone();
-        strictify_schema(&mut schema);
+        strictify_schema(&mut schema).expect("strictify must succeed");
         assert_eq!(schema, original);
         assert!(schema.get("required").is_none());
     }
@@ -406,7 +667,7 @@ mod tests {
                 "x": {"type": "string"}
             }
         });
-        strictify_schema(&mut schema);
+        strictify_schema(&mut schema).expect("strictify must succeed");
         assert_eq!(
             schema.get("additionalProperties").and_then(|v| v.as_bool()),
             Some(false),
@@ -428,7 +689,7 @@ mod tests {
             },
             "required": ["ok", "reason"]
         });
-        strictify_schema(&mut schema);
+        strictify_schema(&mut schema).expect("strictify must succeed");
         let required: Vec<&str> = schema
             .get("required")
             .and_then(|v| v.as_array())
@@ -459,7 +720,7 @@ mod tests {
                 }
             ]
         });
-        strictify_schema(&mut schema);
+        strictify_schema(&mut schema).expect("strictify must succeed");
         let branch = &schema.get("allOf").and_then(|v| v.as_array()).unwrap()[0];
         assert_eq!(
             branch.get("additionalProperties").and_then(|v| v.as_bool()),
@@ -491,7 +752,7 @@ mod tests {
                 }
             }
         });
-        strictify_schema(&mut schema);
+        strictify_schema(&mut schema).expect("strictify must succeed");
         let point = schema
             .get("definitions")
             .and_then(|v| v.as_object())
@@ -542,7 +803,7 @@ mod tests {
                 }
             }
         });
-        strictify_schema(&mut schema);
+        strictify_schema(&mut schema).expect("strictify must succeed");
 
         // Top-level is strictified.
         assert_eq!(
@@ -611,7 +872,7 @@ mod tests {
                 }
             }
         });
-        strictify_schema(&mut schema);
+        strictify_schema(&mut schema).expect("strictify must succeed");
 
         let contains_schema = schema
             .get("properties")
@@ -660,7 +921,7 @@ mod tests {
                 }
             }
         });
-        strictify_schema(&mut schema);
+        strictify_schema(&mut schema).expect("strictify must succeed");
 
         let prefix_items = schema
             .get("properties")
@@ -696,7 +957,7 @@ mod tests {
                 }
             }
         });
-        strictify_schema(&mut schema);
+        strictify_schema(&mut schema).expect("strictify must succeed");
 
         let dep_schema = schema
             .get("dependentSchemas")
@@ -734,9 +995,9 @@ mod tests {
         });
         let mut schema2 = schema1.clone();
 
-        strictify_schema(&mut schema1);
-        strictify_schema(&mut schema2);
-        strictify_schema(&mut schema2);
+        strictify_schema(&mut schema1).expect("strictify must succeed");
+        strictify_schema(&mut schema2).expect("strictify must succeed");
+        strictify_schema(&mut schema2).expect("strictify must succeed");
 
         assert_eq!(schema1, schema2, "double-call must be idempotent");
     }
@@ -746,7 +1007,7 @@ mod tests {
         // A null schema value must not panic. Strictify returns
         // immediately when the value isn't an object.
         let mut schema = Value::Null;
-        strictify_schema(&mut schema);
+        strictify_schema(&mut schema).expect("strictify must succeed");
         assert_eq!(schema, Value::Null);
     }
 
@@ -763,7 +1024,7 @@ mod tests {
         ] {
             let mut schema = value.clone();
             let original = schema.clone();
-            strictify_schema(&mut schema);
+            strictify_schema(&mut schema).expect("strictify must succeed");
             assert_eq!(
                 schema, original,
                 "non-object schema {value} must pass through unchanged"
@@ -782,7 +1043,7 @@ mod tests {
             }
         });
         let original = schema.clone();
-        strictify_schema(&mut schema);
+        strictify_schema(&mut schema).expect("strictify must succeed");
         assert_eq!(
             schema, original,
             "schema with properties but no `type: object` must pass through"

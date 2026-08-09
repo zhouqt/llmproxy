@@ -760,7 +760,7 @@ impl CopilotProvider {
     ) -> Result<ProviderOutput> {
         let merged = self.merged_rewrite(model_rewrite);
         let mut responses_req =
-            crate::conversion::anthropic_to_responses_request(req, &merged);
+            crate::conversion::anthropic_to_responses_request(req, &merged)?;
         responses_req.stream = false;
         // PR-9: Copilot strips high-risk fields before serialization.
         // Copilot's request-side tolerance is unverified (closed source,
@@ -798,7 +798,7 @@ impl CopilotProvider {
     ) -> Result<ProviderOutput> {
         let merged = self.merged_rewrite(model_rewrite);
         let mut responses_req =
-            crate::conversion::anthropic_to_responses_request(req, &merged);
+            crate::conversion::anthropic_to_responses_request(req, &merged)?;
         responses_req.stream = true;
         // PR-9: strip high-risk fields before serialization (see
         // complete_responses for rationale).
@@ -920,7 +920,7 @@ impl Provider for CopilotProvider {
         }
 
         let mut openai_req =
-            crate::conversion::anthropic_to_openai_request(req, &merged);
+            crate::conversion::anthropic_to_openai_request(req, &merged)?;
         openai_req.stream = false;
         openai_req.stream_options = None;
         // PR-9: strip high-risk fields before serialization (see
@@ -971,7 +971,7 @@ impl Provider for CopilotProvider {
         }
 
         let mut openai_req =
-            crate::conversion::anthropic_to_openai_request(req, &merged);
+            crate::conversion::anthropic_to_openai_request(req, &merged)?;
         openai_req.stream = true;
         openai_req.stream_options = Some(crate::openai::StreamOptions {
             include_usage: true,
