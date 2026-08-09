@@ -607,22 +607,10 @@ mod tests {
     use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
     /// Wire-level "field X must NOT be present in the JSON request
-    /// body" matcher. wiremock's `body_partial_json` only checks
-    /// presence; we need this complement to verify the proxy never
-    /// pollutes a request with `prompt_cache_key` /
-    /// `prompt_cache_retention` when the Anthropic client didn't ask
-    /// for caching.
-    struct JsonFieldAbsent(&'static str);
-
-    impl Match for JsonFieldAbsent {
-        fn matches(&self, request: &Request) -> bool {
-            let body: serde_json::Value = match serde_json::from_slice(&request.body) {
-                Ok(v) => v,
-                Err(_) => return false,
-            };
-            body.get(self.0).is_none()
-        }
-    }
+    /// body" matcher. See `crate::test_support::JsonFieldAbsent`
+    /// (PR-10 moved the implementation into the shared test_support
+    /// module).
+    use crate::test_support::JsonFieldAbsent;
 
     fn cache_request_with(cache_type: &str, user_id: Option<&str>) -> MessagesRequest {
         let mut v = json!({
