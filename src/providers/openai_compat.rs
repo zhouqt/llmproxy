@@ -606,58 +606,11 @@ mod tests {
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// Wire-level "field X must NOT be present in the JSON request
-    /// body" matcher. See `crate::test_support::JsonFieldAbsent`
-    /// (PR-10 moved the implementation into the shared test_support
-    /// module).
-    use crate::test_support::JsonFieldAbsent;
-
-    fn cache_request_with(cache_type: &str, user_id: Option<&str>) -> MessagesRequest {
-        let mut v = json!({
-            "model": "claude-sonnet-4.6",
-            "max_tokens": 64,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "long prefix", "cache_control": {"type": cache_type}},
-                    {"type": "text", "text": "actual question"}
-                ]
-            }]
-        });
-        if let Some(uid) = user_id {
-            v["metadata"] = json!({"user_id": uid});
-        }
-        serde_json::from_value(v).unwrap()
-    }
-
-    fn request(streaming: bool) -> MessagesRequest {
-        serde_json::from_value(json!({
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": 64,
-            "stream": streaming,
-            "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .unwrap()
-    }
-
-    fn chat_response() -> Value {
-        json!({
-            "id": "chatcmpl-1",
-            "object": "chat.completion",
-            "created": 1,
-            "model": "upstream-model",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "world"},
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": 3,
-                "completion_tokens": 2,
-                "total_tokens": 5
-            }
-        })
-    }
+    /// Wire-level matcher + wire fixtures shared with openai_responses
+    /// (PR-10 consolidated them into crate::test_support).
+    use crate::test_support::{
+        cache_request_with, chat_response, openai_request as request, JsonFieldAbsent,
+    };
 
     /// The user-reported upstream 400: OpenAI-style wording on the
     /// /chat/completions path (opencode Zen → deepseek in thinking mode).
