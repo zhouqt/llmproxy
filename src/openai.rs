@@ -239,6 +239,13 @@ pub struct ChatUsage {
     /// by reasoning. See fix-R6 in docs/TEST_ISSUES.md.
     #[serde(default)]
     pub completion_tokens_details: Option<CompletionTokensDetails>,
+    /// PR-7: upstream OpenAI `service_tier` (auto/default/flex/scale/
+    /// priority/fast) echoed back as an Anthropic `Usage.service_tier`
+    /// string for the client to interpret. Anthropic's own response
+    /// enum is standard/priority/batch; only `priority` overlaps — the
+    /// rest pass through unvalidated (plan v0.12 P1-B).
+    #[serde(default)]
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

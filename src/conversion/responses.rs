@@ -593,7 +593,7 @@ pub fn responses_to_anthropic_response(
             cache_creation: None,
             server_tool_use: None,
             output_tokens_details: thinking_tokens.map(|n| json!({"thinking_tokens": n})),
-            service_tier: None,
+            service_tier: usage.service_tier,
             inference_geo: None,
         },
         extra: HashMap::new(),
@@ -764,6 +764,33 @@ mod tests {
         let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
         let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_1").unwrap();
         assert_eq!(out.stop_reason.as_deref(), Some("max_tokens"));
+    }
+
+    /// PR-7 response side: upstream Responses `service_tier` (e.g.
+    /// `fast`) echoes back as Anthropic `Usage.service_tier` — passthrough
+    /// string, no enum validation (plan v0.12 P1-B).
+    #[test]
+    fn usage_service_tier_passes_through() {
+        let raw = json!({
+            "id": "resp_st",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [
+                {"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+                 "content": [{"type": "output_text", "text": "hi"}]}
+            ],
+            "usage": {
+                "input_tokens": 3,
+                "output_tokens": 2,
+                "total_tokens": 5,
+                "service_tier": "fast"
+            }
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_1").unwrap();
+        assert_eq!(out.usage.service_tier.as_deref(), Some("fast"));
     }
 
     // ── PR-2 · B2 + B3 ──────────────────────────────────────────────────

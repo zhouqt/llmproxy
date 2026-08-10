@@ -179,7 +179,7 @@ impl StreamTranslator {
                 cache_creation: None,
                 server_tool_use: None,
                 output_tokens_details: thinking_tokens.map(|n| json!({"thinking_tokens": n})),
-                service_tier: None,
+                service_tier: u.service_tier.clone(),
                 inference_geo: None,
             }
         });
@@ -1283,6 +1283,7 @@ mod tests {
                 completion_tokens_details: Some(CompletionTokensDetails {
                     reasoning_tokens: Some(15),
                 }),
+                service_tier: None,
             }),
             extra: serde_json::json!({}),
         };
@@ -1319,6 +1320,7 @@ mod tests {
                 total_tokens: 60,
                 prompt_tokens_details: None,
                 completion_tokens_details: None,
+                service_tier: None,
             }),
             extra: serde_json::json!({}),
         };
@@ -1352,6 +1354,7 @@ mod tests {
                 completion_tokens_details: Some(CompletionTokensDetails {
                     reasoning_tokens: Some(0),
                 }),
+                service_tier: None,
             }),
             extra: serde_json::json!({}),
         };

@@ -102,7 +102,7 @@ pub fn openai_to_anthropic_response(
                 cache_creation: None,
                 server_tool_use: None,
                 output_tokens_details: thinking_tokens.map(|n| json!({"thinking_tokens": n})),
-                service_tier: None,
+                service_tier: u.service_tier.clone(),
                 inference_geo: None,
             }
         })
@@ -247,6 +247,33 @@ mod tests {
             map_stop_reason("totally_unknown_reason").unwrap(),
             None
         );
+    }
+
+    /// PR-7 response side: upstream OpenAI `service_tier` (e.g. `scale`)
+    /// echoes back as Anthropic `Usage.service_tier` — passthrough
+    /// string, no enum validation (plan v0.12 P1-B).
+    #[test]
+    fn usage_service_tier_passes_through() {
+        let resp: ChatResponse = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-st",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "upstream",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 3,
+                "completion_tokens": 2,
+                "total_tokens": 5,
+                "service_tier": "scale"
+            }
+        }))
+        .unwrap();
+        let out = openai_to_anthropic_response(&resp, "model", "msg_1").unwrap();
+        assert_eq!(out.usage.service_tier.as_deref(), Some("scale"));
     }
 
     #[test]
