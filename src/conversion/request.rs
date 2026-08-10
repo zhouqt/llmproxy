@@ -47,6 +47,9 @@ pub fn anthropic_to_openai_request(
     let stream_options = if req.stream {
         Some(crate::openai::StreamOptions {
             include_usage: true,
+            // PR-9: no Anthropic source for include_obfuscation — kept
+            // None so the wire stays absent (upstream default false).
+            include_obfuscation: None,
         })
     } else {
         None
@@ -1233,5 +1236,41 @@ mod tests {
         .unwrap();
         let out = anthropic_to_openai_request(&req, &Default::default());
         assert_eq!(out.verbosity.as_deref(), Some("low"));
+    }
+
+    // ── PR-9 · P2 fields stay absent on the wire ───────────────────────
+
+    /// PR-9: the nine P2 fields (plan M3c "写" list minus
+    /// include_obfuscation) have no Anthropic source, so the conversion
+    /// layer must leave them None and, critically, absent from the
+    /// serialized body — a bare `null` on the wire would confuse strict
+    /// upstreams. This is the plan M3c "明确不写" contract at the
+    /// conversion boundary (plan line 538: assert via to_value, not just
+    /// field access).
+    #[test]
+    fn chat_request_pr9_p2_fields_absent_from_serialized_body() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o", "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let out = anthropic_to_openai_request(&req, &Default::default());
+        let v = serde_json::to_value(&out).unwrap();
+        for key in [
+            "n",
+            "logit_bias",
+            "logprobs",
+            "top_logprobs",
+            "prediction",
+            "metadata",
+            "presence_penalty",
+            "frequency_penalty",
+            "seed",
+        ] {
+            assert!(
+                v.get(key).is_none(),
+                "conversion must not inject {key}; got: {v}"
+            );
+        }
     }
 }

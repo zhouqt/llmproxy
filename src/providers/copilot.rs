@@ -975,6 +975,9 @@ impl Provider for CopilotProvider {
         openai_req.stream = true;
         openai_req.stream_options = Some(crate::openai::StreamOptions {
             include_usage: true,
+            // PR-9: include_obfuscation has no Anthropic source; keep
+            // absent on the wire (upstream default false).
+            include_obfuscation: None,
         });
         // PR-9: strip high-risk fields before serialization (see
         // complete_responses for rationale).
@@ -1116,6 +1119,129 @@ mod tests {
             "verbosity must be cleared from text; got {}",
             req.extra["text"]
         );
+    }
+
+    /// PR-9 (plan:437/427): the Copilot mock double-assertion — "accepts
+    /// without 400". A request carrying the low-risk P2 fields that
+    /// survive stripping (presence_penalty/frequency_penalty/seed, plus
+    /// PR-8's parallel_tool_calls) must be accepted by Copilot with a
+    /// 200. This is the "wiremock 200 接受" half: Copilot tolerates
+    /// these fields (they are NOT stripped because the plan's Opus
+    /// survey found Copilot accepts them), so the request succeeds.
+    ///
+    /// The conversion layer never injects these fields today (plan M3c
+    /// "明确不写" — Anthropic has no source for them), so we build the
+    /// ChatRequest by hand to simulate a future injection, strip the
+    /// high-risk subset exactly as `complete_chat` does, then assert
+    /// both the wire shape (stripped fields absent, low-risk present)
+    /// and Copilot's 200 acceptance.
+    #[tokio::test]
+    async fn copilot_accepts_p2_fields_without_400() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", "Bearer copilot-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response("ok")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+
+        let mut req = crate::openai::ChatRequest {
+            model: "gpt-4o".into(),
+            messages: vec![crate::openai::ChatMessage::User {
+                content: crate::openai::UserContent::Text("hi".into()),
+                name: None,
+            }],
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+            stream: false,
+            stream_options: None,
+            tools: None,
+            tool_choice: None,
+            user: None,
+            reasoning_effort: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            service_tier: Some("auto".into()),
+            parallel_tool_calls: Some(false),
+            safety_identifier: Some("user-42".into()),
+            verbosity: Some("low".into()),
+            n: Some(2),
+            logit_bias: Some(std::collections::HashMap::from([("x".into(), 1)])),
+            logprobs: Some(true),
+            top_logprobs: Some(5),
+            prediction: Some(json!({"type": "content", "content": "x"})),
+            metadata: Some(json!({"trace": "abc"})),
+            presence_penalty: Some(0.5),
+            frequency_penalty: Some(-0.5),
+            seed: Some(12345),
+            extra: json!({}),
+        };
+        // Mirror complete_chat: strip high-risk fields before sending.
+        strip_high_risk_fields_chat(&mut req);
+        let body = serde_json::to_value(&req).unwrap();
+
+        // Wire shape: stripped fields absent, low-risk fields present.
+        for key in [
+            "service_tier",
+            "prediction",
+            "logit_bias",
+            "logprobs",
+            "top_logprobs",
+            "metadata",
+            "safety_identifier",
+            "verbosity",
+        ] {
+            assert!(body.get(key).is_none(), "{key} must be stripped, got: {body}");
+        }
+        for key in ["presence_penalty", "frequency_penalty", "seed", "parallel_tool_calls"] {
+            assert!(body.get(key).is_some(), "{key} must survive to the wire: {body}");
+        }
+
+        let resp = provider
+            .send_with_token(&provider.chat_url(), &body)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    /// PR-9 (plan:437/427): the Copilot mock double-assertion — "rejects
+    /// surfaces fallback". If Copilot 400s (e.g. a field it does NOT
+    /// tolerate, or an unknown-model envelope), the provider must
+    /// surface the upstream error unchanged so the router can fall back
+    /// to the next provider in the chain. This is the "wiremock 400 验证
+    /// fallback" half.
+    #[tokio::test]
+    async fn copilot_rejects_p2_fields_surfaces_fallback() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("unsupported parameter"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+
+        let error = provider
+            .complete(&request(false), &HashMap::new())
+            .await
+            .err()
+            .expect("Copilot 400 must fail");
+
+        assert!(matches!(
+            error,
+            ProxyError::Upstream { status: 400, ref body } if body == "unsupported parameter"
+        ));
     }
 
     fn now() -> i64 {

@@ -136,6 +136,13 @@ pub struct ChatRequest {
 #[derive(Debug, Clone, Serialize)]
 pub struct StreamOptions {
     pub include_usage: bool,
+    /// PR-9: OpenAI `stream_options.include_obfuscation` — whether the
+    /// provider should obfuscate certain streamed data. Anthropic has
+    /// no equivalent, so this is only ever set when a future PR wires a
+    /// Claude Code extension surface to it; absent on the wire by
+    /// default (OpenAI's default is false).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_obfuscation: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -456,6 +463,154 @@ mod tests {
         assert_eq!(chunk.model.as_deref(), Some("gpt-4o"));
         assert!(!chunk.choices.is_empty());
         assert_eq!(chunk.extra["x-opencode-type"], "inference-cost");
+    }
+
+    /// PR-9: `StreamOptions.include_obfuscation` is absent on the wire
+    /// when `None` (the only value the conversion layer produces today —
+    /// Anthropic has no source for it). Presence is gated by
+    /// `skip_serializing_if`, so the field must not leak a bare `null`.
+    #[test]
+    fn stream_options_include_obfuscation_none_is_absent_on_wire() {
+        let opts = StreamOptions {
+            include_usage: true,
+            include_obfuscation: None,
+        };
+        let v = serde_json::to_value(&opts).unwrap();
+        assert_eq!(v["include_usage"], true);
+        assert!(
+            v.get("include_obfuscation").is_none(),
+            "None include_obfuscation must be omitted, got: {v}"
+        );
+    }
+
+    /// PR-9: `StreamOptions.include_obfuscation: Some(true)` must
+    /// serialize to `true` — a future PR that wires a Claude Code
+    /// extension surface to it needs the round-trip to hold.
+    #[test]
+    fn stream_options_include_obfuscation_some_serializes_to_true() {
+        let opts = StreamOptions {
+            include_usage: true,
+            include_obfuscation: Some(true),
+        };
+        let v = serde_json::to_value(&opts).unwrap();
+        assert_eq!(v["include_obfuscation"], true);
+    }
+
+    // ── PR-9 · P2 field wire round-trips ────────────────────────────────
+
+    /// PR-9: every P2 field added in PR-9 must serialize onto the wire
+    /// when set. Anthropic has no source for any of them today, so the
+    /// conversion layer keeps them None — but the wire types must be
+    /// able to carry them (that's the "写" half of plan M3c).
+    #[test]
+    fn chat_request_serializes_all_pr9_p2_fields() {
+        use std::collections::HashMap;
+        let req = ChatRequest {
+            model: "m".into(),
+            messages: vec![],
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+            stream: false,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+                include_obfuscation: Some(true),
+            }),
+            tools: None,
+            tool_choice: None,
+            user: None,
+            reasoning_effort: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            service_tier: None,
+            parallel_tool_calls: None,
+            safety_identifier: None,
+            verbosity: None,
+            n: Some(2),
+            logit_bias: Some(HashMap::from([("42".into(), -5)])),
+            logprobs: Some(true),
+            top_logprobs: Some(5),
+            prediction: Some(serde_json::json!({"type": "content", "content": "x"})),
+            metadata: Some(serde_json::json!({"trace": "abc"})),
+            presence_penalty: Some(0.5),
+            frequency_penalty: Some(-0.5),
+            seed: Some(12345),
+            extra: serde_json::json!({}),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["n"], 2);
+        assert_eq!(v["logit_bias"]["42"], -5);
+        assert_eq!(v["logprobs"], true);
+        assert_eq!(v["top_logprobs"], 5);
+        assert_eq!(v["prediction"]["type"], "content");
+        assert_eq!(v["metadata"]["trace"], "abc");
+        assert_eq!(v["presence_penalty"], 0.5);
+        assert_eq!(v["frequency_penalty"], -0.5);
+        assert_eq!(v["seed"], 12345);
+        assert_eq!(v["stream_options"]["include_obfuscation"], true);
+    }
+
+    /// PR-9: the same P2 fields must be absent from the wire when unset
+    /// (the "明确不写" half of plan M3c — every field is Option with
+    /// skip_serializing_if, so a bare null must never leak).
+    #[test]
+    fn chat_request_default_omits_pr9_p2_fields() {
+        let req = ChatRequest {
+            model: "m".into(),
+            messages: vec![],
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+            stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+                include_obfuscation: None,
+            }),
+            tools: None,
+            tool_choice: None,
+            user: None,
+            reasoning_effort: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            service_tier: None,
+            parallel_tool_calls: None,
+            safety_identifier: None,
+            verbosity: None,
+            n: None,
+            logit_bias: None,
+            logprobs: None,
+            top_logprobs: None,
+            prediction: None,
+            metadata: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            extra: serde_json::json!({}),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        for key in [
+            "n",
+            "logit_bias",
+            "logprobs",
+            "top_logprobs",
+            "prediction",
+            "metadata",
+            "presence_penalty",
+            "frequency_penalty",
+            "seed",
+        ] {
+            assert!(v.get(key).is_none(), "{key} must be absent, got: {v}");
+        }
+        assert!(
+            v.get("stream_options")
+                .and_then(|o| o.get("include_obfuscation"))
+                .is_none(),
+            "include_obfuscation must be absent when None, got: {v}"
+        );
     }
 }
 
