@@ -1011,28 +1011,11 @@ impl Provider for CopilotProvider {
 mod tests {
     use super::*;
     use crate::expect_variant;
+    use crate::test_support::JsonFieldAbsent;
     use futures_util::StreamExt;
     use serde_json::json;
     use wiremock::matchers::{body_partial_json, header, method, path};
-    use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
-
-    /// Wire-level "field X must NOT be present in the JSON request body"
-    /// matcher (PR-9). wiremock's `body_partial_json` only checks
-    /// presence; the complement is needed to assert that the stripped
-    /// high-risk P2 fields never reach Copilot (plan:538). Inline copy —
-    /// openai_compat.rs / openai_responses.rs carry the same one until
-    /// PR-10 consolidates it into `src/test_support.rs`.
-    struct JsonFieldAbsent(&'static str);
-
-    impl Match for JsonFieldAbsent {
-        fn matches(&self, request: &Request) -> bool {
-            let body: serde_json::Value = match serde_json::from_slice(&request.body) {
-                Ok(v) => v,
-                Err(_) => return false,
-            };
-            body.get(self.0).is_none()
-        }
-    }
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // ── PR-9 · high-risk field stripping ────────────────────────────────
 
