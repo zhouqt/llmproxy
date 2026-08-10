@@ -604,7 +604,7 @@ mod tests {
     use futures_util::{stream, StreamExt};
     use serde_json::json;
     use wiremock::matchers::{body_partial_json, header, method, path};
-    use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// Wire-level "field X must NOT be present in the JSON request
     /// body" matcher. See `crate::test_support::JsonFieldAbsent`

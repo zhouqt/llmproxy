@@ -347,7 +347,7 @@ mod tests {
     use serde_json::json;
     use serde_json::Value;
     use wiremock::matchers::{body_partial_json, header, method, path};
-    use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// Wire-level "field X must NOT be present in the JSON request
     /// body" matcher. wiremock's `body_partial_json` only checks
