@@ -226,6 +226,13 @@ pub struct ResponsesUsage {
     pub input_tokens_details: Option<InputTokensDetails>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens_details: Option<OutputTokensDetails>,
+    /// PR-7: upstream `service_tier` (auto/default/flex/scale/priority/
+    /// fast) echoed back as an Anthropic `Usage.service_tier` string.
+    /// Anthropic's response enum is standard/priority/batch; only
+    /// `priority` overlaps — the rest pass through unvalidated (plan
+    /// v0.12 P1-B).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
