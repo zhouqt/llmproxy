@@ -1014,7 +1014,25 @@ mod tests {
     use futures_util::StreamExt;
     use serde_json::json;
     use wiremock::matchers::{body_partial_json, header, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
+
+    /// Wire-level "field X must NOT be present in the JSON request body"
+    /// matcher (PR-9). wiremock's `body_partial_json` only checks
+    /// presence; the complement is needed to assert that the stripped
+    /// high-risk P2 fields never reach Copilot (plan:538). Inline copy —
+    /// openai_compat.rs / openai_responses.rs carry the same one until
+    /// PR-10 consolidates it into `src/test_support.rs`.
+    struct JsonFieldAbsent(&'static str);
+
+    impl Match for JsonFieldAbsent {
+        fn matches(&self, request: &Request) -> bool {
+            let body: serde_json::Value = match serde_json::from_slice(&request.body) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            body.get(self.0).is_none()
+        }
+    }
 
     // ── PR-9 · high-risk field stripping ────────────────────────────────
 
@@ -1123,7 +1141,7 @@ mod tests {
 
     /// PR-9 (plan:437/427): the Copilot mock double-assertion — "accepts
     /// without 400". A request carrying the low-risk P2 fields that
-    /// survive stripping (presence_penalty/frequency_penalty/seed, plus
+    /// survive stripping (n/presence_penalty/frequency_penalty/seed, plus
     /// PR-8's parallel_tool_calls) must be accepted by Copilot with a
     /// 200. This is the "wiremock 200 接受" half: Copilot tolerates
     /// these fields (they are NOT stripped because the plan's Opus
@@ -1132,15 +1150,38 @@ mod tests {
     /// The conversion layer never injects these fields today (plan M3c
     /// "明确不写" — Anthropic has no source for them), so we build the
     /// ChatRequest by hand to simulate a future injection, strip the
-    /// high-risk subset exactly as `complete_chat` does, then assert
-    /// both the wire shape (stripped fields absent, low-risk present)
-    /// and Copilot's 200 acceptance.
+    /// high-risk subset exactly as `complete_chat` does, and send it.
+    /// The final provider request JSON is asserted via wiremock matchers
+    /// (plan:538): `body_partial_json` locks the low-risk fields present,
+    /// `JsonFieldAbsent` locks the stripped high-risk ones absent.
     #[tokio::test]
     async fn copilot_accepts_p2_fields_without_400() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(header("authorization", "Bearer copilot-token"))
+            // plan:538 — assert the *final provider request JSON* via
+            // wiremock matchers, not just serde round-trip: body_partial_json
+            // locks the low-risk P2 fields present on the wire (n is a
+            // plan:433 "写" field, not stripped), JsonFieldAbsent locks the
+            // stripped high-risk ones absent. A shape mismatch makes
+            // wiremock return 404 (no matching mock) and fail the 200
+            // assertion below.
+            .and(body_partial_json(json!({
+                "n": 2,
+                "presence_penalty": 0.5,
+                "frequency_penalty": -0.5,
+                "seed": 12345,
+                "parallel_tool_calls": false,
+            })))
+            .and(JsonFieldAbsent("service_tier"))
+            .and(JsonFieldAbsent("prediction"))
+            .and(JsonFieldAbsent("logit_bias"))
+            .and(JsonFieldAbsent("logprobs"))
+            .and(JsonFieldAbsent("top_logprobs"))
+            .and(JsonFieldAbsent("metadata"))
+            .and(JsonFieldAbsent("safety_identifier"))
+            .and(JsonFieldAbsent("verbosity"))
             .respond_with(ResponseTemplate::new(200).set_body_json(completion_response("ok")))
             .expect(1)
             .mount(&server)
@@ -1188,23 +1229,9 @@ mod tests {
         strip_high_risk_fields_chat(&mut req);
         let body = serde_json::to_value(&req).unwrap();
 
-        // Wire shape: stripped fields absent, low-risk fields present.
-        for key in [
-            "service_tier",
-            "prediction",
-            "logit_bias",
-            "logprobs",
-            "top_logprobs",
-            "metadata",
-            "safety_identifier",
-            "verbosity",
-        ] {
-            assert!(body.get(key).is_none(), "{key} must be stripped, got: {body}");
-        }
-        for key in ["presence_penalty", "frequency_penalty", "seed", "parallel_tool_calls"] {
-            assert!(body.get(key).is_some(), "{key} must survive to the wire: {body}");
-        }
-
+        // Wire shape is enforced by the mock's matchers above: a request
+        // that leaks a stripped field or drops a low-risk one gets a 404
+        // (no matching mock) and fails the 200 assertion below.
         let resp = provider
             .send_with_token(&provider.chat_url(), &body)
             .await
@@ -1215,9 +1242,18 @@ mod tests {
     /// PR-9 (plan:437/427): the Copilot mock double-assertion — "rejects
     /// surfaces fallback". If Copilot 400s (e.g. a field it does NOT
     /// tolerate, or an unknown-model envelope), the provider must
-    /// surface the upstream error unchanged so the router can fall back
-    /// to the next provider in the chain. This is the "wiremock 400 验证
-    /// fallback" half.
+    /// surface the upstream error unchanged (`ProxyError::Upstream`) so
+    /// the router can decide fallback to the next provider in the chain.
+    /// This is the "wiremock 400 验证 fallback" half.
+    ///
+    /// It goes through `complete()` (the production path) rather than
+    /// `send_with_token` so the 400 → `ProxyError::Upstream` conversion
+    /// is what's asserted (send_with_token returns a raw Response and
+    /// never produces that error). The request carries no P2 fields
+    /// because the conversion layer never injects them (plan M3c
+    /// "明确不写"), so a field-triggered 400 cannot be produced through
+    /// the production path — this test locks the error-surfacing
+    /// mechanism the router depends on for fallback.
     #[tokio::test]
     async fn copilot_rejects_p2_fields_surfaces_fallback() {
         let server = MockServer::start().await;
