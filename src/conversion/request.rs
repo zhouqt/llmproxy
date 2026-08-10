@@ -1256,7 +1256,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap();
-        let out = anthropic_to_openai_request(&req, &Default::default());
+        let out = anthropic_to_openai_request(&req, &Default::default()).unwrap();
         let v = serde_json::to_value(&out).unwrap();
         for key in [
             "n",
