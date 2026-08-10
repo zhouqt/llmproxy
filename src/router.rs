@@ -601,6 +601,7 @@ mod tests {
         let cfg = Config {
             server: Default::default(),
             proxy: Default::default(),
+            user_agent: crate::config::default_user_agent(),
             providers: vec![
                 ProviderConfig::OpenaiCompat {
                     name: "primary".into(),
@@ -676,6 +677,7 @@ mod tests {
         let cfg = Config {
             server: Default::default(),
             proxy: Default::default(),
+            user_agent: crate::config::default_user_agent(),
             providers: vec![
                 ProviderConfig::OpenaiCompat {
                     name: "primary".into(),
@@ -962,6 +964,7 @@ mod tests {
         let cfg = Config {
             server: Default::default(),
             proxy: Default::default(),
+            user_agent: crate::config::default_user_agent(),
             providers: vec![
                 ProviderConfig::OpenaiCompat {
                     name: "primary".into(),
@@ -1039,6 +1042,7 @@ mod tests {
         let cfg = Config {
             server: Default::default(),
             proxy: Default::default(),
+            user_agent: crate::config::default_user_agent(),
             providers: vec![ProviderConfig::OpenaiCompat {
                 name: "primary".into(),
                 api_key: "k".into(),
@@ -1228,6 +1232,7 @@ mod tests {
         let cfg = Config {
             server: Default::default(),
             proxy: Default::default(),
+            user_agent: crate::config::default_user_agent(),
             providers: vec![
                 ProviderConfig::OpenaiCompat {
                     name: "primary".into(),
@@ -1293,6 +1298,7 @@ mod tests {
         let cfg = Config {
             server: Default::default(),
             proxy: Default::default(),
+            user_agent: crate::config::default_user_agent(),
             providers: vec![
                 ProviderConfig::OpenaiCompat {
                     name: "primary".into(),
@@ -1386,6 +1392,7 @@ mod tests {
         let cfg = Config {
             server: Default::default(),
             proxy: Default::default(),
+            user_agent: crate::config::default_user_agent(),
             providers: vec![
                 ProviderConfig::OpenaiCompat {
                     name: "primary".into(),
@@ -1558,6 +1565,7 @@ mod tests {
         let cfg = Config {
             server: Default::default(),
             proxy: Default::default(),
+            user_agent: crate::config::default_user_agent(),
             providers: vec![
                 ProviderConfig::OpenaiCompat {
                     name: "primary".into(),
@@ -1717,6 +1725,7 @@ mod tests {
         let cfg = Config {
             server: Default::default(),
             proxy: Default::default(),
+            user_agent: crate::config::default_user_agent(),
             providers: vec![
                 ProviderConfig::OpenaiCompat {
                     name: "primary".into(),
@@ -1900,6 +1909,7 @@ mod tests {
         let cfg = Config {
             server: Default::default(),
             proxy: Default::default(),
+            user_agent: crate::config::default_user_agent(),
             providers: vec![
                 ProviderConfig::OpenaiCompat {
                     name: "primary".into(),
@@ -1971,6 +1981,7 @@ mod tests {
         let cfg = Config {
             server: Default::default(),
             proxy: Default::default(),
+            user_agent: crate::config::default_user_agent(),
             providers: vec![
                 ProviderConfig::OpenaiCompat {
                     name: "primary".into(),
@@ -2037,6 +2048,7 @@ mod tests {
         let cfg = Config {
             server: Default::default(),
             proxy: Default::default(),
+            user_agent: crate::config::default_user_agent(),
             providers: vec![
                 ProviderConfig::OpenaiCompat {
                     name: "primary".into(),
