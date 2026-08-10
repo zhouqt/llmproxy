@@ -349,43 +349,9 @@ mod tests {
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// Wire-level "field X must NOT be present in the JSON request
-    /// body" matcher. wiremock's `body_partial_json` only checks
-    /// presence; we need this complement to verify that the proxy
-    /// doesn't pollute requests with `prompt_cache_key` /
-    /// `prompt_cache_retention` when the Anthropic client didn't ask
-    /// for caching. See `crate::test_support::JsonFieldAbsent`
-    /// (PR-10 moved the implementation into the shared test_support
-    /// module).
-    use crate::test_support::JsonFieldAbsent;
-
-    fn cache_request_with(cache_type: &str, user_id: Option<&str>) -> MessagesRequest {
-        let mut v = json!({
-            "model": "claude-sonnet-4.6",
-            "max_tokens": 64,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "long prefix", "cache_control": {"type": cache_type}},
-                    {"type": "text", "text": "actual question"}
-                ]
-            }]
-        });
-        if let Some(uid) = user_id {
-            v["metadata"] = json!({"user_id": uid});
-        }
-        serde_json::from_value(v).unwrap()
-    }
-
-    fn request(streaming: bool) -> MessagesRequest {
-        serde_json::from_value(json!({
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": 64,
-            "stream": streaming,
-            "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .unwrap()
-    }
+    /// Wire-level matcher + wire fixtures shared with openai_compat
+    /// (PR-10 consolidated them into crate::test_support).
+    use crate::test_support::{cache_request_with, openai_request as request, JsonFieldAbsent};
 
     fn responses_body() -> Value {
         json!({
