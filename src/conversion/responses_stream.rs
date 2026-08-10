@@ -557,7 +557,7 @@ impl ResponsesStreamTranslator {
             cache_creation: None,
             server_tool_use: None,
             output_tokens_details: thinking_tokens.map(|n| json!({"thinking_tokens": n})),
-            service_tier: None,
+            service_tier: raw.service_tier,
             inference_geo: None,
         });
         out.push(StreamEvent::MessageDelta {
@@ -826,6 +826,7 @@ mod tests {
             total_tokens: 15,
             input_tokens_details: None,
             output_tokens_details: None,
+            service_tier: None,
         });
         let evs = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
             response: Box::new(resp),
@@ -865,6 +866,7 @@ mod tests {
             total_tokens: 110,
             input_tokens_details: Some(InputTokensDetails { cached_tokens: 60 }),
             output_tokens_details: None,
+            service_tier: None,
         });
         let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
             response: Box::new(resp),
@@ -2392,6 +2394,7 @@ mod tests {
             total_tokens: 60,
             input_tokens_details: None,
             output_tokens_details: Some(OutputTokensDetails { reasoning_tokens: 21 }),
+            service_tier: None,
         });
         let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
             response: Box::new(resp),
@@ -2426,6 +2429,7 @@ mod tests {
             total_tokens: 60,
             input_tokens_details: None,
             output_tokens_details: None,
+            service_tier: None,
         });
         let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
             response: Box::new(resp),
@@ -2455,6 +2459,7 @@ mod tests {
             total_tokens: 60,
             input_tokens_details: None,
             output_tokens_details: Some(OutputTokensDetails { reasoning_tokens: 0 }),
+            service_tier: None,
         });
         let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
             response: Box::new(resp),
