@@ -17,6 +17,7 @@
 use crate::anthropic::{
     BlockDelta, MessageDeltaPayload, MessagesResponse, ResponseBlock, StreamEvent, Usage,
 };
+use crate::conversion::util::build_usage;
 use crate::responses::{OutputItem, ResponsesStreamEvent};
 
 pub struct ResponsesStreamTranslator {
@@ -32,6 +33,12 @@ pub struct ResponsesStreamTranslator {
     /// for them.
     closed_blocks: std::collections::HashSet<u32>,
     final_stop_reason: Option<String>,
+    /// `incomplete_details.reason` captured from the terminal
+    /// `response.incomplete` event. `finalize` uses it to distinguish a
+    /// content-filter refusal (`refusal`, B2) and to let an incomplete
+    /// stream's stop reason override mid-stream function_call items
+    /// (`max_tokens`, B3).
+    incomplete_reason: Option<String>,
     final_usage: Option<crate::responses::ResponsesUsage>,
     /// Set to true when the stream contains at least one function_call
     /// output item. Forces the final stop_reason to `tool_use` so Claude
@@ -50,6 +57,22 @@ pub struct ResponsesStreamTranslator {
     /// arrived). When no delta was seen, the done event's `text` is emitted
     /// as a fallback text delta so the client does not see an empty block.
     deltas_seen: std::collections::HashSet<u32>,
+    /// Anthropic block index of the currently-open thinking block (driven
+    /// by `response.reasoning_text.*` events). `None` when no thinking
+    /// block is open. Thinking blocks are allocated independently of the
+    /// `block_map` (reasoning items don't map to `block_map` entries).
+    thinking_block_index: Option<u32>,
+    /// Item ID of the reasoning item currently streaming into the open
+    /// thinking block, matched by `reasoning_text.done` and by the first
+    /// delta of a new reasoning item.
+    thinking_item_id: Option<String>,
+    /// Set of reasoning item IDs whose thinking blocks were already closed,
+    /// so `finalize` doesn't emit a second `content_block_stop`.
+    closed_thinking_items: std::collections::HashSet<String>,
+    /// Anthropic block index of the currently-open text block. Thinking
+    /// and text blocks are mutually exclusive: opening one closes the
+    /// other.
+    text_block_index: Option<u32>,
     /// Set to true when an upstream `error` SSE event was handled.
     /// Signals to the adapter that it should stop processing the stream
     /// immediately and avoid calling `finalize()` on EOF.
@@ -87,10 +110,15 @@ impl ResponsesStreamTranslator {
             block_map: std::collections::HashMap::new(),
             closed_blocks: std::collections::HashSet::new(),
             final_stop_reason: None,
+            incomplete_reason: None,
             final_usage: None,
             has_tool_calls: false,
             fc_item_index: std::collections::HashMap::new(),
             deltas_seen: std::collections::HashSet::new(),
+            thinking_block_index: None,
+            thinking_item_id: None,
+            closed_thinking_items: std::collections::HashSet::new(),
+            text_block_index: None,
             finalized: false,
         }
     }
@@ -126,6 +154,34 @@ impl ResponsesStreamTranslator {
         }
     }
 
+    /// Close the open thinking block (if any), emitting a
+    /// `content_block_stop` exactly once per reasoning item.
+    fn close_open_thinking_block(&mut self, out: &mut Vec<StreamEvent>) {
+        let Some(idx) = self.thinking_block_index.take() else {
+            return;
+        };
+        let already_closed = self
+            .thinking_item_id
+            .take()
+            .map(|id| !self.closed_thinking_items.insert(id))
+            .unwrap_or(false);
+        if !already_closed {
+            out.push(StreamEvent::ContentBlockStop { index: idx });
+        }
+    }
+
+    /// Close the open text block (if any), emitting `content_block_stop`
+    /// exactly once. Used to enforce mutual exclusivity between thinking
+    /// and text blocks.
+    fn close_open_text_block(&mut self, out: &mut Vec<StreamEvent>) {
+        let Some(idx) = self.text_block_index.take() else {
+            return;
+        };
+        if self.closed_blocks.insert(idx) {
+            out.push(StreamEvent::ContentBlockStop { index: idx });
+        }
+    }
+
     pub fn push_event(&mut self, event: &ResponsesStreamEvent) -> Vec<StreamEvent> {
         let mut out = Vec::new();
         match event {
@@ -142,18 +198,32 @@ impl ResponsesStreamTranslator {
             }
             ResponsesStreamEvent::ResponseOutputItemAdded { output_index, item } => {
                 self.ensure_started(&mut out);
-                // Hosted tools (web_search_call) and unknown items don't
-                // produce content blocks — skip them here so the caller
-                // doesn't hit unreachable! in output_item_to_block.
-                if matches!(item, OutputItem::Unknown | OutputItem::WebSearchCall { .. }) {
+                // Hosted tools (web_search_call) and unknown/reasoning
+                // items don't produce content blocks — skip them here so
+                // the caller doesn't hit unreachable! in
+                // output_item_to_block. Reasoning reasoning_* delta/done
+                // events arrive independently (response.reasoning_text.*)
+                // and own the Thinking block themselves.
+                if matches!(
+                    item,
+                    OutputItem::Unknown | OutputItem::WebSearchCall { .. } | OutputItem::Reasoning { .. }
+                ) {
                     return out;
                 }
                 if let OutputItem::FunctionCall { id, .. } = item {
                     self.has_tool_calls = true;
                     self.fc_item_index.insert(id.clone(), *output_index);
                 }
+                // Thinking and text blocks are mutually exclusive: a message
+                // item opening a text block closes any open thinking block.
+                if matches!(item, OutputItem::Message { .. }) {
+                    self.close_open_thinking_block(&mut out);
+                }
                 let block_idx = self.allocate_block(*output_index);
                 let block = output_item_to_block(item);
+                if matches!(item, OutputItem::Message { .. }) {
+                    self.text_block_index = Some(block_idx);
+                }
                 out.push(StreamEvent::ContentBlockStart {
                     index: block_idx,
                     content_block: block,
@@ -200,6 +270,98 @@ impl ResponsesStreamTranslator {
                 }
                 if self.closed_blocks.insert(block_idx) {
                     out.push(StreamEvent::ContentBlockStop { index: block_idx });
+                }
+                if self.text_block_index == Some(block_idx) {
+                    self.text_block_index = None;
+                }
+            }
+            ResponsesStreamEvent::ResponseReasoningTextDelta { item_id, delta, .. } => {
+                self.ensure_started(&mut out);
+                // First delta of a reasoning item opens a fresh thinking
+                // block (mutually exclusive with any open text block); a
+                // new reasoning item closes the previous thinking block.
+                let idx = match self.thinking_block_index {
+                    Some(idx) if self.thinking_item_id.as_deref() == Some(item_id.as_str()) => idx,
+                    _ => {
+                        self.close_open_thinking_block(&mut out);
+                        self.close_open_text_block(&mut out);
+                        let idx = self.block_index;
+                        self.block_index += 1;
+                        self.thinking_block_index = Some(idx);
+                        self.thinking_item_id = Some(item_id.clone());
+                        out.push(StreamEvent::ContentBlockStart {
+                            index: idx,
+                            content_block: ResponseBlock::Thinking {
+                                thinking: String::new(),
+                                signature: None,
+                            },
+                        });
+                        idx
+                    }
+                };
+                out.push(StreamEvent::ContentBlockDelta {
+                    index: idx,
+                    delta: BlockDelta::ThinkingDelta { thinking: delta.clone() },
+                });
+            }
+            ResponsesStreamEvent::ResponseReasoningTextDone { item_id, .. } => {
+                // The reasoning item finished — close its thinking block.
+                if self.thinking_item_id.as_deref() == Some(item_id.as_str()) {
+                    self.close_open_thinking_block(&mut out);
+                }
+            }
+            // Anthropic has no reasoning-summary concept; the summary events
+            // are tolerated (modeled) but produce no output.
+            ResponsesStreamEvent::ResponseReasoningSummaryTextDelta { .. }
+            | ResponsesStreamEvent::ResponseReasoningSummaryTextDone { .. } => {}
+            ResponsesStreamEvent::ResponseRefusalDelta {
+                output_index,
+                delta,
+                ..
+            } => {
+                // PR-5 (G3/G4 streaming): map refusal deltas to text deltas
+                // on the same text block the upstream will use. We open a
+                // text block if needed (mirrors text_delta path) and route
+                // the delta through the same block. finalize() will land
+                // stop_reason="refusal" because the request-side refusal
+                // (output_text emission + no tool calls) plus any
+                // incomplete_details.reason="content_filter" turn this into
+                // a refusal-shape stop reason.
+                self.ensure_started(&mut out);
+                let Some(&block_idx) = self.block_map.get(output_index) else {
+                    tracing::warn!(?output_index, "refusal delta for unseen block; ignoring");
+                    return out;
+                };
+                self.deltas_seen.insert(block_idx);
+                out.push(StreamEvent::ContentBlockDelta {
+                    index: block_idx,
+                    delta: BlockDelta::TextDelta { text: delta.clone() },
+                });
+            }
+            ResponsesStreamEvent::ResponseRefusalDone {
+                output_index,
+                text,
+                ..
+            } => {
+                // Close the refusal/text block. If no delta was seen (rare:
+                // upstream sends the full refusal only on .done), emit the
+                // full text as a fallback delta so the client doesn't see
+                // an empty block.
+                let Some(&block_idx) = self.block_map.get(output_index) else {
+                    tracing::warn!(?output_index, "refusal.done for unseen block; ignoring");
+                    return out;
+                };
+                if !self.deltas_seen.contains(&block_idx) {
+                    out.push(StreamEvent::ContentBlockDelta {
+                        index: block_idx,
+                        delta: BlockDelta::TextDelta { text: text.clone() },
+                    });
+                }
+                if self.closed_blocks.insert(block_idx) {
+                    out.push(StreamEvent::ContentBlockStop { index: block_idx });
+                }
+                if self.text_block_index == Some(block_idx) {
+                    self.text_block_index = None;
                 }
             }
             ResponsesStreamEvent::ResponseFunctionCallArgumentsDelta {
@@ -265,6 +427,10 @@ impl ResponsesStreamTranslator {
                     "completed" => "end_turn".to_string(),
                     _ => "end_turn".to_string(),
                 });
+                self.incomplete_reason = response
+                    .incomplete_details
+                    .as_ref()
+                    .and_then(|d| d.reason.clone());
             }
             ResponsesStreamEvent::ResponseFailed { response } => {
                 self.ensure_started(&mut out);
@@ -344,34 +510,43 @@ impl ResponsesStreamTranslator {
         for block_idx in open {
             out.push(StreamEvent::ContentBlockStop { index: block_idx });
         }
+        // Close any still-open thinking block — a `reasoning_text.done` may
+        // not arrive before the terminal event, so finalize is the backstop.
+        self.close_open_thinking_block(&mut out);
         let stop_reason = self.final_stop_reason.take();
-        // If the stream produced function_call items, the stop reason
-        // must be "tool_use" regardless of response.status. Claude Code
-        // uses stop_reason to decide whether to execute tools; an
-        // "end_turn" when tools are present causes the client to discard
-        // the tool_use blocks.
-        let stop_reason = if self.has_tool_calls {
+        let incomplete_reason = self.incomplete_reason.take();
+        // B2 + B3 stop-reason priority:
+        //  1. content_filter → refusal (spec-confirmed reason value)
+        //  2. an incomplete stream keeps max_tokens — overriding any
+        //     function_call items seen mid-stream, so a truncated tool
+        //     call does not read as a completed tool_use request
+        //  3. only a *completed* stream lets has_tool_calls force tool_use
+        //     (Claude Code uses stop_reason to decide whether to execute
+        //     tools; an "end_turn" with tools present causes the client
+        //     to discard the tool_use blocks)
+        let stop_reason = if incomplete_reason.as_deref() == Some("content_filter") {
+            Some("refusal".to_string())
+        } else if stop_reason.as_deref() == Some("max_tokens") {
+            stop_reason
+        } else if self.has_tool_calls {
             Some("tool_use".to_string())
         } else {
             stop_reason
         };
         let raw = self.final_usage.take().unwrap_or_default();
         let cached = raw.input_tokens_details.as_ref().map(|d| d.cached_tokens).unwrap_or(0);
-        let usage = Some(Usage {
-            input_tokens: raw.input_tokens.saturating_sub(cached),
-            output_tokens: raw.output_tokens,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: raw
-                .input_tokens_details
-                .as_ref()
-                .filter(|d| d.cached_tokens > 0)
-                .map(|d| d.cached_tokens),
-            cache_creation: None,
-            server_tool_use: None,
-            output_tokens_details: None,
-            service_tier: None,
-            inference_geo: None,
-        });
+        let reasoning = raw
+            .output_tokens_details
+            .as_ref()
+            .map(|d| d.reasoning_tokens)
+            .unwrap_or(0);
+        let usage = Some(build_usage(
+            raw.input_tokens,
+            raw.output_tokens,
+            cached,
+            reasoning,
+            raw.service_tier,
+        ));
         out.push(StreamEvent::MessageDelta {
             delta: MessageDeltaPayload {
                 stop_reason,
@@ -412,13 +587,18 @@ fn output_item_to_block(item: &OutputItem) -> ResponseBlock {
             }
         }
         // Caller (`ResponseOutputItemAdded` arm) early-returns on
-        // `OutputItem::Unknown` and `OutputItem::WebSearchCall`, so this
+        // `OutputItem::Unknown`, `WebSearchCall`, and `Reasoning`, so this
         // variant is unreachable here.
         OutputItem::Unknown => unreachable!("OutputItem::Unknown is filtered before output_item_to_block"),
         // Caller early-returns on WebSearchCall (same as Unknown) — this
         // arm is a compile-time safety net.
         OutputItem::WebSearchCall { .. } => unreachable!(
             "OutputItem::WebSearchCall is filtered before output_item_to_block"
+        ),
+        // Caller early-returns on Reasoning — reasoning_* delta/done
+        // events own the Thinking block themselves.
+        OutputItem::Reasoning { .. } => unreachable!(
+            "OutputItem::Reasoning is filtered before output_item_to_block"
         ),
     }
 }
@@ -427,7 +607,8 @@ fn output_item_to_block(item: &OutputItem) -> ResponseBlock {
 mod tests {
     use super::*;
     use crate::responses::{
-        InputTokensDetails, OutputContentPart, ResponsesResponse, ResponsesUsage,
+        IncompleteDetails, InputTokensDetails, OutputContentPart, ResponsesResponse,
+        ResponsesUsage,
     };
     use serde_json::json;
 
@@ -632,6 +813,7 @@ mod tests {
             total_tokens: 15,
             input_tokens_details: None,
             output_tokens_details: None,
+            service_tier: None,
         });
         let evs = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
             response: Box::new(resp),
@@ -671,6 +853,7 @@ mod tests {
             total_tokens: 110,
             input_tokens_details: Some(InputTokensDetails { cached_tokens: 60 }),
             output_tokens_details: None,
+            service_tier: None,
         });
         let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
             response: Box::new(resp),
@@ -691,6 +874,379 @@ mod tests {
         );
         assert_eq!(usage.cache_read_input_tokens, Some(60));
         assert_eq!(usage.output_tokens, 10);
+    }
+
+    // ── PR-2 · B2 + B3 (streaming) ─────────────────────────────────────
+
+    /// B2 (streaming): a terminal `response.incomplete` with
+    /// `incomplete_details.reason == "content_filter"` must finalize with
+    /// stop_reason `refusal`.
+    #[test]
+    fn stream_incomplete_with_content_filter_emits_refusal_message_delta() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let mut resp = placeholder_response("incomplete");
+        resp.incomplete_details = Some(IncompleteDetails {
+            reason: Some("content_filter".into()),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseIncomplete {
+            response: Box::new(resp),
+        });
+        let tail = t.finalize();
+        let delta = tail
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { delta, .. } => Some(delta),
+                _ => None,
+            })
+            .expect("finalize must emit a MessageDelta");
+        assert_eq!(
+            delta.stop_reason.as_deref(),
+            Some("refusal"),
+            "content_filter must finalize as refusal, got {:?}",
+            delta.stop_reason
+        );
+    }
+
+    /// B3 core (streaming): an incomplete stream that emitted a
+    /// function_call item mid-stream must finalize with `max_tokens`, NOT
+    /// `tool_use` — a truncated tool call must not read as a completed
+    /// tool_use request.
+    #[test]
+    fn stream_incomplete_with_function_call_returns_max_tokens_not_tool_use() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        // A function_call output item arrives mid-stream (sets has_tool_calls).
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::FunctionCall {
+                id: "fc_1".into(),
+                call_id: "c_1".into(),
+                name: "get_weather".into(),
+                arguments: "{\"city\":".into(),
+                status: "incomplete".into(),
+            },
+        });
+        let mut resp = placeholder_response("incomplete");
+        resp.incomplete_details = Some(IncompleteDetails {
+            reason: Some("max_output_tokens".into()),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseIncomplete {
+            response: Box::new(resp),
+        });
+        let tail = t.finalize();
+        let delta = tail
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { delta, .. } => Some(delta),
+                _ => None,
+            })
+            .expect("finalize must emit a MessageDelta");
+        assert_eq!(
+            delta.stop_reason.as_deref(),
+            Some("max_tokens"),
+            "incomplete stream with function_call must finalize max_tokens, got {:?}",
+            delta.stop_reason
+        );
+    }
+
+    /// B3 positive regression (streaming): a *completed* stream with a
+    /// function_call still finalizes with `tool_use`.
+    #[test]
+    fn stream_completed_with_function_call_returns_tool_use() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::FunctionCall {
+                id: "fc_1".into(),
+                call_id: "c_1".into(),
+                name: "get_weather".into(),
+                arguments: "{\"city\":\"SF\"}".into(),
+                status: "completed".into(),
+            },
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(placeholder_response("completed")),
+        });
+        let tail = t.finalize();
+        let delta = tail
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { delta, .. } => Some(delta),
+                _ => None,
+            })
+            .expect("finalize must emit a MessageDelta");
+        assert_eq!(delta.stop_reason.as_deref(), Some("tool_use"));
+    }
+
+    /// v0.11: a terminal event with an unknown status (including the
+    /// official `cancelled`, which has no dedicated SSE event) falls through
+    /// to the `_ => end_turn` fallback — it must NOT be misread as
+    /// `max_tokens` and must not read as `tool_use` without a completed item.
+    #[test]
+    fn stream_terminal_event_with_unknown_status_maps_to_end_turn() {
+        for status in ["cancelled", "some_future_status"] {
+            let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+            let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+                response: Box::new(placeholder_response("in_progress")),
+            });
+            let _ = t.push_event(&ResponsesStreamEvent::ResponseIncomplete {
+                response: Box::new(placeholder_response(status)),
+            });
+            let tail = t.finalize();
+            let delta = tail
+                .iter()
+                .find_map(|e| match e {
+                    StreamEvent::MessageDelta { delta, .. } => Some(delta),
+                    _ => None,
+                })
+                .expect("finalize must emit a MessageDelta");
+            assert_eq!(
+                delta.stop_reason.as_deref(),
+                Some("end_turn"),
+                "unknown terminal status {status} must map to end_turn, got {:?}",
+                delta.stop_reason
+            );
+        }
+    }
+
+    // ── PR-4 · streaming reasoning (G2) ────────────────────────────────
+
+    fn reasoning_delta(item_id: &str, delta: &str, seq: u64) -> ResponsesStreamEvent {
+        ResponsesStreamEvent::ResponseReasoningTextDelta {
+            item_id: item_id.into(),
+            output_index: 0,
+            content_index: 0,
+            delta: delta.into(),
+            sequence_number: seq,
+        }
+    }
+
+    #[test]
+    fn reasoning_text_delta_opens_thinking_block_and_streams() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        // First delta opens the thinking block and emits the first fragment.
+        let evs = t.push_event(&reasoning_delta("rsn_1", "let me think", 1));
+        assert_eq!(evs.len(), 2, "expected start + delta, got {evs:?}");
+        assert!(
+            matches!(&evs[0], StreamEvent::ContentBlockStart { index: 0, content_block: ResponseBlock::Thinking { .. } }),
+            "first event must open a Thinking block, got {:?}",
+            evs[0]
+        );
+        assert!(
+            matches!(&evs[1], StreamEvent::ContentBlockDelta { index: 0, delta: BlockDelta::ThinkingDelta { thinking } } if thinking == "let me think"),
+            "second event must be a ThinkingDelta, got {:?}",
+            evs[1]
+        );
+        // Subsequent deltas for the same item reuse the open block.
+        let evs2 = t.push_event(&reasoning_delta("rsn_1", " more", 2));
+        assert_eq!(evs2.len(), 1);
+        assert!(
+            matches!(&evs2[0], StreamEvent::ContentBlockDelta { index: 0, delta: BlockDelta::ThinkingDelta { thinking } } if thinking == " more")
+        );
+    }
+
+    #[test]
+    fn reasoning_text_done_closes_thinking_block() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let _ = t.push_event(&reasoning_delta("rsn_1", "think", 1));
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseReasoningTextDone {
+            item_id: "rsn_1".into(),
+            output_index: 0,
+            content_index: 0,
+            text: "think".into(),
+            sequence_number: 2,
+        });
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(evs[0], StreamEvent::ContentBlockStop { index: 0 }));
+        // A second done for the same item must not double-close.
+        let evs2 = t.push_event(&ResponsesStreamEvent::ResponseReasoningTextDone {
+            item_id: "rsn_1".into(),
+            output_index: 0,
+            content_index: 0,
+            text: "think".into(),
+            sequence_number: 3,
+        });
+        assert!(evs2.is_empty());
+    }
+
+    #[test]
+    fn multiple_reasoning_items_get_distinct_thinking_blocks() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        // First reasoning item.
+        let _ = t.push_event(&reasoning_delta("rsn_1", "first", 1));
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseReasoningTextDone {
+            item_id: "rsn_1".into(),
+            output_index: 0,
+            content_index: 0,
+            text: "first".into(),
+            sequence_number: 2,
+        });
+        // Second reasoning item starts a fresh block (index 1).
+        let evs = t.push_event(&reasoning_delta("rsn_2", "second", 3));
+        assert!(
+            evs.iter().any(|e| matches!(e, StreamEvent::ContentBlockStart { index: 1, content_block: ResponseBlock::Thinking { .. } })),
+            "second reasoning item must open block 1, got {evs:?}"
+        );
+    }
+
+    #[test]
+    fn text_after_thinking_opens_text_block_mutually_exclusive() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let _ = t.push_event(&reasoning_delta("rsn_1", "reason", 1));
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseReasoningTextDone {
+            item_id: "rsn_1".into(),
+            output_index: 0,
+            content_index: 0,
+            text: "reason".into(),
+            sequence_number: 2,
+        });
+        // Message item arrives after the thinking block — opens text block 1.
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 1,
+            item: OutputItem::Message {
+                id: "msg_x".into(),
+                role: "assistant".into(),
+                status: "in_progress".into(),
+                content: vec![],
+            },
+        });
+        assert!(
+            evs.iter().any(|e| matches!(e, StreamEvent::ContentBlockStart { index: 1, content_block: ResponseBlock::Text { .. } })),
+            "message item must open text block 1 after thinking, got {evs:?}"
+        );
+    }
+
+    #[test]
+    fn reasoning_after_text_closes_open_text_block() {
+        // Reverse mutual-exclusivity direction: a reasoning delta arriving
+        // while a text block is open must close the text block first.
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::Message {
+                id: "msg_x".into(),
+                role: "assistant".into(),
+                status: "in_progress".into(),
+                content: vec![],
+            },
+        });
+        let evs = t.push_event(&reasoning_delta("rsn_1", "think", 1));
+        assert!(
+            evs.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { index: 0 })),
+            "open text block must be closed before the thinking block, got {evs:?}"
+        );
+        assert!(
+            evs.iter().any(|e| matches!(e, StreamEvent::ContentBlockStart { index: 1, content_block: ResponseBlock::Thinking { .. } })),
+            "thinking block must open at index 1, got {evs:?}"
+        );
+    }
+
+    #[test]
+    fn reasoning_summary_events_emit_nothing() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseReasoningSummaryTextDelta {
+            item_id: "rsn_1".into(),
+            output_index: 0,
+            summary_index: 0,
+            delta: "sum".into(),
+            sequence_number: 1,
+        });
+        assert!(evs.is_empty(), "summary delta must be ignored, got {evs:?}");
+        let evs2 = t.push_event(&ResponsesStreamEvent::ResponseReasoningSummaryTextDone {
+            item_id: "rsn_1".into(),
+            output_index: 0,
+            summary_index: 0,
+            text: "sum".into(),
+            sequence_number: 2,
+        });
+        assert!(evs2.is_empty(), "summary done must be ignored, got {evs2:?}");
+    }
+
+    /// P2-9: a completed response carrying only reasoning (no text/tool
+    /// items) must finalize as end_turn with no leftover open blocks — the
+    /// thinking block is closed and no text block is created.
+    #[test]
+    fn reasoning_only_completed_emits_end_turn_with_empty_text() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let _ = t.push_event(&reasoning_delta("rsn_1", "deep reasoning", 1));
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseReasoningTextDone {
+            item_id: "rsn_1".into(),
+            output_index: 0,
+            content_index: 0,
+            text: "deep reasoning".into(),
+            sequence_number: 2,
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(placeholder_response("completed")),
+        });
+        let tail = t.finalize();
+        let delta = tail
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { delta, .. } => Some(delta),
+                _ => None,
+            })
+            .expect("finalize must emit MessageDelta");
+        assert_eq!(
+            delta.stop_reason.as_deref(),
+            Some("end_turn"),
+            "reasoning-only completed must be end_turn, got {:?}",
+            delta.stop_reason
+        );
+        // No ContentBlockStart for a text block, and the thinking block was
+        // closed by the done event (no stray stop in finalize).
+        assert!(
+            !tail.iter().any(|e| matches!(e, StreamEvent::ContentBlockStart { content_block: ResponseBlock::Text { .. }, .. })),
+            "reasoning-only response must not open a text block, got {tail:?}"
+        );
+    }
+
+    #[test]
+    fn finalize_closes_untouched_open_thinking_block() {
+        // If `reasoning_text.done` never arrives, finalize must still close
+        // the open thinking block (backstop).
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let _ = t.push_event(&reasoning_delta("rsn_1", "partial", 1));
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(placeholder_response("completed")),
+        });
+        let tail = t.finalize();
+        assert!(
+            tail.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { index: 0 })),
+            "finalize must close the open thinking block, got {tail:?}"
+        );
     }
 
     #[test]
@@ -1698,6 +2254,214 @@ mod tests {
         assert!(
             !out.iter().any(|e| matches!(e, StreamEvent::ContentBlockDelta { .. })),
             "must not emit a content_block_delta for unknown item_id; got {out:?}"
+        );
+    }
+
+    // ── PR-5 · refusal (streaming) ───────────────────────────────────
+
+    /// PR-5 (G3/G4 streaming): a `response.refusal.delta` stream must
+    /// land on the same text block as the message item that opens it,
+    /// delivered as a TextDelta (Anthropic has no refusal-specific
+    /// delta type). The downstream stop_reason is decided by the
+    /// `response.incomplete` event's `incomplete_details.reason` —
+    /// `content_filter` flips finalize to `refusal`.
+    #[test]
+    fn refusal_delta_routes_through_text_block_as_text_delta() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        // Message item opens a text block.
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::Message {
+                id: "msg_r".into(),
+                role: "assistant".into(),
+                status: "in_progress".into(),
+                content: vec![],
+            },
+        });
+        // Refusal delta lands on the same block as text delta.
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseRefusalDelta {
+            item_id: "msg_r".into(),
+            output_index: 0,
+            content_index: 0,
+            delta: "no".into(),
+            sequence_number: 1,
+        });
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(
+            evs[0],
+            StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: BlockDelta::TextDelta { ref text }
+            } if text == "no"
+        ));
+    }
+
+    /// PR-5: `response.refusal.done` closes the text block; if no delta
+    /// preceded it, the done text is emitted as a fallback delta so the
+    /// client doesn't see an empty block (parity with `output_text.done`).
+    #[test]
+    fn refusal_done_with_no_delta_emits_fallback_then_stop() {
+        let mut t = ResponsesStreamTranslator::new("msg_1", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
+            output_index: 0,
+            item: OutputItem::Message {
+                id: "msg_r".into(),
+                role: "assistant".into(),
+                status: "in_progress".into(),
+                content: vec![],
+            },
+        });
+        let evs = t.push_event(&ResponsesStreamEvent::ResponseRefusalDone {
+            item_id: "msg_r".into(),
+            output_index: 0,
+            content_index: 0,
+            text: "I cannot help with that.".into(),
+            sequence_number: 1,
+        });
+        assert_eq!(evs.len(), 2, "expected fallback delta + stop, got {evs:?}");
+        assert!(matches!(
+            evs[0],
+            StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: BlockDelta::TextDelta { ref text }
+            } if text == "I cannot help with that."
+        ));
+        assert!(matches!(evs[1], StreamEvent::ContentBlockStop { index: 0 }));
+        // finalize must not double-close.
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseIncomplete {
+            response: Box::new({
+                let mut r = placeholder_response("incomplete");
+                r.incomplete_details = Some(IncompleteDetails {
+                    reason: Some("content_filter".into()),
+                });
+                r
+            }),
+        });
+        let tail = t.finalize();
+        assert!(
+            !tail.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { .. })),
+            "finalize must not re-close the refusal block"
+        );
+        // refusal stop_reason comes from the incomplete_details path.
+        let delta = tail
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { delta, .. } => Some(delta),
+                _ => None,
+            })
+            .expect("finalize must emit MessageDelta");
+        assert_eq!(delta.stop_reason.as_deref(), Some("refusal"));
+    }
+
+    // ── PR-6b · output_tokens_details.thinking_tokens (Responses stream) ──
+
+    /// PR-6b (Responses stream): the final MessageDelta's usage must
+    /// carry `output_tokens_details.thinking_tokens` when the upstream
+    /// returned `output_tokens_details.reasoning_tokens`, and must
+    /// omit the field entirely when absent or zero.
+    #[test]
+    fn responses_stream_propagates_reasoning_tokens_as_thinking_tokens() {
+        use crate::responses::OutputTokensDetails;
+
+        // (a) reasoning_tokens present → thinking_tokens surfaced.
+        let mut t = ResponsesStreamTranslator::new("msg_s", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let mut resp = placeholder_response("completed");
+        resp.usage = Some(ResponsesUsage {
+            input_tokens: 10,
+            output_tokens: 50,
+            total_tokens: 60,
+            input_tokens_details: None,
+            output_tokens_details: Some(OutputTokensDetails { reasoning_tokens: 21 }),
+            service_tier: None,
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(resp),
+        });
+        let tail = t.finalize();
+        let delta = tail
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { usage, .. } => usage.as_ref(),
+                _ => None,
+            })
+            .expect("finalize must emit MessageDelta with usage");
+        let details = delta
+            .output_tokens_details
+            .as_ref()
+            .expect("reasoning_tokens>0 must surface output_tokens_details");
+        assert_eq!(details["thinking_tokens"], 21);
+        assert!(
+            details.get("reasoning_tokens").is_none(),
+            "OpenAI read key must not leak; got {details}"
+        );
+
+        // (b) output_tokens_details absent → field absent.
+        let mut t = ResponsesStreamTranslator::new("msg_s", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let mut resp = placeholder_response("completed");
+        resp.usage = Some(ResponsesUsage {
+            input_tokens: 10,
+            output_tokens: 50,
+            total_tokens: 60,
+            input_tokens_details: None,
+            output_tokens_details: None,
+            service_tier: None,
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(resp),
+        });
+        let tail = t.finalize();
+        let delta = tail
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { usage, .. } => usage.as_ref(),
+                _ => None,
+            })
+            .expect("finalize must emit MessageDelta");
+        assert!(
+            delta.output_tokens_details.is_none(),
+            "no output_tokens_details → must be absent"
+        );
+
+        // (c) reasoning_tokens == 0 → field absent (Some(0) changes wire shape).
+        let mut t = ResponsesStreamTranslator::new("msg_s", "gpt-5");
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+        let mut resp = placeholder_response("completed");
+        resp.usage = Some(ResponsesUsage {
+            input_tokens: 10,
+            output_tokens: 50,
+            total_tokens: 60,
+            input_tokens_details: None,
+            output_tokens_details: Some(OutputTokensDetails { reasoning_tokens: 0 }),
+            service_tier: None,
+        });
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
+            response: Box::new(resp),
+        });
+        let tail = t.finalize();
+        let delta = tail
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta { usage, .. } => usage.as_ref(),
+                _ => None,
+            })
+            .expect("finalize must emit MessageDelta");
+        assert!(
+            delta.output_tokens_details.is_none(),
+            "reasoning_tokens==0 → must be absent"
         );
     }
 }
