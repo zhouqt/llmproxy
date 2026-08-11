@@ -22,14 +22,14 @@ use uuid::Uuid;
 
 use crate::anthropic::{
     ContentBlock, MessageContent, MessagesRequest, MessagesResponse, ResponseBlock, SystemPrompt,
-    ToolChoice, Usage,
+    ToolChoice,
 };
 use crate::conversion::derive_cache_hints;
-use crate::conversion::util::strictify_schema;
+use crate::conversion::util::{build_usage, strictify_schema};
 use crate::error::{ProxyError, Result};
 use crate::responses::{
-    OutputContentPart, OutputItem, ReasoningConfig, ResponseInputContent, ResponseInputItem,
-    ResponseInputPart, ResponsesRequest, ResponsesResponse, ResponsesTool,
+    OutputContentPart, OutputItem, ReasoningConfig, ReasoningSummary, ResponseInputContent,
+    ResponseInputItem, ResponseInputPart, ResponsesRequest, ResponsesResponse, ResponsesTool,
 };
 
 /// Truncate the `user` identifier to the 64-character limit enforced by
@@ -48,7 +48,7 @@ pub(crate) fn truncate_user(user: &str) -> String {
 pub fn anthropic_to_responses_request(
     req: &MessagesRequest,
     model_rewrite: &std::collections::HashMap<String, String>,
-) -> ResponsesRequest {
+) -> crate::error::Result<ResponsesRequest> {
     let model = model_rewrite
         .get(&req.model)
         .cloned()
@@ -112,7 +112,7 @@ pub fn anthropic_to_responses_request(
         // upstream lists web_search_preview separately.
         for t in ts {
             if crate::conversion::util::is_web_search_tool(t) {
-                result.push(ResponsesTool::WebSearch {
+                result.push(ResponsesTool::WebSearchPreview {
                     search_context_size: t
                         .extra
                         .get("search_context_size")
@@ -161,7 +161,7 @@ pub fn anthropic_to_responses_request(
         }
     });
 
-    ResponsesRequest {
+    Ok(ResponsesRequest {
         model,
         input,
         instructions,
@@ -178,14 +178,24 @@ pub fn anthropic_to_responses_request(
             });
             let tc = req.tool_choice.as_ref().and_then(convert_tool_choice);
             if has_web_search
-                && matches!(req.tool_choice, Some(ToolChoice::Tool { ref name }) if name == "web_search")
+                && matches!(req.tool_choice, Some(ToolChoice::Tool { ref name, .. }) if name == "web_search")
             {
                 Some(json!("auto"))
             } else {
                 tc
             }
         },
-        parallel_tool_calls: None,
+        parallel_tool_calls: match req.tool_choice.as_ref() {
+            // PR-8: Anthropic `tool_choice.disable_parallel_tool_use=true`
+            // → Responses `parallel_tool_calls=false`. Absent/false →
+            // None (OpenAI wire default is true; emitting the field as
+            // explicit `true` would be noisier than necessary).
+            Some(crate::anthropic::ToolChoice::Tool {
+                disable_parallel_tool_use,
+                ..
+            }) if *disable_parallel_tool_use == Some(true) => Some(false),
+            _ => None,
+        },
         user: req
             .metadata
             .as_ref()
@@ -195,38 +205,59 @@ pub fn anthropic_to_responses_request(
         prompt_cache_retention,
         reasoning: req.output_config.as_ref()
             .and_then(|oc| oc.effort.clone())
-            .map(|e| ReasoningConfig::Enabled { effort: Some(e) })
+            .map(|e| ReasoningConfig { effort: Some(e), summary: Some(ReasoningSummary::Auto) })
             .or_else(|| req.thinking.as_ref().and_then(convert_thinking)),
+        // PR-3: keep OpenAI's default (Responses `store: true`) — do not
+        // send the field. See `ResponsesRequest.store` doc.
+        store: None,
+        // PR-7: same mapping as Chat (auto→auto, standard_only→drop).
+        // See `conversion/request.rs` for the full rationale.
+        service_tier: req.service_tier.as_deref().and_then(|tier| match tier {
+            "auto" => Some("auto".to_string()),
+            _ => None,
+        }),
         extra: {
             let mut e = Value::Object(Map::new());
+            // PR-8: Responses API carries verbosity under
+            // `text.verbosity` (same enum as Chat top-level `verbosity`).
+            // Build the text object once and merge in format if any.
+            let mut text_obj = serde_json::Map::new();
+            if let Some(v) = req.output_config.as_ref().and_then(|oc| oc.verbosity.clone()) {
+                text_obj.insert("verbosity".into(), Value::String(v));
+            }
             if let Some(fmt) = req.output_config.as_ref().and_then(|oc| oc.format.as_ref()) {
-                e["text"] = json!({"format": ensure_json_schema_name(fmt)});
+                text_obj.insert("format".into(), ensure_json_schema_name(fmt)?);
+            }
+            if !text_obj.is_empty() {
+                e["text"] = Value::Object(text_obj);
             }
             e
         },
-    }
+    })
 }
 
 /// OpenAI Responses API requires `text.format.name` on `json_schema` shapes;
 /// Anthropic's `output_config.format` doesn't carry one. Synthesize a stable
 /// default so the schema constraint round-trips, and pin `strict: true` so the
 /// model is held to the schema (matches Anthropic's enforcement semantics).
-fn ensure_json_schema_name(fmt: &Value) -> Value {
+fn ensure_json_schema_name(
+    fmt: &Value,
+) -> std::result::Result<Value, crate::conversion::util::SchemaError> {
     if fmt.get("type").and_then(|v| v.as_str()) != Some("json_schema") {
-        return fmt.clone();
+        return Ok(fmt.clone());
     }
     let Some(obj) = fmt.as_object() else {
-        return fmt.clone();
+        return Ok(fmt.clone());
     };
     let mut out = obj.clone();
     if let Some(mut schema) = out.get("schema").cloned() {
-        strictify_schema(&mut schema);
+        strictify_schema(&mut schema)?;
         out.insert("schema".to_string(), schema);
     }
     out.entry("name".to_string())
         .or_insert(json!("structured_output"));
     out.entry("strict".to_string()).or_insert(json!(true));
-    Value::Object(out)
+    Ok(Value::Object(out))
 }
 
 fn convert_message(m: &crate::anthropic::Message) -> Vec<ResponseInputItem> {
@@ -388,7 +419,7 @@ fn convert_tool_choice(c: &ToolChoice) -> Option<Value> {
     match c {
         ToolChoice::Auto => Some(json!("auto")),
         ToolChoice::Any => Some(json!("required")),
-        ToolChoice::Tool { name } => Some(json!({
+        ToolChoice::Tool { name, .. } => Some(json!({
             "type": "function",
             "name": name
         })),
@@ -410,7 +441,12 @@ fn convert_thinking(t: &crate::anthropic::ThinkingConfig) -> Option<ReasoningCon
                 }
             })
             .unwrap_or_else(|| "medium".to_string());
-        Some(ReasoningConfig::Enabled { effort: Some(effort) })
+        Some(ReasoningConfig {
+            effort: Some(effort),
+            // PR-4: request the reasoning summary so the upstream emits
+            // `reasoning_summary_text` alongside `reasoning_text`.
+            summary: Some(ReasoningSummary::Auto),
+        })
     } else {
         None
     }
@@ -442,6 +478,21 @@ pub fn responses_to_anthropic_response(
                                 content.push(ResponseBlock::Text { text: text.clone(), citations: None });
                             }
                         }
+                        // PR-5 (G3/G4 inbound): a refusal content part maps
+                        // to an Anthropic Text block (the wire has no
+                        // refusal-specific block type). The refusal text
+                        // surfaces to the client as text; the upstream
+                        // `stop_reason=refusal` (PR-7 outbound, picked up
+                        // via the incomplete_details path) tells Claude
+                        // Code to treat it as a refusal, not user content.
+                        OutputContentPart::Refusal { refusal } => {
+                            if !refusal.is_empty() {
+                                content.push(ResponseBlock::Text {
+                                    text: refusal.clone(),
+                                    citations: None,
+                                });
+                            }
+                        }
                         OutputContentPart::Unknown => {}
                     }
                 }
@@ -452,6 +503,16 @@ pub fn responses_to_anthropic_response(
                 arguments,
                 ..
             } => {
+                // B3: inside an *incomplete* response, a function_call
+                // whose arguments don't parse (truncated mid-JSON) must not
+                // surface as an empty-input ToolUse — that would hand the
+                // client a phantom tool call. Skip it; the `max_tokens`
+                // stop_reason below already signals the turn was cut off.
+                if resp.status == "incomplete"
+                    && serde_json::from_str::<Value>(arguments).is_err()
+                {
+                    continue;
+                }
                 let input: Value = serde_json::from_str(arguments)
                     .unwrap_or_else(|_| Value::Object(Default::default()));
                 content.push(ResponseBlock::ToolUse {
@@ -462,6 +523,13 @@ pub fn responses_to_anthropic_response(
                 });
                 has_tool_calls = true;
             }
+            // PR-5: OutputItem::Reasoning is the response-side mirror of
+            // ResponseInputItem::Reasoning. We don't fold reasoning into
+            // Anthropic `ContentBlock::Thinking` here (the streaming
+            // translator owns that surface; non-streaming responses that
+            // arrive with a `reasoning` item but no text/tool blocks are
+            // reported as end_turn with empty content).
+            OutputItem::Reasoning { .. } => {}
             // WebSearchCall doesn't carry result text directly —
             // search results appear as url_citation annotations on
             // the subsequent output_text block. No block to emit.
@@ -470,38 +538,69 @@ pub fn responses_to_anthropic_response(
         }
     }
 
-    let stop_reason = if has_tool_calls {
-        Some("tool_use".to_string())
-    } else {
-        match resp.status.as_str() {
-            "incomplete" => Some("max_tokens".to_string()),
-            "completed" => Some("end_turn".to_string()),
-            "failed" => {
-                // If the response carries error details in extra, surface
-                // them as an upstream error rather than silently mapping
-                // to end_turn.
-                let err_msg = resp
-                    .extra
-                    .get("error")
-                    .and_then(|v| v.get("message"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_owned())
-                    .unwrap_or_else(|| "upstream error".to_string());
-                return Err(ProxyError::Upstream {
-                    status: 502,
-                    body: err_msg,
-                });
+    // B2 (spec-confirmed): `incomplete_details.reason` is a two-value enum
+    // (`max_output_tokens` / `content_filter`). Read it to map a content
+    // filter refusal to `refusal` instead of the old blanket `max_tokens`.
+    // B3: `status == "incomplete"` takes priority over `has_tool_calls` — a
+    // truncated function_call must read as `max_tokens`, never `tool_use`.
+    let stop_reason = match resp.status.as_str() {
+        "incomplete" => Some(
+            match resp.incomplete_details.as_ref().and_then(|d| d.reason.as_deref()) {
+                Some("content_filter") => "refusal".to_string(),
+                _ => "max_tokens".to_string(),
+            },
+        ),
+        "completed" => {
+            if has_tool_calls {
+                Some("tool_use".to_string())
+            } else {
+                Some("end_turn".to_string())
             }
-            _ => None,
         }
+        // Official `cancelled` status (spec-confirmed) carries no usable
+        // output — present it as a clean end_turn with empty content
+        // (deliberate Anthropic-compat choice, not OpenAI semantics).
+        "cancelled" => {
+            content.clear();
+            Some("end_turn".to_string())
+        }
+        "failed" => {
+            // If the response carries error details in extra, surface
+            // them as an upstream error rather than silently mapping
+            // to end_turn.
+            let err_msg = resp
+                .extra
+                .get("error")
+                .and_then(|v| v.get("message"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned())
+                .unwrap_or_else(|| "upstream error".to_string());
+            return Err(ProxyError::Upstream {
+                status: 502,
+                body: err_msg,
+            });
+        }
+        _ => None,
     };
 
-    let usage = resp.usage.clone().unwrap_or_default();
-    let cached = usage
+    let usage_raw = resp.usage.clone().unwrap_or_default();
+    let cached = usage_raw
         .input_tokens_details
         .as_ref()
         .map(|d| d.cached_tokens)
         .unwrap_or(0);
+    let reasoning = usage_raw
+        .output_tokens_details
+        .as_ref()
+        .map(|d| d.reasoning_tokens)
+        .unwrap_or(0);
+    let usage = build_usage(
+        usage_raw.input_tokens,
+        usage_raw.output_tokens,
+        cached,
+        reasoning,
+        usage_raw.service_tier,
+    );
 
     Ok(MessagesResponse {
         id: message_id.to_string(),
@@ -513,17 +612,7 @@ pub fn responses_to_anthropic_response(
         stop_sequence: None,
         stop_details: None,
         container: None,
-        usage: Usage {
-            input_tokens: usage.input_tokens.saturating_sub(cached),
-            output_tokens: usage.output_tokens,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: if cached > 0 { Some(cached) } else { None },
-            cache_creation: None,
-            server_tool_use: None,
-            output_tokens_details: None,
-            service_tier: None,
-            inference_geo: None,
-        },
+        usage,
         extra: HashMap::new(),
     })
 }
@@ -553,7 +642,7 @@ mod tests {
     #[test]
     fn request_maps_system_to_instructions() {
         let req = req_with_text();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.model, "gpt-5");
         assert_eq!(out.instructions.as_deref(), Some("be brief"));
         assert_eq!(out.max_output_tokens, Some(256));
@@ -586,7 +675,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         // user msg → assistant function_call → user tool_result (function_call_output)
         assert_eq!(out.input.len(), 3);
         match &out.input[1] {
@@ -622,15 +711,19 @@ mod tests {
             "thinking": {"type": "enabled", "budget_tokens": 4000}
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(
             out.tool_choice.as_ref().unwrap(),
             &json!("required")
         );
         match out.reasoning.as_ref().unwrap() {
-            ReasoningConfig::Enabled { effort } => {
+            ReasoningConfig {
+                effort,
+                summary: Some(ReasoningSummary::Auto),
+            } => {
                 assert_eq!(effort.as_deref(), Some("medium"));
             }
+            other => panic!("expected struct with summary Auto, got {other:?}"),
         }
         let tools = out.tools.as_ref().unwrap();
         assert_eq!(tools.len(), 1);
@@ -688,6 +781,163 @@ mod tests {
         let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
         let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_1").unwrap();
         assert_eq!(out.stop_reason.as_deref(), Some("max_tokens"));
+    }
+
+    /// PR-7 response side: upstream Responses `service_tier` (e.g.
+    /// `fast`) echoes back as Anthropic `Usage.service_tier` — passthrough
+    /// string, no enum validation (plan v0.12 P1-B).
+    #[test]
+    fn usage_service_tier_passes_through() {
+        let raw = json!({
+            "id": "resp_st",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [
+                {"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+                 "content": [{"type": "output_text", "text": "hi"}]}
+            ],
+            "usage": {
+                "input_tokens": 3,
+                "output_tokens": 2,
+                "total_tokens": 5,
+                "service_tier": "fast"
+            }
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_1").unwrap();
+        assert_eq!(out.usage.service_tier.as_deref(), Some("fast"));
+    }
+
+    // ── PR-2 · B2 + B3 ──────────────────────────────────────────────────
+
+    /// B2 (spec-confirmed): `incomplete_details.reason == "content_filter"`
+    /// must map to stop_reason `refusal`, not the old blanket `max_tokens`.
+    #[test]
+    fn incomplete_with_content_filter_reason_returns_refusal() {
+        let raw = json!({
+            "id": "resp_cf",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "content_filter"},
+            "output": [{"type": "message", "id": "m", "role": "assistant", "status": "incomplete",
+                        "content": [{"type": "output_text", "text": ""}]}],
+            "usage": {"input_tokens": 5, "output_tokens": 0, "total_tokens": 5}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_cf").unwrap();
+        assert_eq!(
+            out.stop_reason.as_deref(),
+            Some("refusal"),
+            "content_filter must map to refusal, got {:?}",
+            out.stop_reason
+        );
+    }
+
+    /// B2 regression: `reason == "max_output_tokens"` (or absent) keeps the
+    /// old `max_tokens` mapping.
+    #[test]
+    fn incomplete_with_max_tokens_returns_max_tokens_stop_reason() {
+        for details in [json!({"reason": "max_output_tokens"}), json!({})] {
+            let raw = json!({
+                "id": "resp_mt",
+                "object": "response",
+                "created_at": 0,
+                "model": "gpt-5",
+                "status": "incomplete",
+                "incomplete_details": details,
+                "output": [{"type": "message", "id": "m", "role": "assistant", "status": "incomplete",
+                            "content": [{"type": "output_text", "text": "partial"}]}],
+                "usage": {"input_tokens": 5, "output_tokens": 1, "total_tokens": 6}
+            });
+            let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+            let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_mt").unwrap();
+            assert_eq!(out.stop_reason.as_deref(), Some("max_tokens"));
+        }
+    }
+
+    /// B3 core (non-streaming): status="incomplete" takes priority over
+    /// has_tool_calls. A truncated function_call must yield `max_tokens`
+    /// (never `tool_use`) and its unparseable arguments must NOT surface
+    /// as an empty-input ToolUse block.
+    #[test]
+    fn incomplete_with_truncated_function_call_returns_max_tokens_not_tool_use() {
+        let raw = json!({
+            "id": "resp_tfc",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [
+                {"type": "function_call", "id": "fc_1", "call_id": "c_1",
+                 "name": "get_weather", "arguments": "{\"city\":", "status": "incomplete"}
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_tfc").unwrap();
+        assert_eq!(
+            out.stop_reason.as_deref(),
+            Some("max_tokens"),
+            "incomplete + truncated function_call must be max_tokens, got {:?}",
+            out.stop_reason
+        );
+        assert!(
+            !out.content.iter().any(|b| matches!(b, ResponseBlock::ToolUse { .. })),
+            "truncated function_call must not produce an empty-input ToolUse; got {:?}",
+            out.content
+        );
+    }
+
+    /// B3 positive regression (non-streaming): a *completed* response with
+    /// a function_call still maps to `tool_use`.
+    #[test]
+    fn completed_with_function_call_returns_tool_use() {
+        let raw = json!({
+            "id": "resp_cfc",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [
+                {"type": "function_call", "id": "fc_1", "call_id": "c_1",
+                 "name": "get_weather", "arguments": "{\"city\":\"SF\"}", "status": "completed"}
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_cfc").unwrap();
+        assert_eq!(out.stop_reason.as_deref(), Some("tool_use"));
+        assert!(out.content.iter().any(|b| matches!(b, ResponseBlock::ToolUse { .. })));
+    }
+
+    /// Official `cancelled` status → end_turn + empty content (deliberate
+    /// Anthropic-compat choice). The test feeds partial output to prove
+    /// the content is actively cleared, not merely empty by construction.
+    #[test]
+    fn non_stream_cancelled_status_maps_to_end_turn_empty() {
+        let raw = json!({
+            "id": "resp_canc",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "cancelled",
+            "output": [{"type": "message", "id": "m", "role": "assistant", "status": "incomplete",
+                        "content": [{"type": "output_text", "text": "partial reply"}]}],
+            "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_canc").unwrap();
+        assert_eq!(out.stop_reason.as_deref(), Some("end_turn"));
+        assert!(
+            out.content.is_empty(),
+            "cancelled response must present empty content, got {:?}",
+            out.content
+        );
     }
 
     #[test]
@@ -748,6 +998,70 @@ mod tests {
         assert_eq!(out.usage.cache_read_input_tokens, Some(60));
     }
 
+    // ── PR-6b · output_tokens_details.thinking_tokens (Responses non-stream) ──
+
+    /// PR-6b (Responses non-stream): forward `output_tokens_details.
+    /// reasoning_tokens` (OpenAI read key) as `output_tokens_details.
+    /// thinking_tokens` (Anthropic write key). Different keys on each
+    /// side — never leak `reasoning_tokens` into the Anthropic write
+    /// payload. Absent and zero both produce a fully-absent field.
+    #[test]
+    fn responses_non_stream_propagates_reasoning_tokens_as_thinking_tokens() {
+        use crate::responses::OutputTokensDetails;
+        // (a) reasoning_tokens present → thinking_tokens surfaced.
+        let raw = json!({
+            "id": "resp_t", "object": "response", "created_at": 0,
+            "model": "gpt-5", "status": "completed",
+            "output": [{"type": "message", "id": "m", "role": "assistant", "status": "completed",
+                        "content": [{"type": "output_text", "text": "ok"}]}],
+            "usage": {"input_tokens": 10, "output_tokens": 50, "total_tokens": 60,
+                      "output_tokens_details": {"reasoning_tokens": 18}}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_t").unwrap();
+        let details = out.usage.output_tokens_details.expect(
+            "reasoning_tokens>0 must surface output_tokens_details",
+        );
+        assert_eq!(details["thinking_tokens"], 18);
+        assert!(
+            details.get("reasoning_tokens").is_none(),
+            "OpenAI read key must not leak; got {details}"
+        );
+
+        // (b) output_tokens_details absent → field absent.
+        let raw_no = json!({
+            "id": "resp_t2", "object": "response", "created_at": 0,
+            "model": "gpt-5", "status": "completed",
+            "output": [{"type": "message", "id": "m", "role": "assistant", "status": "completed",
+                        "content": [{"type": "output_text", "text": "ok"}]}],
+            "usage": {"input_tokens": 10, "output_tokens": 50, "total_tokens": 60}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw_no).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_t").unwrap();
+        assert!(
+            out.usage.output_tokens_details.is_none(),
+            "no output_tokens_details → must be absent"
+        );
+
+        // (c) reasoning_tokens == 0 → field absent (Some(0) changes wire shape).
+        let raw_zero = json!({
+            "id": "resp_t3", "object": "response", "created_at": 0,
+            "model": "gpt-5", "status": "completed",
+            "output": [{"type": "message", "id": "m", "role": "assistant", "status": "completed",
+                        "content": [{"type": "output_text", "text": "ok"}]}],
+            "usage": {"input_tokens": 10, "output_tokens": 50, "total_tokens": 60,
+                      "output_tokens_details": {"reasoning_tokens": 0}}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw_zero).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_t").unwrap();
+        assert!(
+            out.usage.output_tokens_details.is_none(),
+            "reasoning_tokens==0 → must be absent"
+        );
+        // Sanity: the OutputTokensDetails struct still reads reasoning_tokens.
+        let _ = OutputTokensDetails { reasoning_tokens: 0 };
+    }
+
     // silence unused warnings for the helper kept to ensure imports stay live
     #[test]
     fn make_message_id_format() {
@@ -764,7 +1078,7 @@ mod tests {
             "thinking": {"type": "disabled", "budget_tokens": 8000}
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert!(out.reasoning.is_none());
     }
 
@@ -782,7 +1096,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.input.len(), 1);
         // Note: this only drops when there's no top-level system — we
         // accept the silent drop as the lesser evil (no instruction
@@ -856,7 +1170,7 @@ mod tests {
             }]
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.input.len(), 1);
         match &out.input[0] {
             ResponseInputItem::Message { role, content } => {
@@ -893,7 +1207,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.instructions.as_deref(), Some("first half\n\nsecond half"));
     }
 
@@ -908,7 +1222,7 @@ mod tests {
             "system": ""
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert!(out.instructions.is_none());
     }
 
@@ -924,7 +1238,7 @@ mod tests {
             "tool_choice": {"type": "tool", "name": "get_weather"}
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(
             out.tool_choice.as_ref().unwrap(),
             &json!({"type": "function", "name": "get_weather"})
@@ -940,7 +1254,7 @@ mod tests {
             "tool_choice": {"type": "none"}
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.tool_choice.as_ref().unwrap(), &json!("none"));
     }
 
@@ -957,7 +1271,7 @@ mod tests {
             "stream": true
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.temperature, Some(0.7));
         assert_eq!(out.top_p, Some(0.9));
         assert!(out.stream);
@@ -975,7 +1289,7 @@ mod tests {
         .unwrap();
         let mut rewrite = HashMap::new();
         rewrite.insert("claude-sonnet-4.6".to_string(), "gpt-5-mini".to_string());
-        let out = anthropic_to_responses_request(&req, &rewrite);
+        let out = anthropic_to_responses_request(&req, &rewrite).unwrap();
         assert_eq!(out.model, "gpt-5-mini");
         assert_eq!(out.input.len(), 1);
     }
@@ -999,7 +1313,7 @@ mod tests {
             "metadata": {"user_id": "u-1"}
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.prompt_cache_retention.as_deref(), Some("24h"));
     }
 
@@ -1018,7 +1332,7 @@ mod tests {
             }]
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.prompt_cache_retention.as_deref(), Some("24h"));
     }
 
@@ -1039,7 +1353,7 @@ mod tests {
             }]
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.prompt_cache_retention.as_deref(), Some("in_memory"));
     }
 
@@ -1053,7 +1367,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.prompt_cache_retention, None);
     }
 
@@ -1067,7 +1381,7 @@ mod tests {
             "messages": []
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert!(out.input.is_empty());
     }
 
@@ -1239,7 +1553,7 @@ mod tests {
             "system": []
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert!(out.instructions.is_none());
     }
 
@@ -1260,12 +1574,38 @@ mod tests {
             ]
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert!(
             out.instructions.is_none(),
             "all-empty-text system blocks must yield None, got {:?}",
             out.instructions
         );
+    }
+
+    /// PR-13 v0.13 P2-G: when every system block is empty *text* but
+    /// still carries a `cache_control` marker, `instructions` must stay
+    /// absent (empty text → None) while the cache hint still fires (the
+    /// marker lives on the block, not the text). Regression for the
+    /// boundary where "no instructions" and "cache wanted" coexist.
+    #[test]
+    fn cache_hint_escalates_when_all_system_blocks_empty() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "system": [
+                {"type": "text", "text": "", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "", "cache_control": {"type": "ephemeral_1h"}}
+            ],
+            "metadata": {"user_id": "u-edge"}
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
+        assert!(out.instructions.is_none());
+        // 24h marker present → retention escalates; cache key from
+        // metadata.user_id flows through despite empty system text.
+        assert_eq!(out.prompt_cache_retention.as_deref(), Some("24h"));
+        assert_eq!(out.prompt_cache_key.as_deref(), Some("u-edge"));
     }
 
     #[test]
@@ -1285,7 +1625,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(
             out.instructions.as_deref(),
             Some("first real instruction\n\nsecond real instruction"),
@@ -1434,7 +1774,7 @@ mod tests {
             "tool_choice": {"type": "auto"}
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert_eq!(out.tool_choice.as_ref().unwrap(), &json!("auto"));
     }
 
@@ -1450,11 +1790,51 @@ mod tests {
                 "thinking": {"type": "enabled", "budget_tokens": budget}
             }))
             .unwrap();
-            let out = anthropic_to_responses_request(&req, &Default::default());
+            let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
             match out.reasoning.as_ref().unwrap() {
-                ReasoningConfig::Enabled { effort } => {
+                ReasoningConfig {
+                    effort,
+                    summary: Some(ReasoningSummary::Auto),
+                } => {
                     assert_eq!(effort.as_deref(), Some(expected), "budget {budget}");
                 }
+                other => panic!("expected struct with summary Auto, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn convert_thinking_still_produces_effort_after_struct_migration() {
+        // Regression sentinel (PR-1 + PR-4): ReasoningConfig changed from
+        // tagged enum `ReasoningConfig::Enabled { effort }` to plain struct
+        // `ReasoningConfig { effort, summary }`. Both construction paths
+        // (output_config.effort and thinking.budget_tokens) must still
+        // produce a struct with the expected effort and summary Auto (PR-4
+        // requests the reasoning summary on the wire).
+        let via_output_config: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": "xhigh"},
+        }))
+        .unwrap();
+        let via_thinking: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 2000},
+        }))
+        .unwrap();
+        for (req, expected) in [(via_output_config, Some("xhigh")), (via_thinking, Some("medium"))] {
+            let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
+            match out.reasoning.as_ref() {
+                Some(ReasoningConfig {
+                    effort,
+                    summary: Some(ReasoningSummary::Auto),
+                }) => {
+                    assert_eq!(effort.as_deref(), expected);
+                }
+                other => panic!("expected ReasoningConfig struct with effort {expected:?}, got {other:?}"),
             }
         }
     }
@@ -1507,6 +1887,71 @@ mod tests {
         let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_ui").unwrap();
         assert_eq!(out.content.len(), 1);
         assert!(matches!(out.content[0], ResponseBlock::Text { .. }));
+    }
+
+    // ── PR-5 · refusal (non-streaming) ────────────────────────────────
+
+    /// PR-5 (G3/G4 inbound): a `refusal` content part in a completed
+    /// response must surface as an Anthropic Text block. The Anthropic
+    /// wire has no refusal-specific block; clients read it as text and
+    /// the stop_reason (set by incomplete_details.content_filter on the
+    /// upstream path, PR-7 outbound) tells Claude Code to treat it as
+    /// a refusal rather than user content.
+    #[test]
+    fn response_with_refusal_content_part_maps_to_text_block() {
+        let raw = json!({
+            "id": "resp_rf",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [{
+                "type": "message", "id": "m", "role": "assistant", "status": "completed",
+                "content": [
+                    {"type": "output_text", "text": ""},
+                    {"type": "refusal", "refusal": "I cannot comply with this request."}
+                ]
+            }],
+            "usage": {"input_tokens": 5, "output_tokens": 6, "total_tokens": 11}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_rf").unwrap();
+        assert_eq!(out.content.len(), 1, "refusal must surface as one text block");
+        match &out.content[0] {
+            ResponseBlock::Text { text, .. } => {
+                assert_eq!(text, "I cannot comply with this request.");
+            }
+            other => panic!("expected Text block, got {other:?}"),
+        }
+    }
+
+    /// PR-5: a refusal in an `incomplete` response whose reason is
+    /// `content_filter` carries both the refusal text (PR-5) and the
+    /// `refusal` stop_reason (B2 from PR-2). Both must be honored.
+    #[test]
+    fn response_with_refusal_and_content_filter_reason_surfaces_refusal() {
+        let raw = json!({
+            "id": "resp_cfr",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "content_filter"},
+            "output": [{
+                "type": "message", "id": "m", "role": "assistant", "status": "incomplete",
+                "content": [{"type": "refusal", "refusal": "blocked by content policy"}]
+            }],
+            "usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7}
+        });
+        let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
+        let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_cfr").unwrap();
+        assert_eq!(
+            out.stop_reason.as_deref(),
+            Some("refusal"),
+            "content_filter + refusal must finalize as refusal"
+        );
+        assert_eq!(out.content.len(), 1);
+        assert!(matches!(&out.content[0], ResponseBlock::Text { text, .. } if text == "blocked by content policy"));
     }
 
     #[test]
@@ -1577,7 +2022,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         let text_format = out.extra.get("text").and_then(|v| v.get("format")).unwrap();
         assert_eq!(text_format.get("type").and_then(|v| v.as_str()), Some("json_schema"));
         // Anthropic doesn't carry a schema name; OpenAI requires one. The
@@ -1593,8 +2038,39 @@ mod tests {
         assert!(required.iter().any(|v| v.as_str() == Some("impossible")));
         assert!(matches!(
             out.reasoning.as_ref(),
-            Some(ReasoningConfig::Enabled { effort: Some(e) }) if e == "medium"
+            Some(ReasoningConfig { effort: Some(e), summary: Some(ReasoningSummary::Auto) }) if e == "medium"
         ));
+    }
+
+    /// PR-13: an external URI `$ref` inside `output_config.format.schema`
+    /// cannot be strictified — the conversion must fail with a `Schema`
+    /// error rather than forwarding a schema the upstream will reject.
+    #[test]
+    fn external_ref_in_format_schema_surfaces_schema_error() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "respond in json"}],
+            "output_config": {
+                "format": {"type": "json_schema", "schema": {
+                    "type": "object",
+                    "properties": {
+                        "shared": {"$ref": "https://schemas.example/common.json"}
+                    }
+                }}
+            }
+        }))
+        .unwrap();
+        let err = anthropic_to_responses_request(&req, &Default::default())
+            .expect_err("external $ref must propagate as an error");
+        assert!(
+            matches!(err, ProxyError::Schema(_)),
+            "expected ProxyError::Schema, got {err:?}"
+        );
+        assert_eq!(
+            err.status_code(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]
@@ -1608,7 +2084,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert!(out.extra.get("text").is_some());
         assert!(out.reasoning.is_none());
     }
@@ -1621,7 +2097,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert!(out.extra.as_object().unwrap().is_empty());
         assert!(out.reasoning.is_none());
     }
@@ -1638,10 +2114,10 @@ mod tests {
             }
         }))
         .unwrap();
-        let out = anthropic_to_responses_request(&req, &Default::default());
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         assert!(matches!(
             out.reasoning.as_ref(),
-            Some(ReasoningConfig::Enabled { effort: Some(e) }) if e == "low"
+            Some(ReasoningConfig { effort: Some(e), summary: Some(ReasoningSummary::Auto) }) if e == "low"
         ));
     }
 
@@ -1651,11 +2127,11 @@ mod tests {
         // "json_schema" — the Responses API's text.format only requires
         // the `name`+`strict` shim for json_schema shapes.
         let input = json!({"type": "json_object"});
-        let out = ensure_json_schema_name(&input);
+        let out = ensure_json_schema_name(&input).unwrap();
         assert_eq!(out, input);
 
         let input = json!({"type": "text"});
-        let out = ensure_json_schema_name(&input);
+        let out = ensure_json_schema_name(&input).unwrap();
         assert_eq!(out, input);
     }
 
@@ -1670,8 +2146,98 @@ mod tests {
             "name": "my_response",
             "schema": {"type": "object", "properties": {"x": {"type": "integer"}}}
         });
-        let out = ensure_json_schema_name(&input);
+        let out = ensure_json_schema_name(&input).unwrap();
         assert_eq!(out.get("name").and_then(|v| v.as_str()), Some("my_response"));
         assert_eq!(out.get("strict").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    // ── PR-7 · service_tier request mapping (Responses) ──────────────────
+
+    /// PR-7: Anthropic `service_tier: "auto"` → Responses `service_tier:
+    /// "auto"` (same-value passthrough, parity with Chat path).
+    #[test]
+    fn responses_request_service_tier_auto_passes_through() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "service_tier": "auto"
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
+        assert_eq!(out.service_tier.as_deref(), Some("auto"));
+    }
+
+    /// PR-7: Anthropic `service_tier: "standard_only"` → Responses
+    /// drops the field (no OpenAI equivalent). Parity with Chat path.
+    #[test]
+    fn responses_request_service_tier_standard_only_is_dropped() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "service_tier": "standard_only"
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
+        assert!(
+            out.service_tier.is_none(),
+            "standard_only must drop, got {:?}",
+            out.service_tier
+        );
+    }
+
+    // ── PR-8 · Responses parallel_tool_calls + verbosity ────────────────
+
+    /// PR-8: Responses `parallel_tool_calls=false` when Anthropic
+    /// `tool_choice.disable_parallel_tool_use=true`. Same logic as Chat
+    /// path; ResponsesRequest.parallel_tool_calls was modeled in PR-1,
+    /// this PR wires the injection.
+    #[test]
+    fn responses_request_disable_parallel_tool_use_maps_to_parallel_tool_calls_false() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "f", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "tool", "name": "f", "disable_parallel_tool_use": true}
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
+        assert_eq!(out.parallel_tool_calls, Some(false));
+    }
+
+    /// PR-8: Responses `text.verbosity` is injected when
+    /// `output_config.verbosity` is set (plan v0.7 P1-3 dual-path).
+    /// Verbatim passthrough.
+    #[test]
+    fn responses_request_verbosity_injected_into_text_extra() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"verbosity": "high"}
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
+        assert_eq!(out.extra["text"]["verbosity"], "high");
+    }
+
+    /// PR-8: when no verbosity is set, the wire stays absent under
+    /// `text` (don't inject an empty object either).
+    #[test]
+    fn responses_request_verbosity_absent_when_unset() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
+        assert!(
+            out.extra.get("text").is_none(),
+            "no verbosity → text object must be absent; got {}",
+            out.extra
+        );
     }
 }

@@ -17,7 +17,7 @@ use futures_util::Stream;
 use serde_json::{json, Value};
 
 use crate::anthropic::{MessagesRequest, StreamEvent};
-use crate::conversion::{anthropic_to_openai_request, openai_to_anthropic_response};
+use crate::conversion::{anthropic_to_openai_request, make_message_id, openai_to_anthropic_response};
 use crate::error::{ProxyError, Result};
 use crate::openai::{looks_like_error_envelope, ChatMessage, ChatRequest};
 use crate::providers::{Provider, ProviderOutput};
@@ -194,6 +194,15 @@ impl Provider for OpenAiCompatProvider {
         self.model_rewrite.is_empty() || self.model_rewrite.contains_key(model)
     }
 
+    fn merged_rewrite<'a>(
+        &'a self,
+        runtime: &'a HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        let mut merged = self.model_rewrite.clone();
+        merged.extend(runtime.iter().map(|(k, v)| (k.clone(), v.clone())));
+        merged
+    }
+
     async fn list_models(&self) -> Option<Vec<serde_json::Value>> {
         let url = self.models_url();
         let resp = self
@@ -244,10 +253,9 @@ impl Provider for OpenAiCompatProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
-        let mut merged = self.model_rewrite.clone();
-        merged.extend(model_rewrite.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let merged = self.merged_rewrite(model_rewrite);
 
-        let mut openai_req = anthropic_to_openai_request(req, &merged);
+        let mut openai_req = anthropic_to_openai_request(req, &merged)?;
         openai_req.stream = false;
         openai_req.stream_options = None;
 
@@ -327,7 +335,7 @@ impl Provider for OpenAiCompatProvider {
                 });
             }
             let chat: crate::openai::ChatResponse = serde_json::from_value(parsed)?;
-            let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+            let msg_id = make_message_id();
             let anthropic_resp = openai_to_anthropic_response(&chat, &req.model, &msg_id)?;
             // Downgrades are invisible to the client (response shape is
             // unchanged), but operators need observability — only warn on a
@@ -357,10 +365,9 @@ impl Provider for OpenAiCompatProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
-        let mut merged = self.model_rewrite.clone();
-        merged.extend(model_rewrite.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let merged = self.merged_rewrite(model_rewrite);
 
-        let mut openai_req = anthropic_to_openai_request(req, &merged);
+        let mut openai_req = anthropic_to_openai_request(req, &merged)?;
         openai_req.stream = true;
 
         // Streaming retry: response_format 400 is safe to retry (the 400 is
@@ -446,7 +453,7 @@ where
         Self {
             inner,
             translator: Some(crate::conversion::stream::StreamTranslator::new(
-                format!("msg_{}", uuid::Uuid::new_v4().simple()),
+                make_message_id(),
                 model,
             )),
             pending: BytesMut::new(),
@@ -604,72 +611,13 @@ mod tests {
     use futures_util::{stream, StreamExt};
     use serde_json::json;
     use wiremock::matchers::{body_partial_json, header, method, path};
-    use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// Wire-level "field X must NOT be present in the JSON request
-    /// body" matcher. wiremock's `body_partial_json` only checks
-    /// presence; we need this complement to verify the proxy never
-    /// pollutes a request with `prompt_cache_key` /
-    /// `prompt_cache_retention` when the Anthropic client didn't ask
-    /// for caching.
-    struct JsonFieldAbsent(&'static str);
-
-    impl Match for JsonFieldAbsent {
-        fn matches(&self, request: &Request) -> bool {
-            let body: serde_json::Value = match serde_json::from_slice(&request.body) {
-                Ok(v) => v,
-                Err(_) => return false,
-            };
-            body.get(self.0).is_none()
-        }
-    }
-
-    fn cache_request_with(cache_type: &str, user_id: Option<&str>) -> MessagesRequest {
-        let mut v = json!({
-            "model": "claude-sonnet-4.6",
-            "max_tokens": 64,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "long prefix", "cache_control": {"type": cache_type}},
-                    {"type": "text", "text": "actual question"}
-                ]
-            }]
-        });
-        if let Some(uid) = user_id {
-            v["metadata"] = json!({"user_id": uid});
-        }
-        serde_json::from_value(v).unwrap()
-    }
-
-    fn request(streaming: bool) -> MessagesRequest {
-        serde_json::from_value(json!({
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": 64,
-            "stream": streaming,
-            "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .unwrap()
-    }
-
-    fn chat_response() -> Value {
-        json!({
-            "id": "chatcmpl-1",
-            "object": "chat.completion",
-            "created": 1,
-            "model": "upstream-model",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "world"},
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": 3,
-                "completion_tokens": 2,
-                "total_tokens": 5
-            }
-        })
-    }
+    /// Wire-level matcher + wire fixtures shared with openai_responses
+    /// (PR-10 consolidated them into crate::test_support).
+    use crate::test_support::{
+        cache_request_with, chat_response, openai_request as request, JsonFieldAbsent,
+    };
 
     /// The user-reported upstream 400: OpenAI-style wording on the
     /// /chat/completions path (opencode Zen → deepseek in thinking mode).
@@ -1230,6 +1178,28 @@ mod tests {
         assert!(!p.can_serve_model(""));
     }
 
+    #[test]
+    fn merged_rewrite_combines_configured_and_runtime_maps() {
+        let mut configured = HashMap::new();
+        configured.insert("claude-a".to_string(), "configured-model".to_string());
+        configured.insert("claude-c".to_string(), "configured-only-model".to_string());
+        let p = provider_with_rewrite(configured);
+
+        let mut runtime = HashMap::new();
+        runtime.insert("claude-a".to_string(), "runtime-model".to_string());
+        runtime.insert("claude-b".to_string(), "runtime-b".to_string());
+
+        let merged = p.merged_rewrite(&runtime);
+        // runtime wins on key collision; configured-only entries survive.
+        assert_eq!(merged.get("claude-a").map(String::as_str), Some("runtime-model"));
+        assert_eq!(merged.get("claude-b").map(String::as_str), Some("runtime-b"));
+        assert_eq!(
+            merged.get("claude-c").map(String::as_str),
+            Some("configured-only-model")
+        );
+        assert_eq!(merged.len(), 3);
+    }
+
     #[tokio::test]
     async fn complete_emits_prompt_cache_key_and_in_memory_when_cache_control_ephemeral() {
         // Anthropic cache_control.ephemeral + metadata.user_id → wire
@@ -1638,6 +1608,19 @@ mod tests {
             reasoning_effort: Some("medium".to_string()),
             prompt_cache_key: None,
             prompt_cache_retention: None,
+            service_tier: None,
+            parallel_tool_calls: None,
+            safety_identifier: None,
+            verbosity: None,
+            n: None,
+            logit_bias: None,
+            logprobs: None,
+            top_logprobs: None,
+            prediction: None,
+            metadata: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
             extra: json!({"thinking": {"type": "enabled"}}),
         };
 
@@ -1678,7 +1661,8 @@ mod tests {
     fn strip_reasoning_echo_is_noop_without_reasoning_signals() {
         // A plain request converted from `request(false)` has no reasoning
         // signals — stripping must leave it untouched (a pure no-op).
-        let mut req = anthropic_to_openai_request(&request(false), &HashMap::new());
+        let mut req = anthropic_to_openai_request(&request(false), &HashMap::new())
+            .expect("conversion must succeed");
         strip_reasoning_echo(&mut req);
         assert!(req.reasoning_effort.is_none());
         assert!(req.extra.as_object().unwrap().is_empty());
@@ -1720,6 +1704,19 @@ mod tests {
             reasoning_effort: Some("medium".to_string()),
             prompt_cache_key: None,
             prompt_cache_retention: None,
+            service_tier: None,
+            parallel_tool_calls: None,
+            safety_identifier: None,
+            verbosity: None,
+            n: None,
+            logit_bias: None,
+            logprobs: None,
+            top_logprobs: None,
+            prediction: None,
+            metadata: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
             extra: Value::Null,
         };
 
@@ -2065,6 +2062,19 @@ mod tests {
             reasoning_effort: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+            service_tier: None,
+            parallel_tool_calls: None,
+            safety_identifier: None,
+            verbosity: None,
+            n: None,
+            logit_bias: None,
+            logprobs: None,
+            top_logprobs: None,
+            prediction: None,
+            metadata: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
             extra: json!({
                 "response_format": {
                     "type": "json_schema",
@@ -2116,6 +2126,19 @@ mod tests {
             reasoning_effort: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+            service_tier: None,
+            parallel_tool_calls: None,
+            safety_identifier: None,
+            verbosity: None,
+            n: None,
+            logit_bias: None,
+            logprobs: None,
+            top_logprobs: None,
+            prediction: None,
+            metadata: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
             extra: json!({"response_format": {"type": "json_object"}}),
         };
         assert!(!downgrade_response_format(&mut req));
