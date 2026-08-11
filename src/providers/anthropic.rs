@@ -71,15 +71,6 @@ impl AnthropicProvider {
         format!("{}/v1/models", stripped)
     }
 
-    fn merged_rewrite<'a>(
-        &'a self,
-        runtime: &'a HashMap<String, String>,
-    ) -> HashMap<String, String> {
-        let mut merged = self.model_rewrite.clone();
-        merged.extend(runtime.iter().map(|(k, v)| (k.clone(), v.clone())));
-        merged
-    }
-
     /// Build a friendly Anthropic-shaped error body when an upstream rejects
     /// the request because it doesn't support thinking/reasoning mode. The
     /// proxy does NOT silently strip thinking and retry — the user has
@@ -136,6 +127,15 @@ impl AnthropicProvider {
 impl Provider for AnthropicProvider {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn merged_rewrite<'a>(
+        &'a self,
+        runtime: &'a HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        let mut merged = self.model_rewrite.clone();
+        merged.extend(runtime.iter().map(|(k, v)| (k.clone(), v.clone())));
+        merged
     }
 
     async fn list_models(&self) -> Option<Vec<serde_json::Value>> {

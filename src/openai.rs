@@ -66,6 +66,69 @@ pub struct ChatRequest {
     /// `cache_control` markers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_retention: Option<String>,
+    /// PR-7: OpenAI `service_tier`. Forwarded from Anthropic
+    /// `service_tier` per plan v0.7 mapping (auto→auto same-value
+    /// passthrough; standard_only is dropped — no OpenAI equivalent).
+    /// Valid OpenAI values: auto/default/flex/scale/priority/fast.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    /// PR-8: OpenAI `parallel_tool_calls`. Maps from Anthropic
+    /// `tool_choice.disable_parallel_tool_use` (true → false, default
+    /// → None; OpenAI's wire default is true so leaving this absent
+    /// when disable_parallel_tool_use is unset/false is correct).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    /// PR-8: OpenAI `safety_identifier` (maxLength 64 per spec).
+    /// String passthrough from Anthropic's user identity, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety_identifier: Option<String>,
+    /// PR-8: OpenAI `verbosity` (low/medium/high, default medium).
+    /// Spec enum `Verbosity`. Same enum on the Responses path
+    /// (text.verbosity) per plan v0.7 P1-3.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verbosity: Option<String>,
+    /// PR-9: OpenAI `n` — number of chat completion choices to
+    /// generate. Anthropic has no equivalent (single-choice API);
+    /// clients that need `n>1` would have to use OpenAI directly.
+    /// Default = 1 upstream; not surfaced to clients, hence None
+    /// unless explicitly set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
+    /// PR-9: OpenAI `logit_bias` — token-id → bias map (-100..100).
+    /// Map<String, i32> per spec. Anthropic has no equivalent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logit_bias: Option<std::collections::HashMap<String, i32>>,
+    /// PR-9: OpenAI `logprobs` — whether to return log probabilities.
+    /// Anthropic has no equivalent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<bool>,
+    /// PR-9: OpenAI `top_logprobs` — number of most-likely tokens to
+    /// return at each position (0..=20). Requires `logprobs=true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<u32>,
+    /// PR-9: OpenAI `prediction` — speculative content for faster
+    /// responses (`content`/`type`). Anthropic has no equivalent.
+    /// `Value` here to keep the wire shape tolerant of all spec
+    /// sub-fields without a full enum model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prediction: Option<Value>,
+    /// PR-9: OpenAI `metadata` — arbitrary key-value tags attached to
+    /// the request for billing/analytics. Anthropic has no equivalent.
+    /// `Value` keeps the field shape-tolerant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+    /// PR-9: OpenAI `presence_penalty` (-2.0..=2.0). Distinct from
+    /// `frequency_penalty`. Anthropic has no equivalent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    /// PR-9: OpenAI `frequency_penalty` (-2.0..=2.0). Distinct from
+    /// `presence_penalty`. Anthropic has no equivalent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    /// PR-9: OpenAI `seed` — best-effort deterministic sampling seed.
+    /// Anthropic has no equivalent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
     #[serde(flatten)]
     pub extra: Value,
 }
@@ -73,6 +136,13 @@ pub struct ChatRequest {
 #[derive(Debug, Clone, Serialize)]
 pub struct StreamOptions {
     pub include_usage: bool,
+    /// PR-9: OpenAI `stream_options.include_obfuscation` — whether the
+    /// provider should obfuscate certain streamed data. Anthropic has
+    /// no equivalent, so this is only ever set when a future PR wires a
+    /// Claude Code extension surface to it; absent on the wire by
+    /// default (OpenAI's default is false).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_obfuscation: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,6 +281,11 @@ pub struct AssistantMessage {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(default)]
     pub reasoning_content: Option<String>,
+    /// PR-6a: spec `AssistantMessage.refusal` — surfaces when the model
+    /// refuses to comply. Plan v0.11: this proxy never emits audio, so
+    /// `audio` is deliberately not modeled (PR-6a scope, v0.11 P0-5).
+    #[serde(default)]
+    pub refusal: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -228,6 +303,13 @@ pub struct ChatUsage {
     /// by reasoning. See fix-R6 in docs/TEST_ISSUES.md.
     #[serde(default)]
     pub completion_tokens_details: Option<CompletionTokensDetails>,
+    /// PR-7: upstream OpenAI `service_tier` (auto/default/flex/scale/
+    /// priority/fast) echoed back as an Anthropic `Usage.service_tier`
+    /// string for the client to interpret. Anthropic's own response
+    /// enum is standard/priority/batch; only `priority` overlaps — the
+    /// rest pass through unvalidated (plan v0.12 P1-B).
+    #[serde(default)]
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -382,6 +464,154 @@ mod tests {
         assert!(!chunk.choices.is_empty());
         assert_eq!(chunk.extra["x-opencode-type"], "inference-cost");
     }
+
+    /// PR-9: `StreamOptions.include_obfuscation` is absent on the wire
+    /// when `None` (the only value the conversion layer produces today —
+    /// Anthropic has no source for it). Presence is gated by
+    /// `skip_serializing_if`, so the field must not leak a bare `null`.
+    #[test]
+    fn stream_options_include_obfuscation_none_is_absent_on_wire() {
+        let opts = StreamOptions {
+            include_usage: true,
+            include_obfuscation: None,
+        };
+        let v = serde_json::to_value(&opts).unwrap();
+        assert_eq!(v["include_usage"], true);
+        assert!(
+            v.get("include_obfuscation").is_none(),
+            "None include_obfuscation must be omitted, got: {v}"
+        );
+    }
+
+    /// PR-9: `StreamOptions.include_obfuscation: Some(true)` must
+    /// serialize to `true` — a future PR that wires a Claude Code
+    /// extension surface to it needs the round-trip to hold.
+    #[test]
+    fn stream_options_include_obfuscation_some_serializes_to_true() {
+        let opts = StreamOptions {
+            include_usage: true,
+            include_obfuscation: Some(true),
+        };
+        let v = serde_json::to_value(&opts).unwrap();
+        assert_eq!(v["include_obfuscation"], true);
+    }
+
+    // ── PR-9 · P2 field wire round-trips ────────────────────────────────
+
+    /// PR-9: every P2 field added in PR-9 must serialize onto the wire
+    /// when set. Anthropic has no source for any of them today, so the
+    /// conversion layer keeps them None — but the wire types must be
+    /// able to carry them (that's the "写" half of plan M3c).
+    #[test]
+    fn chat_request_serializes_all_pr9_p2_fields() {
+        use std::collections::HashMap;
+        let req = ChatRequest {
+            model: "m".into(),
+            messages: vec![],
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+            stream: false,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+                include_obfuscation: Some(true),
+            }),
+            tools: None,
+            tool_choice: None,
+            user: None,
+            reasoning_effort: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            service_tier: None,
+            parallel_tool_calls: None,
+            safety_identifier: None,
+            verbosity: None,
+            n: Some(2),
+            logit_bias: Some(HashMap::from([("42".into(), -5)])),
+            logprobs: Some(true),
+            top_logprobs: Some(5),
+            prediction: Some(serde_json::json!({"type": "content", "content": "x"})),
+            metadata: Some(serde_json::json!({"trace": "abc"})),
+            presence_penalty: Some(0.5),
+            frequency_penalty: Some(-0.5),
+            seed: Some(12345),
+            extra: serde_json::json!({}),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["n"], 2);
+        assert_eq!(v["logit_bias"]["42"], -5);
+        assert_eq!(v["logprobs"], true);
+        assert_eq!(v["top_logprobs"], 5);
+        assert_eq!(v["prediction"]["type"], "content");
+        assert_eq!(v["metadata"]["trace"], "abc");
+        assert_eq!(v["presence_penalty"], 0.5);
+        assert_eq!(v["frequency_penalty"], -0.5);
+        assert_eq!(v["seed"], 12345);
+        assert_eq!(v["stream_options"]["include_obfuscation"], true);
+    }
+
+    /// PR-9: the same P2 fields must be absent from the wire when unset
+    /// (the "明确不写" half of plan M3c — every field is Option with
+    /// skip_serializing_if, so a bare null must never leak).
+    #[test]
+    fn chat_request_default_omits_pr9_p2_fields() {
+        let req = ChatRequest {
+            model: "m".into(),
+            messages: vec![],
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+            stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+                include_obfuscation: None,
+            }),
+            tools: None,
+            tool_choice: None,
+            user: None,
+            reasoning_effort: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            service_tier: None,
+            parallel_tool_calls: None,
+            safety_identifier: None,
+            verbosity: None,
+            n: None,
+            logit_bias: None,
+            logprobs: None,
+            top_logprobs: None,
+            prediction: None,
+            metadata: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            extra: serde_json::json!({}),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        for key in [
+            "n",
+            "logit_bias",
+            "logprobs",
+            "top_logprobs",
+            "prediction",
+            "metadata",
+            "presence_penalty",
+            "frequency_penalty",
+            "seed",
+        ] {
+            assert!(v.get(key).is_none(), "{key} must be absent, got: {v}");
+        }
+        assert!(
+            v.get("stream_options")
+                .and_then(|o| o.get("include_obfuscation"))
+                .is_none(),
+            "include_obfuscation must be absent when None, got: {v}"
+        );
+    }
 }
 
 // ─── Streaming chunks ────────────────────────────────────────────────────
@@ -440,6 +670,12 @@ pub struct ChunkDelta {
     pub tool_calls: Option<Vec<ChunkToolCall>>,
     #[serde(default)]
     pub reasoning_content: Option<String>,
+    /// PR-6a: spec `ChatCompletionStreamResponseDelta.refusal`. Plan
+    /// v0.7 + v0.11 confirm `audio`/`annotations` are NOT in spec for
+    /// the delta — only `content/function_call/tool_calls/role/refusal`.
+    /// `audio`/`annotations` deliberately not modeled.
+    #[serde(default)]
+    pub refusal: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -508,5 +744,50 @@ mod looks_like_error_envelope_tests {
             "error": {"message": "rate limited", "type": "rate_limit"}
         });
         assert!(looks_like_error_envelope(&body));
+    }
+
+    // ── PR-6a · Chat refusal wire field ───────────────────────────────
+
+    /// PR-6a: spec `ChatCompletionStreamResponseDelta.refusal` decodes
+    /// to `ChunkDelta.refusal: Option<String>`. Other delta fields
+    /// (`role`/`content`/`tool_calls`) absent in this fixture must default
+    /// to `None`.
+    #[test]
+    fn chunk_delta_decodes_refusal_field() {
+        let raw = serde_json::json!({
+            "role": "assistant",
+            "refusal": "I cannot help with that."
+        });
+        let delta: ChunkDelta = serde_json::from_value(raw).unwrap();
+        assert_eq!(delta.refusal.as_deref(), Some("I cannot help with that."));
+        assert!(delta.role.as_deref() == Some("assistant"));
+        assert!(delta.content.is_none());
+        assert!(delta.tool_calls.is_none());
+        assert!(delta.reasoning_content.is_none());
+    }
+
+    /// PR-6a: a delta with no `refusal` field decodes with `refusal: None`
+    /// — confirms `#[serde(default)]` is in place so tolerant upstreams
+    /// (Copilot) that omit the field don't 400.
+    #[test]
+    fn chunk_delta_decodes_without_refusal_field() {
+        let raw = serde_json::json!({"role": "assistant", "content": "hi"});
+        let delta: ChunkDelta = serde_json::from_value(raw).unwrap();
+        assert!(delta.refusal.is_none());
+    }
+
+    /// PR-6a: spec `AssistantMessage.refusal` decodes alongside the
+    /// existing `content`/`tool_calls`/`reasoning_content` fields.
+    #[test]
+    fn assistant_message_decodes_refusal_field() {
+        let raw = serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "refusal": "blocked by policy"
+        });
+        let msg: AssistantMessage = serde_json::from_value(raw).unwrap();
+        assert_eq!(msg.role, "assistant");
+        assert!(msg.content.is_none());
+        assert_eq!(msg.refusal.as_deref(), Some("blocked by policy"));
     }
 }

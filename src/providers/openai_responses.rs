@@ -76,6 +76,15 @@ impl Provider for OpenaiResponsesProvider {
         self.model_rewrite.is_empty() || self.model_rewrite.contains_key(model)
     }
 
+    fn merged_rewrite<'a>(
+        &'a self,
+        runtime: &'a HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        let mut merged = self.model_rewrite.clone();
+        merged.extend(runtime.iter().map(|(k, v)| (k.clone(), v.clone())));
+        merged
+    }
+
     async fn list_models(&self) -> Option<Vec<serde_json::Value>> {
         let url = self.models_url();
         let resp = self
@@ -126,10 +135,9 @@ impl Provider for OpenaiResponsesProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
-        let mut merged = self.model_rewrite.clone();
-        merged.extend(model_rewrite.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let merged = self.merged_rewrite(model_rewrite);
 
-        let mut responses_req = anthropic_to_responses_request(req, &merged);
+        let mut responses_req = anthropic_to_responses_request(req, &merged)?;
         responses_req.stream = false;
 
         let resp = self
@@ -161,10 +169,9 @@ impl Provider for OpenaiResponsesProvider {
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
-        let mut merged = self.model_rewrite.clone();
-        merged.extend(model_rewrite.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let merged = self.merged_rewrite(model_rewrite);
 
-        let mut responses_req = anthropic_to_responses_request(req, &merged);
+        let mut responses_req = anthropic_to_responses_request(req, &merged)?;
         responses_req.stream = true;
 
         let resp = self
@@ -347,53 +354,11 @@ mod tests {
     use serde_json::json;
     use serde_json::Value;
     use wiremock::matchers::{body_partial_json, header, method, path};
-    use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// Wire-level "field X must NOT be present in the JSON request
-    /// body" matcher. wiremock's `body_partial_json` only checks
-    /// presence; we need this complement to verify that the proxy
-    /// doesn't pollute requests with `prompt_cache_key` /
-    /// `prompt_cache_retention` when the Anthropic client didn't ask
-    /// for caching.
-    struct JsonFieldAbsent(&'static str);
-
-    impl Match for JsonFieldAbsent {
-        fn matches(&self, request: &Request) -> bool {
-            let body: serde_json::Value = match serde_json::from_slice(&request.body) {
-                Ok(v) => v,
-                Err(_) => return false,
-            };
-            body.get(self.0).is_none()
-        }
-    }
-
-    fn cache_request_with(cache_type: &str, user_id: Option<&str>) -> MessagesRequest {
-        let mut v = json!({
-            "model": "claude-sonnet-4.6",
-            "max_tokens": 64,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "long prefix", "cache_control": {"type": cache_type}},
-                    {"type": "text", "text": "actual question"}
-                ]
-            }]
-        });
-        if let Some(uid) = user_id {
-            v["metadata"] = json!({"user_id": uid});
-        }
-        serde_json::from_value(v).unwrap()
-    }
-
-    fn request(streaming: bool) -> MessagesRequest {
-        serde_json::from_value(json!({
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": 64,
-            "stream": streaming,
-            "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .unwrap()
-    }
+    /// Wire-level matcher + wire fixtures shared with openai_compat
+    /// (PR-10 consolidated them into crate::test_support).
+    use crate::test_support::{cache_request_with, openai_request as request, JsonFieldAbsent};
 
     fn responses_body() -> Value {
         json!({
@@ -625,6 +590,28 @@ mod tests {
         assert!(p.can_serve_model("claude-sonnet-4.6"));
         assert!(!p.can_serve_model("gpt-5"));
         assert!(!p.can_serve_model(""));
+    }
+
+    #[test]
+    fn merged_rewrite_combines_configured_and_runtime_maps() {
+        let mut configured = HashMap::new();
+        configured.insert("claude-a".to_string(), "configured-model".to_string());
+        configured.insert("claude-c".to_string(), "configured-only-model".to_string());
+        let p = provider_with_rewrite(configured);
+
+        let mut runtime = HashMap::new();
+        runtime.insert("claude-a".to_string(), "runtime-model".to_string());
+        runtime.insert("claude-b".to_string(), "runtime-b".to_string());
+
+        let merged = p.merged_rewrite(&runtime);
+        // runtime wins on key collision; configured-only entries survive.
+        assert_eq!(merged.get("claude-a").map(String::as_str), Some("runtime-model"));
+        assert_eq!(merged.get("claude-b").map(String::as_str), Some("runtime-b"));
+        assert_eq!(
+            merged.get("claude-c").map(String::as_str),
+            Some("configured-only-model")
+        );
+        assert_eq!(merged.len(), 3);
     }
 
     #[test]

@@ -257,7 +257,15 @@ pub struct Tool {
 pub enum ToolChoice {
     Auto,
     Any,
-    Tool { name: String },
+    Tool {
+        name: String,
+        /// PR-8: when set, the model is disallowed from calling the
+        /// named tool in parallel. Maps to OpenAI
+        /// `parallel_tool_calls: false`; absent/unset → None (OpenAI's
+        /// wire default is true, so leaving it absent is correct).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
     #[serde(other)]
     None,
 }
@@ -297,6 +305,11 @@ pub struct OutputConfig {
     pub effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<Value>,
+    /// PR-8: spec `Verbosity` (low/medium/high, default medium).
+    /// Forwarded to OpenAI Chat `verbosity` and Responses
+    /// `text.verbosity`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verbosity: Option<String>,
 }
 
 // ─── Response ────────────────────────────────────────────────────────────
@@ -646,7 +659,7 @@ mod schema_tests {
             "content": [{"type": "text", "text": "hi"}],
             "model": "claude-sonnet-4-6",
             "stop_reason": "end_turn",
-            "stop_details": {"reason": "policy"},
+            "stop_details": {"type": "refusal", "category": null, "explanation": null},
             "container": {"id": "container_x"},
             "usage": {
                 "input_tokens": 10,
@@ -716,7 +729,7 @@ mod schema_tests {
             "type": "message_delta",
             "delta": {
                 "stop_reason": "end_turn",
-                "stop_details": {"reason": "policy"},
+                "stop_details": {"type": "refusal", "category": null, "explanation": null},
                 "container": {"id": "x"}
             },
             "usage": {
@@ -741,7 +754,7 @@ mod schema_tests {
         let payload = MessageDeltaPayload {
             stop_reason: Some("end_turn".into()),
             stop_sequence: None,
-            stop_details: Some(json!({"reason": "policy"})),
+            stop_details: Some(json!({"type": "refusal", "category": null, "explanation": null})),
             container: Some(json!({"id": "x"})),
         };
         let ev = StreamEvent::MessageDelta {

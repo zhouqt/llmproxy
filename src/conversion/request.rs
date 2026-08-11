@@ -20,7 +20,7 @@ use crate::openai::{
 pub fn anthropic_to_openai_request(
     req: &MessagesRequest,
     model_rewrite: &std::collections::HashMap<String, String>,
-) -> ChatRequest {
+) -> crate::error::Result<ChatRequest> {
     let model = model_rewrite
         .get(&req.model)
         .cloned()
@@ -47,6 +47,9 @@ pub fn anthropic_to_openai_request(
     let stream_options = if req.stream {
         Some(crate::openai::StreamOptions {
             include_usage: true,
+            // PR-9: no Anthropic source for include_obfuscation — kept
+            // None so the wire stays absent (upstream default false).
+            include_obfuscation: None,
         })
     } else {
         None
@@ -71,7 +74,7 @@ pub fn anthropic_to_openai_request(
         (Some(req.max_tokens), None)
     };
 
-    ChatRequest {
+    Ok(ChatRequest {
         model,
         messages,
         max_tokens,
@@ -120,7 +123,7 @@ pub fn anthropic_to_openai_request(
             if non_hosted_count == 0 {
                 None
             } else if has_web_search
-                && matches!(req.tool_choice, Some(ToolChoice::Tool { ref name }) if name == "web_search")
+                && matches!(req.tool_choice, Some(ToolChoice::Tool { ref name, .. }) if name == "web_search")
             {
                 Some(json!("auto"))
             } else {
@@ -137,10 +140,64 @@ pub fn anthropic_to_openai_request(
             .or_else(|| extract_reasoning_effort(req)),
         prompt_cache_key: hints.prompt_cache_key,
         prompt_cache_retention,
+        // PR-7: Anthropic `service_tier` → OpenAI `service_tier`.
+        // Anthropic enum: `auto` / `standard_only`. OpenAI enum:
+        // `auto` / `default` / `flex` / `scale` / `priority` / `fast`.
+        // Map:
+        //   Anthropic `auto` → OpenAI `auto` (same-value passthrough;
+        //     `auto` is a spec-legal OpenAI value, v0.7 correction).
+        //   Anthropic `standard_only` → drop — OpenAI has no equivalent
+        //     (standard_only is a routing preference; scale/flex/priority
+        //     are pricing tiers). Sending it would 400.
+        service_tier: req.service_tier.as_deref().and_then(|tier| match tier {
+            "auto" => Some("auto".to_string()),
+            // "standard_only" → None (drop the field; documented gap).
+            _ => None,
+        }),
+        // PR-8: Anthropic `tool_choice.disable_parallel_tool_use=true`
+        // → OpenAI `parallel_tool_calls=false`. Anthropic's
+        // ToolChoice::Tool carries the field; absent/false → None
+        // (OpenAI's wire default is true, so leaving the field absent
+        // is correct — emitting `parallel_tool_calls: true` explicitly
+        // would also work but is noisier).
+        parallel_tool_calls: match req.tool_choice.as_ref() {
+            Some(crate::anthropic::ToolChoice::Tool {
+                disable_parallel_tool_use,
+                ..
+            }) if *disable_parallel_tool_use == Some(true) => Some(false),
+            _ => None,
+        },
+        // PR-8: `safety_identifier` — string passthrough from
+        // `metadata.user_id` (Anthropic's user-identity surface; max
+        // length 64 per spec).
+        safety_identifier: req
+            .metadata
+            .as_ref()
+            .and_then(|m| m.user_id.as_deref())
+            .map(|u| crate::conversion::responses::truncate_user(u)),
+        // PR-8: `verbosity` — string passthrough from
+        // `output_config.verbosity` (Anthropic spec). Same enum on the
+        // Responses path via text.verbosity.
+        verbosity: req.output_config.as_ref().and_then(|oc| oc.verbosity.clone()),
+        // PR-9 P2 fields. Anthropic has no direct equivalent for any of
+        // these — pass through only if the client somehow attached
+        // them. We don't synthesize them; their defaults are None so the
+        // wire stays absent unless a future PR injects from a Claude
+        // Code extension surface (currently no source on the Anthropic
+        // schema side, hence not wired into request translation yet).
+        n: None,
+        logit_bias: None,
+        logprobs: None,
+        top_logprobs: None,
+        prediction: None,
+        metadata: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        seed: None,
         extra: {
             let mut e = Value::Object(Map::new());
             if let Some(fmt) = req.output_config.as_ref().and_then(|oc| oc.format.as_ref()) {
-                e["response_format"] = ensure_chat_json_schema_name(fmt);
+                e["response_format"] = ensure_chat_json_schema_name(fmt)?;
             }
             // When web search tools are present, inject
             // web_search_options into extra_body. The tool was stripped
@@ -152,7 +209,7 @@ pub fn anthropic_to_openai_request(
             }
             e
         },
-    }
+    })
 }
 
 /// OpenAI Chat Completions requires `response_format.json_schema.name` on
@@ -160,12 +217,14 @@ pub fn anthropic_to_openai_request(
 /// `{type: "json_schema", schema: {...}}` with no `json_schema` wrapper and no
 /// `name`. Wrap the schema and synthesize `name` (stable default) plus
 /// `strict: true` so the schema constraint round-trips and is enforced.
-fn ensure_chat_json_schema_name(fmt: &Value) -> Value {
+fn ensure_chat_json_schema_name(
+    fmt: &Value,
+) -> Result<Value, crate::conversion::util::SchemaError> {
     if fmt.get("type").and_then(|v| v.as_str()) != Some("json_schema") {
-        return fmt.clone();
+        return Ok(fmt.clone());
     }
     let Some(obj) = fmt.as_object() else {
-        return fmt.clone();
+        return Ok(fmt.clone());
     };
     let mut out = obj.clone();
 
@@ -174,22 +233,22 @@ fn ensure_chat_json_schema_name(fmt: &Value) -> Value {
         let mut j = j;
         if let Some(s) = j.get("schema").cloned() {
             let mut s = s;
-            strictify_schema(&mut s);
+            strictify_schema(&mut s)?;
             j.insert("schema".to_string(), s);
         }
         j.entry("name".to_string())
             .or_insert(json!("structured_output"));
         j.entry("strict".to_string()).or_insert(json!(true));
         out.insert("json_schema".to_string(), Value::Object(j));
-        return Value::Object(out);
+        return Ok(Value::Object(out));
     }
 
     // Anthropic-style flat: lift `schema` (and any top-level `name`) into a
     // json_schema wrapper. Top-level `name` is honored so a future Anthropic
     // schema-name field isn't silently dropped.
     let schema = out.remove("schema").map(|mut s| {
-        strictify_schema(&mut s);
-        s
+        strictify_schema(&mut s)?;
+        Ok::<Value, crate::conversion::util::SchemaError>(s)
     });
     let top_name = out.remove("name");
     let mut inner = serde_json::Map::new();
@@ -199,10 +258,10 @@ fn ensure_chat_json_schema_name(fmt: &Value) -> Value {
     );
     inner.insert("strict".to_string(), json!(true));
     if let Some(s) = schema {
-        inner.insert("schema".to_string(), s);
+        inner.insert("schema".to_string(), s?);
     }
     out.insert("json_schema".to_string(), Value::Object(inner));
-    Value::Object(out)
+    Ok(Value::Object(out))
 }
 
 fn system_to_text(sys: &SystemPrompt) -> String {
@@ -402,7 +461,7 @@ fn convert_tool_choice(c: &ToolChoice) -> Value {
     match c {
         ToolChoice::Auto => json!("auto"),
         ToolChoice::Any => json!("required"),
-        ToolChoice::Tool { name } => json!({
+        ToolChoice::Tool { name, .. } => json!({
             "type": "function",
             "function": { "name": name }
         }),
@@ -474,7 +533,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hello"}],
         });
         let req: MessagesRequest = serde_json::from_value(raw).unwrap();
-        let out = anthropic_to_openai_request(&req, &Default::default());
+        let out = anthropic_to_openai_request(&req, &Default::default()).unwrap();
         assert_eq!(out.model, "claude-sonnet-4-5");
         assert_eq!(out.messages.len(), 1);
         assert!(matches!(out.messages[0], ChatMessage::User { .. }));
@@ -500,7 +559,7 @@ mod tests {
             "tool_choice": {"type": "auto"}
         });
         let req: MessagesRequest = serde_json::from_value(raw).unwrap();
-        let out = anthropic_to_openai_request(&req, &Default::default());
+        let out = anthropic_to_openai_request(&req, &Default::default()).unwrap();
         assert_eq!(out.messages.len(), 4);
         // system, user, assistant, tool
         assert!(matches!(out.messages[0], ChatMessage::System { .. }));
@@ -523,7 +582,7 @@ mod tests {
             ]}]
         });
         let req: MessagesRequest = serde_json::from_value(raw).unwrap();
-        let out = anthropic_to_openai_request(&req, &Default::default());
+        let out = anthropic_to_openai_request(&req, &Default::default()).unwrap();
         expect_variant!(&out.messages[0], ChatMessage::User { content: UserContent::Parts(parts), .. } => {
             assert_eq!(parts.len(), 2);
         });
@@ -539,7 +598,7 @@ mod tests {
         let req: MessagesRequest = serde_json::from_value(raw).unwrap();
         let mut rewrite = std::collections::HashMap::new();
         rewrite.insert("claude-sonnet-4-5".to_string(), "deepseek-chat".to_string());
-        let out = anthropic_to_openai_request(&req, &rewrite);
+        let out = anthropic_to_openai_request(&req, &rewrite).unwrap();
         assert_eq!(out.model, "deepseek-chat");
     }
 
@@ -564,7 +623,7 @@ mod tests {
             "tool_choice": {"type": "any"}
         });
         let req: MessagesRequest = serde_json::from_value(base.clone()).unwrap();
-        let converted = anthropic_to_openai_request(&req, &Default::default());
+        let converted = anthropic_to_openai_request(&req, &Default::default()).unwrap();
 
         assert!(matches!(
             &converted.messages[0],
@@ -583,7 +642,7 @@ mod tests {
         named_tool["tool_choice"] = json!({"type": "tool", "name": "tool"});
         let req: MessagesRequest = serde_json::from_value(named_tool).unwrap();
         assert_eq!(
-            anthropic_to_openai_request(&req, &Default::default()).tool_choice,
+            anthropic_to_openai_request(&req, &Default::default()).unwrap().tool_choice,
             Some(json!({"type": "function", "function": {"name": "tool"}}))
         );
 
@@ -591,7 +650,7 @@ mod tests {
         none["tool_choice"] = json!({"type": "future_choice"});
         let req: MessagesRequest = serde_json::from_value(none).unwrap();
         assert_eq!(
-            anthropic_to_openai_request(&req, &Default::default()).tool_choice,
+            anthropic_to_openai_request(&req, &Default::default()).unwrap().tool_choice,
             Some(json!("none"))
         );
     }
@@ -622,7 +681,7 @@ mod tests {
         });
         let req: MessagesRequest = serde_json::from_value(raw).unwrap();
 
-        let converted = anthropic_to_openai_request(&req, &Default::default());
+        let converted = anthropic_to_openai_request(&req, &Default::default()).unwrap();
 
         assert_eq!(converted.messages.len(), 2);
         assert!(matches!(
@@ -656,7 +715,7 @@ mod tests {
             .unwrap();
 
             assert_eq!(
-                anthropic_to_openai_request(&req, &Default::default())
+                anthropic_to_openai_request(&req, &Default::default()).unwrap()
                     .reasoning_effort
                     .as_deref(),
                 expected
@@ -678,7 +737,7 @@ mod tests {
         }))
         .unwrap();
 
-        let converted = anthropic_to_openai_request(&req, &Default::default());
+        let converted = anthropic_to_openai_request(&req, &Default::default()).unwrap();
         assert_eq!(converted.messages.len(), 2);
         assert!(matches!(
             &converted.messages[1],
@@ -706,7 +765,7 @@ mod tests {
         }))
         .unwrap();
 
-        let converted = anthropic_to_openai_request(&req, &Default::default());
+        let converted = anthropic_to_openai_request(&req, &Default::default()).unwrap();
         assert_eq!(converted.messages.len(), 1);
         assert!(matches!(
             &converted.messages[0],
@@ -729,7 +788,7 @@ mod tests {
         }))
         .unwrap();
 
-        let converted = anthropic_to_openai_request(&req, &Default::default());
+        let converted = anthropic_to_openai_request(&req, &Default::default()).unwrap();
         assert_eq!(converted.messages.len(), 1);
         assert!(matches!(
             &converted.messages[0],
@@ -754,7 +813,7 @@ mod tests {
         }))
         .unwrap();
 
-        let converted = anthropic_to_openai_request(&req, &Default::default());
+        let converted = anthropic_to_openai_request(&req, &Default::default()).unwrap();
         assert_eq!(converted.messages.len(), 1);
         assert!(matches!(
             &converted.messages[0],
@@ -777,7 +836,7 @@ mod tests {
         }))
         .unwrap();
 
-        let converted = anthropic_to_openai_request(&req, &Default::default());
+        let converted = anthropic_to_openai_request(&req, &Default::default()).unwrap();
         assert_eq!(converted.messages.len(), 1);
         assert!(matches!(
             &converted.messages[0],
@@ -801,7 +860,7 @@ mod tests {
         }))
         .unwrap();
 
-        let converted = anthropic_to_openai_request(&req, &Default::default());
+        let converted = anthropic_to_openai_request(&req, &Default::default()).unwrap();
         assert_eq!(converted.messages.len(), 1);
         assert!(matches!(
             &converted.messages[0],
@@ -822,7 +881,7 @@ mod tests {
         }))
         .unwrap();
 
-        let converted = anthropic_to_openai_request(&req, &Default::default());
+        let converted = anthropic_to_openai_request(&req, &Default::default()).unwrap();
 
         assert_eq!(converted.model, "模型-2025abcd");
         assert_eq!(converted.messages.len(), 1);
@@ -845,7 +904,7 @@ mod tests {
         .unwrap();
         let mut rewrite = std::collections::HashMap::new();
         rewrite.insert("claude-sonnet-4-5".to_string(), "gpt-5".to_string());
-        let converted = anthropic_to_openai_request(&req, &rewrite);
+        let converted = anthropic_to_openai_request(&req, &rewrite).unwrap();
         assert_eq!(
             converted.prompt_cache_retention.as_deref(),
             Some("24h"),
@@ -855,7 +914,7 @@ mod tests {
         // gpt-5-mini also escalates
         let mut rewrite2 = std::collections::HashMap::new();
         rewrite2.insert("claude-sonnet-4-5".to_string(), "gpt-5-mini".to_string());
-        let converted2 = anthropic_to_openai_request(&req, &rewrite2);
+        let converted2 = anthropic_to_openai_request(&req, &rewrite2).unwrap();
         assert_eq!(
             converted2.prompt_cache_retention.as_deref(),
             Some("24h"),
@@ -865,7 +924,7 @@ mod tests {
         // o4-mini also escalates
         let mut rewrite3 = std::collections::HashMap::new();
         rewrite3.insert("claude-sonnet-4-5".to_string(), "o4-mini".to_string());
-        let converted3 = anthropic_to_openai_request(&req, &rewrite3);
+        let converted3 = anthropic_to_openai_request(&req, &rewrite3).unwrap();
         assert_eq!(
             converted3.prompt_cache_retention.as_deref(),
             Some("24h"),
@@ -873,7 +932,7 @@ mod tests {
         );
 
         // non-gpt-5 model keeps in_memory
-        let converted4 = anthropic_to_openai_request(&req, &Default::default());
+        let converted4 = anthropic_to_openai_request(&req, &Default::default()).unwrap();
         assert_eq!(
             converted4.prompt_cache_retention.as_deref(),
             Some("in_memory"),
@@ -893,7 +952,7 @@ mod tests {
         .unwrap();
         let mut rewrite = std::collections::HashMap::new();
         rewrite.insert("claude-sonnet-4-5".to_string(), "gpt-5".to_string());
-        let converted = anthropic_to_openai_request(&req, &rewrite);
+        let converted = anthropic_to_openai_request(&req, &rewrite).unwrap();
         assert_eq!(converted.max_tokens, None, "gpt-5 must not emit max_tokens");
         assert_eq!(
             converted.max_completion_tokens,
@@ -904,7 +963,7 @@ mod tests {
         // o3-mini also uses max_completion_tokens
         let mut rewrite2 = std::collections::HashMap::new();
         rewrite2.insert("claude-sonnet-4-5".to_string(), "o3-mini".to_string());
-        let converted2 = anthropic_to_openai_request(&req, &rewrite2);
+        let converted2 = anthropic_to_openai_request(&req, &rewrite2).unwrap();
         assert_eq!(converted2.max_tokens, None, "o3-mini must not emit max_tokens");
         assert_eq!(
             converted2.max_completion_tokens,
@@ -923,7 +982,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hello"}]
         }))
         .unwrap();
-        let converted = anthropic_to_openai_request(&req, &Default::default());
+        let converted = anthropic_to_openai_request(&req, &Default::default()).unwrap();
         assert_eq!(
             converted.max_tokens,
             Some(100),
@@ -952,7 +1011,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let out = anthropic_to_openai_request(&req, &Default::default());
+        let out = anthropic_to_openai_request(&req, &Default::default()).unwrap();
         let resp_format = out.extra.get("response_format").unwrap();
         assert_eq!(resp_format.get("type").and_then(|v| v.as_str()), Some("json_schema"));
         // Anthropic doesn't carry a schema name; OpenAI requires one inside
@@ -971,7 +1030,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap();
-        let out = anthropic_to_openai_request(&req, &Default::default());
+        let out = anthropic_to_openai_request(&req, &Default::default()).unwrap();
         assert!(out.extra.as_object().unwrap().is_empty());
         assert!(out.reasoning_effort.is_none());
     }
@@ -988,7 +1047,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let out = anthropic_to_openai_request(&req, &Default::default());
+        let out = anthropic_to_openai_request(&req, &Default::default()).unwrap();
         assert_eq!(out.reasoning_effort.as_deref(), Some("low"));
     }
 
@@ -1006,7 +1065,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let out = anthropic_to_openai_request(&req, &Default::default());
+        let out = anthropic_to_openai_request(&req, &Default::default()).unwrap();
         let resp_format = out.extra.get("response_format").unwrap();
         let inner = resp_format.get("json_schema").unwrap();
         assert_eq!(inner.get("name").and_then(|v| v.as_str()), Some("my_schema"));
@@ -1034,7 +1093,7 @@ mod tests {
                 }}
             }
         })).unwrap();
-        let out = anthropic_to_openai_request(&req, &Default::default());
+        let out = anthropic_to_openai_request(&req, &Default::default()).unwrap();
         let inner = out.extra.get("response_format").and_then(|v| v.get("json_schema")).unwrap();
         assert_eq!(inner.get("name").and_then(|v| v.as_str()), Some("structured_output"));
         assert_eq!(inner.get("strict").and_then(|v| v.as_bool()), Some(true));
@@ -1051,11 +1110,169 @@ mod tests {
         // than "json_schema" — e.g. plain "json_object" or "text" must be
         // returned unchanged (no json_schema wrapper synthesized).
         let input = serde_json::json!({"type": "json_object"});
-        let out = ensure_chat_json_schema_name(&input);
+        let out = ensure_chat_json_schema_name(&input).unwrap();
         assert_eq!(out, input);
 
         let input = serde_json::json!({"type": "text"});
-        let out = ensure_chat_json_schema_name(&input);
+        let out = ensure_chat_json_schema_name(&input).unwrap();
         assert_eq!(out, input);
+    }
+
+    // ── PR-7 · service_tier request mapping ─────────────────────────────
+
+    /// PR-7: Anthropic `service_tier: "auto"` must pass through to
+    /// OpenAI `service_tier: "auto"` (same-value passthrough — `auto`
+    /// is a spec-legal OpenAI value per plan v0.7 correction; v0.2
+    /// erroneously listed only default/priority/flex and was missing
+    /// auto/scale/fast).
+    #[test]
+    fn chat_request_service_tier_auto_passes_through() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "service_tier": "auto"
+        }))
+        .unwrap();
+        let out = anthropic_to_openai_request(&req, &Default::default()).unwrap();
+        assert_eq!(out.service_tier.as_deref(), Some("auto"));
+    }
+
+    /// PR-7: Anthropic `service_tier: "standard_only"` has no OpenAI
+    /// equivalent (Anthropic routing preference ≠ OpenAI pricing tier)
+    /// — must be dropped, not coerced to a default. Coercing would 400
+    /// on tier-strict upstreams.
+    #[test]
+    fn chat_request_service_tier_standard_only_is_dropped() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "service_tier": "standard_only"
+        }))
+        .unwrap();
+        let out = anthropic_to_openai_request(&req, &Default::default()).unwrap();
+        assert!(
+            out.service_tier.is_none(),
+            "standard_only must drop, got {:?}",
+            out.service_tier
+        );
+    }
+
+    // ── PR-8 · safety_identifier / verbosity / parallel_tool_calls ──
+
+    /// PR-8: Anthropic `tool_choice.disable_parallel_tool_use=true`
+    /// maps to OpenAI `parallel_tool_calls=false`. Absent/false →
+    /// None (OpenAI wire default is true; emitting an explicit true
+    /// would be noisier).
+    #[test]
+    fn chat_request_disable_parallel_tool_use_maps_to_parallel_tool_calls_false() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "f", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "tool", "name": "f", "disable_parallel_tool_use": true}
+        }))
+        .unwrap();
+        let out = anthropic_to_openai_request(&req, &Default::default()).unwrap();
+        assert_eq!(
+            out.parallel_tool_calls,
+            Some(false),
+            "disable_parallel_tool_use=true must map to parallel_tool_calls=false"
+        );
+    }
+
+    /// PR-8: disable_parallel_tool_use=false (or absent) → None on the
+    /// wire (default true at OpenAI is the desired behavior).
+    #[test]
+    fn chat_request_disable_parallel_tool_use_unset_or_false_leaves_field_absent() {
+        for body in [
+            serde_json::json!({
+                "model": "gpt-4o", "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "f", "input_schema": {"type": "object"}}],
+                "tool_choice": {"type": "tool", "name": "f"}
+            }),
+            serde_json::json!({
+                "model": "gpt-4o", "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "f", "input_schema": {"type": "object"}}],
+                "tool_choice": {"type": "tool", "name": "f", "disable_parallel_tool_use": false}
+            }),
+        ] {
+            let req: MessagesRequest = serde_json::from_value(body).unwrap();
+            let out = anthropic_to_openai_request(&req, &Default::default()).unwrap();
+            assert!(
+                out.parallel_tool_calls.is_none(),
+                "unset/false must leave parallel_tool_calls absent; got {:?}",
+                out.parallel_tool_calls
+            );
+        }
+    }
+
+    /// PR-8: `safety_identifier` is sourced from `metadata.user_id`
+    /// (Anthropic's user-identity surface; maxLength 64 enforced by
+    /// `truncate_user`).
+    #[test]
+    fn chat_request_safety_identifier_sourced_from_metadata_user_id() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o", "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"user_id": "user-42"}
+        }))
+        .unwrap();
+        let out = anthropic_to_openai_request(&req, &Default::default()).unwrap();
+        assert_eq!(out.safety_identifier.as_deref(), Some("user-42"));
+    }
+
+    /// PR-8: `verbosity` is sourced from `output_config.verbosity` and
+    /// passes through verbatim.
+    #[test]
+    fn chat_request_verbosity_passes_through() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o", "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"verbosity": "low"}
+        }))
+        .unwrap();
+        let out = anthropic_to_openai_request(&req, &Default::default()).unwrap();
+        assert_eq!(out.verbosity.as_deref(), Some("low"));
+    }
+
+    // ── PR-9 · P2 fields stay absent on the wire ───────────────────────
+
+    /// PR-9: the nine P2 fields (plan M3c "写" list minus
+    /// include_obfuscation) have no Anthropic source, so the conversion
+    /// layer must leave them None and, critically, absent from the
+    /// serialized body — a bare `null` on the wire would confuse strict
+    /// upstreams. This is the plan M3c "明确不写" contract at the
+    /// conversion boundary (plan line 538: assert via to_value, not just
+    /// field access).
+    #[test]
+    fn chat_request_pr9_p2_fields_absent_from_serialized_body() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o", "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let out = anthropic_to_openai_request(&req, &Default::default()).unwrap();
+        let v = serde_json::to_value(&out).unwrap();
+        for key in [
+            "n",
+            "logit_bias",
+            "logprobs",
+            "top_logprobs",
+            "prediction",
+            "metadata",
+            "presence_penalty",
+            "frequency_penalty",
+            "seed",
+        ] {
+            assert!(
+                v.get(key).is_none(),
+                "conversion must not inject {key}; got: {v}"
+            );
+        }
     }
 }
