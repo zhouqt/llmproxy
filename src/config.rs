@@ -127,6 +127,16 @@ pub enum ProviderConfig {
         /// through the global SOCKS/HTTP proxy. Defaults to `false`.
         #[serde(default)]
         use_proxy: bool,
+        /// The list of OpenRouter backend-provider slugs to exclude (e.g. `["Inceptron"]`).
+        /// When non-empty, the request body carries a `provider: {ignore: [...]}` field,
+        /// which makes OpenRouter skip those providers. It only applies when `api_base` points at
+        /// `openrouter.ai`; other Anthropic-compatible backends (e.g.
+        /// DeepSeek, Minimax, Alibaba Bailian) ignore this setting and produce a
+        /// startup warning, because strict Anthropic-compatible backends answer 400 on
+        /// unknown top-level fields.
+        /// An empty list (the default) injects no `provider` field at all.
+        #[serde(default)]
+        provider_ignore: Vec<String>,
     },
     #[serde(rename = "openai_compat")]
     OpenaiCompat {
@@ -137,6 +147,15 @@ pub enum ProviderConfig {
         model_rewrite: HashMap<String, String>,
         #[serde(default)]
         use_proxy: bool,
+        /// The list of OpenRouter backend-provider slugs to exclude (e.g. `["Azure"]`).
+        /// When non-empty, the request body carries a `provider: {ignore: [...]}` field,
+        /// which makes OpenRouter skip those providers. It only applies when `api_base` points at
+        /// `openrouter.ai`; other OpenAI-compatible backends ignore this setting
+        /// and produce a startup warning (strict OpenAI-compatible backends such
+        /// as DeepSeek answer 400 on unknown top-level fields).
+        /// An empty list (the default) injects no `provider` field at all.
+        #[serde(default)]
+        provider_ignore: Vec<String>,
     },
     /// OpenAI Responses API passthrough provider. Sends an
     /// Anthropic-converted request to `{api_base}/responses` and
@@ -667,6 +686,7 @@ models:
                     api_base: "https://example.test/v1".into(),
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
+                    provider_ignore: Vec::new(),
                 },
                 "anthropic",
             ),
@@ -677,6 +697,7 @@ models:
                     api_base: "https://example.test/v1".into(),
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
+                    provider_ignore: Vec::new(),
                 },
                 "openai_compat",
             ),
