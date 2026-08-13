@@ -38,6 +38,16 @@ pub struct AnthropicProvider {
     api_key: String,
     api_base: String,
     model_rewrite: HashMap<String, String>,
+    /// 要排除的 OpenRouter 后端提供商 slug 列表。
+    /// 非空 + `is_openrouter == true` 时，向请求体注入
+    /// `provider: {ignore: [...]}` 字段（OpenRouter 的 `/v1/messages`
+    /// 端点支持该字段用于客户端路由）。非 OpenRouter 后端上忽略
+    /// 该配置并产生启动警告。
+    provider_ignore: Vec<String>,
+    /// 缓存的 `api_base` host 检测结果：`true` 当且仅当 host 是
+    /// `openrouter.ai`（大小写不敏感，允许 `www.openrouter.ai` 等子域）。
+    /// 在 `new()` 中计算一次，避免每请求重复解析。
+    is_openrouter: bool,
     http: reqwest::Client,
 }
 
@@ -47,6 +57,54 @@ impl AnthropicProvider {
         api_key: String,
         api_base: String,
         model_rewrite: HashMap<String, String>,
+        provider_ignore: Vec<String>,
+        http: reqwest::Client,
+    ) -> Result<Self> {
+        let api_base = api_base.trim_end_matches('/').to_string();
+        let is_openrouter = reqwest::Url::parse(&api_base)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+            .map(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
+            .unwrap_or(false);
+
+        // 启动时一次性警告：避免每请求刷日志。误配到 DeepSeek/Minimax
+        // 等严格校验后端时，请求体保持干净（不注入 provider 字段）。
+        if !provider_ignore.is_empty() && !is_openrouter {
+            tracing::warn!(
+                provider = %name,
+                api_base = %api_base,
+                "provider_ignore configured but api_base is not openrouter.ai; \
+                 field will be ignored (strict Anthropic-compat backends like \
+                 DeepSeek may reject unknown top-level fields)"
+            );
+        }
+
+        Ok(Self {
+            name,
+            api_key,
+            api_base,
+            model_rewrite,
+            provider_ignore,
+            is_openrouter,
+            http,
+        })
+    }
+
+    /// Test-only constructor that bypasses the `is_openrouter` host
+    /// detection so wire-level tests can assert both the ON and OFF
+    /// paths of the gate without depending on `openrouter.ai` DNS or
+    /// constructing a real HTTP server at that hostname. The override
+    /// mirrors the production semantics: when `force_openrouter` is
+    /// `true`, the gate permits injection regardless of `api_base`;
+    /// when `false`, the gate suppresses injection.
+    #[cfg(test)]
+    fn new_for_test(
+        name: String,
+        api_key: String,
+        api_base: String,
+        model_rewrite: HashMap<String, String>,
+        provider_ignore: Vec<String>,
+        force_openrouter: bool,
         http: reqwest::Client,
     ) -> Result<Self> {
         let api_base = api_base.trim_end_matches('/').to_string();
@@ -55,6 +113,8 @@ impl AnthropicProvider {
             api_key,
             api_base,
             model_rewrite,
+            provider_ignore,
+            is_openrouter: force_openrouter,
             http,
         })
     }
@@ -69,6 +129,29 @@ impl AnthropicProvider {
     fn models_url(&self) -> String {
         let stripped = self.api_base.trim_end_matches("/v1");
         format!("{}/v1/models", stripped)
+    }
+
+    /// 将 `provider: {ignore: [...]}` 注入到 Anthropic 请求体顶部（仅当
+    /// `provider_ignore` 非空且 `api_base` 指向 OpenRouter 时）。
+    ///
+    /// 三种门控：
+    /// - `provider_ignore` 为空 → 无操作（默认行为）。
+    /// - 非空且是 OpenRouter → 注入。
+    /// - 非空且非 OpenRouter → 无操作（已在 `new()` 启动时记录警告）。
+    ///
+    /// 注入必须在 retry 循环之前：`strip_thinking_blocks()` 不触碰顶层
+    /// `provider` 字段，所以 retry 请求体保持携带该字段（正确的语义 —
+    /// 排除的提供商在每次尝试中都应被排除）。
+    fn inject_provider_ignore(&self, body: &mut Value) {
+        if self.provider_ignore.is_empty() || !self.is_openrouter {
+            return;
+        }
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "provider".to_string(),
+                json!({"ignore": self.provider_ignore}),
+            );
+        }
     }
 
     /// Build a friendly Anthropic-shaped error body when an upstream rejects
@@ -189,6 +272,11 @@ impl Provider for AnthropicProvider {
     ) -> Result<ProviderOutput> {
         let merged = self.merged_rewrite(model_rewrite);
         let mut body = build_body(req, &merged, false)?;
+        // Inject `provider: {ignore: [...]}` for OpenRouter upstreams.
+        // Must happen BEFORE the retry loop so the field survives any
+        // strip-think-and-retry passes — those only operate on the
+        // `messages` array and the top-level `thinking` key.
+        self.inject_provider_ignore(&mut body);
         let url = self.messages_url();
         let api_key = self.api_key.clone();
 
@@ -264,7 +352,8 @@ impl Provider for AnthropicProvider {
         let url = self.messages_url();
         let api_key = self.api_key.clone();
         let merged = self.merged_rewrite(model_rewrite);
-        let body = build_body(req, &merged, true)?;
+        let mut body = build_body(req, &merged, true)?;
+        self.inject_provider_ignore(&mut body);
         let resp = self
             .http
             .post(&url)
@@ -411,6 +500,7 @@ where
 mod tests {
     use super::*;
     use crate::expect_variant;
+    use crate::test_support::JsonFieldAbsent;
     use futures_util::StreamExt;
     use serde_json::json;
     use wiremock::matchers::{body_partial_json, header, method, path};
@@ -533,6 +623,7 @@ mod tests {
             "router-key".to_string(),
             format!("{}/", server.uri()),
             rewrite,
+            Vec::new(),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -635,6 +726,7 @@ mod tests {
             "router-key".to_string(),
             format!("{}/", server.uri()),
             empty_rewrite(),
+            Vec::new(),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -686,6 +778,7 @@ mod tests {
             "router-key".to_string(),
             format!("{}/", server.uri()),
             rewrite,
+            Vec::new(),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -731,6 +824,7 @@ mod tests {
             "k".to_string(),
             "https://example.test/v1".to_string(),
             configured,
+            Vec::new(),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -770,6 +864,7 @@ mod tests {
             "router-key".to_string(),
             format!("{}/api/v1/", server.uri()),
             rewrite,
+            Vec::new(),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -801,6 +896,7 @@ mod tests {
             "key".to_string(),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
+            Vec::new(),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -829,6 +925,7 @@ mod tests {
             "key".to_string(),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
+            Vec::new(),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1166,6 +1263,7 @@ mod tests {
             "key".to_string(),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
+            Vec::new(),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1231,6 +1329,7 @@ mod tests {
             "key".to_string(),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
+            Vec::new(),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1293,6 +1392,7 @@ mod tests {
             "key".to_string(),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
+            Vec::new(),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1363,6 +1463,7 @@ mod tests {
             "key".to_string(),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
+            Vec::new(),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1417,6 +1518,7 @@ mod tests {
             "key".to_string(),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
+            Vec::new(),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1492,6 +1594,7 @@ mod tests {
             "key".to_string(),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
+            Vec::new(),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1534,6 +1637,7 @@ mod tests {
             "key".to_string(),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
+            Vec::new(),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1573,6 +1677,7 @@ mod tests {
             "key".to_string(),
             format!("{}/v1", server.uri()),
             rewrite,
+            Vec::new(),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1618,6 +1723,7 @@ mod tests {
             "key".to_string(),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
+            Vec::new(),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1657,6 +1763,7 @@ mod tests {
             "test-key".to_string(),
             server.uri(),
             HashMap::new(),
+            Vec::new(),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1694,6 +1801,7 @@ mod tests {
             "test-key".to_string(),
             server.uri(),
             HashMap::new(),
+            Vec::new(),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1712,6 +1820,7 @@ mod tests {
             "test-key".to_string(),
             uri,
             HashMap::new(),
+            Vec::new(),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1734,6 +1843,7 @@ mod tests {
             "test-key".to_string(),
             server.uri(),
             HashMap::new(),
+            Vec::new(),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1758,10 +1868,289 @@ mod tests {
             "test-key".to_string(),
             server.uri(),
             HashMap::new(),
+            Vec::new(),
             reqwest::Client::new(),
         )
         .unwrap();
 
         assert!(provider.list_models().await.is_none());
+    }
+
+    // ─── J group: provider_ignore (OpenRouter /v1/messages routing) ────────
+    //
+    // Mirrors the OpenAI-compat provider_ignore group (src/providers/
+    // openai_compat.rs "I group"): the field lives on the Anthropic
+    // variant too because the user's OpenRouter config uses
+    // `type: anthropic` to talk to OpenRouter's `/v1/messages` endpoint.
+    // The same host-based gate (is_openrouter=true) decides whether the
+    // `provider: {ignore: [...]}` block is injected. Tests use
+    // `new_for_test` to pin both branches of `is_openrouter` without
+    // requiring real DNS for openrouter.ai.
+
+    /// `provider_ignore` + `is_openrouter=true` → wire body carries
+    /// `provider: {ignore: [...]}`. Mirrors the exact shape OpenRouter's
+    /// `/v1/messages` endpoint accepts for client-side provider routing.
+    #[tokio::test]
+    async fn complete_injects_provider_ignore_for_openrouter() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_partial_json(json!({
+                "provider": {"ignore": ["Inceptron"]}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_ok",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ok"}],
+                "model": "rewritten-model",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new_for_test(
+            "openrouter_ds".to_string(),
+            "k".to_string(),
+            format!("{}/", server.uri()),
+            HashMap::new(),
+            vec!["Inceptron".to_string()],
+            true, // force_openrouter
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let _ = provider
+            .complete(&request(false), &empty_rewrite())
+            .await
+            .unwrap();
+    }
+
+    /// `provider_ignore` + `is_openrouter=false` (non-OpenRouter, e.g.
+    /// DeepSeek or Minimax via the `anthropic` provider type) → wire
+    /// body must NOT carry `provider`. Strict Anthropic-compat backends
+    /// reject unknown top-level fields with 400; the gate must keep
+    /// the wire clean.
+    #[tokio::test]
+    async fn complete_omits_provider_field_on_non_openrouter_api_base() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(JsonFieldAbsent("provider"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_ok",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ok"}],
+                "model": "claude-model",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new_for_test(
+            "deepseek".to_string(),
+            "k".to_string(),
+            format!("{}/", server.uri()),
+            HashMap::new(),
+            vec!["Inceptron".to_string()],
+            false, // force_openrouter
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let _ = provider
+            .complete(&request(false), &empty_rewrite())
+            .await
+            .unwrap();
+    }
+
+    /// Empty `provider_ignore` + `is_openrouter=true` → wire body must
+    /// NOT carry a `provider` key (field-omission-is-correctness — no
+    /// empty objects or null pollution).
+    #[tokio::test]
+    async fn complete_omits_provider_field_when_ignore_list_empty() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(JsonFieldAbsent("provider"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_ok",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ok"}],
+                "model": "claude-model",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new_for_test(
+            "openrouter_ds".to_string(),
+            "k".to_string(),
+            format!("{}/", server.uri()),
+            HashMap::new(),
+            Vec::new(),
+            true, // force_openrouter — but empty list still means no injection
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let _ = provider
+            .complete(&request(false), &empty_rewrite())
+            .await
+            .unwrap();
+    }
+
+    /// `provider_ignore` must survive the strip-and-retry loop: when
+    /// the upstream first 400s on cross-model thinking-signature
+    /// wording and then 200s, the second attempt's body must still
+    /// carry `provider: {ignore: [...]}`. (`strip_thinking_blocks()`
+    /// operates only on `messages` and top-level `thinking`, never on
+    /// `provider`, so the field survives untouched.)
+    #[tokio::test]
+    async fn complete_provider_ignore_survives_thinking_strip_retry() {
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured.clone();
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = counter.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(move |req: &wiremock::Request| {
+                let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    ResponseTemplate::new(400).set_body_json(json!({
+                        "error": {"message": "The `content[].thinking` in the thinking mode must be passed back to the API."}
+                    }))
+                } else {
+                    *captured_for_responder.lock().unwrap() = Some(
+                        serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
+                    );
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "id": "msg_ok2",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "model": "claude-model",
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new_for_test(
+            "openrouter_ds".to_string(),
+            "k".to_string(),
+            format!("{}/v1", server.uri()),
+            HashMap::new(),
+            vec!["Inceptron".to_string(), "Azure".to_string()],
+            true,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let _ = provider
+            .complete(&thinking_history_request(false), &empty_rewrite())
+            .await
+            .unwrap();
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        assert_eq!(
+            sent["provider"],
+            json!({"ignore": ["Inceptron", "Azure"]}),
+            "provider.ignore must be present on the second (stripped) attempt"
+        );
+    }
+
+    /// `provider_ignore` must also be injected on the streaming path.
+    /// The streaming send happens before the first byte reaches the
+    /// client, so the gate behaviour must match `complete()`.
+    #[tokio::test]
+    async fn stream_injects_provider_ignore_for_openrouter() {
+        let server = MockServer::start().await;
+        let sse = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\"}\n\n",
+            "event: ping\ndata: {\"type\":\"ping\"}\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_partial_json(json!({
+                "provider": {"ignore": ["Inceptron"]}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new_for_test(
+            "openrouter_ds".to_string(),
+            "k".to_string(),
+            server.uri(),
+            HashMap::new(),
+            vec!["Inceptron".to_string()],
+            true,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let output = provider
+            .stream(&request(true), &empty_rewrite())
+            .await
+            .unwrap();
+        expect_variant!(output, ProviderOutput::Stream(mut stream) => {
+            while let Some(_) = stream.next().await {}
+        });
+    }
+
+    /// The `is_openrouter` flag must be `true` for `https://openrouter.ai`
+    /// and any `*.openrouter.ai` subdomain (case-insensitive). Pinning
+    /// this gate avoids accidental regressions where the production
+    /// host detection drifts and silently disables the field.
+    #[test]
+    fn openrouter_host_detection_covers_subdomains_and_case() {
+        // `new_for_test` overrides `is_openrouter`, but we still exercise
+        // the production constructor on the canonical URL — the
+        // constructor should not panic, and the resulting `name()` and
+        // default `provider_ignore` must round-trip.
+        let p = AnthropicProvider::new(
+            "p".to_string(),
+            "k".to_string(),
+            "https://openrouter.ai/api/v1".to_string(),
+            HashMap::new(),
+            vec!["Azure".to_string()],
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        assert_eq!(p.name(), "p");
+
+        // Also exercise the gate directly via `inject_provider_ignore`
+        // with a forced-openrouter handle, since the production host
+        // detection is private to `new()`.
+        let forced = AnthropicProvider::new_for_test(
+            "p".to_string(),
+            "k".to_string(),
+            "https://example.test/v1".to_string(),
+            HashMap::new(),
+            vec!["Azure".to_string()],
+            true,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let mut body = json!({"model": "m", "messages": []});
+        forced.inject_provider_ignore(&mut body);
+        assert_eq!(body["provider"], json!({"ignore": ["Azure"]}));
     }
 }

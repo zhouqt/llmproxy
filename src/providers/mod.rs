@@ -116,6 +116,7 @@ pub fn build(
             api_key,
             api_base,
             model_rewrite,
+            provider_ignore,
             ..
         } => {
             let inner = anthropic::AnthropicProvider::new(
@@ -123,16 +124,25 @@ pub fn build(
                 api_key.clone(),
                 api_base.clone(),
                 model_rewrite.clone(),
+                provider_ignore.clone(),
                 http,
             )?;
             Ok(Arc::new(inner))
         }
-        ProviderConfig::OpenaiCompat { name, api_key, api_base, model_rewrite, .. } => {
+        ProviderConfig::OpenaiCompat {
+            name,
+            api_key,
+            api_base,
+            model_rewrite,
+            provider_ignore,
+            ..
+        } => {
             let inner = openai_compat::OpenAiCompatProvider::new(
                 name.clone(),
                 api_base.clone(),
                 api_key.clone(),
                 model_rewrite.clone(),
+                provider_ignore.clone(),
                 http,
             )?;
             Ok(Arc::new(inner))
@@ -164,6 +174,7 @@ mod tests {
                 api_base: "https://example.test/v1".to_string(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
+                provider_ignore: Vec::new(),
             },
             reqwest::Client::new(),
         )
@@ -178,6 +189,7 @@ mod tests {
                 api_base: "https://openrouter.ai/api/v1".to_string(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
+                provider_ignore: Vec::new(),
             },
             reqwest::Client::new(),
         )

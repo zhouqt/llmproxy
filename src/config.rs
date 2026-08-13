@@ -127,6 +127,16 @@ pub enum ProviderConfig {
         /// through the global SOCKS/HTTP proxy. Defaults to `false`.
         #[serde(default)]
         use_proxy: bool,
+        /// 要排除的 OpenRouter 后端提供商 slug 列表（如 `["Inceptron"]`）。
+        /// 非空时，请求体会携带 `provider: {ignore: [...]}` 字段，
+        /// 让 OpenRouter 跳过这些提供商。仅当 `api_base` 指向
+        /// `openrouter.ai` 时生效；其他 Anthropic 兼容后端（如
+        /// DeepSeek、Minimax、阿里云百炼）会忽略该配置并产生一条
+        /// 启动警告，因为严格的 Anthropic 兼容后端会对未知顶层
+        /// 字段返回 400。
+        /// 空列表（默认）不注入任何 `provider` 字段。
+        #[serde(default)]
+        provider_ignore: Vec<String>,
     },
     #[serde(rename = "openai_compat")]
     OpenaiCompat {
@@ -137,6 +147,15 @@ pub enum ProviderConfig {
         model_rewrite: HashMap<String, String>,
         #[serde(default)]
         use_proxy: bool,
+        /// 要排除的 OpenRouter 后端提供商 slug 列表（如 `["Azure"]`）。
+        /// 非空时，请求体会携带 `provider: {ignore: [...]}` 字段，
+        /// 让 OpenRouter 跳过这些提供商。仅当 `api_base` 指向
+        /// `openrouter.ai` 时生效；其他 OpenAI-compat 后端会忽略该
+        /// 配置并产生一条启动警告（因为严格校验的 OpenAI-compat 后端
+        /// 如 DeepSeek 会对未知顶层字段返回 400）。
+        /// 空列表（默认）不注入任何 `provider` 字段。
+        #[serde(default)]
+        provider_ignore: Vec<String>,
     },
     /// OpenAI Responses API passthrough provider. Sends an
     /// Anthropic-converted request to `{api_base}/responses` and
@@ -667,6 +686,7 @@ models:
                     api_base: "https://example.test/v1".into(),
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
+                    provider_ignore: Vec::new(),
                 },
                 "anthropic",
             ),
@@ -677,6 +697,7 @@ models:
                     api_base: "https://example.test/v1".into(),
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
+                    provider_ignore: Vec::new(),
                 },
                 "openai_compat",
             ),
