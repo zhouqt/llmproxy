@@ -35,6 +35,13 @@ pub struct OpenAiCompatProvider {
     /// `openrouter.ai`（大小写不敏感，允许 `www.openrouter.ai` 等子域）。
     /// 在 `new()` 中计算一次，避免每请求重复解析。
     is_openrouter: bool,
+    /// 当为 `true` 时，thinking 请求里每条缺失 `reasoning_content` 的历史
+    /// assistant 消息（跨模型 thinking 轮 / redacted_thinking / 纯文本轮）
+    /// 由转换层以 `reasoning_content: ""` 填充，使 DeepSeek-V4 类上游在
+    /// thinking 模式下接受而非 400。同时关闭 reasoning-echo 400 的
+    /// strip-and-retry / 友好 envelope 兜底（400 不再可预期；若仍出现则
+    /// 逐字透传）。默认 `false`（wire 字节与关闭前一致）。
+    reasoning_echo: bool,
     http: reqwest::Client,
 }
 
@@ -45,6 +52,7 @@ impl OpenAiCompatProvider {
         api_key: String,
         model_rewrite: HashMap<String, String>,
         provider_ignore: Vec<String>,
+        reasoning_echo: bool,
         http: reqwest::Client,
     ) -> Result<Self> {
         let api_base = api_base.trim_end_matches('/').to_string();
@@ -74,6 +82,7 @@ impl OpenAiCompatProvider {
             model_rewrite,
             provider_ignore,
             is_openrouter,
+            reasoning_echo,
             http,
         })
     }
@@ -128,6 +137,7 @@ impl OpenAiCompatProvider {
         api_key: String,
         model_rewrite: HashMap<String, String>,
         provider_ignore: Vec<String>,
+        reasoning_echo: bool,
         force_openrouter: bool,
         http: reqwest::Client,
     ) -> Result<Self> {
@@ -139,6 +149,7 @@ impl OpenAiCompatProvider {
             model_rewrite,
             provider_ignore,
             is_openrouter: force_openrouter,
+            reasoning_echo,
             http,
         })
     }
@@ -342,7 +353,7 @@ impl Provider for OpenAiCompatProvider {
     ) -> Result<ProviderOutput> {
         let merged = self.merged_rewrite(model_rewrite);
 
-        let mut openai_req = anthropic_to_openai_request(req, &merged)?;
+        let mut openai_req = anthropic_to_openai_request(req, &merged, self.reasoning_echo)?;
         openai_req.stream = false;
         openai_req.stream_options = None;
         self.inject_provider_ignore(&mut openai_req);
@@ -377,7 +388,12 @@ impl Provider for OpenAiCompatProvider {
             let body = resp.text().await?;
             if !status.is_success() {
                 if status.as_u16() == 400 && attempt < MAX_ATTEMPTS {
-                    if !reasoning_stripped && has_reasoning_echo_error(&body) {
+                    // When reasoning_echo is enabled the conversion already
+                    // fills every assistant message with `reasoning_content`,
+                    // so this 400 is no longer expected; skip the strip-and-
+                    // retry path entirely and surface any 400 verbatim (a real
+                    // protocol violation rather than the known gap).
+                    if !reasoning_stripped && !self.reasoning_echo && has_reasoning_echo_error(&body) {
                         tracing::warn!(
                             provider = %self.name,
                             client_model = %req.model,
@@ -455,7 +471,7 @@ impl Provider for OpenAiCompatProvider {
     ) -> Result<ProviderOutput> {
         let merged = self.merged_rewrite(model_rewrite);
 
-        let mut openai_req = anthropic_to_openai_request(req, &merged)?;
+        let mut openai_req = anthropic_to_openai_request(req, &merged, self.reasoning_echo)?;
         openai_req.stream = true;
         self.inject_provider_ignore(&mut openai_req);
 
@@ -510,7 +526,12 @@ impl Provider for OpenAiCompatProvider {
                 format_downgraded = true;
                 continue;
             }
-            if status.as_u16() == 400 && has_reasoning_echo_error(&text) {
+            // When reasoning_echo is enabled the conversion already fills every
+            // assistant message with `reasoning_content`, so this 400 is no
+            // longer expected; skip the friendly envelope and surface the
+            // 400 verbatim (a real protocol violation rather than the known
+            // gap).
+            if status.as_u16() == 400 && !self.reasoning_echo && has_reasoning_echo_error(&text) {
                 return Err(self.reasoning_echo_error(
                     &req.model,
                     &openai_req.model, // wire name: real model sent upstream
@@ -761,6 +782,7 @@ mod tests {
             configured_rewrite,
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -798,6 +820,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -842,6 +865,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -885,6 +909,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -974,6 +999,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1040,6 +1066,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1247,6 +1274,7 @@ mod tests {
             "k".to_string(),
             rewrite,
             Vec::new(),
+            false,
             reqwest::Client::new(),
         )
         .unwrap()
@@ -1328,6 +1356,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1362,6 +1391,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1398,6 +1428,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1433,6 +1464,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1545,6 +1577,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1584,6 +1617,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1604,6 +1638,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1628,6 +1663,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1654,6 +1690,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1781,7 +1818,7 @@ mod tests {
     fn strip_reasoning_echo_is_noop_without_reasoning_signals() {
         // A plain request converted from `request(false)` has no reasoning
         // signals — stripping must leave it untouched (a pure no-op).
-        let mut req = anthropic_to_openai_request(&request(false), &HashMap::new())
+        let mut req = anthropic_to_openai_request(&request(false), &HashMap::new(), false)
             .expect("conversion must succeed");
         strip_reasoning_echo(&mut req);
         assert!(req.reasoning_effort.is_none());
@@ -1892,6 +1929,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1972,6 +2010,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2029,6 +2068,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2069,6 +2109,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2111,6 +2152,7 @@ mod tests {
             rewrite,
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2376,6 +2418,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2444,6 +2487,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2496,6 +2540,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2549,6 +2594,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2632,6 +2678,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2702,6 +2749,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2751,6 +2799,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
 
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2796,6 +2845,7 @@ mod tests {
             "key".to_string(),
             HashMap::new(),
             vec!["Azure".to_string()],
+            false,
             true,  // force_openrouter
             reqwest::Client::new(),
         )
@@ -2827,8 +2877,51 @@ mod tests {
             format!("{}/v1/", server.uri()),
             "key".to_string(),
             HashMap::new(),
-            vec!["Azure".to_string()],
+            Vec::new(),
+            false,
             false, // force_openrouter
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let _ = provider
+            .complete(&request(false), &HashMap::new())
+            .await
+            .unwrap();
+    }
+
+    /// `provider_ignore` is non-empty but `is_openrouter=false` → wire
+    /// body must STILL NOT carry `provider` (the non-empty branch of
+    /// the gate is suppressed). This is the load-bearing safety path:
+    /// an operator misconfiguring `provider_ignore` on a DeepSeek /
+    /// opencode provider must not inject an unknown top-level field
+    /// that would 400 the strict upstream. Empty-list case is covered
+    /// by `complete_omits_provider_field_on_non_openrouter_api_base`
+    /// above; this test exercises the *non-empty* list specifically.
+    /// (Plan: "non-empty + non-OpenRouter host → no injection + startup
+    /// warn"; we assert the wire-side guarantee directly.)
+    #[tokio::test]
+    async fn complete_omits_provider_when_nonempty_and_not_openrouter() {
+        let server = MockServer::start().await;
+        // `provider` is a top-level field, so the existing
+        // JsonFieldAbsent matcher IS correct here (unlike
+        // `reasoning_content` which lives under `messages[]`).
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(JsonFieldAbsent("provider"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new_for_test(
+            "deepseek-proxy".to_string(),
+            format!("{}/v1/", server.uri()),
+            "key".to_string(),
+            HashMap::new(),
+            vec!["Azure".to_string()], // non-empty list
+            false,
+            false, // force_openrouter=false → gate suppresses injection
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2859,6 +2952,7 @@ mod tests {
             "key".to_string(),
             HashMap::new(),
             Vec::new(),
+            false,
             true,  // force_openrouter (even so, empty list means no injection)
             reqwest::Client::new(),
         )
@@ -2906,6 +3000,7 @@ mod tests {
             "key".to_string(),
             HashMap::new(),
             vec!["Azure".to_string()],
+            false,
             true,  // force_openrouter
             reqwest::Client::new(),
         )
@@ -2930,6 +3025,87 @@ mod tests {
         assert!(
             sent.as_object().unwrap().get("reasoning_effort").is_none(),
             "reasoning_effort must be gone after strip: {sent}"
+        );
+    }
+
+    /// Companion to the test above: `provider_ignore` must ALSO
+    /// survive the response_format downgrade retry. The downgrade
+    /// rewrites `extra.response_format` from json_schema to
+    /// json_object, but must not touch `extra.provider` — otherwise
+    /// the retry request loses the ignore list and OpenRouter routes
+    /// to the excluded backend on the second attempt. (Plan §5.2.)
+    #[tokio::test]
+    async fn complete_provider_ignore_survives_response_format_downgrade_retry() {
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured.clone();
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = counter.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |req: &wiremock::Request| {
+                let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    // First response: response_format 400 (DeepSeek
+                    // wording). The proxy will then run
+                    // `downgrade_response_format` and retry.
+                    ResponseTemplate::new(400).set_body_string(RESPONSE_FORMAT_400)
+                } else {
+                    // Second response: 200, body captured for the
+                    // assertion below. The retry body must STILL carry
+                    // `provider: {ignore:[...]}` — that's the load-
+                    // bearing guarantee.
+                    *captured_for_responder.lock().unwrap() = Some(
+                        serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
+                    );
+                    ResponseTemplate::new(200).set_body_json(chat_response())
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new_for_test(
+            "p".to_string(),
+            server.uri(),
+            "key".to_string(),
+            HashMap::new(),
+            vec!["Azure".to_string()],
+            false,
+            true, // force_openrouter
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        // Build a request that exercises the response_format downgrade
+        // path: `output_config.format = json_schema` is converted to
+        // `extra.response_format = {type:"json_schema",...}`.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4.6",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {
+                "format": {"type": "json_schema", "schema": {"type": "object"}}
+            }
+        }))
+        .unwrap();
+        let _ = provider.complete(&req, &HashMap::new()).await.unwrap();
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // Retried body: provider.ignore survived the downgrade, AND
+        // response_format was actually rewritten to json_object (the
+        // downgrade path actually ran, otherwise this test is no-op).
+        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        assert_eq!(
+            sent["provider"]["ignore"],
+            json!(["Azure"]),
+            "provider.ignore must survive the response_format downgrade, got: {sent}"
+        );
+        assert_eq!(
+            sent["response_format"]["type"],
+            json!("json_object"),
+            "response_format must be downgraded to json_object, got: {sent}"
         );
     }
 
@@ -2959,6 +3135,7 @@ mod tests {
             "key".to_string(),
             HashMap::new(),
             vec!["Azure".to_string(), "Together".to_string()],
+            false,
             true,  // force_openrouter
             reqwest::Client::new(),
         )
@@ -2992,6 +3169,7 @@ mod tests {
             "k".to_string(),
             HashMap::new(),
             vec!["Azure".to_string()],
+            false,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -3045,6 +3223,242 @@ mod tests {
             frequency_penalty: None,
             seed: None,
             extra: serde_json::json!({}),
+        }
+    }
+
+    /// Cross-model assistant history: redacted_thinking (Anthropic
+    /// encrypted blob → dropped by convert_blocks) + plain text. With
+    /// `reasoning_echo=true` this request would 400 on a DeepSeek/opencode
+    /// upstream without the fill; the wiremock tests below pin the
+    /// correct wire shape and the strip-retry suppression.
+    fn thinking_request_with_redacted(stream: bool) -> MessagesRequest {
+        serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 64,
+            "stream": stream,
+            "thinking": {"type": "enabled", "budget_tokens": 2000},
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": [
+                    {"type": "redacted_thinking", "data": "encrypted-blob"},
+                    {"type": "text", "text": "previous answer"}
+                ]},
+                {"role": "user", "content": "continue"}
+            ]
+        }))
+        .unwrap()
+    }
+
+    /// reasoning_echo=true + cross-model redacted-think history → wire
+    /// carries `reasoning_content: ""` on the assistant message, and the
+    /// upstream returns 200 on the FIRST request (no strip-and-retry).
+    /// The counter assertion is the load-bearing one: if reasoning_echo
+    /// were inactive, the wire would be missing reasoning_content and
+    /// upstream would 400, which we deliberately do NOT simulate here.
+    #[tokio::test]
+    async fn complete_reasoning_echo_on_accepts_on_first_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(json!({
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant",
+                     "content": "previous answer",
+                     "reasoning_content": ""},
+                    {"role": "user", "content": "continue"}
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new(
+            "opencode_zen".to_string(),
+            format!("{}/v1/", server.uri()),
+            "test-key".to_string(),
+            HashMap::new(),
+            Vec::new(),
+            true, // reasoning_echo on
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let out = provider
+            .complete(&thinking_request_with_redacted(false), &HashMap::new())
+            .await
+            .expect("reasoning_echo=true must succeed on first POST");
+        let _ = out;
+    }
+
+    /// reasoning_echo=true + upstream STILL 400s with the reasoning-echo
+    /// error wording (e.g. a future upstream changes its validation to
+    /// reject `reasoning_content: ""` because it requires non-empty).
+    /// The proxy must:
+    ///   - NOT retry (reasoning_echo is on, so the strip-and-retry path
+    ///     is gated off — `!self.reasoning_echo` short-circuits).
+    ///   - NOT wrap in the friendly `reasoning_content_not_passed_back`
+    ///     envelope (the same gate suppresses it in `stream()`).
+    ///   - Surface the 400 VERBATIM as `ProxyError::Upstream { status,
+    ///     body }` so the client sees the real upstream error.
+    /// This is the surface-path test that pins the `&& !self.reasoning_echo`
+    /// guards on lines ~396 and ~534.
+    #[tokio::test]
+    async fn complete_reasoning_echo_on_surfaces_400_verbatim() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(REASONING_ECHO_400))
+            .expect(1) // exactly ONE call: no retry with reasoning_echo on
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new(
+            "opencode_zen".to_string(),
+            format!("{}/v1/", server.uri()),
+            "test-key".to_string(),
+            HashMap::new(),
+            Vec::new(),
+            true, // reasoning_echo on
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let err = provider
+            .complete(&thinking_request_with_redacted(false), &HashMap::new())
+            .await
+            .err()
+            .expect("reasoning_echo=true + 400 must surface as error");
+
+        // Must be a verbatim Upstream 400 (NOT the friendly envelope).
+        // The friendly envelope uses `error: { type: "reasoning_content_not_passed_back" }`
+        // inside the body; we assert the body bytes are the literal
+        // upstream response, untouched.
+        match err {
+            ProxyError::Upstream { status, ref body } => {
+                assert_eq!(status, 400);
+                assert_eq!(body, REASONING_ECHO_400);
+            }
+            other => panic!(
+                "reasoning_echo=true + 400 must surface as ProxyError::Upstream, got: {other:?}"
+            ),
+        }
+    }
+
+    /// reasoning_echo=false: the existing strip-and-retry behavior for
+    /// the `reasoning_content ... must be passed back` 400 must be
+    /// unchanged. This pins the OFF path so a future change can't
+    /// accidentally suppress the safety net for non-echo providers.
+    #[tokio::test]
+    async fn complete_reasoning_echo_off_preserves_strip_retry() {
+        let server = MockServer::start().await;
+        // First request: 400 with the reasoning-echo error envelope,
+        // triggered regardless of body shape (the strip path matches
+        // only on the error MESSAGE in the body, not on wire shape).
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "The reasoning_content in the thinking mode must be passed back to the API"}
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Retry after strip: reasoning_content must be absent on every
+        // assistant message. The `JsonFieldAbsent` matcher only inspects
+        // the top-level body object, but `reasoning_content` lives inside
+        // `messages[]`; we need a custom matcher that walks the array and
+        // confirms no inner message carries the key.
+        struct MessagesReasoningContentAbsent;
+        impl wiremock::Match for MessagesReasoningContentAbsent {
+            fn matches(&self, request: &wiremock::Request) -> bool {
+                let Ok(body) = serde_json::from_slice::<serde_json::Value>(&request.body) else {
+                    return false;
+                };
+                let Some(messages) = body.get("messages").and_then(|m| m.as_array()) else {
+                    return false;
+                };
+                !messages.iter().any(|m| m.get("reasoning_content").is_some())
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(MessagesReasoningContentAbsent)
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new(
+            "deepseek".to_string(),
+            format!("{}/v1/", server.uri()),
+            "test-key".to_string(),
+            HashMap::new(),
+            Vec::new(),
+            false, // reasoning_echo off → strip-and-retry path active
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let out = provider
+            .complete(&thinking_request_with_redacted(false), &HashMap::new())
+            .await
+            .expect("strip-and-retry must recover the request");
+        let _ = out;
+    }
+
+    /// reasoning_echo=true + streaming: upstream 200 on first request,
+    /// no friendly `reasoning_content_not_passed_back` envelope is
+    /// ever surfaced. The wire body still carries
+    /// `reasoning_content: ""` on the assistant message.
+    #[tokio::test]
+    async fn stream_reasoning_echo_on_accepts_without_envelope() {
+        let server = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(json!({
+                "stream": true,
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant",
+                     "content": "previous answer",
+                     "reasoning_content": ""},
+                    {"role": "user", "content": "continue"}
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new(
+            "opencode_zen".to_string(),
+            format!("{}/v1/", server.uri()),
+            "test-key".to_string(),
+            HashMap::new(),
+            Vec::new(),
+            true, // reasoning_echo on
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let out = provider
+            .stream(&thinking_request_with_redacted(true), &HashMap::new())
+            .await
+            .expect("reasoning_echo=true must succeed without envelope");
+        // The output must be a Stream (not an error). Wire the stream
+        // body just enough to drain it — wiremock recorded the request.
+        match out {
+            ProviderOutput::Stream(mut s) => {
+                use futures_util::StreamExt;
+                let _ = s.next().await;
+            }
+            ProviderOutput::Json(v) => panic!("expected Stream, got JSON: {v}"),
         }
     }
 }
