@@ -61,11 +61,12 @@ impl AnthropicProvider {
         http: reqwest::Client,
     ) -> Result<Self> {
         let api_base = api_base.trim_end_matches('/').to_string();
-        let is_openrouter = reqwest::Url::parse(&api_base)
-            .ok()
-            .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
-            .map(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
-            .unwrap_or(false);
+        // Detect whether api_base points at OpenRouter. The detection
+        // itself lives in `providers::is_openrouter_api_base` so the
+        // Anthropic and OpenAI-compat providers share one canonical
+        // implementation; the per-provider struct field just caches
+        // the result to avoid re-parsing on every request.
+        let is_openrouter = crate::providers::is_openrouter_api_base(&api_base);
 
         // 启动时一次性警告：避免每请求刷日志。误配到 DeepSeek/Minimax
         // 等严格校验后端时，请求体保持干净（不注入 provider 字段）。
@@ -1876,16 +1877,19 @@ mod tests {
         assert!(provider.list_models().await.is_none());
     }
 
-    // ─── J group: provider_ignore (OpenRouter /v1/messages routing) ────────
+    // ─── J group: provider_ignore (OpenRouter /v1/messages routing) ───────
     //
     // Mirrors the OpenAI-compat provider_ignore group (src/providers/
     // openai_compat.rs "I group"): the field lives on the Anthropic
     // variant too because the user's OpenRouter config uses
     // `type: anthropic` to talk to OpenRouter's `/v1/messages` endpoint.
     // The same host-based gate (is_openrouter=true) decides whether the
-    // `provider: {ignore: [...]}` block is injected. Tests use
-    // `new_for_test` to pin both branches of `is_openrouter` without
-    // requiring real DNS for openrouter.ai.
+    // `provider: {ignore: [...]}` block is injected. The host-detection
+    // expression is shared with OpenAiCompatProvider via
+    // `providers::is_openrouter_api_base` (see
+    // src/providers/mod.rs `is_openrouter_api_base_matches_canonical_subdomains_and_case`).
+    // Other tests use `new_for_test` to pin both branches of the gate
+    // without depending on a real DNS lookup of `openrouter.ai`.
 
     /// `provider_ignore` + `is_openrouter=true` → wire body carries
     /// `provider: {ignore: [...]}`. Mirrors the exact shape OpenRouter's
@@ -2119,12 +2123,15 @@ mod tests {
     /// and any `*.openrouter.ai` subdomain (case-insensitive). Pinning
     /// this gate avoids accidental regressions where the production
     /// host detection drifts and silently disables the field.
+    ///
+    /// The detection itself is unit-tested exhaustively in
+    /// `src/providers/mod.rs` (see
+    /// `is_openrouter_api_base_matches_canonical_subdomains_and_case`).
+    /// This test pins the integration: the production `new()` with a
+    /// canonical OpenRouter URL must cache `is_openrouter = true`, so a
+    /// subsequent `inject_provider_ignore` actually injects.
     #[test]
     fn openrouter_host_detection_covers_subdomains_and_case() {
-        // `new_for_test` overrides `is_openrouter`, but we still exercise
-        // the production constructor on the canonical URL — the
-        // constructor should not panic, and the resulting `name()` and
-        // default `provider_ignore` must round-trip.
         let p = AnthropicProvider::new(
             "p".to_string(),
             "k".to_string(),
@@ -2135,22 +2142,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.name(), "p");
-
-        // Also exercise the gate directly via `inject_provider_ignore`
-        // with a forced-openrouter handle, since the production host
-        // detection is private to `new()`.
-        let forced = AnthropicProvider::new_for_test(
-            "p".to_string(),
-            "k".to_string(),
-            "https://example.test/v1".to_string(),
-            HashMap::new(),
-            vec!["Azure".to_string()],
-            true,
-            reqwest::Client::new(),
-        )
-        .unwrap();
+        // The flag is private; the strongest public-surface check is
+        // that `inject_provider_ignore` actually mutates the body when
+        // the production constructor detected an OpenRouter api_base.
         let mut body = json!({"model": "m", "messages": []});
-        forced.inject_provider_ignore(&mut body);
+        p.inject_provider_ignore(&mut body);
         assert_eq!(body["provider"], json!({"ignore": ["Azure"]}));
     }
 }

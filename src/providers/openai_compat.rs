@@ -48,13 +48,12 @@ impl OpenAiCompatProvider {
         http: reqwest::Client,
     ) -> Result<Self> {
         let api_base = api_base.trim_end_matches('/').to_string();
-        // 检测 api_base 是否指向 OpenRouter。仅当 host 是
-        // `openrouter.ai` 时为 `true`（大小写不敏感）。
-        let is_openrouter = reqwest::Url::parse(&api_base)
-            .ok()
-            .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
-            .map(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
-            .unwrap_or(false);
+        // Detect whether api_base points at OpenRouter. The detection
+        // itself lives in `providers::is_openrouter_api_base` so the
+        // Anthropic and OpenAI-compat providers share one canonical
+        // implementation; the per-provider struct field just caches
+        // the result to avoid re-parsing on every request.
+        let is_openrouter = crate::providers::is_openrouter_api_base(&api_base);
 
         // 启动时一次性警告：避免每请求刷日志。误配到 DeepSeek/opencode
         // 等严格校验后端时，请求体保持干净（不注入 provider 字段）。
@@ -2979,36 +2978,44 @@ mod tests {
 
     /// `is_openrouter` is computed in `new()` by lowercasing the host
     /// string and comparing to `openrouter.ai` / `*.openrouter.ai`.
-    /// This unit test pins that detection without going through a real
-    /// HTTP request: build providers with several `api_base` shapes and
-    /// observe the flag.
+    /// The detection itself is unit-tested exhaustively in
+    /// `src/providers/mod.rs` (see
+    /// `is_openrouter_api_base_matches_canonical_subdomains_and_case`).
+    /// This test pins the integration: the production `new()` with a
+    /// canonical OpenRouter URL must cache `is_openrouter = true`, so a
+    /// subsequent `inject_provider_ignore` actually injects.
     #[test]
     fn openrouter_host_detection_covers_subdomains_and_case() {
-        let p = OpenAiCompatProvider::new_for_test(
+        let p = OpenAiCompatProvider::new(
             "p".to_string(),
             "https://openrouter.ai/api/v1".to_string(),
             "k".to_string(),
             HashMap::new(),
             vec!["Azure".to_string()],
-            // The override is ignored for THIS assertion; we just
-            // want to observe the production path. We pass true
-            // (which matches the host) — the test still pins the
-            // gate path because the empty-list unit test already
-            // covers the absent case.
-            true,
             reqwest::Client::new(),
         )
         .unwrap();
-        // The wire assertion isn't needed here; the host detection
-        // is private to `new()` and not exposed. What we *can* check:
-        // the constructor succeeded (no panic) for the URL.
         assert_eq!(p.name(), "p");
+        // The flag is private; the strongest public-surface check is
+        // that `inject_provider_ignore` actually mutates the request
+        // when the production constructor detected an OpenRouter
+        // api_base.
+        let mut req = minimal_chat_request();
+        p.inject_provider_ignore(&mut req);
+        assert_eq!(
+            req.extra["provider"]["ignore"],
+            json!(["Azure"]),
+            "production constructor with an OpenRouter api_base must \
+             wire the gate so provider.ignore is injected"
+        );
+    }
 
-        // Also verify the gate by exercising `inject_provider_ignore`
-        // with a non-empty list. (We can't observe `is_openrouter`
-        // directly without exposing it; this is the strongest
-        // public-surface check.)
-        let mut req = crate::openai::ChatRequest {
+    /// Build a `ChatRequest` carrying only the fields exercised by the
+    /// `provider_ignore` tests (everything else is `None` / empty).
+    /// Keeping the constructor inline avoids the ~25-field literal
+    /// that previously lived in `openrouter_host_detection_covers_subdomains_and_case`.
+    fn minimal_chat_request() -> crate::openai::ChatRequest {
+        crate::openai::ChatRequest {
             model: "m".to_string(),
             messages: vec![],
             max_tokens: None,
@@ -3038,12 +3045,6 @@ mod tests {
             frequency_penalty: None,
             seed: None,
             extra: serde_json::json!({}),
-        };
-        p.inject_provider_ignore(&mut req);
-        assert_eq!(
-            req.extra["provider"]["ignore"],
-            json!(["Azure"]),
-            "gate (forced) must populate provider.ignore"
-        );
+        }
     }
 }

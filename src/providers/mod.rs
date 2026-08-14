@@ -89,6 +89,26 @@ pub trait Provider: Send + Sync {
 
 pub type SharedProvider = Arc<dyn Provider>;
 
+/// Detect whether `api_base` points at the OpenRouter gateway.
+///
+/// Returns `true` when the URL's host is `openrouter.ai` or any
+/// `*.openrouter.ai` subdomain (case-insensitive). On parse failure
+/// or a missing host, returns `false` (so non-URL garbage is never
+/// classified as OpenRouter).
+///
+/// Used by `AnthropicProvider` and `OpenAiCompatProvider` to gate
+/// the `provider: {ignore: [...]}` injection: the field is only
+/// meaningful on OpenRouter's `/v1/messages` and
+/// `/v1/chat/completions` endpoints, and strict Anthropic-compat
+/// backends like DeepSeek would reject an unknown top-level field.
+pub(crate) fn is_openrouter_api_base(api_base: &str) -> bool {
+    reqwest::Url::parse(api_base)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+        .map(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
+        .unwrap_or(false)
+}
+
 /// Build a provider instance from a ProviderConfig.
 pub fn build(
     cfg: &ProviderConfig,
@@ -244,5 +264,34 @@ mod tests {
             .spawn_background()
             .expect("copilot should spawn token refresh");
         handle.abort();
+    }
+
+    #[test]
+    fn is_openrouter_api_base_matches_canonical_subdomains_and_case() {
+        // Canonical OpenRouter host.
+        assert!(is_openrouter_api_base("https://openrouter.ai/api/v1"));
+        // www. subdomain.
+        assert!(is_openrouter_api_base("https://www.openrouter.ai/api/v1"));
+        // Generic subdomain (api.openrouter.ai etc.).
+        assert!(is_openrouter_api_base("https://api.openrouter.ai/v1"));
+        // Case-insensitive: scheme + host in mixed case.
+        assert!(is_openrouter_api_base("HTTPS://OPENROUTER.AI/api/v1"));
+        assert!(is_openrouter_api_base("Https://OpenRouter.Ai/api/v1"));
+
+        // Negative cases: well-known Anthropic-compat / OpenAI-compat
+        // backends must NOT be classified as OpenRouter — the field
+        // would be rejected by strict backends like DeepSeek.
+        assert!(!is_openrouter_api_base("https://api.deepseek.com/v1"));
+        assert!(!is_openrouter_api_base("https://api.minimaxi.com/v1"));
+        assert!(!is_openrouter_api_base("https://api.anthropic.com/v1"));
+        // Host that merely contains the substring as a label prefix
+        // (not as a real subdomain) — `evil-openrouter.ai.example.com`
+        // ends in `.example.com`, so it must NOT match.
+        assert!(!is_openrouter_api_base(
+            "https://openrouter.ai.example.com/v1"
+        ));
+        // Unparseable / empty input is conservative `false`.
+        assert!(!is_openrouter_api_base("not-a-url"));
+        assert!(!is_openrouter_api_base(""));
     }
 }
