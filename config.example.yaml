@@ -173,6 +173,21 @@ providers:
   #                  (the router skips them when a non-empty upstream-
   #                  model mapping is required — see `can_serve_model`).
   #   use_proxy     — see proxy section. Default: false.
+  #   provider_ignore — optional list of OpenRouter backend-provider slugs
+  #                  to exclude (e.g. ["Azure"]). Injects
+  #                  `provider: {ignore: [...]}` only when api_base points
+  #                  at openrouter.ai; ignored with a startup warning on
+  #                  other backends (DeepSeek etc. 400 on unknown fields).
+  #                  Default: empty (no injection).
+  #   reasoning_echo — when true, thinking requests have every historical
+  #                  assistant message padded with `reasoning_content: ""`
+  #                  so DeepSeek-V4-style upstreams in thinking mode
+  #                  accept cross-model history (redacted_thinking /
+  #                  plain-text / tool-only turns) instead of 400ing
+  #                  with `reasoning_content ... must be passed back`.
+  #                  Only enable on upstreams that tolerate the field on
+  #                  empty-reasoning turns. Default: false (strict OpenAI
+  #                  spec upstreams may reject the non-standard field).
 
   - name: deepseek
     type: openai_compat
@@ -187,11 +202,16 @@ providers:
   # call `-free` models (hy3-free, mimo-v2.5-free, deepseek-v4-flash-free,
   # ...); paid-model requests return 401 CreditsError. The rewrites below
   # map Claude-style names to free model IDs so the provider works as a
-  # fallback for paid Claude models.
+  # fallback for paid Claude models. `reasoning_echo: true` lets
+  # thinking-enabled requests survive cross-model history that contains
+  # redacted_thinking or plain-text assistant turns (Anthropic passthrough
+  # produces both, and opencode_zen's DeepSeek backend rejects them with
+  # `reasoning_content ... must be passed back` otherwise).
   - name: opencode_zen
     type: openai_compat
     api_key: "${OPENCODE_API_KEY}"
     api_base: "https://opencode.ai/zen/v1"
+    reasoning_echo: true
     model_rewrite:
       "deepseek-v4-flash-free": "deepseek-v4-flash-free"
       "claude-haiku-4.6": "deepseek-v4-flash-free"

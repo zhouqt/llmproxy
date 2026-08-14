@@ -122,6 +122,7 @@ fn build_app(
         model_rewrite: HashMap::new(),
         use_proxy: false,
         provider_ignore: Vec::new(),
+    reasoning_echo: false,
     }];
     let fallback_chain = if let Some(backup) = backup {
         providers.insert("backup".to_string(), backup);
@@ -132,6 +133,7 @@ fn build_app(
             model_rewrite: HashMap::new(),
             use_proxy: false,
             provider_ignore: Vec::new(),
+        reasoning_echo: false,
         });
         vec!["backup".to_string()]
     } else {
@@ -921,6 +923,7 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
                 provider_ignore: Vec::new(),
+            reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -929,6 +932,7 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
                 provider_ignore: Vec::new(),
+            reasoning_echo: false,
             },
         ],
         models: vec![

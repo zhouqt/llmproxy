@@ -156,6 +156,14 @@ pub enum ProviderConfig {
         /// An empty list (the default) injects no `provider` field at all.
         #[serde(default)]
         provider_ignore: Vec<String>,
+        /// When `true`, every historical assistant message that lacks `reasoning_content`
+        /// in a thinking request (a cross-model thinking turn, a redacted_thinking
+        /// or a plain-text turn) is sent with `reasoning_content: ""`, so that
+        /// DeepSeek-V4-like upstreams accept it in thinking mode instead of answering
+        /// 400. Default `false` (upstreams that follow the OpenAI spec strictly may
+        /// reject this non-standard field; other providers keep the wire bytes unchanged).
+        #[serde(default)]
+        reasoning_echo: bool,
     },
     /// OpenAI Responses API passthrough provider. Sends an
     /// Anthropic-converted request to `{api_base}/responses` and
@@ -398,6 +406,7 @@ fn strip_outer_quotes(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expect_variant;
 
     #[test]
     fn env_var_expansion() {
@@ -698,6 +707,7 @@ models:
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
                     provider_ignore: Vec::new(),
+                reasoning_echo: false,
                 },
                 "openai_compat",
             ),
@@ -836,5 +846,45 @@ models:
 "#;
         let err = Config::parse(raw).unwrap_err();
         assert!(matches!(err, ProxyError::Yaml(_)), "got: {err:?}");
+    }
+
+    /// `reasoning_echo: true` parses correctly on `openai_compat`
+    /// providers. Off by default when absent — the field is gated by
+    /// `#[serde(default)]` so existing configs without the field still
+    /// load.
+    #[test]
+    fn reasoning_echo_parses_and_defaults_to_false() {
+        // Explicit `true` round-trips.
+        let raw = r#"
+providers:
+  - name: opencode_zen
+    type: openai_compat
+    api_key: k
+    api_base: https://opencode.ai/zen/v1
+    reasoning_echo: true
+models:
+  - name: m
+    primary: opencode_zen
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        expect_variant!(&cfg.providers[0], ProviderConfig::OpenaiCompat { reasoning_echo, .. } => {
+            assert!(*reasoning_echo, "explicit true must parse as true");
+        });
+
+        // Field absent defaults to false.
+        let raw = r#"
+providers:
+  - name: p
+    type: openai_compat
+    api_key: k
+    api_base: https://example.test/v1
+models:
+  - name: m
+    primary: p
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        expect_variant!(&cfg.providers[0], ProviderConfig::OpenaiCompat { reasoning_echo, .. } => {
+            assert!(!*reasoning_echo, "absent field must default to false");
+        });
     }
 }
