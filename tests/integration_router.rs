@@ -204,6 +204,7 @@ async fn mock_llm_provider_primary_succeeds_returns_anthropic_response() {
             model_rewrite: HashMap::new(),
             use_proxy: false,
         provider_ignore: Vec::new(),
+        reasoning_echo: false,
         }],
         models: vec![ModelConfig {
             name: "claude-test".into(),
@@ -267,6 +268,7 @@ async fn mock_llm_provider_falls_back_when_primary_returns_429() {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
             provider_ignore: Vec::new(),
+            reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -275,6 +277,7 @@ async fn mock_llm_provider_falls_back_when_primary_returns_429() {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
             provider_ignore: Vec::new(),
+            reasoning_echo: false,
             },
         ],
         models: vec![ModelConfig {
@@ -346,6 +349,7 @@ async fn mock_llm_provider_falls_back_when_primary_returns_402_quota() {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
             provider_ignore: Vec::new(),
+            reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -354,6 +358,7 @@ async fn mock_llm_provider_falls_back_when_primary_returns_402_quota() {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
             provider_ignore: Vec::new(),
+            reasoning_echo: false,
             },
         ],
         models: vec![ModelConfig {
@@ -423,6 +428,7 @@ async fn mock_llm_provider_falls_back_when_primary_returns_empty_body_402() {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
             provider_ignore: Vec::new(),
+            reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -431,6 +437,7 @@ async fn mock_llm_provider_falls_back_when_primary_returns_empty_body_402() {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
             provider_ignore: Vec::new(),
+            reasoning_echo: false,
             },
         ],
         models: vec![ModelConfig {
@@ -501,6 +508,7 @@ async fn mock_llm_provider_does_not_fall_back_on_403() {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
             provider_ignore: Vec::new(),
+            reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -509,6 +517,7 @@ async fn mock_llm_provider_does_not_fall_back_on_403() {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
             provider_ignore: Vec::new(),
+            reasoning_echo: false,
             },
         ],
         models: vec![ModelConfig {
@@ -578,6 +587,7 @@ async fn mock_llm_provider_chain_exhausted_returns_last_upstream_error() {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
             provider_ignore: Vec::new(),
+            reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -586,6 +596,7 @@ async fn mock_llm_provider_chain_exhausted_returns_last_upstream_error() {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
             provider_ignore: Vec::new(),
+            reasoning_echo: false,
             },
         ],
         models: vec![ModelConfig {
@@ -674,6 +685,7 @@ async fn mock_llm_provider_per_provider_retry_three_times_before_chain_advance()
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
             provider_ignore: Vec::new(),
+            reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -682,6 +694,7 @@ async fn mock_llm_provider_per_provider_retry_three_times_before_chain_advance()
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
             provider_ignore: Vec::new(),
+            reasoning_echo: false,
             },
         ],
         models: vec![ModelConfig {
@@ -1004,6 +1017,7 @@ async fn http_end_to_end_primary_succeeds_returns_requested_model_name() {
         model_rewrite: HashMap::new(),
         use_proxy: false,
     provider_ignore: Vec::new(),
+    reasoning_echo: false,
     }];
     let app = build_axum_app(providers, configs, vec!["primary".to_string()]);
 
@@ -1059,6 +1073,7 @@ async fn http_end_to_end_hosted_web_search_tool_passes_through_extractor() {
         "wiremock-key".to_string(),
         HashMap::new(),
         Vec::new(),
+        false,
         reqwest::Client::new(),
     )
     .unwrap();
@@ -1073,6 +1088,7 @@ async fn http_end_to_end_hosted_web_search_tool_passes_through_extractor() {
         model_rewrite: HashMap::new(),
         use_proxy: false,
     provider_ignore: Vec::new(),
+    reasoning_echo: false,
     }];
     let app = build_axum_app(providers, configs, vec!["primary".to_string()]);
 
@@ -1125,6 +1141,7 @@ async fn http_end_to_end_429_falls_back_to_backup_with_failed_providers_header()
             model_rewrite: HashMap::new(),
             use_proxy: false,
         provider_ignore: Vec::new(),
+        reasoning_echo: false,
         },
         ProviderConfig::OpenaiCompat {
             name: "backup".to_string(),
@@ -1133,6 +1150,7 @@ async fn http_end_to_end_429_falls_back_to_backup_with_failed_providers_header()
             model_rewrite: HashMap::new(),
             use_proxy: false,
         provider_ignore: Vec::new(),
+        reasoning_echo: false,
         },
     ];
     let app = build_axum_app(providers, configs, vec!["primary".into(), "backup".into()]);
@@ -1183,6 +1201,7 @@ async fn http_end_to_end_chain_exhausted_returns_status_and_failed_providers_hea
             model_rewrite: HashMap::new(),
             use_proxy: false,
         provider_ignore: Vec::new(),
+        reasoning_echo: false,
         },
         ProviderConfig::OpenaiCompat {
             name: "backup".to_string(),
@@ -1191,6 +1210,7 @@ async fn http_end_to_end_chain_exhausted_returns_status_and_failed_providers_hea
             model_rewrite: HashMap::new(),
             use_proxy: false,
         provider_ignore: Vec::new(),
+        reasoning_echo: false,
         },
     ];
     let app = build_axum_app(providers, configs, vec!["primary".into(), "backup".into()]);
@@ -1376,6 +1396,7 @@ async fn mock_llm_provider_short_cooldown_for_non_429_upstream_error() {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
             provider_ignore: Vec::new(),
+            reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -1384,6 +1405,7 @@ async fn mock_llm_provider_short_cooldown_for_non_429_upstream_error() {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
             provider_ignore: Vec::new(),
+            reasoning_echo: false,
             },
         ],
         models: vec![ModelConfig {
@@ -1472,6 +1494,7 @@ async fn mock_llm_provider_402_uses_configured_cooldown_seconds_and_skips_primar
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
             provider_ignore: Vec::new(),
+            reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -1480,6 +1503,7 @@ async fn mock_llm_provider_402_uses_configured_cooldown_seconds_and_skips_primar
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
             provider_ignore: Vec::new(),
+            reasoning_echo: false,
             },
         ],
         models: vec![ModelConfig {
@@ -1574,6 +1598,7 @@ async fn mock_llm_provider_subsequent_request_skips_cooldown_provider_directly()
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
             provider_ignore: Vec::new(),
+            reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -1582,6 +1607,7 @@ async fn mock_llm_provider_subsequent_request_skips_cooldown_provider_directly()
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
             provider_ignore: Vec::new(),
+            reasoning_echo: false,
             },
         ],
         models: vec![ModelConfig {
@@ -1691,6 +1717,7 @@ async fn mock_llm_provider_skips_provider_with_unsupported_model_via_runtime_400
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
             provider_ignore: Vec::new(),
+            reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -1699,6 +1726,7 @@ async fn mock_llm_provider_skips_provider_with_unsupported_model_via_runtime_400
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
             provider_ignore: Vec::new(),
+            reasoning_echo: false,
             },
         ],
         models: vec![ModelConfig {
@@ -1791,6 +1819,7 @@ async fn output_config_propagation_through_router() {
         "k".to_string(),
         HashMap::new(),
         Vec::new(),
+        false,
         reqwest::Client::new(),
     )
     .expect("OpenAiCompatProvider must construct against wiremock URI");
@@ -1804,6 +1833,7 @@ async fn output_config_propagation_through_router() {
         model_rewrite: HashMap::new(),
         use_proxy: false,
     provider_ignore: Vec::new(),
+    reasoning_echo: false,
     }];
     let app = build_axum_app(providers, configs, vec!["primary".to_string()]);
 
