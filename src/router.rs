@@ -609,6 +609,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
+                provider_ignore: Vec::new(),
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -616,6 +617,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
+                provider_ignore: Vec::new(),
                 },
             ],
             models: vec![ModelConfig {
@@ -685,6 +687,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
+                provider_ignore: Vec::new(),
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -692,6 +695,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
+                provider_ignore: Vec::new(),
                 },
             ],
             models: vec![ModelConfig {
@@ -972,6 +976,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
+                provider_ignore: Vec::new(),
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -979,6 +984,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
+                provider_ignore: Vec::new(),
                 },
             ],
             models: vec![ModelConfig {
@@ -1049,6 +1055,7 @@ mod tests {
                 api_base: "http://x".into(),
                 model_rewrite: Default::default(),
                 use_proxy: false,
+            provider_ignore: Vec::new(),
             }],
             models: vec![ModelConfig {
                 name: "m".into(),
@@ -1240,6 +1247,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
+                provider_ignore: Vec::new(),
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -1247,6 +1255,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
+                provider_ignore: Vec::new(),
                 },
             ],
             models: vec![ModelConfig {
@@ -1306,6 +1315,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
+                provider_ignore: Vec::new(),
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -1313,6 +1323,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
+                provider_ignore: Vec::new(),
                 },
             ],
             models: vec![ModelConfig {
@@ -1400,6 +1411,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
+                provider_ignore: Vec::new(),
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -1407,6 +1419,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
+                provider_ignore: Vec::new(),
                 },
             ],
             models: vec![ModelConfig {
@@ -1573,6 +1586,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
+                provider_ignore: Vec::new(),
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -1580,6 +1594,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
+                provider_ignore: Vec::new(),
                 },
             ],
             models: vec![ModelConfig {
@@ -1733,6 +1748,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
+                provider_ignore: Vec::new(),
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -1740,6 +1756,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
+                provider_ignore: Vec::new(),
                 },
             ],
             models: vec![ModelConfig {
@@ -1917,6 +1934,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
+                provider_ignore: Vec::new(),
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -1924,6 +1942,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
+                provider_ignore: Vec::new(),
                 },
             ],
             models: vec![ModelConfig {
@@ -1989,6 +2008,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
+                provider_ignore: Vec::new(),
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -1996,6 +2016,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
+                provider_ignore: Vec::new(),
                 },
             ],
             models: vec![ModelConfig {
@@ -2056,6 +2077,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
+                provider_ignore: Vec::new(),
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -2063,6 +2085,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
+                provider_ignore: Vec::new(),
                 },
             ],
             models: vec![ModelConfig {
