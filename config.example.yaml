@@ -134,6 +134,18 @@ providers:
     api_key: "${OPENROUTER_API_KEY}"
     api_base: "https://openrouter.ai/api/v1"
     use_proxy: true
+    # `provider_ignore` is honored by both `openai_compat` and `anthropic`
+    # provider types when their `api_base` points to `openrouter.ai`. The
+    # field is injected as `provider: {ignore: [...]}` into the request
+    # body so OpenRouter skips the listed backend providers at routing
+    # time (useful when a specific upstream is broken or misconfigured
+    # and you can't gate it server-side via the OpenRouter team account).
+    # Empty list (default) omits the `provider` key entirely.
+    # On non-OpenRouter `api_base` values the field is logged as a warning
+    # at startup and the wire body stays clean (strict Anthropic-compat
+    # backends like DeepSeek reject unknown top-level fields with 400).
+    provider_ignore:
+      - "Inceptron"
 
   - name: minimax
     type: anthropic
@@ -192,6 +204,15 @@ providers:
     type: openai_compat
     api_key: "${OPENROUTER_API_KEY}"
     api_base: "https://openrouter.ai/api/v1"
+    # OpenRouter-specific: exclude backend providers that are misconfigured
+    # or unreliable. Values are provider slugs (case-sensitive), e.g.
+    # "Azure", "Together", "Fireworks". Only effective when api_base points
+    # to openrouter.ai; on other OpenAI-compat backends the field is ignored
+    # and a startup warning is logged (strict validators like DeepSeek would
+    # reject unknown top-level fields with 400). Leave empty (or omit) to
+    # allow all providers.
+    provider_ignore:
+      - "Azure"
     model_rewrite:
       "gpt-4o":            "openai/gpt-4o"
       "claude-haiku-4.6":  "anthropic/claude-haiku-4.5"
