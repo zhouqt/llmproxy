@@ -155,6 +155,7 @@ pub fn build(
             api_base,
             model_rewrite,
             provider_ignore,
+            reasoning_echo,
             ..
         } => {
             let inner = openai_compat::OpenAiCompatProvider::new(
@@ -163,6 +164,7 @@ pub fn build(
                 api_key.clone(),
                 model_rewrite.clone(),
                 provider_ignore.clone(),
+                reasoning_echo.clone(),
                 http,
             )?;
             Ok(Arc::new(inner))
@@ -195,6 +197,7 @@ mod tests {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
                 provider_ignore: Vec::new(),
+            reasoning_echo: false,
             },
             reqwest::Client::new(),
         )
