@@ -60,7 +60,7 @@ The response carries `x-llmproxy-failed-providers` (e.g. `copilot:429,deepseek:5
   - `anthropic.rs` — native passthrough (body verbatim, only `model`+`stream` rewritten)
   - `openai_compat.rs` — `/chat/completions` + `OpenAiSseToAnthropic` SSE adapter
   - `openai_responses.rs` — `/responses` + `ResponsesSseToAnthropic`
-  - `copilot.rs` — OAuth device flow, token persistence, and **endpoint routing**: GPT-5.x → `/responses`, everything else → `/chat/completions` (unless the `/models` cache advertises otherwise)
+  - `copilot.rs` — OAuth device flow, token persistence, `/models` cache (in-memory + disk-persisted to `copilot_models.json` next to the token store), and **endpoint routing**: `/responses` default; gpt-5.x → `/chat/completions` only when the cache advertises chat (EnterWorktree whitelist); cold cache → `/responses` for everything
 - **`src/router.rs`** — fallback chain, `CooldownCache`, retry accounting, `is_model_unsupported` 400 detection (skips provider instead of erroring), `/admin/status` health snapshot.
 - **`src/server.rs`** — axum routes: `/v1/messages`, `/v1/messages/count_tokens`, `/v1/models`, `/health`, `/admin/copilot/auth`, `/admin/status`.
 - **`src/oauth/`** — Copilot GitHub device flow + token store (`~/.local/share/llmproxy/github_token.json`).

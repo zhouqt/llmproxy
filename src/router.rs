@@ -45,7 +45,14 @@ fn is_model_unsupported(err: &ProxyError) -> bool {
         || body_lower.contains("not a valid")
         || body_lower.contains("model_not_")
         || body_lower.contains("\"model\"")
-        || (body_lower.contains("supported api model") && body_lower.contains("you passed"));
+        || (body_lower.contains("supported api model") && body_lower.contains("you passed"))
+        // Copilot rejections of the wrong endpoint, e.g.
+        // model "grok-4.5" is not accessible via the /chat/completions endpoint.
+        // Gated on the trailing "the /" so generic routing errors like
+        // "file is not accessible via fallback proxy" do not match. This
+        // phrase is currently only observed in Copilot's endpoint-rejection
+        // shape; if another source surfaces it, revisit the gate.
+        || body_lower.contains("is not accessible via the /");
     mentions_model
 }
 
@@ -1836,6 +1843,16 @@ mod tests {
             // Bare "model" without a "not supported" cue is also not
             // enough — covers "missing field `model`" false positives.
             (r#"{"error":"invalid value for field `model`"}"#, false),
+            // Copilot endpoint rejection (responses-only model sent to
+            // the chat endpoint): must be treated as model-unsupported so
+            // the router falls back instead of leaking a 400.
+            (
+                r#"{"error":{"message":"model \"grok-4.5\" is not accessible via the /chat/completions endpoint"}}"#,
+                true,
+            ),
+            // Generic routing error must NOT match: the pattern is gated
+            // on "the /" so this stays a surfaced failure.
+            (r#"{"error":{"message":"file is not accessible via fallback proxy"}}"#, false),
         ];
         for (body, expected) in cases {
             let err = ProxyError::Upstream { status: 400, body: body.into() };

@@ -8,6 +8,7 @@
 //! 3. Use copilot_token with required Copilot headers against api.githubcopilot.com
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -32,19 +33,19 @@ const COPILOT_INTERNAL_TOKEN_URL: &str =
 /// Policy state and capabilities from the upstream response are discarded
 /// — the cache only keeps entries whose `policy.state == "enabled"`, so
 /// disabled/preview models are never advertised.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct CopilotModel {
     pub id: String,
     pub name: String,
     pub vendor: String,
     /// Endpoints Copilot advertises for this model, e.g.
     /// `["/chat/completions", "/responses"]`. Drives endpoint selection in
-    /// [`CopilotProvider::endpoint_for_model`]: when `/chat/completions` is
-    /// listed we prefer it (parity with llmgateway), since the Responses
-    /// path triggers GPT-5.x to emit malformed `EnterWorktree` `name` values
-    /// (empty strings / absolute paths) that fail Claude Code's `Kor(name)`
-    /// validator. Missing/empty on older Copilot payloads — falls back to
-    /// the `gpt-5` heuristic.
+    /// [`CopilotProvider::endpoint_for_model`]: routing is responses-default,
+    /// chat chosen only when the model advertises chat alone, or advertises
+    /// both while matching the EnterWorktree whitelist (`gpt-5*` — the
+    /// Responses path risks malformed `name` values that fail Claude Code's
+    /// `Kor(name)` validator). Missing/empty on older Copilot payloads is
+    /// schema drift, treated like a cold cache: responses default.
     #[serde(default)]
     pub supported_endpoints: Vec<String>,
 }
@@ -102,63 +103,107 @@ impl std::fmt::Display for CopilotFetchError {
 
 impl std::error::Error for CopilotFetchError {}
 
-/// Heuristic endpoint used when the `/models` cache is unavailable or the
-/// model isn't listed. Kept as the historical default so a cold cache can't
-/// regress behavior: GPT-5.x → `/responses`, everything else →
-/// `/chat/completions`.
+/// Whether `/responses` triggers malformed `EnterWorktree` tool arguments
+/// for this model — empty `name`s, absolute paths, or both mutex keys
+/// non-empty, all of which fail Claude Code's `Kor(name)` validator. When
+/// such a model advertises chat in the `/models` cache we route it to
+/// `/chat/completions` as a whitelist fallback.
 ///
-/// **Endpoint routing vs. request shaping**: uses the empirical prefix
-/// `gpt-5` (not `util::gpt5_family`) because O-series models go to
-/// `/chat/completions` even though they share request-shaping rules with
-/// GPT-5.x (max_completion_tokens, 24h prompt-cache retention).
-fn endpoint_for_model_fallback(model: &str) -> &'static str {
-    if model.starts_with("gpt-5") {
-        "responses"
-    } else {
-        "chat_completions"
+/// The whitelist only takes effect when the cache is hot AND the entry
+/// advertises both endpoints. On a cold cache even these models go to
+/// `/responses` — the same as the historical `gpt-5` prefix heuristic, so
+/// this is not a regression. Kept until a real-device smoke test (Phase 4)
+/// proves the Responses path is safe, then narrowed.
+fn prefers_chat_via_enterworktree(model: &str) -> bool {
+    model.starts_with("gpt-5")
+}
+
+/// Location of the persisted `/models` snapshot. Co-located with the token
+/// store (`github_token.json`) so tempdir-scoped tests stay isolated.
+fn models_cache_path_for(store: &TokenStore) -> PathBuf {
+    store
+        .path()
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("copilot_models.json")
+}
+
+/// Reads a previously persisted `/models` snapshot into memory at cold
+/// start. Missing file → `None` (true cold start); unreadable or corrupt
+/// → warn + `None` (a bad cache must never block startup, same contract as
+/// the token store).
+fn load_models_from_disk(path: &Path) -> Option<Vec<CopilotModel>> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "copilot: failed to read models cache; starting cold"
+            );
+            return None;
+        }
+    };
+    match serde_json::from_str::<Vec<CopilotModel>>(&raw) {
+        Ok(models) => Some(models),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "copilot: failed to parse models cache; starting cold"
+            );
+            None
+        }
     }
 }
 
 impl CopilotProvider {
     /// Pick the upstream endpoint for a model.
     ///
-    /// Prefers `/chat/completions` when Copilot's `/models` cache advertises it
-    /// for the model — parity with llmgateway (`auth/github_device.ex`), which
-    /// always prefers chat when available. This matters because the Responses
-    /// path triggers GPT-5.x to emit malformed `EnterWorktree` `name` values
-    /// (empty strings, absolute paths, or both mutex keys non-empty) that fail
-    /// Claude Code's `Kor(name)` / object-level refine validators — see
-    /// `docs/REVIEWS/llmproxy-vs-llmgateway-translation-diff.md`.
+    /// Defaults to Copilot's `/responses` endpoint - the ecosystem default
+    /// (Codex dropped `/chat/completions` in Feb 2026; Assistants API shuts
+    /// down 2026-08-26) and the only endpoint for responses-only models such
+    /// as grok-4.5, which used to 400 on a cold cache. Three
+    /// cache-advertised exceptions:
     ///
-    /// Falls back to [`endpoint_for_model_fallback`] when the cache is cold or
-    /// the model isn't listed: GPT-5.x → `/responses` (the historical default,
-    /// kept so a cold cache never regresses pre-existing behavior), everything
-    /// else → `/chat/completions`.
+    /// - chat-only entry -> `/chat/completions`;
+    /// - dual-endpoint entry for an EnterWorktree-whitelisted model (`gpt-5*`)
+    ///   -> `/chat/completions` (the Responses path makes these emit
+    ///   malformed `EnterWorktree` tool args - see
+    ///   [`prefers_chat_via_enterworktree`]);
+    /// - everything else -> `/responses`.
+    ///
+    /// `Some(entry)` with an empty `supported_endpoints` is schema drift on
+    /// an older Copilot payload and is treated as a cold cache ->
+    /// `/responses`. This silently changes behavior for non-gpt-5 models that
+    /// used to fall back to `/chat/completions`; that is the intended
+    /// direction of travel.
     async fn endpoint_for_model(&self, model: &str) -> &'static str {
-        let endpoint = if let Some(models) = self.cached_models().await {
-            if let Some(entry) = models.iter().find(|m| m.id == model) {
-                if entry
+        let entry = self
+            .cached_models()
+            .await
+            .and_then(|ms| ms.into_iter().find(|m| m.id == model));
+        match entry {
+            Some(e) => {
+                let chat = e
                     .supported_endpoints
                     .iter()
-                    .any(|e| e == "/chat/completions" || e == "chat/completions")
-                {
+                    .any(|s| s == "/chat/completions" || s == "chat_completions");
+                let responses = e
+                    .supported_endpoints
+                    .iter()
+                    .any(|s| s == "/responses" || s == "responses");
+                if chat && !responses {
                     "chat_completions"
-                } else if entry
-                    .supported_endpoints
-                    .iter()
-                    .any(|e| e == "/responses" || e == "responses")
-                {
-                    "responses"
+                } else if chat && responses && prefers_chat_via_enterworktree(model) {
+                    "chat_completions"
                 } else {
-                    endpoint_for_model_fallback(model)
+                    "responses"
                 }
-            } else {
-                endpoint_for_model_fallback(model)
             }
-        } else {
-            endpoint_for_model_fallback(model)
-        };
-        endpoint
+            None => "responses", // cold cache / unlisted -> responses default
+        }
     }
 
     pub fn new(
@@ -169,6 +214,39 @@ impl CopilotProvider {
         http: reqwest::Client,
     ) -> Result<Self> {
         let store = TokenStore::new()?;
+        Ok(Self::from_store(
+            store,
+            name,
+            vscode_version,
+            account_type,
+            model_rewrite,
+            http,
+        ))
+    }
+
+    /// Test-only: like [`Self::new`] but with a caller-provided token
+    /// store, so the cold-start disk-cache load can be exercised against
+    /// a tempdir instead of the real `XDG_DATA_HOME`.
+    #[cfg(test)]
+    pub(crate) fn new_with_store(store: TokenStore) -> Self {
+        Self::from_store(
+            store,
+            "copilot".to_string(),
+            "1.95.0".to_string(),
+            "individual".to_string(),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+    }
+
+    fn from_store(
+        store: TokenStore,
+        name: String,
+        vscode_version: String,
+        account_type: String,
+        model_rewrite: HashMap<String, String>,
+        http: reqwest::Client,
+    ) -> Self {
         let initial = store.load().unwrap_or_else(|e| {
             tracing::warn!(
                 provider = "copilot",
@@ -178,13 +256,14 @@ impl CopilotProvider {
             );
             None
         });
+        let cached_models = load_models_from_disk(&models_cache_path_for(&store));
         let state = Arc::new(CopilotState {
             tokens: RwLock::new(initial),
             store,
             refresh_lock: Mutex::new(()),
-            cached_models: RwLock::new(None),
+            cached_models: RwLock::new(cached_models),
         });
-        Ok(Self {
+        Self {
             name,
             vscode_version,
             account_type,
@@ -195,7 +274,7 @@ impl CopilotProvider {
             api_base_override: None,
             #[cfg(test)]
             copilot_token_url: COPILOT_INTERNAL_TOKEN_URL.to_string(),
-        })
+        }
     }
 
     fn base_url(&self) -> String {
@@ -437,6 +516,12 @@ impl CopilotProvider {
         self.state.store.save(&new_tokens)?;
         *self.state.tokens.write().await = Some(new_tokens);
 
+        // A fresh OAuth cycle may belong to a different account with a
+        // different model set. Drop the on-disk cache now so a cold start
+        // between this point and the fetch below cannot route on the
+        // previous account's endpoint metadata.
+        let _ = std::fs::remove_file(models_cache_path_for(&self.state.store));
+
         // Token is fresh — populate the model list immediately without
         // calling ensure_token (which would re-enter refresh_lock).
         self.cache_models_with_token(&copilot_token).await;
@@ -623,15 +708,59 @@ impl CopilotProvider {
                     model_count = models.len(),
                     "copilot models cached"
                 );
+                // Persist FIRST, then move into memory: `save_models_to_disk`
+                // borrows, `Some(models)` moves.
+                self.save_models_to_disk(&models);
                 *self.state.cached_models.write().await = Some(models);
             }
             Err(CopilotFetchError::Auth(msg)) => {
                 tracing::warn!("{msg}");
+                // Deliberately keep the on-disk cache: it is endpoint-routing
+                // metadata, independent of authentication state. Only memory is
+                // cleared so `/v1/models` stops advertising models we currently
+                // cannot reach. The on-disk cache is dropped at the next fresh
+                // OAuth cycle (see `complete_bootstrap`), which is when the
+                // account can actually have changed.
                 *self.state.cached_models.write().await = None;
             }
             Err(e) => {
                 tracing::warn!(error = %e, "copilot /models fetch failed; keeping stale cache");
             }
+        }
+    }
+
+    /// Persists the `/models` snapshot next to the token store so a cold
+    /// restart can route without a warm-up fetch. Best effort: a failed
+    /// write only logs; the in-memory cache still serves. Entries are
+    /// sorted by `id` so refresh cycles do not churn the file.
+    ///
+    /// The file holds no secrets (model ids/names/vendors only), so unlike
+    /// the 0o600 token file it is explicitly widened to 0o644 — a
+    /// low-privilege process must be able to read a cache written by
+    /// another user, or it silently falls back to a cold start.
+    fn save_models_to_disk(&self, models: &[CopilotModel]) {
+        let path = models_cache_path_for(&self.state.store);
+        let mut sorted: Vec<&CopilotModel> = models.iter().collect();
+        sorted.sort_by(|a, b| a.id.cmp(&b.id));
+        let raw = match serde_json::to_vec_pretty(&sorted) {
+            Ok(raw) => raw,
+            Err(e) => {
+                tracing::warn!(error = %e, "copilot: failed to serialize models cache");
+                return;
+            }
+        };
+        if let Err(e) = crate::oauth::token_store::write_atomic(&path, &raw) {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "copilot: failed to persist models cache"
+            );
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
         }
     }
 
@@ -1250,6 +1379,7 @@ mod tests {
             Some(&server),
             Some(stored_tokens("github-token", "copilot-token", 600)),
         );
+        seed_chat_only_cache(&provider, "claude-model").await;
 
         let error = provider
             .complete(&request(false), &HashMap::new())
@@ -1318,6 +1448,19 @@ mod tests {
             "messages": [{"role": "user", "content": "hello"}]
         }))
         .unwrap()
+    }
+
+    /// Pins the chat endpoint for `model`: these tests exercise the Chat
+    /// Completions conversion path, which under responses-default routing
+    /// needs the /models cache to advertise chat-only for the upstream
+    /// model (otherwise a cold cache would send the request to /responses).
+    async fn seed_chat_only_cache(provider: &CopilotProvider, model: &str) {
+        *provider.state.cached_models.write().await = Some(vec![CopilotModel {
+            id: model.to_string(),
+            name: model.to_string(),
+            vendor: "v".to_string(),
+            supported_endpoints: vec!["/chat/completions".to_string()],
+        }]);
     }
 
     fn completion_response(content: &str) -> Value {
@@ -1685,6 +1828,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             Some(&server),
             Some(stored_tokens("github-token", "copilot-token", 600)),
         );
+        seed_chat_only_cache(&provider, "copilot-model").await;
         let mut rewrite = HashMap::new();
         rewrite.insert("claude-model".to_string(), "copilot-model".to_string());
 
@@ -2101,22 +2245,25 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
     }
 
     #[tokio::test]
-    async fn non_gpt5_request_never_touches_responses_endpoint() {
-        // A non-GPT-5 source model with no rewrite resolving to a GPT-5
-        // upstream name must NOT be routed to /responses. The mock on
-        // /responses asserts it is never hit; the chat-completions mock
-        // is what serves the request.
+    async fn cold_cache_non_gpt5_routes_to_responses_endpoint() {
+        // User-reported fix: with a cold /models cache (no endpoint data),
+        // requests for non-gpt-5 models now default to /responses instead
+        // of /chat/completions. grok-4.5 is responses-only on Copilot and
+        // previously 400'd on the chat endpoint during the cold-cache
+        // window. The chat-completions mock asserts it is never hit.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/responses"))
+            .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(500).set_body_string("should not be called"))
             .expect(0)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .and(body_partial_json(json!({"model": "claude-sonnet-4.6"})))
-            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response("via-chat")))
+            .and(path("/responses"))
+            .and(body_partial_json(json!({"model": "grok-4.5"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                responses_response_json("via-responses"),
+            ))
             .expect(1)
             .mount(&server)
             .await;
@@ -2125,9 +2272,8 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             Some(stored_tokens("github-token", "copilot-token", 600)),
         );
         let mut req = request(false);
-        req.model = "claude-sonnet-4.6".to_string();
-        // No rewrite: upstream_model == req.model, classified as
-        // chat_completions.
+        req.model = "grok-4.5".to_string();
+        // No rewrite: upstream_model == req.model, cold cache -> responses.
         let rewrite = HashMap::new();
 
         let output = provider
@@ -2135,7 +2281,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             .await
             .unwrap();
         expect_variant!(output, ProviderOutput::Json(body) => {
-            assert_eq!(body["content"][0]["text"], "via-chat");
+            assert_eq!(body["content"][0]["text"], "via-responses");
         });
     }
 
@@ -2227,37 +2373,86 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
     }
 
     #[test]
-    fn endpoint_for_model_fallback_classifies_by_prefix() {
-        // Cold-cache heuristic: GPT-5.x → /responses, everything else →
-        // /chat/completions. This is only used when the /models cache is
-        // unavailable; the cache-aware path prefers /chat/completions when
-        // Copilot advertises it (see endpoint_for_model_prefers_chat_* tests).
-        assert_eq!(endpoint_for_model_fallback("gpt-5"), "responses");
-        assert_eq!(endpoint_for_model_fallback("gpt-5-mini"), "responses");
-        assert_eq!(endpoint_for_model_fallback("gpt-5.5"), "responses");
-        assert_eq!(endpoint_for_model_fallback("gpt-4"), "chat_completions");
-        assert_eq!(endpoint_for_model_fallback("claude-sonnet-4.6"), "chat_completions");
-        assert_eq!(endpoint_for_model_fallback(""), "chat_completions");
-        // T25: o-series routes to /chat/completions, not /responses.
-        // The fallback uses empirical gpt-5 prefix only.
-        assert_eq!(endpoint_for_model_fallback("o1"), "chat_completions");
-        assert_eq!(endpoint_for_model_fallback("o3-mini"), "chat_completions");
-        assert_eq!(endpoint_for_model_fallback("o4-mini"), "chat_completions");
+    fn prefers_chat_via_enterworktree_recognises_gpt5_prefix_only() {
+        // The whitelist is deliberately narrow and exact-lowercase: it
+        // protects models known to emit malformed EnterWorktree args under
+        // /responses, nothing else. The reverse cases guard against the
+        // whitelist silently widening (coverage + regression).
+        assert!(prefers_chat_via_enterworktree("gpt-5"));
+        assert!(prefers_chat_via_enterworktree("gpt-5-mini"));
+        assert!(prefers_chat_via_enterworktree("gpt-5.5"));
+        assert!(prefers_chat_via_enterworktree("gpt-5-2025-08-07"));
+        assert!(!prefers_chat_via_enterworktree("o3-mini"));
+        assert!(!prefers_chat_via_enterworktree("claude-sonnet-4.6"));
+        assert!(!prefers_chat_via_enterworktree("gpt-4"));
+        assert!(!prefers_chat_via_enterworktree(""));
+        assert!(!prefers_chat_via_enterworktree("GPT-5"));
+    }
+    #[tokio::test]
+    async fn endpoint_for_model_chat_only_routes_to_chat() {
+        let (_dir, p) = test_provider(None, None);
+        *p.state.cached_models.write().await = Some(vec![CopilotModel {
+            id: "claude-sonnet-4.6".to_string(),
+            name: "claude-sonnet-4.6".to_string(),
+            vendor: "anthropic".to_string(),
+            supported_endpoints: vec!["/chat/completions".to_string()],
+        }]);
+        assert_eq!(p.endpoint_for_model("claude-sonnet-4.6").await, "chat_completions");
     }
 
-    #[test]
-    fn endpoint_for_model_fallback_is_case_sensitive() {
-        // Routing is case-sensitive: only the exact lowercase prefix
-        // "gpt-5" hits /responses. Mixed-case model names fall through
-        // to /chat/completions, which is the safer default — we'd
-        // rather retry on the wrong endpoint than silently mis-route
-        // an unknown model.
-        assert_eq!(endpoint_for_model_fallback("GPT-5"), "chat_completions");
-        assert_eq!(endpoint_for_model_fallback("Gpt-5-mini"), "chat_completions");
-        assert_eq!(endpoint_for_model_fallback("GPT5"), "chat_completions");
-        // Real-world GPT-5 variants: all lowercase prefix matches.
-        assert_eq!(endpoint_for_model_fallback("gpt-5.5-mini"), "responses");
-        assert_eq!(endpoint_for_model_fallback("gpt-5-2025-08-07"), "responses");
+    #[tokio::test]
+    async fn endpoint_for_model_whitelisted_gpt5_dual_endpoint_prefers_chat() {
+        // EnterWorktree whitelist: gpt-5 advertising both endpoints keeps
+        // the chat preference (the Responses path risks malformed tool args).
+        let (_dir, p) = test_provider(None, None);
+        *p.state.cached_models.write().await = Some(vec![CopilotModel {
+            id: "gpt-5".to_string(),
+            name: "gpt-5".to_string(),
+            vendor: "openai".to_string(),
+            supported_endpoints: vec!["/chat/completions".to_string(), "/responses".to_string()],
+        }]);
+        assert_eq!(p.endpoint_for_model("gpt-5").await, "chat_completions");
+    }
+
+    #[tokio::test]
+    async fn endpoint_for_model_non_whitelist_dual_endpoint_routes_to_responses() {
+        // Flip core: a non-whitelist model advertising BOTH endpoints
+        // routes to /responses (responses-default), unlike the old chat
+        // preference.
+        let (_dir, p) = test_provider(None, None);
+        *p.state.cached_models.write().await = Some(vec![CopilotModel {
+            id: "o3-mini".to_string(),
+            name: "o3-mini".to_string(),
+            vendor: "openai".to_string(),
+            supported_endpoints: vec!["/chat/completions".to_string(), "/responses".to_string()],
+        }]);
+        assert_eq!(p.endpoint_for_model("o3-mini").await, "responses");
+    }
+
+    #[tokio::test]
+    async fn endpoint_for_model_empty_supported_endpoints_routes_to_responses() {
+        // Schema drift: entry present but no endpoints advertised. Treated
+        // as a cold cache -> responses default (was chat for non-gpt-5).
+        let (_dir, p) = test_provider(None, None);
+        *p.state.cached_models.write().await = Some(vec![CopilotModel {
+            id: "grok-4.5".to_string(),
+            name: "grok-4.5".to_string(),
+            vendor: "xai".to_string(),
+            supported_endpoints: vec![],
+        }]);
+        assert_eq!(p.endpoint_for_model("grok-4.5").await, "responses");
+    }
+
+    #[tokio::test]
+    async fn endpoint_for_model_responses_only_routes_to_responses() {
+        let (_dir, p) = test_provider(None, None);
+        *p.state.cached_models.write().await = Some(vec![CopilotModel {
+            id: "grok-4.6".to_string(),
+            name: "grok-4.6".to_string(),
+            vendor: "xai".to_string(),
+            supported_endpoints: vec!["responses".to_string()],
+        }]);
+        assert_eq!(p.endpoint_for_model("grok-4.6").await, "responses");
     }
 
     #[test]
@@ -2320,6 +2515,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             Some(&server),
             Some(stored_tokens("github-token", "old-token", 600)),
         );
+        seed_chat_only_cache(&provider, "claude-model").await;
 
         let output = provider
             .complete(&request(false), &HashMap::new())
@@ -2400,6 +2596,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             Some(&server),
             Some(stored_tokens("github-token", "copilot-token", 600)),
         );
+        seed_chat_only_cache(&provider, "claude-model").await;
 
         let output = provider
             .stream(&request(true), &HashMap::new())
@@ -2433,6 +2630,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             Some(&server),
             Some(stored_tokens("github-token", "copilot-token", 600)),
         );
+        seed_chat_only_cache(&provider, "claude-model").await;
 
         let complete = provider
             .complete(&request(false), &HashMap::new())
@@ -2544,6 +2742,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             Some(&server),
             Some(stored_tokens("github-token", "copilot-token", 600)),
         );
+        seed_chat_only_cache(&provider, "claude-model").await;
 
         let error = provider
             .complete(&request(false), &HashMap::new())
@@ -2577,6 +2776,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             Some(&server),
             Some(stored_tokens("github-token", "copilot-token", 600)),
         );
+        seed_chat_only_cache(&provider, "claude-model").await;
 
         let error = provider
             .stream(&request(true), &HashMap::new())
@@ -2615,6 +2815,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             Some(&server),
             Some(stored_tokens("github-token", "copilot-token", 600)),
         );
+        seed_chat_only_cache(&provider, "claude-model").await;
 
         let error = provider
             .complete(&request(false), &HashMap::new())
@@ -3165,13 +3366,20 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         // returns the device code).
 
         // Poll the memory cache until the spawned bootstrap task
-        // completes (or we time out). With real time + interval=5s
-        // +1=6s poll, this should complete within ~6s.
+        // reaches its terminal state (or we time out). With real time +
+        // interval=5s +1=6s poll, this should complete within ~6s.
+        // Wait on BOTH tokens and the model cache: complete_bootstrap
+        // populates tokens before its fetch_models round-trip + disk
+        // write fill cached_models, so observing tokens alone races the
+        // cache write (deterministically reproducible under slow /
+        // instrumented runs, e.g. llvm-cov).
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             async {
                 loop {
-                    if provider.state.tokens.read().await.is_some() {
+                    let tokens_set = provider.state.tokens.read().await.is_some();
+                    let models_set = provider.cached_models().await.is_some();
+                    if tokens_set && models_set {
                         break;
                     }
                     tokio::task::yield_now().await;
@@ -3403,6 +3611,251 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             .expect("cached_models should be Some after cache_models");
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].id, "m1");
+    }
+
+    #[test]
+    fn save_load_models_roundtrip_and_modes() {
+        // Two entries out of id order: the disk write must sort by id so
+        // refresh cycles do not churn the file.
+        let (dir, p) = test_provider(None, None);
+        let models = vec![
+            CopilotModel {
+                id: "z-model".to_string(),
+                name: "Z".to_string(),
+                vendor: "v".to_string(),
+                supported_endpoints: vec![],
+            },
+            CopilotModel {
+                id: "a-model".to_string(),
+                name: "A".to_string(),
+                vendor: "v".to_string(),
+                supported_endpoints: vec!["/responses".to_string()],
+            },
+        ];
+        p.save_models_to_disk(&models);
+
+        let path = models_cache_path_for(&p.state.store);
+        assert!(path.exists(), "models cache must be written next to token store");
+        let loaded = load_models_from_disk(&path).expect("roundtrip load must succeed");
+        let ids: Vec<_> = loaded.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["a-model", "z-model"], "disk snapshot is sorted by id");
+
+        // No `.tmp` residue: write_atomic writes a temp file and renames.
+        let leftover: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftover.is_empty(), "atomic write must leave no tmp files");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o644, "models cache holds no secrets; must be group-readable");
+        }
+    }
+
+    #[test]
+    fn load_models_from_disk_missing_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            load_models_from_disk(&dir.path().join("copilot_models.json")).is_none(),
+            "missing cache file must be treated as cold start"
+        );
+    }
+
+    #[test]
+    fn load_models_from_disk_corrupt_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("copilot_models.json");
+        std::fs::write(&path, "{ definitely not json").unwrap();
+        assert!(
+            load_models_from_disk(&path).is_none(),
+            "corrupt cache must warn and start cold, not block startup"
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_start_loads_disk_cache_and_list_models_returns_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::from_path(dir.path().join("github_token.json"));
+        let models = vec![CopilotModel {
+            id: "grok-4.5".to_string(),
+            name: "grok-4.5".to_string(),
+            vendor: "xai".to_string(),
+            supported_endpoints: vec!["/responses".to_string()],
+        }];
+        std::fs::write(
+            models_cache_path_for(&store),
+            serde_json::to_vec_pretty(&models).unwrap(),
+        )
+        .unwrap();
+
+        let provider = CopilotProvider::new_with_store(store);
+        let cached = provider
+            .cached_models()
+            .await
+            .expect("cold start must load the persisted cache without a fetch");
+        assert_eq!(cached[0].id, "grok-4.5");
+        assert_eq!(cached[0].supported_endpoints, vec!["/responses"]);
+
+        // Intentional behavior change (Opus P1-A): /v1/models is served
+        // from the disk cache on cold start instead of returning None.
+        let listed = provider
+            .list_models()
+            .await
+            .expect("list_models must return disk-cache models on cold start");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["id"], "grok-4.5");
+        assert_eq!(listed[0]["owned_by"], "xai");
+    }
+
+    #[tokio::test]
+    async fn cache_models_persists_fetched_snapshot_to_disk() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [
+                    {"id": "m1", "name": "Model 1", "vendor": "v", "policy": {"state": "enabled"}},
+                    {"id": "m2", "name": "Model 2", "vendor": "v", "policy": {"state": "enabled"},
+                     "supported_endpoints": ["/chat/completions", "/responses"]}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let initial = StoredTokens {
+            github_access_token: "gh".into(),
+            copilot_token: "test-token".into(),
+            copilot_expires_at: 9999999999,
+            refresh_in: 3600,
+        };
+        let (_dir, p) = test_provider(Some(&server), Some(initial));
+        p.cache_models().await;
+
+        let path = models_cache_path_for(&p.state.store);
+        let persisted =
+            load_models_from_disk(&path).expect("a successful fetch must persist to disk");
+        assert_eq!(persisted.len(), 2);
+        let endpoints: Vec<_> = persisted
+            .iter()
+            .filter(|m| m.id == "m2")
+            .flat_map(|m| m.supported_endpoints.iter().cloned())
+            .collect();
+        assert_eq!(endpoints, vec!["/chat/completions", "/responses"]);
+    }
+
+    #[tokio::test]
+    async fn auth_failure_clears_memory_but_keeps_disk_cache() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let initial = StoredTokens {
+            github_access_token: "gh".into(),
+            copilot_token: "test-token".into(),
+            copilot_expires_at: 9999999999,
+            refresh_in: 3600,
+        };
+        let (_dir, p) = test_provider(Some(&server), Some(initial));
+        let path = models_cache_path_for(&p.state.store);
+        // Seed a disk snapshot as if a real fetch had persisted it.
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&vec![CopilotModel {
+                id: "account-model".to_string(),
+                name: "A".to_string(),
+                vendor: "v".to_string(),
+                supported_endpoints: vec![],
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(path.exists(), "precondition: disk snapshot exists");
+
+        p.cache_models().await;
+
+        assert!(
+            p.cached_models().await.is_none(),
+            "memory cache must be cleared on 401"
+        );
+        assert!(
+            path.exists(),
+            "disk cache is endpoint-routing metadata, independent of auth state; kept on 401 (Opus P2-B)"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_bootstrap_removes_stale_account_disk_cache() {
+        // A fresh OAuth cycle may belong to a different account whose model
+        // set differs. The previous account's persisted snapshot must not
+        // survive to be loaded by a cold restart (Opus P1-C). A transient
+        // /models failure (5xx) keeps the fetch from re-persisting, so a
+        // missing file here proves the removal inside complete_bootstrap.
+        // Real tokio time: the device-flow poll sleeps on tokio::time::sleep.
+        let _env_guard = crate::oauth::device_flow::ENV_LOCK.lock().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/login/oauth/access_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "boot-github"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/copilot_internal/v2/token"))
+            .and(header("authorization", "token boot-github"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "token": "boot-copilot",
+                "expires_at": now() + 900,
+                "refresh_in": 800
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("upstream down"))
+            .mount(&server)
+            .await;
+
+        std::env::set_var("LLMPROXY_TEST_GITHUB_BASE_URL", &server.uri());
+        let (_dir, p) = test_provider(Some(&server), None);
+        let path = models_cache_path_for(&p.state.store);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&vec![CopilotModel {
+                id: "old-account-model".to_string(),
+                name: "Old".to_string(),
+                vendor: "v".to_string(),
+                supported_endpoints: vec![],
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(path.exists(), "precondition: stale previous-account cache exists");
+
+        let dc = DeviceCodeResponse {
+            device_code: "sb-device".to_string(),
+            user_code: "SB-CODE".to_string(),
+            verification_uri: "https://example.test/device".to_string(),
+            expires_in: 600,
+            interval: 5,
+        };
+        p.complete_bootstrap(dc).await.expect("bootstrap must succeed despite /models 5xx");
+        std::env::remove_var("LLMPROXY_TEST_GITHUB_BASE_URL");
+
+        assert!(
+            !path.exists(),
+            "stale account's disk cache must be removed on a fresh OAuth cycle"
+        );
     }
 
     #[tokio::test]
