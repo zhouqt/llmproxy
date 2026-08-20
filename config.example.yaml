@@ -75,12 +75,19 @@ providers:
   #   $XDG_DATA_HOME/llmproxy/github_token.json
   # (defaults to ~/.local/share/llmproxy/github_token.json)
   #
-  # Routing: the proxy auto-routes by model name. Any incoming model
-  # starting with "gpt-5" is dispatched to Copilot's /v1/responses
-  # endpoint (Responses API), since Copilot rejects /v1/chat/completions
-  # for GPT-5.x with `unsupported_api_for_model`. All other model names
-  # go to /v1/chat/completions as before. No configuration flag is
-  # needed — the dispatch happens per-request.
+  # Routing: the proxy auto-routes by model name, defaulting to Copilot's
+  # /v1/responses endpoint (the ecosystem default — Responses is replacing
+  # Chat Completions). Exceptions, driven by the per-model /models cache:
+  #   - a model advertised chat-only  -> /v1/chat/completions
+  #   - gpt-5.x advertising both      -> /v1/chat/completions (EnterWorktree
+  #     whitelist: the Responses path risks malformed tool args for these)
+  #   - everything else               -> /v1/responses
+  #   - cold cache (no /models data)  -> /v1/responses for ALL models
+  # The /models snapshot is persisted to copilot_models.json next to the
+  # token store, so a restart starts warm (and /v1/models reflects it
+  # immediately). A 400 that says a model "is not accessible via the"
+  # selected endpoint is treated as model-unsupported and falls back to
+  # the next provider instead of surfacing to the client.
   #
   # Fields:
   #   name           — internal key referenced by `models:`
@@ -262,10 +269,11 @@ providers:
   #                   a non-empty table is an explicit allow-list.
   #   use_proxy     — see proxy section. Default: false.
   #
-  # NOTE: GitHub Copilot also speaks Responses API but routes automatically
-  # by model name — see the github_copilot section above. Any incoming
-  # model starting with "gpt-5" is dispatched to /v1/responses; all other
-  # names go to /v1/chat/completions. No configuration flag needed.
+  # NOTE: GitHub Copilot also speaks the Responses API but routes
+  # automatically per-model by its `/models` cache — see the github_copilot
+  # section above. Under that policy responses is the default and chat is
+  # chosen only for chat-only models or the EnterWorktree whitelist. No
+  # configuration flag needed here.
   - name: openai_direct
     type: openai_responses
     api_key: "${OPENAI_API_KEY}"
