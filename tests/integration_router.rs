@@ -304,6 +304,88 @@ async fn mock_llm_provider_falls_back_when_primary_returns_429() {
 }
 
 #[tokio::test]
+async fn copilot_endpoint_rejection_400_triggers_fallback() {
+    // Copilot rejects a responses-only model sent to the chat
+    // endpoint with a 400 body that `is_model_unsupported` now
+    // recognizes ("is not accessible via the /"). The router must
+    // classify it as model-unsupported, record the attempt, and
+    // advance to the fallback provider instead of leaking the 400
+    // to the client. This is the end-to-end guard for the
+    // responses-default routing change in copilot.rs.
+    let primary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"message": "model \"grok-4.5\" is not accessible via the /chat/completions endpoint"}
+        })))
+        .expect(1)
+        .mount(&primary)
+        .await;
+    let backup = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_ok("from backup", "claude-test")))
+        .expect(1)
+        .mount(&backup)
+        .await;
+
+    let primary_provider = wiremock_provider("primary", &primary);
+    let backup_provider = wiremock_provider("backup", &backup);
+
+    let mut providers = HashMap::new();
+    providers.insert("primary".to_string(), primary_provider);
+    providers.insert("backup".to_string(), backup_provider);
+
+    let cfg = Config {
+        server: ServerConfig {
+            listen: "127.0.0.1:0".to_string(),
+            api_key: None,
+        },
+        proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
+        providers: vec![
+            ProviderConfig::OpenaiCompat {
+                name: "primary".to_string(),
+                api_key: "k".to_string(),
+                api_base: primary.uri(),
+                model_rewrite: HashMap::new(),
+                use_proxy: false,
+                provider_ignore: Vec::new(),
+                reasoning_echo: false,
+            },
+            ProviderConfig::OpenaiCompat {
+                name: "backup".to_string(),
+                api_key: "k".to_string(),
+                api_base: backup.uri(),
+                model_rewrite: HashMap::new(),
+                use_proxy: false,
+                provider_ignore: Vec::new(),
+                reasoning_echo: false,
+            },
+        ],
+        models: vec![ModelConfig {
+            name: "claude-test".into(),
+            primary: "primary".into(),
+            fallback_chain: vec!["backup".into()],
+            cooldown_seconds: 60,
+            max_retries_per_provider: 1,
+            max_retries_total: 2,
+        }],
+    };
+    let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
+
+    let model_cfg = router.find_model("claude-test").unwrap();
+    let (out, attempts) = router.complete(model_cfg, &make_req("claude-test")).await.unwrap();
+    let ProviderOutput::Json(body) = out else {
+        panic!("expected JSON output");
+    };
+    assert_eq!(body["content"][0]["text"], "from backup");
+    assert_eq!(attempts.len(), 1, "exactly one attempt (primary's 400)");
+    assert_eq!(attempts[0].provider, "primary");
+    assert_eq!(attempts[0].status, 400);
+}
+
+#[tokio::test]
 async fn mock_llm_provider_falls_back_when_primary_returns_402_quota() {
     // Copilot can reject inference with HTTP 402 ("You have exceeded your
     // monthly quota"). The router must (a) treat 402 as a cooldownable

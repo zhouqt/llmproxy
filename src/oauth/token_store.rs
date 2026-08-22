@@ -172,7 +172,7 @@ mod tests_extra {
     }
 }
 
-fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     use std::io::Write;
 
     let dir = path
