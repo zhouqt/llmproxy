@@ -229,6 +229,19 @@ impl ProviderConfig {
             | ProviderConfig::OpenaiResponses { use_proxy, .. } => *use_proxy,
         }
     }
+
+    /// The provider's configured model_rewrite table (client-facing name →
+    /// upstream name). Empty = pass any name verbatim; non-empty = explicit
+    /// allow-list. Used by the `/admin/models` endpoint to enumerate the
+    /// statically-configured upstream models without contacting upstreams.
+    pub fn model_rewrite(&self) -> &HashMap<String, String> {
+        match self {
+            ProviderConfig::GithubCopilot { model_rewrite, .. }
+            | ProviderConfig::Anthropic { model_rewrite, .. }
+            | ProviderConfig::OpenaiCompat { model_rewrite, .. }
+            | ProviderConfig::OpenaiResponses { model_rewrite, .. } => model_rewrite,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

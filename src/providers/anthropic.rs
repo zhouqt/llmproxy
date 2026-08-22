@@ -254,13 +254,19 @@ impl Provider for AnthropicProvider {
                         .and_then(|v| v.as_str())
                         .unwrap_or(id);
                     let created = entry.get("created").and_then(|v| v.as_i64()).unwrap_or(0);
-                    Some(serde_json::json!({
+                    // Upstream ownership is passed through verbatim; the
+                    // handler fills in `owned_by` with the configured
+                    // provider name (see list_models_handler).
+                    let mut out = serde_json::json!({
                         "id": id,
                         "object": "model",
                         "created": created,
-                        "owned_by": "anthropic",
                         "display_name": display_name,
-                    }))
+                    });
+                    if let Some(owned_by) = entry.get("owned_by").and_then(|v| v.as_str()) {
+                        out["upstream_owned_by"] = serde_json::Value::String(owned_by.to_string());
+                    }
+                    Some(out)
                 })
                 .collect(),
         )
@@ -1775,16 +1781,46 @@ mod tests {
 
         assert_eq!(models[0]["id"], "model-a");
         assert_eq!(models[0]["display_name"], "Model A");
-        assert_eq!(models[0]["owned_by"], "anthropic");
+        // owned_by is filled in by the handler layer, not here.
+        assert!(models[0].get("owned_by").is_none());
         assert_eq!(models[0]["created"], 1000);
 
         assert_eq!(models[1]["id"], "model-b");
         assert_eq!(models[1]["display_name"], "Model B");
-        assert_eq!(models[1]["owned_by"], "anthropic");
+        assert!(models[1].get("owned_by").is_none());
 
         assert_eq!(models[2]["id"], "model-c");
         assert_eq!(models[2]["display_name"], "model-c");
-        assert_eq!(models[2]["owned_by"], "anthropic");
+        assert!(models[2].get("owned_by").is_none());
+    }
+
+    #[tokio::test]
+    async fn list_models_passes_through_upstream_owned_by() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("x-api-key", "test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [
+                    {"id": "model-a", "display_name": "Model A", "owned_by": "org1", "created": 1000}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new(
+            "test".to_string(),
+            "test-key".to_string(),
+            server.uri(),
+            HashMap::new(),
+            Vec::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let models = provider.list_models().await.expect("expected Some(_)");
+        assert_eq!(models[0]["upstream_owned_by"], "org1");
     }
 
     #[tokio::test]
