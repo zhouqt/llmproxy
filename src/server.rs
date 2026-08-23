@@ -37,6 +37,7 @@ pub fn build_router(state: AppState) -> AxumRouter {
     let admin = AxumRouter::new()
         .route("/admin/copilot/auth", post(admin_copilot_auth_handler))
         .route("/admin/status", get(admin_status_handler))
+        .route("/admin/models", get(all_models_handler))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             crate::auth::require_auth,
@@ -257,26 +258,165 @@ async fn count_tokens_handler(
     Json(serde_json::json!({ "input_tokens": tokens }))
 }
 
-/// Reverse-dedup model entries by `id`: last occurrence wins.
+/// Per-call timeout for upstream model-catalog fetches in the model-list
+/// endpoints. The shared reqwest client's default timeout is 600 s
+/// (`proxy_client.rs`), which would let a single hanging upstream stall
+/// these endpoints for minutes; metadata must stay snappy.
+const MODELS_METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Fetch a provider's model catalog, bounded by [`MODELS_METADATA_TIMEOUT`].
+/// `timeout` is factored out so tests can exercise the timeout branch
+/// without waiting 10 seconds.
+async fn fetch_models_with_timeout(
+    provider: &crate::providers::SharedProvider,
+    timeout: std::time::Duration,
+) -> Option<Vec<serde_json::Value>> {
+    match tokio::time::timeout(timeout, provider.list_models()).await {
+        Ok(models) => models,
+        Err(_) => {
+            tracing::warn!(
+                provider = %provider.name(),
+                timeout_secs = timeout.as_secs(),
+                "list_models timed out"
+            );
+            None
+        }
+    }
+}
+
+/// Routing priority for every `(upstream model id, provider name)` pair
+/// reachable through `config.models`.
+///
+/// Keyed by **upstream id** (the `id` a provider's `list_models()` reports),
+/// not the client-facing `ModelConfig::name`: for each chain position we
+/// translate the client name through the provider's configured
+/// `model_rewrite` table. The value is `(chain position, declaration seq)`
+/// where chain position is 0 for the primary and 1, 2, ... for fallbacks,
+/// and `seq` is the visiting order over `config.models` (declaration order,
+/// deterministic — never the `HashMap` iteration order of
+/// `router.providers()`). The minimum wins on duplicate keys.
+///
+/// Providers whose `can_serve_model` rejects the **client** name (the same
+/// check the router performs at dispatch time) are skipped entirely.
+pub(crate) fn build_routing_priority(
+    config: &crate::config::Config,
+    providers: &std::collections::HashMap<String, crate::providers::SharedProvider>,
+) -> std::collections::HashMap<(String, String), (u64, u64)> {
+    let empty = std::collections::HashMap::new();
+    let mut priority = std::collections::HashMap::new();
+    let mut seq: u64 = 0;
+    for m in &config.models {
+        for (pos, provider_name) in m.chain().enumerate() {
+            let Some(provider) = providers.get(provider_name) else {
+                continue;
+            };
+            // Client-facing name — matches the router's own dispatch check.
+            if !provider.can_serve_model(&m.name) {
+                continue;
+            }
+            let rewrite = provider.merged_rewrite(&empty);
+            let upstream_id = rewrite.get(&m.name).cloned().unwrap_or_else(|| m.name.clone());
+            let key = (upstream_id, provider_name.to_string());
+            let rank = (pos as u64, seq);
+            seq += 1;
+            priority
+                .entry(key)
+                .and_modify(|e: &mut (u64, u64)| {
+                    if rank < *e {
+                        *e = rank;
+                    }
+                })
+                .or_insert(rank);
+        }
+    }
+    priority
+}
+
+/// Selection rank for a dedup candidate. Lower wins. Class order:
+/// registered (in a routing chain) < discovered-but-unregistered <
+/// static config entry — so the entry the router would actually use beats
+/// everything else, and a real upstream catalog entry beats the generic
+/// static placeholder.
+///
+/// The trailing `(provider, json)` strings only matter for the
+/// unregistered class: entries there come from unordered sources, so the
+/// lexicographically smallest `(provider, serialized entry)` wins to keep
+/// the result deterministic across restarts.
+type EntryRank = (u8, u64, u64, String, String);
+
+fn entry_rank(
+    entry: &serde_json::Value,
+    priority: &std::collections::HashMap<(String, String), (u64, u64)>,
+) -> EntryRank {
+    let provider = entry.get("owned_by").and_then(|v| v.as_str());
+    let fallback_json = serde_json::to_string(entry).unwrap_or_default();
+    match provider {
+        Some("llmproxy") => (2, 0, 0, String::new(), String::new()),
+        Some(p) => match priority.get(&(entry["id"].as_str().unwrap_or_default().to_string(), p.to_string())) {
+            Some(&(pos, seq)) => (0, pos, seq, String::new(), String::new()),
+            None => (1, 0, 0, p.to_string(), fallback_json),
+        },
+        // No attribution (should not happen post-aggregation): treat as
+        // unregistered so a properly attributed entry wins.
+        None => (1, 0, 0, String::new(), fallback_json),
+    }
+}
+
+/// Dedup model entries by `id`, preferring the entry the router would
+/// actually use. Replaces the previous last-occurrence-wins pass whose
+/// winner depended on `HashMap` iteration order (nondeterministic across
+/// restarts).
+///
+/// Rules (see docs/models-api-split-plan.md §1.2):
+/// - entries attributed to a routing-chain position (per
+///   [`build_routing_priority`]) beat unregistered and static entries;
+/// - among registered entries the smallest `(chain position, declaration
+///   seq)` wins — i.e. the primary beats fallbacks;
+/// - unregistered discovered entries beat the static placeholder;
+/// - static entries (`owned_by: "llmproxy"`) survive only when nothing
+///   else claims the id.
+///
 /// Entries with a missing or empty `id` are filtered out with a warning.
-fn dedup_models_last_wins(entries: &mut Vec<serde_json::Value>) {
-    let mut seen = std::collections::HashSet::new();
-    entries.reverse();
-    entries.retain(|m| {
-        let id = match m.get("id").and_then(|v| v.as_str()) {
+fn dedup_models_by_routing_priority(
+    entries: &mut Vec<serde_json::Value>,
+    priority: &std::collections::HashMap<(String, String), (u64, u64)>,
+) {
+    // First-seen order of each id determines output order.
+    let mut order: Vec<String> = Vec::new();
+    let mut best: std::collections::HashMap<String, (EntryRank, serde_json::Value)> =
+        std::collections::HashMap::new();
+    for entry in entries.drain(..) {
+        let id = match entry.get("id").and_then(|v| v.as_str()) {
             Some(id) if !id.is_empty() => id.to_string(),
             _ => {
                 tracing::warn!("model entry has empty or missing id, skipping");
-                return false;
+                continue;
             }
         };
-        seen.insert(id)
-    });
-    entries.reverse();
+        let rank = entry_rank(&entry, priority);
+        match best.get_mut(&id) {
+            Some((best_rank, _)) if *best_rank <= rank => {}
+            _ => {
+                if !order.contains(&id) {
+                    order.push(id.clone());
+                }
+                best.insert(id, (rank, entry));
+            }
+        }
+    }
+    entries.extend(order.into_iter().filter_map(move |id| {
+        best.remove_entry(&id).map(|(_, (_, entry))| entry)
+    }));
 }
 
 async fn list_models_handler(State(state): State<AppState>) -> impl IntoResponse {
-    // Start with static config entries.
+    // Routing priority decides which provider's entry wins an id collision
+    // (see docs/models-api-split-plan.md §1.2). Built from `config.models`
+    // declaration order — deterministic across restarts.
+    let priority = build_routing_priority(&state.config, state.router.providers());
+
+    // Static config entries: lowest priority (see dedup rules), they only
+    // survive when no provider claims the same id.
     let mut entries: Vec<_> = state
         .config
         .models
@@ -292,19 +432,143 @@ async fn list_models_handler(State(state): State<AppState>) -> impl IntoResponse
         })
         .collect();
 
-    // Collect models from all configured providers.
-    for provider in state.router.providers().values() {
-        if let Some(models) = provider.list_models().await {
-            entries.extend(models);
+    // Provider-declared order (config declaration order, not HashMap order)
+    // for deterministic aggregation; fetches run concurrently, each bounded
+    // by MODELS_METADATA_TIMEOUT so one hanging upstream can't stall the
+    // endpoint for the shared client's 600 s default.
+    let names: Vec<&str> = state.config.providers.iter().map(|p| p.name()).collect();
+    let providers = state.router.providers().clone();
+    let fetches = names.iter().map(|name| {
+        let providers = providers.clone();
+        async move {
+            let models = match providers.get(*name) {
+                Some(p) => fetch_models_with_timeout(p, MODELS_METADATA_TIMEOUT).await,
+                None => None,
+            };
+            (*name, models)
         }
+    });
+    let results = futures_util::future::join_all(fetches).await;
+
+    for (provider_name, models) in results {
+        let Some(models) = models else {
+            continue;
+        };
+        let mut models = models;
+        for entry in models.iter_mut() {
+            let Some(obj) = entry.as_object_mut() else {
+                continue;
+            };
+            // Invariant (plan §1.1): every aggregated entry carries the
+            // configured provider name in `owned_by`. Anything a provider
+            // put in `owned_by` is upstream ownership — relocate it.
+            if let Some(upstream) = obj.remove("owned_by") {
+                obj.entry("upstream_owned_by").or_insert(upstream);
+            }
+            obj.insert("owned_by".to_string(), json!(provider_name));
+        }
+        entries.extend(models);
     }
 
-    // Reverse-dedup by id: last occurrence wins.
-    dedup_models_last_wins(&mut entries);
+    dedup_models_by_routing_priority(&mut entries, &priority);
 
     Json(serde_json::json!({
         "object": "list",
         "data": entries,
+    }))
+}
+
+/// List ALL models from ALL configured providers, grouped per provider and
+/// deliberately NOT deduplicated — `/v1/models` shows what the router would
+/// use; this endpoint shows everything each upstream advertises (see
+/// docs/models-api-split-plan.md §2.1).
+///
+/// Always returns 200: a provider whose catalog fetch fails or times out
+/// still appears with an empty `models` array plus a `cache_state` reason,
+/// mirroring the degradation semantics of `/admin/status`.
+async fn all_models_handler(State(state): State<AppState>) -> impl IntoResponse {
+    use crate::providers::Provider;
+
+    let providers = state.router.providers().clone();
+    let fetches = state.config.providers.iter().map(|cfg| {
+        let providers = providers.clone();
+        let cfg = cfg.clone();
+        async move {
+            let provider = providers.get(cfg.name());
+            let discovered = match &provider {
+                Some(p) => fetch_models_with_timeout(p, MODELS_METADATA_TIMEOUT).await,
+                None => None,
+            };
+            (cfg, provider.is_some(), discovered)
+        }
+    });
+
+    let mut groups = Vec::new();
+    for (cfg, configured, discovered) in futures_util::future::join_all(fetches).await {
+        let rewrite = cfg.model_rewrite();
+        let has_static = !rewrite.is_empty();
+
+        // Merge static (rewrite-table values) + discovered into one map
+        // keyed by id; discovered metadata wins on collision. Static
+        // duplicates collapse deterministically by smallest client key.
+        let mut merged: std::collections::BTreeMap<String, serde_json::Value> =
+            std::collections::BTreeMap::new();
+        if has_static {
+            // Sort by client key: `model_rewrite` is a HashMap with random
+            // iteration order, so this keeps duplicate upstream values
+            // deterministic (smallest client key wins via or_insert).
+            let mut static_pairs: Vec<(&String, &String)> = rewrite.iter().collect();
+            static_pairs.sort();
+            for (_, upstream) in static_pairs {
+                merged
+                    .entry(upstream.clone())
+                    .or_insert_with(|| {
+                        serde_json::json!({
+                            "id": upstream,
+                            "object": "model",
+                            "created": 0,
+                            "display_name": upstream,
+                        })
+                    });
+            }
+        }
+
+        let cache_state = match (&discovered, state.copilot.as_ref()) {
+            (Some(_), _) => "populated",
+            (None, Some(c)) if c.name() == cfg.name() => c.cache_state().await,
+            (None, _) => "fetch_failed",
+        };
+
+        let discovered_ok = discovered.is_some();
+        if let Some(models) = discovered {
+            for entry in models {
+                let Some(id) = entry.get("id").and_then(|v| v.as_str()).map(str::to_string)
+                else {
+                    continue;
+                };
+                merged.insert(id, entry);
+            }
+        }
+
+        let source = match (has_static, discovered_ok) {
+            (true, true) => "static+discovered",
+            (true, false) => "static",
+            (false, _) => "discovered",
+        };
+
+        groups.push(serde_json::json!({
+            "provider": cfg.name(),
+            "type": cfg.type_label(),
+            "configured": configured,
+            "source": source,
+            "cache_state": cache_state,
+            "models": merged.into_values().collect::<Vec<_>>(),
+        }));
+    }
+
+    Json(serde_json::json!({
+        "object": "list",
+        "providers": groups,
     }))
 }
 
@@ -399,6 +663,7 @@ async fn admin_copilot_auth_handler(State(state): State<AppState>) -> Response {
 mod tests {
     use super::*;
     use futures_util::stream;
+    use std::collections::HashMap;
     use std::pin::Pin;
 
     fn make_stream(
@@ -858,50 +1123,413 @@ mod tests {
             let body: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(body["type"], "error");
         }
+
+        #[tokio::test]
+        async fn admin_models_copilot_group_reports_cache_state() {
+            // Cold Copilot provider (private tempdir token store): the
+            // catalog fetch returns None, so the group must degrade to
+            // cache_state "cold" — routed through CopilotProvider's own
+            // introspection rather than the generic "fetch_failed".
+            let provider = new_copilot();
+
+            let cfg = Config {
+                server: ServerConfig {
+                    listen: "127.0.0.1:0".to_string(),
+                    api_key: None,
+                },
+                proxy: Default::default(),
+                user_agent: crate::config::default_user_agent(),
+                providers: vec![ProviderConfig::GithubCopilot {
+                    name: "copilot".to_string(),
+                    vscode_version: "1.95.0".to_string(),
+                    account_type: "individual".to_string(),
+                    model_rewrite: HashMap::new(),
+                    use_proxy: false,
+                }],
+                models: vec![ModelConfig {
+                    name: "m".to_string(),
+                    primary: "copilot".to_string(),
+                    fallback_chain: vec![],
+                    cooldown_seconds: 60,
+                    max_retries_per_provider: 1,
+                    max_retries_total: 1,
+                }],
+            };
+            let cfg = Arc::new(cfg);
+            let cooldown = CooldownCache::new();
+            let mut providers = HashMap::new();
+            providers.insert("copilot".to_string(), provider.clone() as Arc<dyn Provider>);
+            let router = Arc::new(Router::new(cfg.clone(), providers, cooldown.clone()));
+            let app = crate::server::build_router(AppState {
+                config: cfg,
+                router,
+                cooldown,
+                http: reqwest::Client::new(),
+                copilot: Some(provider),
+            });
+
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/admin/models")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            let group = &body["providers"][0];
+            assert_eq!(group["provider"], "copilot");
+            assert_eq!(group["cache_state"], "cold");
+            assert_eq!(group["source"], "discovered");
+        }
     }
 
     #[test]
-    fn dedup_keeps_last_occurrence_for_duplicate_id() {
+    fn build_routing_priority_prefers_primary_and_translates_rewrite() {
+        use crate::config::{Config, ModelConfig, ProviderConfig, ServerConfig};
+        use crate::providers::Provider;
+        use std::sync::Arc;
+
+        // copilot has a non-empty rewrite table: client "claude" →
+        // upstream "gpt-x". compat is a fallback with an empty table.
+        let config = Config {
+            server: ServerConfig {
+                listen: "127.0.0.1:0".to_string(),
+                api_key: None,
+            },
+            proxy: Default::default(),
+            user_agent: crate::config::default_user_agent(),
+            providers: vec![
+                ProviderConfig::OpenaiCompat {
+                    name: "compat".to_string(),
+                    api_key: "k".to_string(),
+                    api_base: "https://x.test".to_string(),
+                    model_rewrite: HashMap::new(),
+                    use_proxy: false,
+                    provider_ignore: Vec::new(),
+                    reasoning_echo: false,
+                },
+                ProviderConfig::GithubCopilot {
+                    name: "copilot".to_string(),
+                    vscode_version: "1.95.0".to_string(),
+                    account_type: "individual".to_string(),
+                    model_rewrite: HashMap::from([
+                        ("claude".to_string(), "gpt-x".to_string()),
+                        ("other".to_string(), "gpt-y".to_string()),
+                    ]),
+                    use_proxy: false,
+                },
+            ],
+            models: vec![ModelConfig {
+                name: "claude".to_string(),
+                primary: "copilot".to_string(),
+                fallback_chain: vec!["compat".to_string()],
+                cooldown_seconds: 60,
+                max_retries_per_provider: 1,
+                max_retries_total: 1,
+            }],
+        };
+        let providers: HashMap<String, crate::providers::SharedProvider> = HashMap::from([
+            (
+                "copilot".to_string(),
+                Arc::new(crate::providers::copilot::CopilotProvider::new(
+                    "copilot".to_string(),
+                    "1.95.0".to_string(),
+                    "individual".to_string(),
+                    config.providers[1].model_rewrite().clone(),
+                    reqwest::Client::new(),
+                )
+                .unwrap()) as Arc<dyn Provider>,
+            ),
+            (
+                "compat".to_string(),
+                crate::providers::build(&config.providers[0], reqwest::Client::new()).unwrap(),
+            ),
+        ]);
+
+        let priority = build_routing_priority(&config, &providers);
+        // Client name translated to the upstream id for the rewritten
+        // provider; primary gets position 0.
+        assert_eq!(
+            priority.get(&("gpt-x".to_string(), "copilot".to_string())),
+            Some(&(0u64, 0u64))
+        );
+        // Untranslated fallback keeps the client name as id, position 1.
+        assert_eq!(
+            priority.get(&("claude".to_string(), "compat".to_string())),
+            Some(&(1u64, 1u64))
+        );
+        // Rewrite keys not referenced by any model chain are absent.
+        assert!(!priority.contains_key(&("gpt-y".to_string(), "copilot".to_string())));
+    }
+
+    #[test]
+    fn build_routing_priority_skips_providers_that_cannot_serve() {        use crate::config::{Config, ModelConfig, ProviderConfig, ServerConfig};
+
+        // copilot can only serve "other" (rewrite key); the chain asks for
+        // "claude", which it cannot serve — so no entry for copilot at all,
+        // while compat (empty rewrite = serve anything) is registered.
+        let config = Config {
+            server: ServerConfig {
+                listen: "127.0.0.1:0".to_string(),
+                api_key: None,
+            },
+            proxy: Default::default(),
+            user_agent: crate::config::default_user_agent(),
+            providers: vec![
+                ProviderConfig::OpenaiCompat {
+                    name: "compat".to_string(),
+                    api_key: "k".to_string(),
+                    api_base: "https://x.test".to_string(),
+                    model_rewrite: HashMap::new(),
+                    use_proxy: false,
+                    provider_ignore: Vec::new(),
+                    reasoning_echo: false,
+                },
+                ProviderConfig::GithubCopilot {
+                    name: "copilot".to_string(),
+                    vscode_version: "1.95.0".to_string(),
+                    account_type: "individual".to_string(),
+                    model_rewrite: HashMap::from([("other".to_string(), "gpt-x".to_string())]),
+                    use_proxy: false,
+                },
+            ],
+            models: vec![ModelConfig {
+                name: "claude".to_string(),
+                primary: "copilot".to_string(),
+                fallback_chain: vec![],
+                cooldown_seconds: 60,
+                max_retries_per_provider: 1,
+                max_retries_total: 1,
+            }],
+        };
+        let providers: HashMap<String, crate::providers::SharedProvider> = HashMap::from([
+            (
+                "copilot".to_string(),
+                crate::providers::build(&config.providers[1], reqwest::Client::new()).unwrap(),
+            ),
+            (
+                "compat".to_string(),
+                crate::providers::build(&config.providers[0], reqwest::Client::new()).unwrap(),
+            ),
+        ]);
+
+        let priority = build_routing_priority(&config, &providers);
+        assert!(priority.is_empty(), "copilot cannot serve claude");
+    }
+
+    #[test]
+    fn build_routing_priority_takes_min_rank_on_duplicate_keys_and_skips_ghosts() {
+        use crate::config::{Config, ModelConfig, ProviderConfig, ServerConfig};
+
+        // copilot's rewrite maps both "m1" and "m2" to the same upstream
+        // id "u". Row1 uses copilot as fallback (pos 1), row2 as primary
+        // (pos 0) — the minimum position must win for ("u", "copilot").
+        // Row1 also references a "ghost" provider absent from the map,
+        // which must be skipped without panicking.
+        let config = Config {
+            server: ServerConfig {
+                listen: "127.0.0.1:0".to_string(),
+                api_key: None,
+            },
+            proxy: Default::default(),
+            user_agent: crate::config::default_user_agent(),
+            providers: vec![ProviderConfig::GithubCopilot {
+                name: "copilot".to_string(),
+                vscode_version: "1.95.0".to_string(),
+                account_type: "individual".to_string(),
+                model_rewrite: HashMap::from([
+                    ("m1".to_string(), "u".to_string()),
+                    ("m2".to_string(), "u".to_string()),
+                ]),
+                use_proxy: false,
+            }],
+            models: vec![
+                ModelConfig {
+                    name: "m1".to_string(),
+                    primary: "ghost".to_string(),
+                    fallback_chain: vec!["copilot".to_string()],
+                    cooldown_seconds: 60,
+                    max_retries_per_provider: 1,
+                    max_retries_total: 1,
+                },
+                ModelConfig {
+                    name: "m2".to_string(),
+                    primary: "copilot".to_string(),
+                    fallback_chain: vec![],
+                    cooldown_seconds: 60,
+                    max_retries_per_provider: 1,
+                    max_retries_total: 1,
+                },
+            ],
+        };
+        let providers: HashMap<String, crate::providers::SharedProvider> = HashMap::from([(
+            "copilot".to_string(),
+            crate::providers::build(&config.providers[0], reqwest::Client::new()).unwrap(),
+        )]);
+
+        let priority = build_routing_priority(&config, &providers);
+        // pos 0 from the m2 row wins over pos 1 from the m1 row; the seq
+        // component reflects insertion order across config.models.
+        assert_eq!(
+            priority.get(&("u".to_string(), "copilot".to_string())),
+            Some(&(0u64, 1u64)),
+            "duplicate key must keep the minimum chain position"
+        );
+        // The ghost provider never lands in the table.
+        assert_eq!(priority.len(), 1);
+    }
+
+    fn rank_of(
+        priority: &HashMap<(String, String), (u64, u64)>,
+        id: &str,
+        provider: &str,
+    ) -> EntryRank {
+        entry_rank(
+            &json!({"id": id, "owned_by": provider}),
+            priority,
+        )
+    }
+
+    #[test]
+    fn dedup_by_priority_registered_beats_unregistered_and_static() {
+        let mut priority = HashMap::new();
+        priority.insert(("shared".to_string(), "primary".to_string()), (0u64, 0u64));
+
         let mut entries = vec![
-            json!({"id": "a", "value": 1}),
-            json!({"id": "b", "value": 2}),
-            json!({"id": "a", "value": 3}),
+            json!({"id": "shared", "owned_by": "llmproxy"}),
+            json!({"id": "shared", "owned_by": "fallback"}),
+            json!({"id": "shared", "owned_by": "primary"}),
         ];
-        dedup_models_last_wins(&mut entries);
-        assert_eq!(entries.len(), 2);
-        // Last occurrence of "a" (value=3) wins; relative order is
-        // the position of each element's last occurrence.
-        assert_eq!(entries[0]["id"], "b");
-        assert_eq!(entries[0]["value"], 2);
-        assert_eq!(entries[1]["id"], "a");
-        assert_eq!(entries[1]["value"], 3);
+        dedup_models_by_routing_priority(&mut entries, &priority);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["owned_by"], "primary");
+
+        // Without any registered entry, an unregistered discovered entry
+        // beats the static placeholder.
+        let mut entries = vec![
+            json!({"id": "shared", "owned_by": "llmproxy"}),
+            json!({"id": "shared", "owned_by": "somewhere"}),
+        ];
+        dedup_models_by_routing_priority(&mut entries, &priority);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["owned_by"], "somewhere");
+
+        // And with nothing else claiming the id, static survives.
+        let mut entries = vec![json!({"id": "shared", "owned_by": "llmproxy"})];
+        dedup_models_by_routing_priority(&mut entries, &priority);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["owned_by"], "llmproxy");
     }
 
     #[test]
-    fn dedup_filters_out_empty_id_entries() {
+    fn dedup_by_priority_smallest_chain_position_and_declaration_seq_win() {
+        let mut priority = HashMap::new();
+        // Same id served by two providers; "a" is primary (pos 0).
+        priority.insert(("m".to_string(), "b".to_string()), (1u64, 3u64));
+        priority.insert(("m".to_string(), "a".to_string()), (0u64, 2u64));
+        // Cross-ModelConfig tie on position: smaller declaration seq wins.
+        priority.insert(("n".to_string(), "y".to_string()), (0u64, 5u64));
+        priority.insert(("n".to_string(), "x".to_string()), (0u64, 7u64));
+
         let mut entries = vec![
-            json!({"id": "a"}),
+            json!({"id": "m", "owned_by": "b"}),
+            json!({"id": "m", "owned_by": "a"}),
+            json!({"id": "n", "owned_by": "x"}),
+            json!({"id": "n", "owned_by": "y"}),
+        ];
+        dedup_models_by_routing_priority(&mut entries, &priority);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["owned_by"], "a");
+        assert_eq!(entries[1]["owned_by"], "y");
+    }
+
+    #[test]
+    fn dedup_by_priority_unregistered_pick_is_deterministic() {
+        // No priority entries: two unregistered providers claim the same
+        // id — the lexicographically smallest provider name must win so
+        // the result does not depend on HashMap iteration order.
+        let priority = HashMap::new();
+        let mut entries = vec![
+            json!({"id": "m", "owned_by": "zeta"}),
+            json!({"id": "m", "owned_by": "alpha"}),
+        ];
+        dedup_models_by_routing_priority(&mut entries, &priority);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["owned_by"], "alpha");
+    }
+
+    #[test]
+    fn dedup_by_priority_filters_empty_ids_and_keeps_first_seen_order() {
+        let priority = HashMap::new();
+        let mut entries = vec![
             json!({"id": ""}),
-            json!({"id": "b"}),
             json!({"not_id": "c"}),
+            json!({"id": "b"}),
+            json!({"id": "a"}),
+            json!({"id": "b", "dup": true}),
         ];
-        dedup_models_last_wins(&mut entries);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0]["id"], "a");
-        assert_eq!(entries[1]["id"], "b");
+        dedup_models_by_routing_priority(&mut entries, &priority);
+        let ids: Vec<&str> = entries.iter().map(|e| e["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["b", "a"]);
     }
 
     #[test]
-    fn dedup_preserves_unique_entries() {
-        let mut entries = vec![
-            json!({"id": "a", "created": 1}),
-            json!({"id": "b", "created": 2}),
-            json!({"id": "c", "created": 3}),
-        ];
-        dedup_models_last_wins(&mut entries);
-        assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0]["id"], "a");
-        assert_eq!(entries[1]["id"], "b");
-        assert_eq!(entries[2]["id"], "c");
+    fn entry_rank_orders_classes() {
+        let mut priority = HashMap::new();
+        priority.insert(("m".to_string(), "p".to_string()), (0u64, 0u64));
+        let registered = rank_of(&priority, "m", "p");
+        let unregistered = rank_of(&priority, "m", "q");
+        let static_entry = rank_of(&priority, "m", "llmproxy");
+        assert!(registered < unregistered);
+        assert!(unregistered < static_entry);
+    }
+
+    // A slow upstream (wiremock delay) must not stall the endpoint: the
+    // per-call timeout converts the hang into a degraded None well under
+    // the shared client's 600 s default.
+    #[tokio::test]
+    async fn fetch_models_with_timeout_returns_none_on_hang() {
+        use std::time::Duration;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(30))
+                    .set_body_json(json!({"object": "list", "data": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = crate::providers::build(
+            &crate::config::ProviderConfig::OpenaiCompat {
+                name: "slow".to_string(),
+                api_key: "k".to_string(),
+                api_base: server.uri(),
+                model_rewrite: HashMap::new(),
+                use_proxy: false,
+                provider_ignore: Vec::new(),
+                reasoning_echo: false,
+            },
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let out = fetch_models_with_timeout(&provider, Duration::from_millis(100)).await;
+        assert!(out.is_none(), "timed-out fetch must degrade to None");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "must return at the timeout, not after the upstream delay"
+        );
     }
 }
