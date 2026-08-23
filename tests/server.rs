@@ -885,7 +885,9 @@ async fn admin_copilot_auth_requires_authentication() {
 
 #[tokio::test]
 async fn list_models_aggregates_static_and_provider_discovered_models() {
-    // Primary provider exposes models via list_models.
+    // Primary provider exposes models via list_models. Includes a
+    // non-object entry and an id-less object — both must be skipped
+    // defensively rather than breaking the endpoint.
     let primary = Arc::new(TestProvider {
         name: "primary".to_string(),
         complete: CompleteBehavior::Json,
@@ -893,6 +895,8 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
         models: Some(vec![
             json!({"id": "gpt-4o", "owned_by": "openai", "display_name": "GPT-4o"}),
             json!({"id": "claude-extra", "owned_by": "openai"}),
+            json!("not-an-object"),
+            json!({"no_id_here": true}),
         ]),
     }) as SharedProvider;
 
@@ -933,6 +937,17 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
                 use_proxy: false,
                 provider_ignore: Vec::new(),
             reasoning_echo: false,
+            },
+            // Declared but never registered in the router map: both model
+            // endpoints must skip it gracefully instead of panicking.
+            ProviderConfig::OpenaiCompat {
+                name: "ghost".to_string(),
+                api_key: "unused".to_string(),
+                api_base: "http://unused".to_string(),
+                model_rewrite: HashMap::new(),
+                use_proxy: false,
+                provider_ignore: Vec::new(),
+                reasoning_echo: false,
             },
         ],
         models: vec![
@@ -990,15 +1005,22 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
         "expected 3 entries: gpt-4o, claude-shared, claude-extra"
     );
 
-    // gpt-4o: provider-discovered wins over static (reverse-dedup keeps
-    // the later occurrence in the original list, which is the provider's).
+    // gpt-4o: the routing primary wins the id collision. Intentional
+    // behavior change (docs/models-api-split-plan.md §1.3): the old
+    // last-occurrence-wins dedup picked whichever provider happened to
+    // iterate last; now the entry from the chain's primary is kept, and
+    // the upstream's own `owned_by` is preserved as `upstream_owned_by`.
     let gpt4o = data
         .iter()
         .find(|m| m["id"] == "gpt-4o")
         .expect("gpt-4o must be present");
     assert_eq!(
-        gpt4o["owned_by"], "openai",
-        "provider-discovered entry must win dedup collision on id 'gpt-4o'"
+        gpt4o["owned_by"], "primary",
+        "chain-primary entry must win dedup collision on id 'gpt-4o'"
+    );
+    assert_eq!(
+        gpt4o["upstream_owned_by"], "openai",
+        "the upstream vendor must be preserved as upstream_owned_by"
     );
 
     // claude-shared: static-only, no collision.
@@ -1013,5 +1035,311 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
         .iter()
         .find(|m| m["id"] == "claude-extra")
         .expect("claude-extra must be present");
-    assert_eq!(extra["owned_by"], "openai");
+    assert_eq!(extra["owned_by"], "primary");
+}
+
+#[tokio::test]
+async fn list_models_collision_winner_follows_chain_order_deterministically() {
+    // Both providers advertise id "shared-model"; a ModelConfig named
+    // "shared-model" chains primary → backup, so `owned_by` must be
+    // "primary" regardless of HashMap iteration order (which changes
+    // every process restart).
+    let mk = |name: &str| {
+        Arc::new(TestProvider {
+            name: name.to_string(),
+            complete: CompleteBehavior::Json,
+            stream: StreamBehavior::Bytes("unused"),
+            models: Some(vec![json!({"id": "shared-model"})]),
+        }) as SharedProvider
+    };
+
+    let mut providers = HashMap::new();
+    providers.insert("primary".to_string(), mk("primary"));
+    providers.insert("backup".to_string(), mk("backup"));
+
+    let config = Config {
+        server: ServerConfig {
+            listen: "127.0.0.1:0".to_string(),
+            api_key: Some("test-key".to_string()),
+        },
+        proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
+        providers: vec![
+            ProviderConfig::OpenaiCompat {
+                name: "primary".to_string(),
+                api_key: "unused".to_string(),
+                api_base: "http://unused".to_string(),
+                model_rewrite: HashMap::new(),
+                use_proxy: false,
+                provider_ignore: Vec::new(),
+                reasoning_echo: false,
+            },
+            ProviderConfig::OpenaiCompat {
+                name: "backup".to_string(),
+                api_key: "unused".to_string(),
+                api_base: "http://unused".to_string(),
+                model_rewrite: HashMap::new(),
+                use_proxy: false,
+                provider_ignore: Vec::new(),
+                reasoning_echo: false,
+            },
+        ],
+        models: vec![ModelConfig {
+            name: "shared-model".to_string(),
+            primary: "primary".to_string(),
+            fallback_chain: vec!["backup".to_string()],
+            cooldown_seconds: 60,
+            max_retries_per_provider: 1,
+            max_retries_total: 2,
+        }],
+    };
+    let config = Arc::new(config);
+    let cooldown = CooldownCache::new();
+    let router = Arc::new(Router::new(config.clone(), providers, cooldown.clone()));
+    let app = llmproxy::server::build_router(AppState {
+        config,
+        router,
+        cooldown,
+        http: reqwest::Client::new(),
+        copilot: None,
+    });
+
+    let mut req = test_request(Method::GET, "/v1/models", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer test-key".parse().unwrap());
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = body_json(resp).await;
+    let data = body["data"].as_array().unwrap();
+    // The registered (chain) entry also beats the same-id static entry,
+    // so only one "shared-model" row survives.
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0]["id"], "shared-model");
+    assert_eq!(
+        data[0]["owned_by"], "primary",
+        "collision winner must follow routing chain order"
+    );
+}
+
+#[tokio::test]
+async fn admin_models_lists_every_provider_without_dedup() {
+    let mk = |name: &str, ids: &[&str], upstream: Option<&str>| {
+        let models: Vec<Value> = ids
+            .iter()
+            .map(|id| match upstream {
+                Some(v) => json!({"id": id, "upstream_owned_by": v}),
+                None => json!({"id": id}),
+            })
+            .collect();
+        Arc::new(TestProvider {
+            name: name.to_string(),
+            complete: CompleteBehavior::Json,
+            stream: StreamBehavior::Bytes("unused"),
+            models: Some(models),
+        }) as SharedProvider
+    };
+
+    let mut providers = HashMap::new();
+    providers.insert(
+        "primary".to_string(),
+        mk("primary", &["gpt-4o", "claude-extra"], Some("openai")),
+    );
+    // Includes an id-less entry, which must be skipped defensively.
+    providers.insert(
+        "backup".to_string(),
+        Arc::new(TestProvider {
+            name: "backup".to_string(),
+            complete: CompleteBehavior::Json,
+            stream: StreamBehavior::Bytes("unused"),
+            models: Some(vec![json!({"id": "gpt-4o"}), json!({"missing_id": true})]),
+        }) as SharedProvider,
+    );
+
+    let config = Config {
+        server: ServerConfig {
+            listen: "127.0.0.1:0".to_string(),
+            api_key: Some("test-key".to_string()),
+        },
+        proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
+        providers: vec![
+            ProviderConfig::OpenaiCompat {
+                name: "primary".to_string(),
+                api_key: "unused".to_string(),
+                api_base: "http://unused".to_string(),
+                model_rewrite: HashMap::new(),
+                use_proxy: false,
+                provider_ignore: Vec::new(),
+                reasoning_echo: false,
+            },
+            ProviderConfig::OpenaiCompat {
+                name: "backup".to_string(),
+                api_key: "unused".to_string(),
+                api_base: "http://unused".to_string(),
+                model_rewrite: HashMap::from([
+                    ("alias-a".to_string(), "gpt-4o".to_string()),
+                    ("alias-b".to_string(), "static-only".to_string()),
+                ]),
+                use_proxy: false,
+                provider_ignore: Vec::new(),
+                reasoning_echo: false,
+            },
+            // Declared but absent from the router map: must appear as a
+            // degraded group instead of breaking the endpoint.
+            ProviderConfig::OpenaiCompat {
+                name: "ghost".to_string(),
+                api_key: "unused".to_string(),
+                api_base: "http://unused".to_string(),
+                model_rewrite: HashMap::new(),
+                use_proxy: false,
+                provider_ignore: Vec::new(),
+                reasoning_echo: false,
+            },
+        ],
+        models: vec![ModelConfig {
+            name: "claude-test".to_string(),
+            primary: "primary".to_string(),
+            fallback_chain: vec!["backup".to_string()],
+            cooldown_seconds: 60,
+            max_retries_per_provider: 1,
+            max_retries_total: 2,
+        }],
+    };
+    let config = Arc::new(config);
+    let cooldown = CooldownCache::new();
+    let router = Arc::new(Router::new(config.clone(), providers, cooldown.clone()));
+    let app = llmproxy::server::build_router(AppState {
+        config,
+        router,
+        cooldown,
+        http: reqwest::Client::new(),
+        copilot: None,
+    });
+
+    // Auth gate applies to /admin/* too.
+    let unauth = app
+        .clone()
+        .oneshot(test_request(Method::GET, "/admin/models", None))
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+    let mut req = test_request(Method::GET, "/admin/models", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer test-key".parse().unwrap());
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a failing provider must not fail the endpoint"
+    );
+
+    let body = body_json(resp).await;
+    assert_eq!(body["object"], "list");
+    let groups = body["providers"].as_array().unwrap();
+    assert_eq!(groups.len(), 3, "one group per configured provider");
+
+    // Declaration order of config.providers.
+    assert_eq!(groups[0]["provider"], "primary");
+    assert_eq!(groups[1]["provider"], "backup");
+    assert_eq!(groups[2]["provider"], "ghost");
+
+    // primary: discovered only (empty rewrite table), no dedup.
+    assert_eq!(groups[0]["source"], "discovered");
+    assert_eq!(groups[0]["cache_state"], "populated");
+    let models = groups[0]["models"].as_array().unwrap();
+    assert_eq!(models.len(), 2, "no dedup across providers here");
+
+    // backup: non-empty rewrite table → static entries from the rewrite
+    // values, merged with the discovered catalog by id; the id-less
+    // discovered entry is dropped.
+    assert_eq!(groups[1]["source"], "static+discovered");
+    assert_eq!(groups[1]["cache_state"], "populated");
+    let models = groups[1]["models"].as_array().unwrap();
+    let ids: Vec<&str> = models.iter().map(|m| m["id"].as_str().unwrap()).collect();
+    assert_eq!(
+        ids,
+        vec!["gpt-4o", "static-only"],
+        "duplicate rewrite value 'gpt-4o' collapses; sorted by id"
+    );
+
+    // ghost: declared but unregistered → degraded group, still 200.
+    assert_eq!(groups[2]["cache_state"], "fetch_failed");
+    assert_eq!(groups[2]["source"], "discovered");
+    assert!(groups[2]["models"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn admin_models_reports_fetch_failed_for_provider_without_catalog() {
+    // The TestProvider returns None for list_models when `models` is None.
+    // A non-empty rewrite table exercises the static-only group shape
+    // (source "static", fetch_failed, models from the rewrite values).
+    let primary = Arc::new(TestProvider {
+        name: "primary".to_string(),
+        complete: CompleteBehavior::Error(503),
+        stream: StreamBehavior::Bytes("unused"),
+        models: None,
+    }) as SharedProvider;
+
+    let mut providers = HashMap::new();
+    providers.insert("primary".to_string(), primary);
+
+    let config = Config {
+        server: ServerConfig {
+            listen: "127.0.0.1:0".to_string(),
+            api_key: Some("test-key".to_string()),
+        },
+        proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
+        providers: vec![ProviderConfig::OpenaiCompat {
+            name: "primary".to_string(),
+            api_key: "unused".to_string(),
+            api_base: "http://unused".to_string(),
+            model_rewrite: HashMap::from([("alias".to_string(), "static-upstream".to_string())]),
+            use_proxy: false,
+            provider_ignore: Vec::new(),
+            reasoning_echo: false,
+        }],
+        models: vec![ModelConfig {
+            name: "claude-test".to_string(),
+            primary: "primary".to_string(),
+            fallback_chain: vec![],
+            cooldown_seconds: 60,
+            max_retries_per_provider: 1,
+            max_retries_total: 2,
+        }],
+    };
+    let config = Arc::new(config);
+    let cooldown = CooldownCache::new();
+    let router = Arc::new(Router::new(config.clone(), providers, cooldown.clone()));
+    let app = llmproxy::server::build_router(AppState {
+        config,
+        router,
+        cooldown,
+        http: reqwest::Client::new(),
+        copilot: None,
+    });
+
+    let mut req = test_request(Method::GET, "/admin/models", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer test-key".parse().unwrap());
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "still a degraded 200");
+
+    let body = body_json(resp).await;
+    let group = &body["providers"][0];
+    assert_eq!(group["provider"], "primary");
+    assert_eq!(group["cache_state"], "fetch_failed");
+    assert_eq!(
+        group["source"], "static",
+        "non-empty rewrite table + failed discovery → static-only group"
+    );
+    let models = group["models"].as_array().unwrap();
+    assert_eq!(
+        models.len(),
+        1,
+        "static rewrite entries survive a failed discovery"
+    );
+    assert_eq!(models[0]["id"], "static-upstream");
 }

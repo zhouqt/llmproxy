@@ -673,6 +673,28 @@ impl CopilotProvider {
         self.state.cached_models.read().await.clone()
     }
 
+    /// Report the state of the `/models` cache for introspection
+    /// endpoints (`/admin/models`). Three states, derived from existing
+    /// signals so no extra bookkeeping is needed:
+    ///
+    /// - `populated`: the in-memory cache holds models;
+    /// - `auth_missing`: memory was cleared by an Auth rejection while the
+    ///   on-disk snapshot still exists (the disk cache is deliberately
+    ///   kept across auth failures — see `cache_models_with_token`);
+    /// - `cold`: neither memory nor disk has ever held models.
+    ///
+    /// Note: a populated list may lag one background refresh cycle.
+    pub async fn cache_state(&self) -> &'static str {
+        if self.state.cached_models.read().await.is_some() {
+            return "populated";
+        }
+        if load_models_from_disk(&models_cache_path_for(&self.state.store)).is_some() {
+            "auth_missing"
+        } else {
+            "cold"
+        }
+    }
+
     /// Fetch models from the Copilot API and update the cache.
     ///
     /// Best-effort: obtains a token via `ensure_token`, then delegates to
@@ -1017,6 +1039,8 @@ impl Provider for CopilotProvider {
 
     async fn list_models(&self) -> Option<Vec<serde_json::Value>> {
         let cached = self.cached_models().await?;
+        // `owned_by` is filled in by the handler layer with the configured
+        // provider name; the upstream vendor lands in `upstream_owned_by`.
         Some(
             cached
                 .iter()
@@ -1025,7 +1049,7 @@ impl Provider for CopilotProvider {
                         "id": m.id,
                         "object": "model",
                         "created": 0,
-                        "owned_by": m.vendor,
+                        "upstream_owned_by": m.vendor,
                         "display_name": m.name,
                     })
                 })
@@ -3677,6 +3701,44 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
     }
 
     #[tokio::test]
+    async fn cache_state_reflects_populated_cold_and_auth_missing() {
+        // cold: no disk cache, memory empty.
+        let dir = tempfile::tempdir().unwrap();
+        let provider =
+            CopilotProvider::new_with_store(TokenStore::from_path(dir.path().join("t1.json")));
+        assert_eq!(provider.cache_state().await, "cold");
+
+        // populated: disk snapshot present at construction is loaded into
+        // memory by from_store.
+        let models = vec![CopilotModel {
+            id: "grok-4.5".to_string(),
+            name: "grok-4.5".to_string(),
+            vendor: "xai".to_string(),
+            supported_endpoints: vec!["/responses".to_string()],
+        }];
+        let store2 = TokenStore::from_path(dir.path().join("t2.json"));
+        std::fs::write(
+            models_cache_path_for(&store2),
+            serde_json::to_vec_pretty(&models).unwrap(),
+        )
+        .unwrap();
+        let provider2 = CopilotProvider::new_with_store(store2);
+        assert_eq!(provider2.cache_state().await, "populated");
+
+        // auth_missing: an Auth rejection clears only the in-memory cache
+        // while the on-disk snapshot survives (see cache_models_with_token).
+        *provider2.state.cached_models.write().await = None;
+        assert_eq!(provider2.cache_state().await, "auth_missing");
+
+        // cold again once the disk snapshot is gone too.
+        std::fs::remove_file(models_cache_path_for(&TokenStore::from_path(
+            dir.path().join("t2.json"),
+        )))
+        .unwrap();
+        assert_eq!(provider2.cache_state().await, "cold");
+    }
+
+    #[tokio::test]
     async fn cold_start_loads_disk_cache_and_list_models_returns_it() {
         let dir = tempfile::tempdir().unwrap();
         let store = TokenStore::from_path(dir.path().join("github_token.json"));
@@ -3708,7 +3770,10 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             .expect("list_models must return disk-cache models on cold start");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0]["id"], "grok-4.5");
-        assert_eq!(listed[0]["owned_by"], "xai");
+        // vendor lands in upstream_owned_by; owned_by is filled in by the
+        // handler layer with the configured provider name.
+        assert_eq!(listed[0]["upstream_owned_by"], "xai");
+        assert!(listed[0].get("owned_by").is_none());
     }
 
     #[tokio::test]
