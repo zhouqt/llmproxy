@@ -325,22 +325,24 @@ impl Provider for OpenAiCompatProvider {
             data.iter()
                 .filter_map(|entry| {
                     let id = entry.get("id")?.as_str()?;
-                    let owned_by = entry
-                        .get("owned_by")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("openai_compat");
                     let display_name = entry
                         .get("display_name")
                         .or_else(|| entry.get("name"))
                         .and_then(|v| v.as_str())
                         .unwrap_or(id);
-                    Some(serde_json::json!({
+                    // Upstream `owned_by` is passed through verbatim (the
+                    // handler fills in `owned_by` with the configured
+                    // provider name); no type-label fallback here.
+                    let mut out = serde_json::json!({
                         "id": id,
                         "object": "model",
                         "created": entry.get("created").and_then(|v| v.as_i64()).unwrap_or(0),
-                        "owned_by": owned_by,
                         "display_name": display_name,
-                    }))
+                    });
+                    if let Some(owned_by) = entry.get("owned_by").and_then(|v| v.as_str()) {
+                        out["upstream_owned_by"] = serde_json::Value::String(owned_by.to_string());
+                    }
+                    Some(out)
                 })
                 .collect(),
         )
@@ -1588,16 +1590,17 @@ mod tests {
 
         assert_eq!(models[0]["id"], "model-a");
         assert_eq!(models[0]["display_name"], "Model A");
-        assert_eq!(models[0]["owned_by"], "org1");
+        assert_eq!(models[0]["upstream_owned_by"], "org1");
         assert_eq!(models[0]["created"], 1000);
 
         assert_eq!(models[1]["id"], "model-b");
         assert_eq!(models[1]["display_name"], "Model B");
-        assert_eq!(models[1]["owned_by"], "openai_compat");
+        // owned_by is filled in by the handler layer, not here.
+        assert!(models[1].get("owned_by").is_none());
 
         assert_eq!(models[2]["id"], "model-c");
         assert_eq!(models[2]["display_name"], "model-c");
-        assert_eq!(models[2]["owned_by"], "openai_compat");
+        assert!(models[2].get("owned_by").is_none());
     }
 
     #[tokio::test]
