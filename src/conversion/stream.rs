@@ -122,6 +122,17 @@ impl StreamTranslator {
         out
     }
 
+    /// Borrow the most recent `ChatUsage` without consuming it. Safe to
+    /// call before `finalize()` (which reads `final_usage` via `as_ref`,
+    /// so the value survives). The SSE adapters use this to write the
+    /// captured usage into the log sink on terminal paths while the
+    /// translator is still held. (A consuming `take_final_usage` was
+    /// removed in code-review F7 — calling it before `finalize()` would
+    /// have broken the sink-write ordering.)
+    pub fn final_usage_ref(&self) -> Option<&ChatUsage> {
+        self.final_usage.as_ref()
+    }
+
     pub fn finalize(&mut self) -> Vec<StreamEvent> {
         if self.finalized {
             return Vec::new();
@@ -172,7 +183,7 @@ impl StreamTranslator {
                 u.completion_tokens,
                 cached,
                 reasoning,
-                u.service_tier.clone(),
+                &u.service_tier,
             )
         });
 

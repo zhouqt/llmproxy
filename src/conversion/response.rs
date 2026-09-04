@@ -97,7 +97,7 @@ pub fn openai_to_anthropic_response(
                 u.completion_tokens,
                 cached,
                 reasoning,
-                u.service_tier.clone(),
+                &u.service_tier,
             )
         })
         .unwrap_or_default();

@@ -15,13 +15,15 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::stream::Stream;
 use serde_json::{json, Value};
 
-use crate::anthropic::{ContentBlock, MessageContent, MessagesRequest};
+use crate::anthropic::{ContentBlock, MessageContent, MessagesRequest, Usage};
 use crate::error::{ProxyError, Result};
-use crate::providers::{Provider, ProviderOutput};
+use crate::providers::{
+    Provider, ProviderOutput, StreamUsage, StreamUsageSink, usage_to_stream_usage,
+};
 
 /// Value of the `x-app` header the real Claude Code client sends to
 /// Anthropic-format gateways (verified by pointing a mock server at the
@@ -355,6 +357,7 @@ impl Provider for AnthropicProvider {
         &self,
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
+        usage_sink: Option<crate::providers::StreamUsageSink>,
     ) -> Result<ProviderOutput> {
         let url = self.messages_url();
         let api_key = self.api_key.clone();
@@ -395,7 +398,10 @@ impl Provider for AnthropicProvider {
             });
         }
         let stream = resp.bytes_stream();
-        Ok(ProviderOutput::Stream(Box::new(PassthroughSse { inner: stream })))
+        Ok(ProviderOutput::Stream(Box::new(PassthroughSse::new(
+            stream,
+            usage_sink.unwrap_or_default(),
+        ))))
     }
 }
 
@@ -483,8 +489,168 @@ fn build_body(
 }
 
 /// Pass-through SSE stream (provider already speaks Anthropic SSE).
+///
+/// Carries a [`StreamUsageSink`] so terminal usage from `message_delta`
+/// events can be captured for log emission. The scanner is intentionally
+/// minimal: it walks the byte stream, tracks `event:` lines, and on
+/// `event: message_delta` parses the `data:` JSON payload for a `usage`
+/// object. `\r\n` line endings are handled (Anthropic SSE uses them,
+/// and a naive `\n`-only split would leave `\r` artifacts that break
+/// JSON parse on the client side).
 pub struct PassthroughSse<S> {
     inner: S,
+    sink: StreamUsageSink,
+    pending: BytesMut,
+    /// Last `event:` line seen, reset on the SSE event boundary (empty line).
+    /// `None` until the first `event:` line of the current event.
+    last_event: Option<String>,
+    /// Last captured `Usage` from a `message_delta` event's `data:` JSON.
+    /// Captured values overwrite on every delta chunk; on stream EOF
+    /// we take this and write it to the sink exactly once.
+    last_usage: Option<Usage>,
+    /// Set when the upstream sent an `event: error` frame (Anthropic's
+    /// native mid-stream error signal, e.g. overloaded_error). The
+    /// error frame is forwarded verbatim to the client; this flag lets
+    /// `MappedStream` classify the stream as `streaming aborted`
+    /// instead of a clean `streaming completed`.
+    terminated_with_error: bool,
+    /// Set once the upstream sent `event: message_stop` — the response
+    /// is complete and the client has the full message. A trailing
+    /// connection reset after this is NOT an error: it would otherwise
+    /// emit a synthetic `event: error` chunk after `message_stop` and
+    /// discard the captured usage (code-review F5). Such a reset is
+    /// treated as clean EOF.
+    saw_message_stop: bool,
+}
+
+impl<S> PassthroughSse<S> {
+    pub fn new(inner: S, sink: StreamUsageSink) -> Self {
+        Self {
+            inner,
+            sink,
+            pending: BytesMut::new(),
+            last_event: None,
+            last_usage: None,
+            terminated_with_error: false,
+            saw_message_stop: false,
+        }
+    }
+
+    /// Drain complete lines from `pending` and process them. We split on
+    /// either `\n` or `\r\n` (Sonnet M6 — Anthropic SSE uses `\r\n`
+    /// endings, and a `\n`-only split leaves a trailing `\r` in the
+    /// payload that breaks JSON parsing on the client side).
+    fn process_lines(&mut self) {
+        loop {
+            let Some(nl) = self.pending.iter().position(|&b| b == b'\n') else {
+                break;
+            };
+            let line_end = if nl > 0 && self.pending[nl - 1] == b'\r' {
+                nl - 1
+            } else {
+                nl
+            };
+            let raw = self.pending.split_to(nl + 1);
+            let line = std::str::from_utf8(&raw[..line_end]).unwrap_or("");
+            self.handle_line(line);
+        }
+    }
+
+    fn handle_line(&mut self, line: &str) {
+        if line.is_empty() {
+            // SSE event boundary: clear the buffered event name so the
+            // next event's `data:` JSON is matched against the new event.
+            self.last_event = None;
+            return;
+        }
+        if let Some(rest) = line.strip_prefix("event:") {
+            let name = rest.trim();
+            if name == "error" {
+                self.terminated_with_error = true;
+            }
+            if name == "message_stop" {
+                self.saw_message_stop = true;
+            }
+            self.last_event = Some(name.to_string());
+            return;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            let payload = rest.trim_start();
+            // We only act on message_delta events; the rest of the SSE
+            // byte stream is forwarded verbatim by the inner stream.
+            if self.last_event.as_deref() != Some("message_delta") {
+                return;
+            }
+            // Parse the JSON. Tolerate malformed payloads (no panic) —
+            // we don't want a stray malformed `data:` line on the
+            // passthrough path to abort the entire stream.
+            if let Ok(parsed) = serde_json::from_str::<Value>(payload) {
+                if let Some(usage_value) = parsed.get("usage") {
+                    // Prefer a full parse (preserves cache_creation /
+                    // service_tier / server_tool_use on the wire shape),
+                    // but tolerate a *partial* usage object where a
+                    // mandatory field (input_tokens / output_tokens) is
+                    // absent — a gateway omitting one would otherwise
+                    // fail from_value::<Usage> and silently drop the
+                    // whole capture (code-review F2). The OpenAI
+                    // Chat/Responses paths tolerate partial usage via
+                    // `.map(...).unwrap_or(0)`; keep passthrough
+                    // consistent.
+                    match serde_json::from_value::<Usage>(usage_value.clone()) {
+                        Ok(u) => self.last_usage = Some(u),
+                        Err(_) => {
+                            let input = usage_value
+                                .get("input_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0) as u32;
+                            let output = usage_value
+                                .get("output_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0) as u32;
+                            let cache_read = usage_value
+                                .get("cache_read_input_tokens")
+                                .and_then(Value::as_u64)
+                                .map(|v| v as u32);
+                            let cache_creation = usage_value
+                                .get("cache_creation_input_tokens")
+                                .and_then(Value::as_u64)
+                                .map(|v| v as u32);
+                            self.last_usage = Some(Usage {
+                                input_tokens: input,
+                                output_tokens: output,
+                                cache_creation_input_tokens: cache_creation,
+                                cache_read_input_tokens: cache_read,
+                                cache_creation: None,
+                                server_tool_use: None,
+                                output_tokens_details: None,
+                                service_tier: None,
+                                inference_geo: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        // `id:`, `retry:`, comment lines (`:`) are ignored.
+    }
+
+    /// Push captured usage (if any) into the sink. Idempotent — calling
+    /// multiple times is a no-op because we drain `last_usage` first.
+    /// Carries the `errored` flag so MappedStream classifies native
+    /// Anthropic `event: error` streams as aborted.
+    fn flush_usage_to_sink(&mut self) {
+        let errored = self.terminated_with_error;
+        if let Some(usage) = self.last_usage.take() {
+            self.sink.set(usage_to_stream_usage(&usage, errored));
+        } else if errored {
+            // No usage was captured (error arrived first), but the
+            // errored signal must still reach MappedStream.
+            self.sink.set(StreamUsage {
+                errored: true,
+                ..Default::default()
+            });
+        }
+    }
 }
 
 impl<S> Stream for PassthroughSse<S>
@@ -495,9 +661,50 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(b))) => Poll::Ready(Some(Ok(b))),
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(ProxyError::Http(e)))),
-            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Some(Ok(b))) => {
+                self.pending.extend_from_slice(&b);
+                self.process_lines();
+                Poll::Ready(Some(Ok(b)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                // If we've already forwarded `message_stop`, the response
+                // is complete and the client has the full message — a
+                // trailing connection reset is NOT an error. Treat it as
+                // clean EOF so we flush the captured usage and do not
+                // emit a synthetic error chunk after message_stop
+                // (code-review F5).
+                if self.saw_message_stop {
+                    self.flush_usage_to_sink();
+                    return Poll::Ready(None);
+                }
+                // Otherwise surface the error to the caller. On the path
+                // that constructs `MappedStream`, the synthetic `event:
+                // error` chunk is emitted by the wrapper. Captured usage
+                // is NOT flushed here — the wrapper discards partial
+                // usage on error (Opus C1 — we cannot prove the upstream
+                // charged the request), so the sink stays empty and the
+                // `streaming aborted (upstream error)` line carries no
+                // token fields. Only the `Ready(None)` EOF arm below
+                // flushes.
+                Poll::Ready(Some(Err(ProxyError::Http(e))))
+            }
+            Poll::Ready(None) => {
+                // Drain any remaining bytes (no trailing newline is a
+                // legitimate end-of-stream form per SSE). Tolerate a
+                // trailing `\r` (a CRLF stream truncated between `\r`
+                // and `\n`) and a non-UTF-8 tail via from_utf8_lossy —
+                // either would otherwise fail JSON parse and silently
+                // drop the final message_delta usage capture (code-review
+                // F3).
+                self.process_lines();
+                let leftover = self.pending.split();
+                if !leftover.is_empty() {
+                    let s = String::from_utf8_lossy(&leftover);
+                    self.handle_line(s.trim_end_matches('\r'));
+                }
+                self.flush_usage_to_sink();
+                Poll::Ready(None)
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -908,7 +1115,7 @@ mod tests {
         )
         .unwrap();
 
-        let output = provider.stream(&request(true), &empty_rewrite()).await.unwrap();
+        let output = provider.stream(&request(true), &empty_rewrite(), None).await.unwrap();
         expect_variant!(output, ProviderOutput::Stream(mut output) => {
             let mut bytes = Vec::new();
             while let Some(item) = output.next().await {
@@ -943,7 +1150,7 @@ mod tests {
             .err()
             .expect("complete should fail");
         let stream = provider
-            .stream(&request(true), &empty_rewrite())
+            .stream(&request(true), &empty_rewrite(), None)
             .await
             .err()
             .expect("stream should fail");
@@ -968,7 +1175,7 @@ mod tests {
             .expect_err("connect to closed port must fail");
         use futures_util::stream;
         let inner = stream::iter(vec![Err::<Bytes, _>(err)]);
-        let mut sse = PassthroughSse { inner };
+        let mut sse = PassthroughSse::new(inner, StreamUsageSink::empty());
         let item = sse.next().await.expect("one item");
         assert!(matches!(item, Err(ProxyError::Http(_))));
     }
@@ -976,24 +1183,245 @@ mod tests {
     #[tokio::test]
     async fn passthrough_sse_returns_none_when_inner_ends() {
         use futures_util::stream;
-        let mut sse = PassthroughSse {
-            inner: stream::empty::<reqwest::Result<Bytes>>(),
-        };
+        let mut sse = PassthroughSse::new(
+            stream::empty::<reqwest::Result<Bytes>>(),
+            StreamUsageSink::empty(),
+        );
         assert!(sse.next().await.is_none());
     }
 
     #[tokio::test]
     async fn passthrough_sse_propagates_pending_from_inner() {
         use futures_util::stream;
-        let mut sse = PassthroughSse {
-            inner: stream::pending::<reqwest::Result<Bytes>>(),
-        };
+        let mut sse = PassthroughSse::new(
+            stream::pending::<reqwest::Result<Bytes>>(),
+            StreamUsageSink::empty(),
+        );
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
         let poll = std::pin::Pin::new(&mut sse).poll_next(&mut cx);
         assert!(
             matches!(poll, std::task::Poll::Pending),
             "PassthroughSse should propagate Poll::Pending"
+        );
+    }
+
+// Scanner tests for PassthroughSse's line scanner. The scanner
+    // extracts `usage` from `event: message_delta` payloads and writes
+    // them into the sink. The scanner must handle `\r\n` line endings
+    // (Sonnet M6 — Anthropic SSE uses them; a `\n`-only split leaves
+    // a trailing `\r` that breaks JSON parse on the client side).
+
+    /// Drive a PassthroughSse to EOF and return whatever the sink holds.
+    async fn drain_sink(chunks: Vec<Bytes>) -> Option<StreamUsage> {
+        use futures_util::stream;
+        let stream = stream::iter(chunks.into_iter().map(Ok::<Bytes, reqwest::Error>));
+        let sink = StreamUsageSink::empty();
+        let watch = sink.arc();
+        let mut sse = PassthroughSse::new(stream, StreamUsageSink::from_arc(watch.clone()));
+        use futures_util::StreamExt;
+        while let Some(item) = sse.next().await {
+            let _ = item.expect("happy-path chunks must be Ok");
+        }
+        let taken = watch.lock().unwrap().take();
+        taken
+    }
+
+    #[tokio::test]
+    async fn passthrough_scanner_captures_message_delta_usage_lf() {
+        let chunks = vec![Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n\
+              event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"cache_read_input_tokens\":4}}\n\n\
+              event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        )];
+        let usage = drain_sink(chunks).await.expect("must capture usage");
+        assert_eq!(usage.input, 10);
+        assert_eq!(usage.output, 5);
+        assert_eq!(usage.cache_read, Some(4));
+    }
+
+    #[tokio::test]
+    async fn passthrough_scanner_handles_crlf_line_endings() {
+        let chunks = vec![Bytes::from_static(
+            b"event: message_delta\r\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":3,\"output_tokens\":7,\"cache_read_input_tokens\":1}}\r\n\r\n",
+        )];
+        let usage = drain_sink(chunks).await.expect("must capture usage");
+        assert_eq!(usage.input, 3);
+        assert_eq!(usage.output, 7);
+        assert_eq!(usage.cache_read, Some(1));
+    }
+
+    #[tokio::test]
+    async fn passthrough_scanner_captures_usage_split_across_chunks() {
+        let chunks = vec![
+            Bytes::from_static(b"event: message_delta\n"),
+            Bytes::from_static(
+                b"data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":2,\"output_tokens\":9}}\n\n",
+            ),
+        ];
+        let usage = drain_sink(chunks).await.expect("must capture usage");
+        assert_eq!(usage.input, 2);
+        assert_eq!(usage.output, 9);
+        assert!(usage.cache_read.is_none());
+    }
+
+    #[tokio::test]
+    async fn passthrough_scanner_ignores_non_delta_events() {
+        let chunks = vec![Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"usage\":{\"input_tokens\":99,\"output_tokens\":99}}\n\n",
+        )];
+        let usage = drain_sink(chunks).await;
+        assert!(
+            usage.is_none(),
+            "non-message_delta events must not populate the sink, got {usage:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn passthrough_scanner_marks_error_event_as_errored() {
+        // Regression (code-review F4): Anthropic's native mid-stream
+        // `event: error` frame (overloaded_error, etc.) is forwarded to
+        // the client verbatim but must also flag the sink so MappedStream
+        // logs `streaming aborted` instead of a clean completion.
+        let chunks = vec![Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n\
+              event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"overloaded\"}}\n\n",
+        )];
+        let usage = drain_sink(chunks).await.expect("errored sentinel must be written");
+        assert!(
+            usage.errored,
+            "native error event must flag the sink, got: {usage:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn passthrough_scanner_error_event_with_prior_usage_keeps_usage_and_flags_errored() {
+        // An error frame arriving AFTER a message_delta usage chunk must
+        // preserve the captured token counts AND flag errored — the
+        // client saw usable bytes before the error.
+        let chunks = vec![Bytes::from_static(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":12,\"output_tokens\":6}}\n\n\
+              event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"overloaded\"}}\n\n",
+        )];
+        let usage = drain_sink(chunks).await.expect("must capture usage");
+        assert_eq!(usage.input, 12);
+        assert_eq!(usage.output, 6);
+        assert!(
+            usage.errored,
+            "error event must flag the sink even with prior usage, got: {usage:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn passthrough_scanner_tolerates_malformed_json() {
+        let chunks = vec![Bytes::from_static(
+            b"event: message_delta\ndata: {not valid json\n\n",
+        )];
+        let usage = drain_sink(chunks).await;
+        assert!(usage.is_none());
+    }
+
+    #[tokio::test]
+    async fn passthrough_scanner_sink_stays_empty_when_no_usage_chunk() {
+        let chunks = vec![Bytes::from_static(
+            b"event: ping\ndata: {}\n\nevent: message_stop\ndata: {}\n\n",
+        )];
+        let usage = drain_sink(chunks).await;
+        assert!(
+            usage.is_none(),
+            "no usage chunk emitted -> sink stays empty, got {usage:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn passthrough_scanner_tolerates_partial_usage_object() {
+        // Regression (code-review F2): a gateway emitting a `message_delta`
+        // usage object that omits a mandatory field (here `output_tokens`)
+        // must still yield the fields it DID send — not silently drop the
+        // whole capture (which all-or-nothing from_value::<Usage> would).
+        let chunks = vec![Bytes::from_static(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":123}}\n\n",
+        )];
+        let usage = drain_sink(chunks).await.expect("partial usage must be captured");
+        assert_eq!(usage.input, 123, "input must survive partial parse, got: {usage:?}");
+        assert_eq!(usage.output, 0, "missing output_tokens defaults to 0, got: {usage:?}");
+    }
+
+    #[tokio::test]
+    async fn passthrough_scanner_full_usage_object_preserves_fields() {
+        // When the gateway sends a complete usage object, the full
+        // from_value::<Usage> path preserves wire fields (cache_creation
+        // etc.) rather than the lossy fallback.
+        let chunks = vec![Bytes::from_static(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"cache_read_input_tokens\":4,\"cache_creation_input_tokens\":2}}\n\n",
+        )];
+        let usage = drain_sink(chunks).await.expect("full usage must be captured");
+        assert_eq!(usage.input, 10);
+        assert_eq!(usage.output, 5);
+        assert_eq!(usage.cache_read, Some(4));
+    }
+
+    #[tokio::test]
+    async fn passthrough_scanner_captures_usage_truncated_between_crlf() {
+        // Regression (code-review F3): a CRLF stream truncated between
+        // `\r` and `\n` on the final message_delta leaves the payload
+        // ending in `\r`. The EOF leftover drain must strip it so JSON
+        // parse succeeds and the usage is captured — otherwise the final
+        // token counts are silently lost.
+        let chunks = vec![Bytes::from_static(
+            b"event: message_delta\r\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":8,\"output_tokens\":3}}\r",
+        )];
+        let usage = drain_sink(chunks).await.expect("truncated CRLF usage must be captured");
+        assert_eq!(usage.input, 8, "got: {usage:?}");
+        assert_eq!(usage.output, 3, "got: {usage:?}");
+    }
+
+    #[tokio::test]
+    async fn passthrough_scanner_after_message_stop_treats_reset_as_clean_eof() {
+        // Regression (code-review F5): a connection reset AFTER
+        // message_stop (the response is complete, client has the full
+        // message) must be treated as clean EOF — flush the captured
+        // usage and do NOT surface an error (which would emit a
+        // synthetic `event: error` chunk after message_stop and discard
+        // the usage).
+        use futures_util::stream;
+        use futures_util::StreamExt;
+
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![
+            Ok(Bytes::from_static(
+                b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":12,\"output_tokens\":6}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            )),
+            Err(reqwest::Error::from(
+                reqwest::Client::new()
+                    .get("http://[invalid")
+                    .build()
+                    .unwrap_err(),
+            )),
+        ];
+        let stream = stream::iter(chunks);
+        let sink = StreamUsageSink::empty();
+        let watch = sink.arc();
+        let mut sse = PassthroughSse::new(stream, StreamUsageSink::from_arc(watch.clone()));
+        let mut saw_err = false;
+        while let Some(item) = sse.next().await {
+            if item.is_err() {
+                saw_err = true;
+            }
+        }
+        assert!(
+            !saw_err,
+            "reset after message_stop must be swallowed as clean EOF"
+        );
+        let usage = watch
+            .lock()
+            .unwrap()
+            .take()
+            .expect("usage must be flushed on clean EOF");
+        assert_eq!(usage.input, 12);
+        assert_eq!(usage.output, 6);
+        assert!(
+            !usage.errored,
+            "clean completion after message_stop, got: {usage:?}"
         );
     }
 
@@ -1607,7 +2035,7 @@ mod tests {
         .unwrap();
 
         let err = provider
-            .stream(&thinking_history_request(true), &empty_rewrite())
+            .stream(&thinking_history_request(true), &empty_rewrite(), None)
             .await
             .err()
             .expect("thinking-mismatch must surface as Err");
@@ -1690,7 +2118,7 @@ mod tests {
         .unwrap();
 
         let err = provider
-            .stream(&thinking_request(true), &empty_rewrite())
+            .stream(&thinking_request(true), &empty_rewrite(), None)
             .await
             .err()
             .expect("thinking-mismatch must surface as Err");
@@ -2147,7 +2575,7 @@ mod tests {
         .unwrap();
 
         let output = provider
-            .stream(&request(true), &empty_rewrite())
+            .stream(&request(true), &empty_rewrite(), None)
             .await
             .unwrap();
         expect_variant!(output, ProviderOutput::Stream(mut stream) => {

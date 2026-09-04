@@ -74,6 +74,7 @@ impl Provider for TestProvider {
         &self,
         _req: &MessagesRequest,
         _model_rewrite: &HashMap<String, String>,
+        _usage_sink: Option<llmproxy::providers::StreamUsageSink>,
     ) -> Result<ProviderOutput> {
         match self.stream {
             StreamBehavior::Bytes(body) => Ok(ProviderOutput::Stream(Box::new(stream::iter([

@@ -474,6 +474,21 @@ impl CopilotProvider {
 
         let dc = request_device_code(&self.http).await?;
 
+        // Surface the device code in the structured log stream, not just
+        // the stdout banner below — operators grep the log for the
+        // WARN/ERROR auth lines and need the code on the same stream.
+        // String fields use bare `&str` so EmptySkipping renders them
+        // quoted, matching the other `provider = "copilot"` lines.
+        // `device_code` is deliberately NOT logged: it is the OAuth
+        // secret used to poll for the access token.
+        tracing::warn!(
+            provider = self.name.as_str(),
+            user_code = dc.user_code.as_str(),
+            verification_uri = dc.verification_uri.as_str(),
+            expires_in = dc.expires_in,
+            "copilot device flow started; enter the code at the verification URI"
+        );
+
         // Print the user code so operators see it in the proxy logs
         // even when bootstrap was triggered by the background loop
         // (no admin endpoint was called).
@@ -946,6 +961,7 @@ impl CopilotProvider {
         &self,
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
+        usage_sink: Option<crate::providers::StreamUsageSink>,
     ) -> Result<ProviderOutput> {
         let merged = self.merged_rewrite(model_rewrite);
         let mut responses_req =
@@ -969,6 +985,7 @@ impl CopilotProvider {
         let sse = crate::providers::openai_responses::ResponsesSseToAnthropic::new(
             stream,
             &req.model,
+            usage_sink,
         );
         Ok(ProviderOutput::Stream(Box::new(sse)))
     }
@@ -1112,6 +1129,7 @@ impl Provider for CopilotProvider {
         &self,
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
+        usage_sink: Option<crate::providers::StreamUsageSink>,
     ) -> Result<ProviderOutput> {
         let merged = self.merged_rewrite(model_rewrite);
         let upstream_model = merged
@@ -1120,7 +1138,7 @@ impl Provider for CopilotProvider {
             .unwrap_or(&req.model);
         let endpoint = self.endpoint_for_model(upstream_model).await;
         if endpoint == "responses" {
-            return self.stream_responses(req, &merged).await;
+            return self.stream_responses(req, &merged, usage_sink).await;
         }
 
         let mut openai_req =
@@ -1147,7 +1165,7 @@ impl Provider for CopilotProvider {
             });
         }
         let stream = resp.bytes_stream();
-        let sse = OpenAiSseToAnthropic::new(stream, &req.model);
+        let sse = OpenAiSseToAnthropic::new(stream, &req.model, usage_sink);
         Ok(ProviderOutput::Stream(Box::new(sse)))
     }
 
@@ -1167,6 +1185,7 @@ mod tests {
     use crate::test_support::JsonFieldAbsent;
     use futures_util::StreamExt;
     use serde_json::json;
+    use tracing_subscriber::layer::SubscriberExt;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1936,7 +1955,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         let mut gpt5_req = request(true);
         gpt5_req.model = "gpt-5".to_string();
 
-        let output = provider.stream(&gpt5_req, &HashMap::new()).await.unwrap();
+        let output = provider.stream(&gpt5_req, &HashMap::new(), None).await.unwrap();
         expect_variant!(output, ProviderOutput::Stream(mut stream) => {
             let mut encoded = String::new();
             while let Some(item) = stream.next().await {
@@ -1995,7 +2014,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         gpt5_req.model = "gpt-5".to_string();
 
         let error = provider
-            .stream(&gpt5_req, &HashMap::new())
+            .stream(&gpt5_req, &HashMap::new(), None)
             .await
             .err()
             .expect("upstream 429 should fail");
@@ -2041,7 +2060,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         gpt5_req.model = "gpt-5".to_string();
 
         let output = provider
-            .stream(&gpt5_req, &HashMap::new())
+            .stream(&gpt5_req, &HashMap::new(), None)
             .await
             .unwrap();
         expect_variant!(output, ProviderOutput::Stream(mut output) => {
@@ -2203,7 +2222,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         let mut gpt5_req = request(true);
         gpt5_req.model = "gpt-5".to_string();
 
-        let output = provider.stream(&gpt5_req, &HashMap::new()).await.unwrap();
+        let output = provider.stream(&gpt5_req, &HashMap::new(), None).await.unwrap();
         expect_variant!(output, ProviderOutput::Stream(mut stream) => {
             let mut encoded = String::new();
             while let Some(item) = stream.next().await {
@@ -2383,7 +2402,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         let mut rewrite = HashMap::new();
         rewrite.insert("work-high".to_string(), "gpt-5.5".to_string());
 
-        let output = provider.stream(&req, &rewrite).await.unwrap();
+        let output = provider.stream(&req, &rewrite, None).await.unwrap();
         expect_variant!(output, ProviderOutput::Stream(mut output) => {
             let mut encoded = String::new();
             while let Some(item) = output.next().await {
@@ -2623,7 +2642,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         seed_chat_only_cache(&provider, "claude-model").await;
 
         let output = provider
-            .stream(&request(true), &HashMap::new())
+            .stream(&request(true), &HashMap::new(), None)
             .await
             .unwrap();
         expect_variant!(output, ProviderOutput::Stream(mut output) => {
@@ -2662,7 +2681,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             .err()
             .expect("complete should fail");
         let stream = provider
-            .stream(&request(true), &HashMap::new())
+            .stream(&request(true), &HashMap::new(), None)
             .await
             .err()
             .expect("stream should fail");
@@ -2735,7 +2754,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         gpt5_req.model = "gpt-5".to_string();
 
         let error = provider
-            .stream(&gpt5_req, &HashMap::new())
+            .stream(&gpt5_req, &HashMap::new(), None)
             .await
             .err()
             .expect("upstream 402 should fail");
@@ -2803,7 +2822,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         seed_chat_only_cache(&provider, "claude-model").await;
 
         let error = provider
-            .stream(&request(true), &HashMap::new())
+            .stream(&request(true), &HashMap::new(), None)
             .await
             .err()
             .expect("upstream 402 should fail");
@@ -3436,6 +3455,71 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         assert!(
             provider.cached_models().await.is_some(),
             "model cache must be populated after bootstrap completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_bootstrap_logs_device_code_in_structured_log() {
+        // The device login code must reach the structured tracing log
+        // (not just the stdout banner) so operators grepping the
+        // WARN/ERROR auth lines can find it. String fields render
+        // quoted (bare `&str` via as_str), matching the other
+        // `provider = "copilot"` lines. `device_code` must NOT appear.
+        //
+        // Uses the default current_thread runtime: the DefaultGuard is
+        // thread-local, so a multi_thread runtime could resume the async
+        // fn on a different worker where no guard is installed and the
+        // warn! would miss the buffer.
+        let _env_guard = crate::oauth::device_flow::ENV_LOCK.lock().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/login/device/code"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "device_code": "log-device",
+                "user_code": "CODE-1234",
+                "verification_uri": "https://example.test/device",
+                "expires_in": 600,
+                "interval": 5,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        std::env::set_var("LLMPROXY_TEST_GITHUB_BASE_URL", &server.uri());
+        let (_dir, provider) = test_provider(Some(&server), None);
+        let provider = Arc::new(provider);
+
+        // Buffer-backed subscriber with the standard `compact()` event
+        // format production uses. set_default (not with_default — that
+        // takes a sync FnOnce) and hold the guard across the await so
+        // the warn! inside start_bootstrap lands in the buffer.
+        let writer = crate::test_support::CaptureWriter::default();
+        let layer = tracing_subscriber::fmt::Layer::default()
+            .with_writer(writer.clone())
+            .with_target(false)
+            .with_level(true)
+            .with_ansi(false)
+            .compact();
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let dc = provider.clone().start_bootstrap().await.unwrap();
+        assert_eq!(dc.user_code, "CODE-1234");
+
+        std::env::remove_var("LLMPROXY_TEST_GITHUB_BASE_URL");
+
+        let out = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("copilot device flow started"), "got: {out:?}");
+        assert!(out.contains(r#"provider="copilot""#), "got: {out:?}");
+        assert!(out.contains(r#"user_code="CODE-1234""#), "got: {out:?}");
+        assert!(
+            out.contains(r#"verification_uri="https://example.test/device""#),
+            "got: {out:?}"
+        );
+        assert!(out.contains("expires_in=600"), "got: {out:?}");
+        assert!(
+            !out.contains("log-device"),
+            "device_code (the OAuth secret) must not be logged, got: {out:?}"
         );
     }
 

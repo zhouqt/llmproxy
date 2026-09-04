@@ -290,7 +290,7 @@ pub fn build_usage(
     output_tokens: u32,
     cached_tokens: u32,
     reasoning_tokens: u32,
-    service_tier: Option<String>,
+    service_tier: &Option<String>,
 ) -> Usage {
     let cached = cached_tokens;
     let reasoning = reasoning_tokens.min(output_tokens);
@@ -306,7 +306,7 @@ pub fn build_usage(
         } else {
             None
         },
-        service_tier,
+        service_tier: service_tier.clone(),
         inference_geo: None,
     }
 }
@@ -1058,7 +1058,7 @@ mod tests {
     /// `input_tokens` (Anthropic convention).
     #[test]
     fn build_usage_with_cached_and_reasoning() {
-        let u = build_usage(100, 50, 30, 20, None);
+        let u = build_usage(100, 50, 30, 20, &None);
         assert_eq!(u.input_tokens, 70, "100 - 30 cached = 70");
         assert_eq!(u.output_tokens, 50);
         assert_eq!(u.cache_read_input_tokens, Some(30));
@@ -1072,14 +1072,14 @@ mod tests {
     /// would change the wire shape from absent to zero).
     #[test]
     fn build_usage_zero_cached_keeps_field_absent() {
-        let u = build_usage(10, 50, 0, 20, None);
+        let u = build_usage(10, 50, 0, 20, &None);
         assert!(u.cache_read_input_tokens.is_none());
     }
 
     /// PR-11: zero reasoning → `output_tokens_details` is None.
     #[test]
     fn build_usage_zero_reasoning_keeps_field_absent() {
-        let u = build_usage(10, 50, 30, 0, None);
+        let u = build_usage(10, 50, 30, 0, &None);
         assert!(u.output_tokens_details.is_none());
     }
 
@@ -1089,7 +1089,7 @@ mod tests {
     #[test]
     fn build_usage_clamps_reasoning_to_output_tokens() {
         // 30 reasoning > 20 output → clamp to 20.
-        let u = build_usage(10, 20, 0, 30, None);
+        let u = build_usage(10, 20, 0, 30, &None);
         let details = u.output_tokens_details.expect("clamped 20 > 0");
         assert_eq!(details["thinking_tokens"], 20);
         // The wire never sees `30 > 20`, so the Anthropic invariant

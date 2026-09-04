@@ -2,6 +2,7 @@
 //! and /admin/copilot/auth (Copilot OAuth bootstrap trigger).
 
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use axum::body::Body;
@@ -17,7 +18,7 @@ use serde_json::json;
 use crate::anthropic::{MessagesRequest, MessagesResponse};
 use crate::error::{ProxyError, Result};
 use crate::extractor::AppJson;
-use crate::providers::ProviderOutput;
+use crate::providers::{ProviderOutput, StreamUsage, StreamUsageSink};
 use crate::state::AppState;
 use crate::tokenize::estimate_request_tokens;
 
@@ -67,17 +68,49 @@ async fn messages_handler(
     let start = std::time::Instant::now();
 
     if req.stream {
-        let (provider, output, attempts) = state.router.stream(&model_cfg, &req).await?;
-        let summary = format_attempts(&attempts);
-        tracing::info!(
-            model = req.model.as_str(),
-            provider = provider.name(),
-            stream = req.stream,
-            elapsed_ms = start.elapsed().as_millis() as u64,
-            failed_providers = %summary,
-            "request completed"
-        );
-        return Ok(stream_response(provider.name(), req.model.as_str(), output, attempts));
+        // Build a single usage-watch Arc shared between the SSE adapter
+        // (writer — fills via terminal-path sink writes) and the
+        // MappedStream callback (reader — drains on Ready(None) to
+        // emit token counts in the `streaming completed` log line).
+        let usage_watch: Arc<Mutex<Option<StreamUsage>>> = Arc::new(Mutex::new(None));
+        let sink = StreamUsageSink::from_arc(usage_watch.clone());
+
+        let (provider, output, attempts) = state
+            .router
+            .stream(&model_cfg, &req, Some(sink))
+            .await?;
+
+        // Aggregated fallback summary (when a fallback actually
+        // happened): the router already logged per-attempt
+        // `fallback triggered` lines; this restores the single
+        // `failed_providers="primary:429,..."` string the non-streaming
+        // path emits. Token counts land on the later `streaming
+        // completed` line from the MappedStream callback.
+        if !attempts.is_empty() {
+            log_streaming_fallback(
+                &req.model,
+                provider.name(),
+                start.elapsed(),
+                &attempts,
+            );
+        }
+
+        // We log the streaming-completed/aborted lines from inside the
+        // MappedStream callback (which fires synchronously in the same
+        // poll that returns Ready(None) — see `MappedStream::poll_next`).
+        // Operators correlate with the prior `request completed` /
+        // `streaming fallback` line on the same request by matching
+        // `model` + `provider`.
+        return Ok(stream_response(
+            provider.name(),
+            req.model.as_str(),
+            output,
+            attempts,
+            usage_watch,
+            provider.name().to_string(),
+            req.model.clone(),
+            start,
+        ));
     }
 
     let (output, attempts) = state.router.complete(&model_cfg, &req).await?;
@@ -90,7 +123,6 @@ async fn messages_handler(
     let mut resp: MessagesResponse = serde_json::from_value(value)?;
     resp.model = req.model.clone();
 
-    let summary = format_attempts(&attempts);
     // For non-streaming, infer the provider that served the request: when
     // no attempts failed, it was the primary; otherwise it's the last
     // chain entry that didn't appear in `attempts`.
@@ -104,13 +136,14 @@ async fn messages_handler(
             .unwrap_or("unknown")
             .to_string()
     };
-    tracing::info!(
-        model = req.model.as_str(),
-        provider = %provider_label,
-        stream = req.stream,
-        elapsed_ms = start.elapsed().as_millis() as u64,
-        failed_providers = %summary,
-        "request completed"
+    let tokens = extract_complete_tokens(&resp);
+    log_request_completed(
+        &req.model,
+        &provider_label,
+        false,
+        start.elapsed(),
+        format_attempts_optional(&attempts).as_deref(),
+        tokens.as_ref(),
     );
 
     let mut headers = HeaderMap::new();
@@ -131,6 +164,19 @@ fn format_attempts(attempts: &[crate::router::RouteAttempt]) -> String {
         .join(",")
 }
 
+/// Same shape as `format_attempts`, but emits `None` when there were
+/// no fallback attempts. The single-macro log helper passes this
+/// straight into the `tracing::info!` call, where `None` records
+/// nothing (`impl Value for Option<T>`) so the `failed_providers`
+/// field is absent on the healthy no-fallback path.
+fn format_attempts_optional(attempts: &[crate::router::RouteAttempt]) -> Option<String> {
+    if attempts.is_empty() {
+        None
+    } else {
+        Some(format_attempts(attempts))
+    }
+}
+
 /// Public summary formatter for router attempts. Exposed for `Router` so
 /// fallback / "all providers failed" logs can render the same shape that
 /// the response header (`x-llmproxy-failed-providers`) emits. Keep the
@@ -140,19 +186,171 @@ pub fn format_attempts_summary(attempts: &[crate::router::RouteAttempt]) -> Stri
     format_attempts(attempts)
 }
 
+/// Token counts captured from upstream usage, ready to emit on the
+/// `request completed` / `streaming completed` log lines. `cache_read`
+/// is `Option<u32>` so the `Empty`-skipping convention distinguishes
+/// "upstream didn't report" from "upstream reported 0".
+pub struct LogTokens {
+    pub input: u32,
+    pub output: u32,
+    pub cache_read: Option<u32>,
+}
+
+/// Extract token counts from a non-streaming Anthropic `MessagesResponse`.
+/// `resp.usage` is non-optional on the wire (Anthropic spec mandates it);
+/// we read directly. Conversion paths set `input = prompt - cached` so
+/// `LogTokens::input + cache_read = prompt_total` is the invariant.
+fn extract_complete_tokens(resp: &MessagesResponse) -> Option<LogTokens> {
+    Some(LogTokens {
+        input: resp.usage.input_tokens,
+        output: resp.usage.output_tokens,
+        cache_read: resp.usage.cache_read_input_tokens,
+    })
+}
+
+/// Emit the canonical `request completed` log line. Conditional fields
+/// use `Option`-absence (see the comment inside the function).
+/// `total_tokens = input + output` follows Anthropic's
+/// convention (Anthropic's `usage` has no top-level `total_tokens`;
+/// clients sum input + output). Operators who want the OpenAI-equivalent
+/// total (prompt + completion, includes cache) add `cache_read_tokens`.
+fn log_request_completed(
+    model: &str,
+    provider: &str,
+    stream: bool,
+    elapsed: std::time::Duration,
+    failed_providers: Option<&str>,
+    tokens: Option<&LogTokens>,
+) {
+    // Conditional fields ride on `tracing`'s native
+    // `impl Value for Option<T>`: a `None` records nothing, so the
+    // field is simply absent from the event — no custom formatter and
+    // no `tracing::field::Empty` sentinel needed. `failed_providers`
+    // goes through `field::display` to keep the unquoted
+    // `failed_providers=cp:429` wire shape; `model`/`provider` stay
+    // quoted via `record_str`. `cache_read_tokens` as `Option<u32>`
+    // distinguishes "no cache hit" (absent) from "upstream reported
+    // 0" (=0). Operators correlate lines by matching
+    // `model` + `provider`; rendering them as event fields is the wire
+    // shape PR #22 produced.
+    tracing::info!(
+        model = model,
+        provider = provider,
+        stream = stream,
+        elapsed_ms = elapsed.as_millis() as u64,
+        failed_providers = failed_providers.map(tracing::field::display),
+        input_tokens = tokens.as_ref().map(|t| t.input),
+        output_tokens = tokens.as_ref().map(|t| t.output),
+        total_tokens = tokens.as_ref().map(|t| (t.input as u64) + (t.output as u64)),
+        cache_read_tokens = tokens.as_ref().and_then(|t| t.cache_read),
+        "request completed"
+    );
+}
+
+/// Outcome of a streaming body drain — passed to the
+/// `MappedStream::with_callback` closure once per stream. We collapse the
+/// success and errored branches into a single enum so the caller can
+/// pick the right log line without holding two booleans (Sonnet M3).
+#[derive(Clone, Debug)]
+pub enum MappedCompletion {
+    /// Stream ended normally. `Option<StreamUsage>` is `None` when the
+    /// upstream never reported usage (e.g. provider doesn't emit a
+    /// `usage` chunk); `Some` when it did. Distinguishing these via
+    /// `Option` prevents operators from reading "0 tokens" when the
+    /// actual situation is "no usage available" (Sonnet M4).
+    Success(Option<StreamUsage>),
+    /// Upstream errored mid-body (transport-level `Err`, or an upstream
+    /// error-envelope that the SSE adapter encoded as an Anthropic
+    /// `event: error` chunk). The synthetic `event: error` SSE chunk has
+    /// been emitted to the client. Partial primary usage is discarded
+    /// (Opus C1) — we cannot prove the upstream charged the request, the
+    /// client received no usable response, and there is no fallback
+    /// (streaming contract — once bytes flow, the chain stops). Logging
+    /// primary's partial tokens would silently misattribute cost.
+    Errored,
+    /// The body stream was dropped before reaching EOF — client
+    /// disconnect (Ctrl-C / tool abort / connection reset). No terminal
+    /// chunk was emitted. Fired from `Drop` so aborted-by-client streams
+    /// still leave a trace in the logs.
+    Aborted,
+}
+
 fn stream_response(
     provider_name: &str,
     model: &str,
     output: ProviderOutput,
     attempts: Vec<crate::router::RouteAttempt>,
+    usage_watch: Arc<Mutex<Option<StreamUsage>>>,
+    provider_for_log: String,
+    model_for_log: String,
+    start: std::time::Instant,
 ) -> Response {
     let ProviderOutput::Stream(stream) = output else {
+        // A stream:true request that yields a non-stream output is a
+        // provider contract violation and returns 500. Log it — without
+        // this the request is completely invisible (no start line, no
+        // MappedStream callback) (code-review F1).
+        tracing::error!(
+            provider = provider_for_log,
+            model = model_for_log,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "streaming request returned non-stream output"
+        );
         return ProxyError::Internal("expected stream output".into()).into_response();
     };
 
     let inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, ProxyError>> + Send>> =
         Box::into_pin(stream);
-    let mapped = MappedStream::new(provider_name, model, inner);
+
+    // The callback fires synchronously in the same poll that returns
+    // Ready(None) (success-EOF) or Ready(Some(Err)) (errored mid-body).
+    // Operators grep for `streaming completed` / `streaming aborted
+    // (upstream error)` to find request-end on the streaming path —
+    // the previous design fired the callback on the *next* poll's
+    // short-circuit, but `axum::body::Body::from_stream` polls exactly
+    // once on success-EOF, so the log line never appeared for the
+    // dominant case. See Sonnet C1.
+    let on_complete = move |completion: MappedCompletion| {
+        let elapsed = start.elapsed();
+        match completion {
+            MappedCompletion::Success(usage) => {
+                let tokens = usage.map(|u| LogTokens {
+                    input: u.input,
+                    output: u.output,
+                    cache_read: u.cache_read,
+                });
+                log_streaming_completed(
+                    &model_for_log,
+                    &provider_for_log,
+                    elapsed,
+                    tokens,
+                );
+            }
+            MappedCompletion::Errored => {
+                // Partial-usage-on-error is discarded. We emit the
+                // aborted line WITHOUT token fields (Opus C1).
+                log_streaming_aborted(&model_for_log, &provider_for_log, elapsed);
+            }
+            MappedCompletion::Aborted => {
+                // Client disconnected before EOF — no error chunk was
+                // emitted, no tokens were logged. Emit a distinct line
+                // so aborted-by-client streams leave a trace.
+                tracing::info!(
+                    model = &model_for_log,
+                    provider = &provider_for_log,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "streaming aborted (client disconnect)"
+                );
+            }
+        }
+    };
+    let mapped = MappedStream::with_callback(
+        provider_name,
+        model,
+        inner,
+        on_complete,
+        usage_watch,
+    );
     let body = Body::from_stream(mapped);
 
     let mut resp = Response::new(body);
@@ -171,6 +369,71 @@ fn stream_response(
     resp
 }
 
+/// Emit the streaming success log line. Mirrors the non-streaming
+/// `request completed` field shape so operators can grep a consistent
+/// vocabulary across both paths. Notably absent: `failed_providers` —
+/// streaming has no fallback (once bytes flow, the chain stops). For
+/// streaming the fallback signal lives on the earlier non-streaming
+/// `request completed` line emitted by `Router::stream`'s `info!`
+/// sites (or in this case by `Router`'s own `tracing::info!` callers
+/// before we return).
+fn log_streaming_completed(
+    model: &str,
+    provider: &str,
+    elapsed: std::time::Duration,
+    tokens: Option<LogTokens>,
+) {
+    // Same `Option<T> = absent` convention as `log_request_completed`
+    // (see its doc comment). Token fields appear only when the SSE
+    // adapter reported usage.
+    tracing::info!(
+        model = model,
+        provider = provider,
+        elapsed_ms = elapsed.as_millis() as u64,
+        input_tokens = tokens.as_ref().map(|t| t.input),
+        output_tokens = tokens.as_ref().map(|t| t.output),
+        total_tokens = tokens.as_ref().map(|t| (t.input as u64) + (t.output as u64)),
+        cache_read_tokens = tokens.as_ref().and_then(|t| t.cache_read),
+        "streaming completed"
+    );
+}
+
+/// Emit the streaming error log line. NO token fields — partial
+/// primary usage is discarded (Opus C1).
+fn log_streaming_aborted(model: &str, provider: &str, elapsed: std::time::Duration) {
+    tracing::info!(
+        model = model,
+        provider = provider,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "streaming aborted (upstream error)"
+    );
+}
+
+/// Emit the aggregated fallback summary on the streaming path. The
+/// router already logs a per-attempt `fallback triggered` line; this is
+/// the streaming equivalent of the non-streaming `request completed`
+/// line's `failed_providers=` field — the one aggregated string
+/// operators grep for. Deliberately NOT named `request completed`
+/// (that would contradict a later `streaming aborted` line on the same
+/// request) and carries no token fields (tokens land on the later
+/// `streaming completed` line from the MappedStream callback).
+fn log_streaming_fallback(
+    model: &str,
+    provider: &str,
+    elapsed: std::time::Duration,
+    attempts: &[crate::router::RouteAttempt],
+) {
+    let failed_providers = format_attempts(&attempts);
+    tracing::info!(
+        model = model,
+        provider = provider,
+        stream = true,
+        elapsed_ms = elapsed.as_millis() as u64,
+        failed_providers = %failed_providers,
+        "streaming fallback"
+    );
+}
+
 /// Adapter: wraps a `Result<Bytes, ProxyError>` stream as a
 /// `Result<Bytes, std::io::Error>` stream for axum's body. Emits an
 /// Anthropic `event: error` SSE chunk before terminating so clients
@@ -184,10 +447,39 @@ pub struct MappedStream {
     /// Client-requested model name, same purpose as `provider`.
     model: String,
     inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, ProxyError>> + Send>>,
-    done: bool,
+    /// Collapsed two-flag state machine (Sonnet M3) — both success-EOF
+    /// and errored-mid-body land in `Done(_)` so the callback-firing
+    /// logic doesn't drift between paths.
+    phase: MappedPhase,
+    /// Shared `Arc<Mutex<Option<StreamUsage>>>` clone of the same cell
+    /// the SSE adapter writes to on its terminal paths. We drain this
+    /// at success-EOF and hand the value to the callback via
+    /// `MappedCompletion::Success(Some(usage))`. Held directly on
+    /// `MappedStream` (not inside `SingleFireCallback`) so the
+    /// callback closure's environment stays minimal (Sonnet m1).
+    usage_watch: Arc<Mutex<Option<StreamUsage>>>,
+    /// Single-fire callback wrapped in a `Mutex<Option<Box<dyn FnOnce>>>`.
+    /// The callback fires synchronously in the same poll that returns
+    /// `Ready(None)` (success-EOF) or `Ready(Some(Err(_)))` (errored
+    /// mid-body) — see `poll_next` for the firing sequence (Sonnet C1).
+    on_complete: Option<Mutex<Option<Box<dyn FnOnce(MappedCompletion) + Send>>>>,
+}
+
+/// Two-phase lifecycle for [`MappedStream`]. Collapsing `done: bool` +
+/// `errored: bool` into a single phase enum eliminates the bug class
+/// where the two flags drift out of sync (Sonnet M3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MappedPhase {
+    Streaming,
+    /// Terminal — terminal callback has been (or is being) fired.
+    Done,
 }
 
 impl MappedStream {
+    /// Test-only constructor: builds a stream with no callback and no
+    /// usage-watch, so it never emits a log line. Production code must
+    /// use `with_callback` — this variant silently skips logging, which
+    /// would make a request invisible in the logs (code-review F7).
     pub fn new(
         provider: &str,
         model: &str,
@@ -197,7 +489,66 @@ impl MappedStream {
             provider: provider.to_string(),
             model: model.to_string(),
             inner,
-            done: false,
+            phase: MappedPhase::Streaming,
+            usage_watch: Arc::new(Mutex::new(None)),
+            on_complete: None,
+        }
+    }
+
+    /// Constructor that wires up the per-stream logging callback.
+    /// `on_complete` fires synchronously in the same poll that returns
+    /// `Ready(None)` (success-EOF) or `Ready(Some(Err(_)))` (errored
+    /// mid-body) — see `poll_next`. `usage_watch` is the same
+    /// `Arc<Mutex<Option<StreamUsage>>>` clone the SSE adapter writes
+    /// to; the callback receives the drained value via
+    /// `MappedCompletion::Success(Some(usage))`.
+    pub fn with_callback(
+        provider: &str,
+        model: &str,
+        inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, ProxyError>> + Send>>,
+        on_complete: impl FnOnce(MappedCompletion) + Send + 'static,
+        usage_watch: Arc<Mutex<Option<StreamUsage>>>,
+    ) -> Self {
+        Self {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            inner,
+            phase: MappedPhase::Streaming,
+            usage_watch,
+            on_complete: Some(Mutex::new(Some(Box::new(on_complete)))),
+        }
+    }
+
+    /// Drain captured usage (if any) from the shared watch cell. Called
+    /// from `poll_next`'s success-EOF arm. `None` when the SSE adapter
+    /// never wrote (upstream didn't report usage).
+    fn take_captured_usage(&self) -> Option<StreamUsage> {
+        self.usage_watch.lock().ok().and_then(|mut g| g.take())
+    }
+
+    /// Fire the single-fire callback once. Wrapped in `catch_unwind` so
+    /// a panic in user-supplied log code cannot tear down the body-sink
+    /// task (which would otherwise surface as a truncated body with no
+    /// signal). After firing, the callback is consumed — re-polls (e.g.
+    /// defensive double-polls from `StreamBody`) are silent no-ops.
+    fn fire_callback(&mut self, completion: MappedCompletion) {
+        let cb = match self.on_complete.as_mut() {
+            Some(slot) => slot.lock().ok().and_then(|mut g| g.take()),
+            None => return,
+        };
+        let Some(cb) = cb else {
+            return;
+        };
+        let cb_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cb(completion);
+        }));
+        if let Err(panic_payload) = cb_result {
+            tracing::error!(
+                provider = %self.provider,
+                model = %self.model,
+                panic = ?panic_payload,
+                "streaming_completed callback panicked; swallowed to preserve body-sink task",
+            );
         }
     }
 }
@@ -206,7 +557,12 @@ impl Stream for MappedStream {
     type Item = std::result::Result<Bytes, std::io::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.done {
+        // Phase terminal: short-circuit forever. The callback has
+        // already fired (or was never set). This is the path that
+        // Sonnet C1's "fire on the next poll's short-circuit" would
+        // have hit but no longer exists — we fire in the SAME poll
+        // that returns Ready(None), then transition to Done.
+        if self.phase == MappedPhase::Done {
             return Poll::Ready(None);
         }
         match self.inner.as_mut().poll_next(cx) {
@@ -218,22 +574,59 @@ impl Stream for MappedStream {
                     error = %e,
                     "upstream stream error"
                 );
-                // Emit a synthetic Anthropic `event: error` SSE chunk so
-                // the client can distinguish "stream ended normally"
-                // from "stream aborted by upstream failure" — without
-                // this, the body just truncates with 200 OK and no
-                // message_stop, which Anthropic SDKs report as a
-                // confusing parse error. Mark `done` so the next poll
-                // terminates the stream instead of emitting the chunk
-                // again.
-                self.done = true;
-                Poll::Ready(Some(Ok(format_stream_error(&e))))
+                // Discard partial primary usage (Opus C1 / Sonnet C1 —
+                // we cannot prove the upstream charged the request,
+                // the client received no usable response, and there
+                // is no fallback on the streaming path).
+                let _ = self.take_captured_usage();
+                let chunk = format_stream_error(&e);
+                // Fire the callback synchronously BEFORE returning the
+                // synthetic chunk. This is critical: if we returned
+                // the chunk first and then transitioned to Done,
+                // `axum::body::Body::from_stream`'s `StreamBody` would
+                // call `poll_next` once more, observe Done, and never
+                // re-emit. Firing here, in the same poll, guarantees
+                // the `streaming aborted (upstream error)` line lands
+                // even if this is the final poll.
+                self.fire_callback(MappedCompletion::Errored);
+                self.phase = MappedPhase::Done;
+                Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(None) => {
-                self.done = true;
+                // Success-EOF. Drain the shared watch cell — the SSE
+                // adapter has already written its terminal usage into
+                // this Arc by the time we observe Ready(None) (Sonnet
+                // M5 — ordering is deterministic; the adapter writes
+                // on [DONE] / error-envelope / Ready(None) before
+                // returning). If the adapter flagged `errored` (an
+                // upstream error-envelope encoded as an Anthropic
+                // `event: error` chunk), classify as aborted instead of
+                // a clean completion.
+                let usage = self.take_captured_usage();
+                let errored = usage.as_ref().map(|u| u.errored).unwrap_or(false);
+                if errored {
+                    self.fire_callback(MappedCompletion::Errored);
+                } else {
+                    self.fire_callback(MappedCompletion::Success(usage));
+                }
+                self.phase = MappedPhase::Done;
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for MappedStream {
+    fn drop(&mut self) {
+        // Client disconnected (or the body was dropped) before the
+        // stream reached EOF. Normal completion sets `phase = Done`
+        // inside `poll_next` before the body is dropped, so this guard
+        // prevents double-firing. `fire_callback` is panic-safe
+        // (catch_unwind) and the callback is sync `tracing::info!`.
+        if self.phase != MappedPhase::Done {
+            let _ = self.take_captured_usage();
+            self.fire_callback(MappedCompletion::Aborted);
         }
     }
 }
@@ -673,12 +1066,7 @@ mod tests {
     }
 
     fn fresh_mapped() -> MappedStream {
-        MappedStream {
-            provider: "test".to_string(),
-            model: "test".to_string(),
-            inner: make_stream(vec![]),
-            done: false,
-        }
+        MappedStream::new("test", "test", make_stream(vec![]))
     }
 
     /// Single shared panic message for all `assert_matches!`-style helpers.
@@ -704,16 +1092,21 @@ mod tests {
 
     #[test]
     fn mapped_stream_returns_none_when_already_done() {
-        // Once `done` is set, poll_next must short-circuit to Ready(None)
-        // without touching the inner stream at all.
-        let mut s = MappedStream {
-            provider: "test".to_string(),
-            model: "test".to_string(),
-            inner: make_stream(vec![Err(ProxyError::Internal("unused".into()))]),
-            done: true,
-        };
+        // Once phase is done, poll_next must short-circuit to
+        // Ready(None) without touching the inner stream at all.
+        let mut s = MappedStream::new(
+            "test",
+            "test",
+            make_stream(vec![Err(ProxyError::Internal("unused".into()))]),
+        );
+        // Drive the inner-error path first: synthetic error chunk is
+        // emitted, phase flips to done. Then a second poll must
+        // short-circuit to Ready(None).
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
+        let p1 = Pin::new(&mut s).poll_next(&mut cx);
+        assert!(matches!(p1, std::task::Poll::Ready(Some(Ok(_)))));
+        assert!(s.phase == MappedPhase::Done);
         let poll = Pin::new(&mut s).poll_next(&mut cx);
         expect_poll_none(poll);
     }
@@ -722,17 +1115,19 @@ mod tests {
     fn mapped_stream_propagates_pending_from_inner() {
         // When the inner stream returns Poll::Pending, the wrapper must
         // also return Poll::Pending (and must NOT mark itself done).
-        let mut s = MappedStream {
-            provider: "test".to_string(),
-            model: "test".to_string(),
-            inner: Box::pin(stream::pending::<std::result::Result<Bytes, ProxyError>>()),
-            done: false,
-        };
+        let mut s = MappedStream::new(
+            "test",
+            "test",
+            Box::pin(stream::pending::<std::result::Result<Bytes, ProxyError>>()),
+        );
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
         let poll = Pin::new(&mut s).poll_next(&mut cx);
         expect_poll_pending(poll);
-        assert!(!s.done, "Pending must not flip done=true");
+        assert!(
+            s.phase == crate::server::MappedPhase::Streaming,
+            "Pending must not flip phase to Done"
+        );
     }
 
     #[tokio::test]
@@ -742,12 +1137,11 @@ mod tests {
         // anything went wrong. We inject an Anthropic `event: error`
         // chunk so the SDK can distinguish aborted streams from normal
         // end-of-stream.
-        let mut s = MappedStream {
-            provider: "test".to_string(),
-            model: "test".to_string(),
-            inner: make_stream(vec![Err(ProxyError::Internal("boom".into()))]),
-            done: false,
-        };
+        let mut s = MappedStream::new(
+            "test",
+            "test",
+            make_stream(vec![Err(ProxyError::Internal("boom".into()))]),
+        );
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
 
@@ -770,20 +1164,19 @@ mod tests {
         // Second poll: stream ends.
         let p2 = Pin::new(&mut s).poll_next(&mut cx);
         assert!(matches!(p2, Poll::Ready(None)));
-        assert!(s.done);
+        assert!(s.phase == crate::server::MappedPhase::Done);
     }
 
     #[tokio::test]
     async fn mapped_stream_emits_bytes_then_terminates() {
-        let mut s = MappedStream {
-            provider: "test".to_string(),
-            model: "test".to_string(),
-            inner: make_stream(vec![
+        let mut s = MappedStream::new(
+            "test",
+            "test",
+            make_stream(vec![
                 Ok(Bytes::from_static(b"event: foo\n\n")),
                 Ok(Bytes::from_static(b"event: bar\n\n")),
             ]),
-            done: false,
-        };
+        );
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
 
@@ -801,7 +1194,7 @@ mod tests {
 
         let p3 = Pin::new(&mut s).poll_next(&mut cx);
         assert!(matches!(p3, Poll::Ready(None)));
-        assert!(s.done);
+        assert!(s.phase == crate::server::MappedPhase::Done);
     }
 
     #[test]
@@ -819,7 +1212,7 @@ mod tests {
     #[test]
     fn fresh_mapped_helper_is_not_done() {
         let s = fresh_mapped();
-        assert!(!s.done);
+        assert!(s.phase == crate::server::MappedPhase::Streaming);
     }
 
     // ──────────────────────────────────────────────────────────────────
@@ -1532,4 +1925,688 @@ mod tests {
             "must return at the timeout, not after the upstream delay"
         );
     }
+
+    // ──────────────────────────────────────────────────────────────────
+    // log_request_completed / log_streaming_completed /
+    // log_streaming_aborted / extract_complete_tokens / MappedCompletion
+    // / MappedPhase — covering the new helpers added for
+    // conditional failed_providers + token counts.
+    //
+    // We exercise the helpers under a tracing subscriber that captures
+    // output to an in-memory buffer (standard `compact()` formatter —
+    // the same shape production installs). Each scenario asserts the
+    // captured log line carries exactly the expected field set.
+
+    // ──────────────────────────────────────────────────────────────────
+
+    use crate::anthropic::Usage;
+    use crate::providers::StreamUsage;
+    use crate::test_support::CaptureWriter;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    fn run_with_capture<F: FnOnce()>(body: F) -> String {
+        let writer = CaptureWriter::default();
+        let layer = tracing_subscriber::fmt::Layer::default()
+            .with_writer(writer.clone())
+            .with_target(false)
+            .with_level(true)
+            .with_ansi(false)
+            .compact();
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, body);
+        let buf = writer.0.lock().unwrap().clone();
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn log_request_completed_no_fallback_no_tokens() {
+        // Healthy path: no fallback, no usage reported.
+        let out = run_with_capture(|| {
+            log_request_completed(
+                "work-mini",
+                "primary",
+                false,
+                std::time::Duration::from_millis(120),
+                None,
+                None,
+            );
+        });
+        assert!(out.contains("request completed"), "got: {out}");
+        assert!(out.contains("model=\"work-mini\""), "got: {out}");
+        assert!(out.contains("provider=\"primary\""), "got: {out}");
+        assert!(out.contains("stream=false"), "got: {out}");
+        assert!(!out.contains("failed_providers"), "must omit failed_providers");
+        assert!(!out.contains("input_tokens"), "must omit input_tokens");
+        assert!(!out.contains("output_tokens"), "must omit output_tokens");
+        assert!(!out.contains("total_tokens"), "must omit total_tokens");
+        assert!(!out.contains("cache_read_tokens"), "must omit cache_read_tokens");
+    }
+
+    #[test]
+    fn log_request_completed_fallback_with_tokens() {
+        // Fallback + usage: all fields present.
+        let out = run_with_capture(|| {
+            log_request_completed(
+                "work-mini",
+                "backup",
+                false,
+                std::time::Duration::from_millis(120),
+                Some("cp:429"),
+                Some(&LogTokens {
+                    input: 6,
+                    output: 4,
+                    cache_read: Some(4),
+                }),
+            );
+        });
+        assert!(out.contains("request completed"), "got: {out}");
+        assert!(out.contains("model=\"work-mini\""), "got: {out}");
+        assert!(out.contains("provider=\"backup\""), "got: {out}");
+        assert!(out.contains("stream=false"), "got: {out}");
+        assert!(out.contains("failed_providers=cp:429"), "got: {out}");
+        assert!(out.contains("input_tokens=6"), "got: {out}");
+        assert!(out.contains("output_tokens=4"), "got: {out}");
+        assert!(out.contains("total_tokens=10"), "got: {out}");
+        assert!(out.contains("cache_read_tokens=4"), "got: {out}");
+    }
+
+    #[test]
+    fn log_request_completed_no_fallback_with_tokens_no_cache() {
+        // Healthy path WITH usage: tokens present, cache_read absent.
+        let out = run_with_capture(|| {
+            log_request_completed(
+                "work-mini",
+                "primary",
+                false,
+                std::time::Duration::from_millis(120),
+                None,
+                Some(&LogTokens {
+                    input: 6,
+                    output: 4,
+                    cache_read: None,
+                }),
+            );
+        });
+        assert!(!out.contains("failed_providers"), "must omit failed_providers");
+        assert!(out.contains("model=\"work-mini\""), "got: {out}");
+        assert!(out.contains("provider=\"primary\""), "got: {out}");
+        assert!(out.contains("stream=false"), "got: {out}");
+        assert!(out.contains("input_tokens=6"), "got: {out}");
+        assert!(out.contains("output_tokens=4"), "got: {out}");
+        assert!(out.contains("total_tokens=10"), "got: {out}");
+        assert!(!out.contains("cache_read_tokens"), "must omit cache_read_tokens");
+    }
+
+    #[test]
+    fn log_request_completed_fallback_no_tokens() {
+        // Fallback without usage: failed_providers present, tokens absent.
+        let out = run_with_capture(|| {
+            log_request_completed(
+                "work-mini",
+                "backup",
+                false,
+                std::time::Duration::from_millis(120),
+                Some("cp:429"),
+                None,
+            );
+        });
+        assert!(out.contains("request completed"), "got: {out}");
+        assert!(out.contains("model=\"work-mini\""), "got: {out}");
+        assert!(out.contains("provider=\"backup\""), "got: {out}");
+        assert!(out.contains("stream=false"), "got: {out}");
+        assert!(out.contains("failed_providers=cp:429"), "got: {out}");
+        assert!(!out.contains("input_tokens"), "must omit input_tokens");
+        assert!(!out.contains("output_tokens"), "must omit output_tokens");
+        assert!(!out.contains("total_tokens"), "must omit total_tokens");
+    }
+
+    #[test]
+    fn log_streaming_completed_with_tokens() {
+        let out = run_with_capture(|| {
+            log_streaming_completed(
+                "work-mini",
+                "primary",
+                std::time::Duration::from_millis(50),
+                Some(LogTokens {
+                    input: 6,
+                    output: 4,
+                    cache_read: Some(4),
+                }),
+            );
+        });
+        assert!(out.contains("streaming completed"), "got: {out}");
+        assert!(out.contains("model=\"work-mini\""), "got: {out}");
+        assert!(out.contains("provider=\"primary\""), "got: {out}");
+        assert!(!out.contains("failed_providers"), "streaming must not carry failed_providers");
+        assert!(out.contains("input_tokens=6"), "got: {out}");
+        assert!(out.contains("output_tokens=4"), "got: {out}");
+        assert!(out.contains("total_tokens=10"), "got: {out}");
+        assert!(out.contains("cache_read_tokens=4"), "got: {out}");
+    }
+
+    #[test]
+    fn log_request_completed_fallback_with_tokens_no_cache() {
+        // Fallback + usage WITHOUT cache_read: failed_providers and
+        // token fields present, cache_read_tokens absent.
+        let out = run_with_capture(|| {
+            log_request_completed(
+                "work-mini",
+                "backup",
+                false,
+                std::time::Duration::from_millis(120),
+                Some("cp:429"),
+                Some(&LogTokens {
+                    input: 6,
+                    output: 4,
+                    cache_read: None,
+                }),
+            );
+        });
+        assert!(out.contains("request completed"), "got: {out}");
+        assert!(out.contains("model=\"work-mini\""), "got: {out}");
+        assert!(out.contains("provider=\"backup\""), "got: {out}");
+        assert!(out.contains("failed_providers=cp:429"), "got: {out}");
+        assert!(out.contains("input_tokens=6"), "got: {out}");
+        assert!(out.contains("output_tokens=4"), "got: {out}");
+        assert!(out.contains("total_tokens=10"), "got: {out}");
+        assert!(!out.contains("cache_read_tokens"), "must omit cache_read_tokens");
+    }
+
+    #[test]
+    fn log_request_completed_no_fallback_with_tokens_with_cache() {
+        // Healthy path with usage + cache hit: no failed_providers, all
+        // token fields (incl. cache_read_tokens) present.
+        let out = run_with_capture(|| {
+            log_request_completed(
+                "work-mini",
+                "primary",
+                false,
+                std::time::Duration::from_millis(120),
+                None,
+                Some(&LogTokens {
+                    input: 6,
+                    output: 4,
+                    cache_read: Some(4),
+                }),
+            );
+        });
+        assert!(out.contains("request completed"), "got: {out}");
+        assert!(out.contains("model=\"work-mini\""), "got: {out}");
+        assert!(out.contains("provider=\"primary\""), "got: {out}");
+        assert!(!out.contains("failed_providers"), "must omit failed_providers");
+        assert!(out.contains("input_tokens=6"), "got: {out}");
+        assert!(out.contains("output_tokens=4"), "got: {out}");
+        assert!(out.contains("total_tokens=10"), "got: {out}");
+        assert!(out.contains("cache_read_tokens=4"), "got: {out}");
+    }
+
+    #[test]
+    fn log_streaming_completed_with_tokens_no_cache() {
+        // Streaming with usage but no cache: token fields present,
+        // cache_read_tokens absent.
+        let out = run_with_capture(|| {
+            log_streaming_completed(
+                "work-mini",
+                "primary",
+                std::time::Duration::from_millis(50),
+                Some(LogTokens {
+                    input: 6,
+                    output: 4,
+                    cache_read: None,
+                }),
+            );
+        });
+        assert!(out.contains("streaming completed"), "got: {out}");
+        assert!(out.contains("model=\"work-mini\""), "got: {out}");
+        assert!(out.contains("provider=\"primary\""), "got: {out}");
+        assert!(!out.contains("failed_providers"), "streaming must not carry failed_providers");
+        assert!(out.contains("input_tokens=6"), "got: {out}");
+        assert!(out.contains("output_tokens=4"), "got: {out}");
+        assert!(out.contains("total_tokens=10"), "got: {out}");
+        assert!(!out.contains("cache_read_tokens"), "must omit cache_read_tokens");
+    }
+
+    #[test]
+    fn log_streaming_fallback_emits_failed_providers_only_when_present() {
+        let out = run_with_capture(|| {
+            log_streaming_fallback(
+                "work-mini",
+                "primary",
+                std::time::Duration::from_millis(50),
+                &[crate::router::RouteAttempt {
+                    provider: "primary".into(),
+                    status: 429,
+                    body: String::new(),
+                }],
+            );
+        });
+        assert!(out.contains("streaming fallback"), "got: {out}");
+        assert!(out.contains("model=\"work-mini\""), "got: {out}");
+        assert!(out.contains("provider=\"primary\""), "got: {out}");
+        assert!(out.contains("stream=true"), "got: {out}");
+        assert!(out.contains("failed_providers=primary:429"), "got: {out}");
+    }
+
+    #[test]
+    fn log_streaming_completed_no_tokens() {
+        let out = run_with_capture(|| {
+            log_streaming_completed(
+                "work-mini",
+                "primary",
+                std::time::Duration::from_millis(50),
+                None,
+            );
+        });
+        assert!(out.contains("streaming completed"), "got: {out}");
+        assert!(out.contains("model=\"work-mini\""), "got: {out}");
+        assert!(out.contains("provider=\"primary\""), "got: {out}");
+        assert!(!out.contains("input_tokens"), "must omit input_tokens");
+        assert!(!out.contains("output_tokens"), "must omit output_tokens");
+    }
+
+    #[test]
+    fn log_streaming_aborted_emits_no_token_fields() {
+        let out = run_with_capture(|| {
+            log_streaming_aborted(
+                "work-mini",
+                "primary",
+                std::time::Duration::from_millis(50),
+            );
+        });
+        assert!(
+            out.contains("streaming aborted (upstream error)"),
+            "got: {out}"
+        );
+        assert!(out.contains("model=\"work-mini\""), "got: {out}");
+        assert!(out.contains("provider=\"primary\""), "got: {out}");
+        assert!(!out.contains("input_tokens"), "must NOT carry input_tokens");
+        assert!(!out.contains("output_tokens"), "must NOT carry output_tokens");
+        assert!(!out.contains("total_tokens"), "must NOT carry total_tokens");
+        assert!(!out.contains("cache_read_tokens"), "must NOT carry cache_read_tokens");
+    }
+
+    #[test]
+    fn extract_complete_tokens_conversion_path_post_cache_subtraction() {
+        // OpenAI Chat shape: prompt=10, cached=4 → input_tokens=6,
+        // cache_read=Some(4). This is the invariant
+        // `LogTokens::input + cache_read = prompt_total`.
+        let usage = Usage {
+            input_tokens: 6,
+            output_tokens: 4,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: Some(4),
+            cache_creation: None,
+            server_tool_use: None,
+            output_tokens_details: None,
+            service_tier: None,
+            inference_geo: None,
+        };
+        let resp = MessagesResponse {
+            id: "msg_test".into(),
+            kind: "message".into(),
+            role: "assistant".into(),
+            model: "m".into(),
+            content: vec![],
+            stop_reason: Some("end_turn".into()),
+            stop_sequence: None,
+            stop_details: None,
+            container: None,
+            usage,
+            extra: Default::default(),
+        };
+        let tokens = extract_complete_tokens(&resp).expect("non-empty usage");
+        assert_eq!(tokens.input, 6);
+        assert_eq!(tokens.output, 4);
+        assert_eq!(tokens.cache_read, Some(4));
+        // Invariant: input + cache_read = prompt_total (10).
+        assert_eq!(tokens.input + tokens.cache_read.unwrap(), 10);
+    }
+
+    #[test]
+    fn extract_complete_tokens_passthrough_path_preserves_cache_creation() {
+        // Anthropic-native shape: cache_creation_input_tokens is
+        // preserved on the wire and MUST flow through to
+        // MessagesResponse.usage (Opus C3 / Sonnet m3). The log
+        // surface in this PR does NOT emit cache_creation — that's a
+        // follow-up — but the wire shape must not be corrupted.
+        let usage = Usage {
+            input_tokens: 8,
+            output_tokens: 4,
+            cache_creation_input_tokens: Some(2),
+            cache_read_input_tokens: Some(8),
+            cache_creation: None,
+            server_tool_use: None,
+            output_tokens_details: None,
+            service_tier: None,
+            inference_geo: None,
+        };
+        let resp = MessagesResponse {
+            id: "msg_test".into(),
+            kind: "message".into(),
+            role: "assistant".into(),
+            model: "m".into(),
+            content: vec![],
+            stop_reason: Some("end_turn".into()),
+            stop_sequence: None,
+            stop_details: None,
+            container: None,
+            usage,
+            extra: Default::default(),
+        };
+        // Field still flows through to MessagesResponse.usage — wire
+        // shape is not corrupted.
+        assert_eq!(resp.usage.cache_creation_input_tokens, Some(2));
+        let tokens = extract_complete_tokens(&resp).expect("non-empty usage");
+        assert_eq!(tokens.cache_read, Some(8));
+        assert_eq!(tokens.input, 8);
+    }
+
+    #[test]
+    fn mapped_completion_success_carries_optional_usage() {
+        // MappedCompletion::Success(Option<StreamUsage>) — None branch
+        // is operator-readable as "no usage available", not "0 tokens".
+        let c = MappedCompletion::Success(None);
+        match c {
+            MappedCompletion::Success(None) => {}
+            _ => panic!("expected Success(None)"),
+        }
+        let usage = StreamUsage {
+            input: 1,
+            output: 2,
+            cache_read: Some(3),
+            ..Default::default()
+        };
+        let c2 = MappedCompletion::Success(Some(usage.clone()));
+        match c2 {
+            MappedCompletion::Success(Some(u)) => {
+                assert_eq!(u.input, 1);
+                assert_eq!(u.output, 2);
+                assert_eq!(u.cache_read, Some(3));
+            }
+            _ => panic!("expected Success(Some(_))"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mapped_completion_errored_discards_partial_usage_via_callback() {
+        // Construct an SSE adapter (OpenAiCompat-style) that emits a
+        // usage chunk, then errors mid-body. The MappedStream wrapper
+        // must fire MappedCompletion::Errored (NOT Success), and the
+        // sink must be empty after the call (partial usage discarded
+        // per Opus C1).
+        use crate::providers::StreamUsageSink;
+        use futures_util::stream;
+
+        let chunks: Vec<std::result::Result<Bytes, ProxyError>> = vec![
+            // A normal SSE chunk first (will be processed by the
+            // translator if it recognized the shape, but here we
+            // short-circuit: any valid bytes are fine — the test
+            // focuses on the inner-error path).
+            Ok(Bytes::from_static(b"event: ping\ndata: {}\n\n")),
+            Err(ProxyError::Internal("boom".into())),
+        ];
+        let inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, ProxyError>> + Send>> =
+            Box::pin(stream::iter(chunks));
+
+        let sink = StreamUsageSink::empty();
+        let usage_watch = sink.arc();
+
+        let captured: Arc<Mutex<Option<MappedCompletion>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+        let mut mapped = MappedStream::with_callback(
+            "primary",
+            "m",
+            inner,
+            move |c| {
+                *captured_clone.lock().unwrap() = Some(c);
+            },
+            usage_watch.clone(),
+        );
+
+        // Drain to EOF (will hit the inner Err mid-body).
+        use futures_util::StreamExt;
+        let _ = mapped.next().await; // Some(Ok(ping))
+        let _ = mapped.next().await; // Some(Ok(synthetic event: error))
+        let none = mapped.next().await; // Ready(None) — phase is Done
+        assert!(none.is_none());
+
+        // Callback fired with Errored.
+        let c = captured.lock().unwrap().clone();
+        match c {
+            Some(MappedCompletion::Errored) => {}
+            other => panic!("expected Errored, got {other:?}"),
+        }
+        // Partial primary usage was discarded.
+        let sink_after = usage_watch.lock().unwrap().clone();
+        assert!(
+            sink_after.is_none(),
+            "partial usage must be discarded on error, got {sink_after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mapped_completion_success_fires_callback_with_drained_usage() {
+        // Pre-populate the shared watch cell with usage. Construct a
+        // MappedStream with `inner = empty`. The Ready(None) arm must
+        // fire MappedCompletion::Success(Some(usage)) (Sonnet M4).
+        use crate::providers::{StreamUsage, StreamUsageSink};
+        use futures_util::stream;
+
+        let inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, ProxyError>> + Send>> =
+            Box::pin(stream::empty());
+
+        let sink = StreamUsageSink::empty();
+        let usage_watch = sink.arc();
+        // Simulate the SSE adapter writing terminal usage before EOF.
+        usage_watch.lock().unwrap().replace(StreamUsage {
+            input: 7,
+            output: 3,
+            cache_read: Some(2),
+            ..Default::default()
+        });
+
+        let captured: Arc<Mutex<Option<MappedCompletion>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+        let mut mapped = MappedStream::with_callback(
+            "primary",
+            "m",
+            inner,
+            move |c| {
+                *captured_clone.lock().unwrap() = Some(c);
+            },
+            usage_watch.clone(),
+        );
+        use futures_util::StreamExt;
+        let none = mapped.next().await;
+        assert!(none.is_none());
+
+        let c = captured.lock().unwrap().clone();
+        match c {
+            Some(MappedCompletion::Success(Some(u))) => {
+                assert_eq!(u.input, 7);
+                assert_eq!(u.output, 3);
+                assert_eq!(u.cache_read, Some(2));
+            }
+            other => panic!("expected Success(Some(_)), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mapped_completion_callback_does_not_fire_twice_on_double_poll() {
+        // After the callback fires once on success-EOF, a second poll
+        // on phase=Done is a no-op (Sonnet M3 idempotency).
+        use futures_util::stream;
+
+        let inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, ProxyError>> + Send>> =
+            Box::pin(stream::empty());
+
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let counter_clone = counter.clone();
+        let usage_watch = crate::providers::StreamUsageSink::empty().arc();
+        let mut mapped = MappedStream::with_callback(
+            "primary",
+            "m",
+            inner,
+            move |_c| {
+                *counter_clone.lock().unwrap() += 1;
+            },
+            usage_watch,
+        );
+        use futures_util::StreamExt;
+        let _ = mapped.next().await; // fires once
+        let _ = mapped.next().await; // short-circuits
+        let _ = mapped.next().await; // short-circuits
+        assert_eq!(*counter.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn mapped_completion_drop_fires_aborted_callback() {
+        // Regression (code-review F3): when the body stream is dropped
+        // before EOF (client disconnect), MappedStream::drop must fire
+        // MappedCompletion::Aborted so the request leaves a log trace.
+        // Normal completion sets phase=Done in poll_next first, so this
+        // must not fire for a drained stream.
+        use crate::providers::StreamUsageSink;
+        use futures_util::stream;
+
+        let inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, ProxyError>> + Send>> =
+            Box::pin(stream::pending());
+
+        let captured: Arc<Mutex<Option<MappedCompletion>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+        let usage_watch = StreamUsageSink::empty().arc();
+        let mapped = MappedStream::with_callback(
+            "primary",
+            "m",
+            inner,
+            move |c| {
+                *captured_clone.lock().unwrap() = Some(c);
+            },
+            usage_watch,
+        );
+
+        // Drop without polling to terminal — Drop must fire Aborted.
+        drop(mapped);
+
+        let c = captured.lock().unwrap().clone();
+        match c {
+            Some(MappedCompletion::Aborted) => {}
+            other => panic!("expected Aborted from Drop, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mapped_completion_drop_does_not_double_fire_after_drain() {
+        // A stream that reached Ready(None) (phase=Done) must NOT fire
+        // Aborted on drop — normal completion already fired the callback.
+        use crate::providers::StreamUsageSink;
+        use futures_util::stream;
+
+        let inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, ProxyError>> + Send>> =
+            Box::pin(stream::empty());
+
+        let captured: Arc<Mutex<Option<MappedCompletion>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+        let usage_watch = StreamUsageSink::empty().arc();
+        let mut mapped = MappedStream::with_callback(
+            "primary",
+            "m",
+            inner,
+            move |c| {
+                *captured_clone.lock().unwrap() = Some(c);
+            },
+            usage_watch,
+        );
+
+        // Poll to Ready(None) — fires Success; then drop.
+        use futures_util::StreamExt;
+        let _ = mapped.next().await; // fires Success
+        let c1 = captured.lock().unwrap().clone();
+        assert!(
+            matches!(c1, Some(MappedCompletion::Success(_))),
+            "drained stream must fire Success, got {c1:?}"
+        );
+        drop(mapped);
+        // Drop must not overwrite the already-fired completion.
+        let c2 = captured.lock().unwrap().clone();
+        assert!(
+            matches!(c2, Some(MappedCompletion::Success(_))),
+            "Drop must not double-fire after drain, got {c2:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mapped_completion_errored_flag_classifies_stream_as_aborted() {
+        // Regression (code-review F4): when the SSE adapter flags the
+        // sink's `errored` (upstream error-envelope), MappedStream's
+        // Ready(None) arm must fire MappedCompletion::Errored instead of
+        // Success — the client saw an `event: error` chunk.
+        use crate::providers::{StreamUsage, StreamUsageSink};
+        use futures_util::stream;
+
+        let inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, ProxyError>> + Send>> =
+            Box::pin(stream::empty());
+
+        let sink = StreamUsageSink::empty();
+        let usage_watch = sink.arc();
+        // Simulate the adapter's error-envelope sentinel write.
+        usage_watch.lock().unwrap().replace(StreamUsage {
+            errored: true,
+            ..Default::default()
+        });
+
+        let captured: Arc<Mutex<Option<MappedCompletion>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+        let mut mapped = MappedStream::with_callback(
+            "primary",
+            "m",
+            inner,
+            move |c| {
+                *captured_clone.lock().unwrap() = Some(c);
+            },
+            usage_watch,
+        );
+        use futures_util::StreamExt;
+        let _ = mapped.next().await;
+
+        let c = captured.lock().unwrap().clone();
+        match c {
+            Some(MappedCompletion::Errored) => {}
+            other => panic!("errored flag must yield Errored, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fire_callback_catches_panicking_on_complete_closure() {
+        // Defense-in-depth (MappedStream::fire_callback wraps the user
+        // closure in catch_unwind): a panic inside the on_complete log
+        // closure must be swallowed, logged, and must NOT propagate to
+        // tear down the body-sink task (which would surface as a
+        // truncated body with no signal).
+        use crate::providers::StreamUsageSink;
+        use futures_util::stream;
+
+        let inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, ProxyError>> + Send>> =
+            Box::pin(stream::empty());
+
+        let usage_watch = StreamUsageSink::empty().arc();
+        let mut mapped = MappedStream::with_callback(
+            "primary",
+            "m",
+            inner,
+            // Deliberately panicking closure — fire_callback must catch it.
+            move |_c| {
+                panic!("boom in on_complete");
+            },
+            usage_watch,
+        );
+        use futures_util::StreamExt;
+        // Poll to Ready(None); the panicking closure fires inside.
+        let _ = mapped.next().await;
+        // If the panic propagated, the test would abort here with the
+        // panic message. Reaching this assert proves it was swallowed.
+        assert!(true, "panic in on_complete must be swallowed");
+    }
+
 }

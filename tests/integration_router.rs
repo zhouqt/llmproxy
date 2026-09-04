@@ -120,6 +120,7 @@ impl Provider for WiremockOpenAiProvider {
         &self,
         _req: &MessagesRequest,
         _model_rewrite: &HashMap<String, String>,
+        _usage_sink: Option<llmproxy::providers::StreamUsageSink>,
     ) -> Result<ProviderOutput> {
         unimplemented!("stream path covered by tests/server.rs unit tests")
     }
@@ -1428,6 +1429,7 @@ impl Provider for DeferredProvider {
         &self,
         _req: &MessagesRequest,
         _model_rewrite: &HashMap<String, String>,
+        _usage_sink: Option<llmproxy::providers::StreamUsageSink>,
     ) -> Result<ProviderOutput> {
         Ok(ProviderOutput::Stream(Box::new(stream::empty())))
     }

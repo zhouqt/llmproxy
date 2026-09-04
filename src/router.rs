@@ -365,10 +365,15 @@ impl Router {
     /// Execute a streaming request. Returns the first provider's stream; if
     /// the request fails before streaming starts, falls back. Once bytes
     /// start flowing, the caller sees the entire stream.
+    ///
+    /// `usage_sink` is forwarded into the provider's SSE adapter so it can
+    /// capture terminal usage (input/output/cache_read tokens). `None` means
+    /// the caller does not want token capture (e.g. some tests).
     pub async fn stream(
         &self,
         model: &ModelConfig,
         req: &MessagesRequest,
+        usage_sink: Option<crate::providers::StreamUsageSink>,
     ) -> Result<(SharedProvider, ProviderOutput, Vec<RouteAttempt>)> {
         let mut attempts: Vec<RouteAttempt> = Vec::new();
         let mut last_error: Option<ProxyError> = None;
@@ -422,7 +427,7 @@ impl Router {
             // success. Retrying after the first byte has flowed is unsafe
             // (we'd double-emit content to the client), so the per-provider
             // attempt count for streaming is implicitly 1.
-            match provider.stream(req, &HashMap::new()).await {
+            match provider.stream(req, &HashMap::new(), usage_sink.clone()).await {
                 Ok(out) => return Ok((provider, out, attempts)),
                 Err(e) if e.is_cooldownable() => {
                     if let ProxyError::Upstream { status, body } = &e {
@@ -545,6 +550,7 @@ mod tests {
             &self,
             _req: &MessagesRequest,
             _model_rewrite: &HashMap<String, String>,
+            _usage_sink: Option<crate::providers::StreamUsageSink>,
         ) -> Result<ProviderOutput> {
             if self.fail_count > 0 {
                 return Err(ProxyError::Upstream {
@@ -579,6 +585,7 @@ mod tests {
             &self,
             _req: &MessagesRequest,
             _model_rewrite: &HashMap<String, String>,
+            _usage_sink: Option<crate::providers::StreamUsageSink>,
         ) -> Result<ProviderOutput> {
             Err(ProxyError::BadRequest("invalid stream request".into()))
         }
@@ -779,6 +786,7 @@ mod tests {
             &self,
             _req: &MessagesRequest,
             _model_rewrite: &HashMap<String, String>,
+            _usage_sink: Option<crate::providers::StreamUsageSink>,
         ) -> Result<ProviderOutput> {
             unimplemented!()
         }
@@ -937,7 +945,7 @@ mod tests {
         let model = router.find_model("m").unwrap();
 
         let (provider, output, attempts) = router
-            .stream(model, &dummy_request())
+            .stream(model, &dummy_request(), None)
             .await
             .unwrap();
 
@@ -1013,7 +1021,7 @@ mod tests {
         let model = router.find_model("m").unwrap();
 
         let (provider, output, attempts) = router
-            .stream(model, &dummy_request())
+            .stream(model, &dummy_request(), None)
             .await
             .unwrap();
 
@@ -1084,7 +1092,7 @@ mod tests {
         let model = router.find_model("m").unwrap();
 
         let error = router
-            .stream(model, &dummy_request())
+            .stream(model, &dummy_request(), None)
             .await
             .err()
             .expect("403 must surface immediately");
@@ -1131,7 +1139,7 @@ mod tests {
             .err()
             .expect("complete should fail");
         let stream = router
-            .stream(model, &dummy_request())
+            .stream(model, &dummy_request(), None)
             .await
             .err()
             .expect("stream should fail");
@@ -1160,7 +1168,7 @@ mod tests {
             .err()
             .expect("request should fail");
         let stream = router
-            .stream(model, &dummy_request())
+            .stream(model, &dummy_request(), None)
             .await
             .err()
             .expect("request should fail");
@@ -1218,7 +1226,7 @@ mod tests {
         model.fallback_chain = vec!["missing".into(), "backup".into()];
 
         let (provider, output, attempts) = router_clone_with(&base)
-            .stream(&model, &dummy_request())
+            .stream(&model, &dummy_request(), None)
             .await
             .unwrap();
         assert_eq!(provider.name(), "backup");
@@ -1357,7 +1365,7 @@ mod tests {
         let model = router.find_model("m").unwrap();
 
         let error = router
-            .stream(model, &dummy_request())
+            .stream(model, &dummy_request(), None)
             .await
             .err()
             .expect("request should fail");
@@ -1567,6 +1575,7 @@ mod tests {
             &self,
             _req: &MessagesRequest,
             _model_rewrite: &HashMap<String, String>,
+            _usage_sink: Option<crate::providers::StreamUsageSink>,
         ) -> Result<ProviderOutput> {
             unimplemented!()
         }
@@ -1735,6 +1744,7 @@ mod tests {
                 &self,
                 _req: &MessagesRequest,
                 _model_rewrite: &HashMap<String, String>,
+                _usage_sink: Option<crate::providers::StreamUsageSink>,
             ) -> Result<ProviderOutput> {
                 self.call_count.fetch_add(1, Ordering::SeqCst);
                 let s: Box<dyn futures_util::Stream<Item = Result<Bytes>> + Send + Unpin> =
@@ -1796,7 +1806,7 @@ mod tests {
         let model = router.find_model("m").unwrap();
 
         let (provider, _output, attempts) =
-            router.stream(model, &dummy_request()).await.unwrap();
+            router.stream(model, &dummy_request(), None).await.unwrap();
         assert_eq!(provider.name(), "backup");
         assert!(attempts.is_empty(), "no upstream attempts should be recorded");
     }
@@ -1810,7 +1820,7 @@ mod tests {
         let model = router.find_model("m").unwrap();
 
         let err = router
-            .stream(model, &dummy_request())
+            .stream(model, &dummy_request(), None)
             .await
             .err()
             .expect("stream should fail");
@@ -1929,6 +1939,7 @@ mod tests {
             &self,
             _req: &MessagesRequest,
             _model_rewrite: &HashMap<String, String>,
+            _usage_sink: Option<crate::providers::StreamUsageSink>,
         ) -> Result<ProviderOutput> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             Err(ProxyError::Upstream {
@@ -2070,7 +2081,7 @@ mod tests {
         let model = router.find_model("m").unwrap();
 
         let (provider, _out, attempts) =
-            router.stream(model, &dummy_request()).await.unwrap();
+            router.stream(model, &dummy_request(), None).await.unwrap();
         // Backup served the stream after primary was skipped.
         assert_eq!(provider.name(), "backup");
         assert_eq!(primary.call_count.load(Ordering::SeqCst), 1);

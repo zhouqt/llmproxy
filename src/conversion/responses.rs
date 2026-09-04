@@ -599,7 +599,7 @@ pub fn responses_to_anthropic_response(
         usage_raw.output_tokens,
         cached,
         reasoning,
-        usage_raw.service_tier,
+        &usage_raw.service_tier,
     );
 
     Ok(MessagesResponse {

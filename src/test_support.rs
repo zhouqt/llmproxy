@@ -19,7 +19,43 @@
 
 use crate::anthropic::MessagesRequest;
 use serde_json::{json, Value};
+use std::sync::{Arc, Mutex};
+use tracing_subscriber::fmt::MakeWriter;
 use wiremock::{Match, Request};
+
+/// In-memory writer that captures every byte the tracing formatter
+/// writes. Cloning shares the same `Arc<Mutex<Vec<u8>>>` so multiple
+/// subscribers (or the subscriber + the assertion site) can read the
+/// same buffer.
+#[derive(Clone, Default)]
+pub struct CaptureWriter(pub Arc<Mutex<Vec<u8>>>);
+
+impl<'a> MakeWriter<'a> for CaptureWriter {
+    type Writer = CaptureWriterGuard;
+    fn make_writer(&'a self) -> Self::Writer {
+        CaptureWriterGuard {
+            inner: self.0.clone(),
+        }
+    }
+}
+
+/// Owned handle used by `tracing_subscriber::fmt` while writing each
+/// event. Holds an `Arc<Mutex<Vec<u8>>>` clone so the writer outlives
+/// any single borrow.
+pub struct CaptureWriterGuard {
+    inner: Arc<Mutex<Vec<u8>>>,
+}
+
+impl std::io::Write for CaptureWriterGuard {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut g = self.inner.lock().expect("CaptureWriter mutex poisoned");
+        g.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Wire-level "field X must NOT be present in the JSON request body"
 /// matcher. See module docs for rationale.

@@ -470,6 +470,7 @@ impl Provider for OpenAiCompatProvider {
         &self,
         req: &MessagesRequest,
         model_rewrite: &HashMap<String, String>,
+        usage_sink: Option<crate::providers::StreamUsageSink>,
     ) -> Result<ProviderOutput> {
         let merged = self.merged_rewrite(model_rewrite);
 
@@ -501,7 +502,7 @@ impl Provider for OpenAiCompatProvider {
             let status = resp.status();
             if status.is_success() {
                 let byte_stream = resp.bytes_stream();
-                let sse = OpenAiSseToAnthropic::new(byte_stream, &req.model);
+                let sse = OpenAiSseToAnthropic::new(byte_stream, &req.model, usage_sink);
                 if format_downgraded {
                     tracing::info!(
                         provider = %self.name,
@@ -555,13 +556,21 @@ pub struct OpenAiSseToAnthropic<S> {
     pending: BytesMut,
     finished: bool,
     output_buffer: VecDeque<Bytes>,
+    /// Shared cell into which the adapter writes the final captured
+    /// usage (if any) on terminal paths. `None` disables capture —
+    /// callers that don't need token counts may pass `None`.
+    usage_sink: Option<crate::providers::StreamUsageSink>,
 }
 
 impl<S> OpenAiSseToAnthropic<S>
 where
     S: Stream<Item = reqwest::Result<Bytes>> + Unpin,
 {
-    pub fn new(inner: S, model: &str) -> Self {
+    pub fn new(
+        inner: S,
+        model: &str,
+        usage_sink: Option<crate::providers::StreamUsageSink>,
+    ) -> Self {
         Self {
             inner,
             translator: Some(crate::conversion::stream::StreamTranslator::new(
@@ -571,7 +580,70 @@ where
             pending: BytesMut::new(),
             finished: false,
             output_buffer: VecDeque::new(),
+            usage_sink,
         }
+    }
+
+    /// Drain captured usage from the translator and write the
+    /// Anthropic-shaped `StreamUsage` into the sink. Must be called
+    /// BEFORE `self.translator.take()` runs `finalize()` — this
+    /// borrows the translator immutably (via `final_usage_ref`) instead
+    /// of taking it, so the value survives for the client-facing
+    /// `message_delta` usage emitted by `finalize()`. `finished`
+    /// gates re-entry so repeated calls are no-ops.
+    fn write_usage_to_sink(&mut self) {
+        self.write_usage_inner(false);
+    }
+
+    /// Error-envelope variant of `write_usage_to_sink`: preserves the
+    /// captured usage (if any) AND flags `errored` so `MappedStream`
+    /// classifies the stream as aborted — matching `PassthroughSse`
+    /// (native passthrough preserves usage + errored). When no usage
+    /// was captured it still emits the errored sentinel so the
+    /// aborted classification is never lost. Writing once (with the
+    /// flag) instead of write-then-clobber avoids discarding real
+    /// token counts (code-review F4).
+    fn write_errored_usage_to_sink(&mut self) {
+        self.write_usage_inner(true);
+    }
+
+    fn write_usage_inner(&mut self, errored: bool) {
+        let Some(sink) = self.usage_sink.clone() else {
+            return;
+        };
+        let Some(chat_usage) = self
+            .translator
+            .as_ref()
+            .and_then(|t| t.final_usage_ref().cloned())
+        else {
+            // No usage captured. On the errored path, still flag so
+            // MappedStream classifies as `streaming aborted`.
+            if errored {
+                sink.set(crate::providers::StreamUsage {
+                    errored: true,
+                    ..Default::default()
+                });
+            }
+            return;
+        };
+        let cached = chat_usage
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens)
+            .unwrap_or(0);
+        let reasoning = chat_usage
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|d| d.reasoning_tokens)
+            .unwrap_or(0);
+        let anthropic_usage = crate::conversion::util::build_usage(
+            chat_usage.prompt_tokens,
+            chat_usage.completion_tokens,
+            cached,
+            reasoning,
+            &chat_usage.service_tier,
+        );
+        sink.set(crate::providers::usage_to_stream_usage(&anthropic_usage, errored));
     }
 
     fn encode(ev: &StreamEvent) -> Bytes {
@@ -597,6 +669,10 @@ where
                 continue;
             }
             if payload == "[DONE]" {
+                // Write the captured usage BEFORE taking the translator —
+                // write_usage_to_sink borrows final_usage via as_ref, and
+                // take()/finalize() below would make it unreachable.
+                self.write_usage_to_sink();
                 if let Some(mut t) = self.translator.take() {
                     for ev in t.finalize() {
                         self.output_buffer.push_back(Self::encode(&ev));
@@ -625,6 +701,12 @@ where
                     }),
                 };
                 self.output_buffer.push_back(Self::encode(&event));
+                // Single write with the errored flag: preserves any
+                // captured usage AND flags aborted (code-review F4).
+                // The gated write early-returns when the error arrives
+                // before any usage chunk — the sentinel fires regardless
+                // so MappedStream classifies this as `streaming aborted`.
+                self.write_errored_usage_to_sink();
                 self.translator.take();
                 self.finished = true;
                 return;
@@ -684,7 +766,9 @@ where
                     return Poll::Ready(Some(Err(ProxyError::Http(e))));
                 }
                 Poll::Ready(None) => {
-                    // EOF: close translator if not already.
+                    // EOF: close translator if not already. Write the
+                    // captured usage first — see [DONE] note above.
+                    self.write_usage_to_sink();
                     if let Some(mut t) = self.translator.take() {
                         for ev in t.finalize() {
                             self.output_buffer.push_back(Self::encode(&ev));
@@ -921,7 +1005,7 @@ mod tests {
             "stream-model".to_string(),
         );
 
-        let output = provider.stream(&request(true), &rewrite).await.unwrap();
+        let output = provider.stream(&request(true), &rewrite, None).await.unwrap();
         expect_variant!(output, ProviderOutput::Stream(mut output) => {
             let mut encoded = String::new();
             while let Some(item) = output.next().await {
@@ -937,11 +1021,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_with_done_sentinel_writes_usage_to_sink() {
+        // Regression (code-review F1): `write_usage_to_sink` used to
+        // re-take the translator after the terminal path had already
+        // taken it, so the captured usage never reached the sink and the
+        // `streaming completed` log line carried no token counts for
+        // this provider family. A usage-carrying [DONE] stream must now
+        // materialize the usage in the shared cell.
+        use crate::providers::StreamUsageSink;
+
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data:{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\ndata:{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14}}\n\ndata: [DONE]\n\n",
+        ))];
+        let sink = StreamUsageSink::empty();
+        let mut adapter =
+            OpenAiSseToAnthropic::new(stream::iter(chunks), "model", Some(sink.clone()));
+        while let Some(item) = adapter.next().await {
+            let _ = item.unwrap();
+        }
+
+        let usage = sink.take().expect("sink must hold captured usage");
+        assert_eq!(usage.input, 10);
+        assert_eq!(usage.output, 4);
+        assert_eq!(usage.cache_read, None);
+        assert!(!usage.errored, "clean [DONE] stream must not be errored");
+    }
+
+    #[tokio::test]
+    async fn error_envelope_marks_sink_errored_and_skips_usage() {
+        // Regression (code-review F4): an upstream `data: {"error":...}`
+        // envelope must set the sink's `errored` flag (so MappedStream
+        // logs `streaming aborted`) even when the error arrived before
+        // any usage chunk — the gated usage write alone would leave the
+        // cell empty and the stream would be misclassified as a clean
+        // `streaming completed` with no tokens.
+        use crate::providers::StreamUsageSink;
+
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data:{\"error\":{\"message\":\"upstream exploded\"}}\n\n",
+        ))];
+        let sink = StreamUsageSink::empty();
+        let mut adapter =
+            OpenAiSseToAnthropic::new(stream::iter(chunks), "model", Some(sink.clone()));
+        while let Some(item) = adapter.next().await {
+            let _ = item.unwrap();
+        }
+
+        let usage = sink.take().expect("sink must hold the errored sentinel");
+        assert!(
+            usage.errored,
+            "error-envelope stream must be flagged errored, got: {usage:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_envelope_after_usage_preserves_usage_and_flags_errored() {
+        // Regression (code-review F4): an upstream `data:{"error":...}`
+        // envelope that arrives AFTER a real usage chunk must NOT zero
+        // the captured token counts. This adapter now writes once with
+        // the errored flag (like PassthroughSse) instead of
+        // write-then-clobber, so the shared cell holds `{input, output,
+        // errored:true}` — not `{0,0,errored:true}`.
+        use crate::providers::StreamUsageSink;
+
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data:{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14}}\n\ndata:{\"error\":{\"message\":\"upstream exploded\"}}\n\n",
+        ))];
+        let sink = StreamUsageSink::empty();
+        let mut adapter =
+            OpenAiSseToAnthropic::new(stream::iter(chunks), "model", Some(sink.clone()));
+        while let Some(item) = adapter.next().await {
+            let _ = item.unwrap();
+        }
+
+        let usage = sink.take().expect("sink must hold usage + errored");
+        assert!(usage.errored, "error-envelope must flag errored, got: {usage:?}");
+        assert_eq!(usage.input, 10, "captured usage must survive the error, got: {usage:?}");
+        assert_eq!(usage.output, 4, "captured usage must survive the error, got: {usage:?}");
+    }
+
+    #[tokio::test]
     async fn stream_maps_text_then_first_tool_to_distinct_anthropic_blocks() {
         let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
             b"data:{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"before\"},\"finish_reason\":null}]}\n\ndata:{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"EnterWorktree\",\"arguments\":\"{\\\"path\\\":\\\"/tmp/x\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata:{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
         ))];
-        let mut adapter = OpenAiSseToAnthropic::new(stream::iter(chunks), "model");
+        let mut adapter = OpenAiSseToAnthropic::new(stream::iter(chunks), "model", None);
         let mut events = Vec::new();
 
         while let Some(item) = adapter.next().await {
@@ -1008,7 +1172,7 @@ mod tests {
 
         let mut rewrite = HashMap::new();
         rewrite.insert("claude-sonnet-4-20250514".to_string(), "m".to_string());
-        let output = provider.stream(&request(true), &rewrite).await.unwrap();
+        let output = provider.stream(&request(true), &rewrite, None).await.unwrap();
         expect_variant!(output, ProviderOutput::Stream(mut output) => {
             let mut events = Vec::new();
             while let Some(item) = output.next().await {
@@ -1074,7 +1238,7 @@ mod tests {
         .unwrap();
 
         let error = provider
-            .stream(&request(true), &HashMap::new())
+            .stream(&request(true), &HashMap::new(), None)
             .await
             .err()
             .expect("request should fail");
@@ -1091,7 +1255,7 @@ mod tests {
             Ok(Bytes::from_static(b"event: ignored\ndata: not-json\ndata: {\"id\":\"c\",")),
             Ok(Bytes::from_static(b"\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n")),
         ];
-        let mut adapter = OpenAiSseToAnthropic::new(stream::iter(chunks), "model");
+        let mut adapter = OpenAiSseToAnthropic::new(stream::iter(chunks), "model", None);
         let mut encoded = String::new();
 
         while let Some(item) = adapter.next().await {
@@ -1111,7 +1275,7 @@ mod tests {
         let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
             b"data: \n: this is a comment\ndata:{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
         ))];
-        let mut adapter = OpenAiSseToAnthropic::new(stream::iter(chunks), "model");
+        let mut adapter = OpenAiSseToAnthropic::new(stream::iter(chunks), "model", None);
         let mut encoded = String::new();
 
         while let Some(item) = adapter.next().await {
@@ -1129,7 +1293,7 @@ mod tests {
         let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
             b"data: {\"error\":{\"message\":\"model rejected request\",\"type\":\"invalid_request_error\"}}\n\n",
         ))];
-        let mut adapter = OpenAiSseToAnthropic::new(stream::iter(chunks), "model");
+        let mut adapter = OpenAiSseToAnthropic::new(stream::iter(chunks), "model", None);
         let mut encoded = String::new();
 
         while let Some(item) = adapter.next().await {
@@ -1155,7 +1319,7 @@ mod tests {
                     .unwrap_err(),
             )),
         ];
-        let mut adapter = OpenAiSseToAnthropic::new(stream::iter(chunks), "model");
+        let mut adapter = OpenAiSseToAnthropic::new(stream::iter(chunks), "model", None);
 
         let mut items = Vec::new();
         while let Some(item) = adapter.next().await {
@@ -1178,7 +1342,7 @@ mod tests {
         let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
             b"data:{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"final\"},\"finish_reason\":null}]}\n\n",
         ))];
-        let mut adapter = OpenAiSseToAnthropic::new(stream::iter(chunks), "model");
+        let mut adapter = OpenAiSseToAnthropic::new(stream::iter(chunks), "model", None);
         let mut encoded = String::new();
 
         while let Some(item) = adapter.next().await {
@@ -1259,6 +1423,7 @@ mod tests {
         let mut adapter = OpenAiSseToAnthropic::new(
             stream::pending::<reqwest::Result<Bytes>>(),
             "model",
+            None,
         );
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
@@ -1503,7 +1668,7 @@ mod tests {
         let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
             b"data:{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\ndata:{\"choices\":[],\"x-opencode-type\":\"inference-cost\",\"cost\":\"0.00\"}\n\ndata: [DONE]\n\n",
         ))];
-        let mut adapter = OpenAiSseToAnthropic::new(stream::iter(chunks), "model");
+        let mut adapter = OpenAiSseToAnthropic::new(stream::iter(chunks), "model", None);
         let mut encoded = String::new();
         while let Some(item) = adapter.next().await {
             encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
@@ -1523,7 +1688,7 @@ mod tests {
         let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
             b"data:{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata:{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2,\"total_tokens\":6}}\n\ndata:{\"choices\":[],\"x-opencode-type\":\"inference-cost\"}\n\ndata: [DONE]\n\n",
         ))];
-        let mut adapter = OpenAiSseToAnthropic::new(stream::iter(chunks), "model");
+        let mut adapter = OpenAiSseToAnthropic::new(stream::iter(chunks), "model", None);
         let mut encoded = String::new();
         while let Some(item) = adapter.next().await {
             encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
@@ -1541,7 +1706,7 @@ mod tests {
         let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
             b"data:{\"choices\":[],\"x-opencode-type\":\"inference-cost\"}\n\ndata:{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
         ))];
-        let mut adapter = OpenAiSseToAnthropic::new(stream::iter(chunks), "model");
+        let mut adapter = OpenAiSseToAnthropic::new(stream::iter(chunks), "model", None);
         let mut encoded = String::new();
         while let Some(item) = adapter.next().await {
             encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
@@ -2161,7 +2326,7 @@ mod tests {
         .unwrap();
 
         let err = provider
-            .stream(&thinking_request(true), &HashMap::new())
+            .stream(&thinking_request(true), &HashMap::new(), None)
             .await
             .err()
             .expect("reasoning-echo must surface as Err");
@@ -2687,7 +2852,7 @@ mod tests {
         .unwrap();
 
         let output = provider
-            .stream(&format_request(true), &HashMap::new())
+            .stream(&format_request(true), &HashMap::new(), None)
             .await
             .unwrap();
         expect_variant!(output, ProviderOutput::Stream(mut stream) => {
@@ -2758,7 +2923,7 @@ mod tests {
         .unwrap();
 
         let err = provider
-            .stream(&format_request(true), &HashMap::new())
+            .stream(&format_request(true), &HashMap::new(), None)
             .await
             .err()
             .expect("second 400 must surface as Err");
@@ -2808,7 +2973,7 @@ mod tests {
         .unwrap();
 
         let err = provider
-            .stream(&format_request(true), &HashMap::new())
+            .stream(&format_request(true), &HashMap::new(), None)
             .await
             .err()
             .expect("should fail");
@@ -3145,7 +3310,7 @@ mod tests {
         .unwrap();
 
         let output = provider
-            .stream(&request(true), &HashMap::new())
+            .stream(&request(true), &HashMap::new(), None)
             .await
             .unwrap();
         expect_variant!(output, ProviderOutput::Stream(mut stream) => {
@@ -3451,7 +3616,7 @@ mod tests {
         .unwrap();
 
         let out = provider
-            .stream(&thinking_request_with_redacted(true), &HashMap::new())
+            .stream(&thinking_request_with_redacted(true), &HashMap::new(), None)
             .await
             .expect("reasoning_echo=true must succeed without envelope");
         // The output must be a Stream (not an error). Wire the stream

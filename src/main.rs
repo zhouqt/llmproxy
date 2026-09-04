@@ -7,8 +7,8 @@ use tracing_subscriber::EnvFilter;
 
 #[allow(unused_imports)]
 use llmproxy::{
-    anthropic, auth, config, conversion, cooldown, error, oauth, openai, proxy_client, providers,
-    router, server, state,
+    anthropic, auth, config, conversion, cooldown, error, oauth, openai,
+    proxy_client, providers, router, server, state,
 };
 
 use crate::config::Config;

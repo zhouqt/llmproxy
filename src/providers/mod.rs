@@ -14,11 +14,73 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::Stream;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::anthropic::MessagesRequest;
 use crate::config::ProviderConfig;
 use crate::error::Result;
+
+/// Per-stream token usage captured from upstream response. Used by the
+/// streaming log line to surface per-request token counts (`input`,
+/// `output`, `cache_read`). `cache_read` is `None` when the upstream
+/// did not report a cache hit. `errored` is set when the stream
+/// terminated with an upstream error envelope (not a transport-level
+/// `Err`) — `MappedStream` reads it to classify the stream as
+/// `streaming aborted` instead of a clean `streaming completed`.
+#[derive(Clone, Debug, Default)]
+pub struct StreamUsage {
+    pub input: u32,
+    pub output: u32,
+    pub cache_read: Option<u32>,
+    pub errored: bool,
+}
+
+/// Shared, thread-safe cell that holds a `StreamUsage` written by an
+/// SSE adapter and read by `MappedStream::with_callback` at terminal
+/// `Ready(None)` time. The two ends share a single `Arc<Mutex<...>>`
+/// so the value is materialized before the adapter is dropped.
+#[derive(Clone, Default)]
+pub struct StreamUsageSink {
+    inner: Arc<Mutex<Option<StreamUsage>>>,
+}
+
+impl StreamUsageSink {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Wrap an existing `Arc` — used by `messages_handler` so it can
+    /// pass one clone to the provider's `stream` call and another to
+    /// `MappedStream::with_callback`. Both ends reference the same
+    /// state cell.
+    pub fn from_arc(inner: Arc<Mutex<Option<StreamUsage>>>) -> Self {
+        Self { inner }
+    }
+
+    /// Borrow the underlying `Arc` for cloning into another owner
+    /// (e.g. `MappedStream`).
+    pub fn arc(&self) -> Arc<Mutex<Option<StreamUsage>>> {
+        self.inner.clone()
+    }
+
+    pub fn set(&self, usage: StreamUsage) {
+        let mut g = self
+            .inner
+            .lock()
+            .expect("StreamUsageSink mutex poisoned");
+        *g = Some(usage);
+    }
+
+    /// Take the current value (consuming it). Returns `None` if the
+    /// SSE adapter never wrote (no usage reported).
+    pub fn take(&self) -> Option<StreamUsage> {
+        let mut g = self
+            .inner
+            .lock()
+            .expect("StreamUsageSink mutex poisoned");
+        g.take()
+    }
+}
 
 /// Output of a Provider call. Either a complete JSON response body or a
 /// byte stream of SSE-encoded Anthropic events.
@@ -31,7 +93,17 @@ pub enum ProviderOutput {
 pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
     async fn complete(&self, req: &MessagesRequest, model_rewrite: &std::collections::HashMap<String, String>) -> Result<ProviderOutput>;
-    async fn stream(&self, req: &MessagesRequest, model_rewrite: &std::collections::HashMap<String, String>) -> Result<ProviderOutput>;
+    /// Streaming variant of `complete`. `usage_sink` is an optional
+    /// cell into which the provider's SSE adapter writes the final
+    /// `StreamUsage` (if the upstream reports usage). `None` disables
+    /// capture; this is the value `messages_handler` passes when the
+    /// caller doesn't need per-stream token counts.
+    async fn stream(
+        &self,
+        req: &MessagesRequest,
+        model_rewrite: &std::collections::HashMap<String, String>,
+        usage_sink: Option<StreamUsageSink>,
+    ) -> Result<ProviderOutput>;
     /// Whether this provider can serve `model` without the proxy sending an
     /// unmapped name upstream. Providers with an empty rewrite table accept
     /// any model name verbatim (they expose a model catalog of their own);
@@ -88,6 +160,23 @@ pub trait Provider: Send + Sync {
 }
 
 pub type SharedProvider = Arc<dyn Provider>;
+
+/// Convert an Anthropic-shaped `Usage` into the log-facing `StreamUsage`,
+/// carrying the errored flag. Shared by the SSE adapters
+/// (`OpenAiSseToAnthropic`, `ResponsesSseToAnthropic`, `PassthroughSse`)
+/// so the `build_usage → StreamUsage` mapping lives in one place instead
+/// of being duplicated per adapter (code-review F8).
+pub(crate) fn usage_to_stream_usage(
+    usage: &crate::anthropic::Usage,
+    errored: bool,
+) -> StreamUsage {
+    StreamUsage {
+        input: usage.input_tokens,
+        output: usage.output_tokens,
+        cache_read: usage.cache_read_input_tokens,
+        errored,
+    }
+}
 
 /// Detect whether `api_base` points at the OpenRouter gateway.
 ///
@@ -296,5 +385,93 @@ mod tests {
         // Unparseable / empty input is conservative `false`.
         assert!(!is_openrouter_api_base("not-a-url"));
         assert!(!is_openrouter_api_base(""));
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // StreamUsage + StreamUsageSink — covering the new types added for
+    // streaming token capture. The two ends (SSE adapter writer +
+    // MappedStream reader) share a single `Arc<Mutex<Option<...>>>`
+    // so the value is materialized before the adapter is dropped
+    // (Sonnet M5 — deterministic ordering).
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn stream_usage_sink_round_trips_through_set_and_take() {
+        let sink = StreamUsageSink::empty();
+        assert!(sink.take().is_none(), "fresh sink must be empty");
+        sink.set(StreamUsage {
+            input: 7,
+            output: 3,
+            cache_read: Some(2),
+            ..Default::default()
+        });
+        let got = sink.take().expect("set value must be readable");
+        assert_eq!(got.input, 7);
+        assert_eq!(got.output, 3);
+        assert_eq!(got.cache_read, Some(2));
+        assert!(!got.errored, "default errored must be false");
+        // take() is consuming: a second take returns None.
+        assert!(sink.take().is_none());
+    }
+
+    #[test]
+    fn stream_usage_sink_arc_shares_state_between_writer_and_reader() {
+        // Two clones of the same sink must observe the same writes.
+        // This is the wire shape that MappedStream relies on.
+        let sink_a = StreamUsageSink::empty();
+        let sink_b = sink_a.clone();
+        sink_a.set(StreamUsage {
+            input: 1,
+            output: 2,
+            cache_read: None,
+            ..Default::default()
+        });
+        let got = sink_b.take().expect("writer's clone must see the value");
+        assert_eq!(got.input, 1);
+        assert_eq!(got.output, 2);
+        assert!(got.cache_read.is_none());
+    }
+
+    #[test]
+    fn stream_usage_sink_from_arc_wraps_existing_cell() {
+        let cell: Arc<Mutex<Option<StreamUsage>>> = Arc::new(Mutex::new(None));
+        let sink = StreamUsageSink::from_arc(cell.clone());
+        sink.set(StreamUsage {
+            input: 5,
+            output: 5,
+            cache_read: Some(0),
+            ..Default::default()
+        });
+        // Direct read of the underlying cell must observe the same
+        // write — confirms `from_arc` shares the cell by reference,
+        // not by snapshot.
+        let g = cell.lock().unwrap();
+        let usage = g.clone().expect("cell must hold a value");
+        assert_eq!(usage.input, 5);
+        assert_eq!(usage.cache_read, Some(0));
+    }
+
+    #[test]
+    fn stream_usage_sink_arc_accessor_round_trips() {
+        let sink = StreamUsageSink::empty();
+        let cell = sink.arc();
+        sink.set(StreamUsage {
+            input: 9,
+            output: 1,
+            cache_read: None,
+            ..Default::default()
+        });
+        let g = cell.lock().unwrap();
+        let usage = g.clone().expect("cell must hold a value");
+        assert_eq!(usage.input, 9);
+        assert_eq!(usage.output, 1);
+    }
+
+    #[test]
+    fn stream_usage_default_is_zeros_and_none() {
+        let u = StreamUsage::default();
+        assert_eq!(u.input, 0);
+        assert_eq!(u.output, 0);
+        assert!(u.cache_read.is_none());
     }
 }

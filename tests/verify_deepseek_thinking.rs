@@ -654,7 +654,7 @@ async fn stream_thinking_400_with_thinking_history_returns_friendly_error() {
     // Call provider.stream() directly — not through Router.
     let ds_provider = router.providers().get("deepseek").unwrap();
     let err = ds_provider
-        .stream(&req, &HashMap::new())
+        .stream(&req, &HashMap::new(), None)
         .await
         .err()
         .expect("thinking mismatch on stream must surface as Err");

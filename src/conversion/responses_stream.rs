@@ -488,6 +488,17 @@ impl ResponsesStreamTranslator {
         out
     }
 
+    /// Borrow the most recent `ResponsesUsage` without consuming it.
+    /// `finalize()` consumes `final_usage` via `take()`, so the SSE
+    /// adapters must clone through this reference BEFORE calling
+    /// `finalize()` — otherwise the log sink write and the client-facing
+    /// `message_delta` usage would race for the same value. (A consuming
+    /// `take_final_usage` was removed in code-review F7 — calling it
+    /// before `finalize()` would have broken the sink-write ordering.)
+    pub fn final_usage_ref(&self) -> Option<&crate::responses::ResponsesUsage> {
+        self.final_usage.as_ref()
+    }
+
     pub fn finalize(&mut self) -> Vec<StreamEvent> {
         if self.finalized {
             return Vec::new();
@@ -545,7 +556,7 @@ impl ResponsesStreamTranslator {
             raw.output_tokens,
             cached,
             reasoning,
-            raw.service_tier,
+            &raw.service_tier,
         ));
         out.push(StreamEvent::MessageDelta {
             delta: MessageDeltaPayload {
