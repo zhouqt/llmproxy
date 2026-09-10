@@ -61,6 +61,23 @@ server:
 # user_agent: "claude-cli/2.1.224 (external, claude-vscode, agent-sdk/0.3.224)"
 
 # ───────────────────────────────────────────────────────────────────────
+# usage_capacity: in-memory ring buffer size for /admin/usage
+# ───────────────────────────────────────────────────────────────────────
+# Every /v1/messages request — streaming and non-streaming — appends
+# one row (started_at / ended_at / provider / model / tokens / outcome
+# / failed_providers) to an in-memory FIFO ring buffer that backs the
+# /admin/usage endpoint. When the buffer is full the oldest row is
+# evicted.
+#
+# Set `usage_capacity: 0` to disable the feature entirely — the
+# request path keeps working, no rows are written, and `/admin/usage`
+# reports an empty snapshot. Hard-capped at 1_000_000 rows (any value
+# above that is silently clamped with a startup warning). Default:
+# 100_000.
+#
+# usage_capacity: 100000
+
+# ───────────────────────────────────────────────────────────────────────
 # providers: backend LLM services the proxy can route to
 # ───────────────────────────────────────────────────────────────────────
 # Each provider is keyed by `name`; the `models:` section below refers
