@@ -1,0 +1,20 @@
+services:
+  llmproxy:
+    image: localhost/llmproxy_llmproxy:latest
+    ports:
+      - "127.0.0.1:1025:1025"
+    volumes:
+      - ./config.dev.yaml:/etc/llmproxy/config.yaml:ro
+      - llmproxy-data-dev:/root/.local/share/llmproxy
+    # Secrets and per-host config come from .env (gitignored). Copy
+    # .env.example -> .env and fill in real values before `docker
+    # compose up`. `env_file` lets us keep this YAML free of any
+    # host-specific data so the file can be pushed without conflicts.
+    env_file:
+      - dev.env
+    environment:
+      # Non-secret defaults only. Override per-host via .env if needed.
+      - RUST_LOG=${RUST_LOG:-debug}
+    restart: unless-stopped
+volumes:
+  llmproxy-data-dev:
