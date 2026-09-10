@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -17,11 +18,24 @@ use llmproxy::error::{ProxyError, Result};
 use llmproxy::providers::{Provider, ProviderOutput, SharedProvider};
 use llmproxy::router::Router;
 use llmproxy::state::AppState;
+use llmproxy::usage::{Outcome, UsageRecord, UsageStats};
 
 enum CompleteBehavior {
     Json,
     Stream,
+    MalformedJson,
     Error(u16),
+    /// First `fail_count` calls return `Upstream{status, body}`,
+    /// subsequent calls return a normal success JSON. C6 regression:
+    /// lets a single test exercise "primary retried N times before
+    /// succeeding" without standing up a per-test provider impl.
+    FailThenSucceed {
+        status: u16,
+        fail_count: u8,
+        /// Mutable counter shared via Arc so successive `complete`
+        /// invocations see each other's increments.
+        counter: Arc<AtomicU32>,
+    },
 }
 
 enum StreamBehavior {
@@ -49,7 +63,7 @@ impl Provider for TestProvider {
         _req: &MessagesRequest,
         _model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
-        match self.complete {
+        match &self.complete {
             CompleteBehavior::Json => Ok(ProviderOutput::Json(json!({
                 "id": "msg_test",
                 "type": "message",
@@ -60,13 +74,40 @@ impl Provider for TestProvider {
                 "stop_sequence": null,
                 "usage": {"input_tokens": 2, "output_tokens": 1}
             }))),
+            CompleteBehavior::MalformedJson => Ok(ProviderOutput::Json(json!({
+                "unexpected": true
+            }))),
             CompleteBehavior::Stream => {
                 Ok(ProviderOutput::Stream(Box::new(stream::empty())))
             }
             CompleteBehavior::Error(status) => Err(ProxyError::Upstream {
-                status,
+                status: *status,
                 body: "upstream failed".to_string(),
             }),
+            CompleteBehavior::FailThenSucceed {
+                status,
+                fail_count,
+                counter,
+            } => {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                if n < u32::from(*fail_count) {
+                    Err(ProxyError::Upstream {
+                        status: *status,
+                        body: format!("planned fail #{n}"),
+                    })
+                } else {
+                    Ok(ProviderOutput::Json(json!({
+                        "id": "msg_test",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "model": "upstream-model",
+                        "stop_reason": "end_turn",
+                        "stop_sequence": null,
+                        "usage": {"input_tokens": 2, "output_tokens": 1}
+                    })))
+                }
+            }
         }
     }
 
@@ -113,6 +154,15 @@ fn build_app(
     primary: SharedProvider,
     backup: Option<SharedProvider>,
 ) -> axum::Router {
+    build_app_with_usage(api_key, primary, backup, UsageStats::new(0))
+}
+
+fn build_app_with_usage(
+    api_key: Option<&str>,
+    primary: SharedProvider,
+    backup: Option<SharedProvider>,
+    usage: UsageStats,
+) -> axum::Router {
     let mut providers = HashMap::new();
     providers.insert("primary".to_string(), primary);
     let mut provider_configs = vec![ProviderConfig::OpenaiCompat {
@@ -139,6 +189,7 @@ fn build_app(
     } else {
         vec![]
     };
+    let capacity = usage.capacity();
     let config = Config {
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
@@ -155,7 +206,8 @@ fn build_app(
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-    };
+
+        usage_capacity: capacity,};
     let config = Arc::new(config);
     let cooldown = CooldownCache::new();
     let router = Arc::new(Router::new(config.clone(), providers, cooldown.clone()));
@@ -165,7 +217,8 @@ fn build_app(
         cooldown,
         http: reqwest::Client::new(),
         copilot: None,
-    })
+
+        usage,})
 }
 
 fn test_request(method: Method, uri: &str, body: Option<Value>) -> Request<Body> {
@@ -968,7 +1021,8 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
                 max_retries_total: 1,
             },
         ],
-    };
+    
+        usage_capacity: 0,};
     let config = Arc::new(config);
     let cooldown = CooldownCache::new();
     let router = Arc::new(Router::new(config.clone(), providers, cooldown.clone()));
@@ -978,7 +1032,8 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
         cooldown,
         http: reqwest::Client::new(),
         copilot: None,
-    });
+    
+        usage: llmproxy::usage::UsageStats::new(0),});
 
     // Auth gate applies: /v1/models requires authentication.
     let unauth = app
@@ -1092,7 +1147,8 @@ async fn list_models_collision_winner_follows_chain_order_deterministically() {
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-    };
+    
+        usage_capacity: 0,};
     let config = Arc::new(config);
     let cooldown = CooldownCache::new();
     let router = Arc::new(Router::new(config.clone(), providers, cooldown.clone()));
@@ -1102,7 +1158,8 @@ async fn list_models_collision_winner_follows_chain_order_deterministically() {
         cooldown,
         http: reqwest::Client::new(),
         copilot: None,
-    });
+    
+        usage: llmproxy::usage::UsageStats::new(0),});
 
     let mut req = test_request(Method::GET, "/v1/models", None);
     req.headers_mut()
@@ -1205,7 +1262,8 @@ async fn admin_models_lists_every_provider_without_dedup() {
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-    };
+    
+        usage_capacity: 0,};
     let config = Arc::new(config);
     let cooldown = CooldownCache::new();
     let router = Arc::new(Router::new(config.clone(), providers, cooldown.clone()));
@@ -1215,7 +1273,8 @@ async fn admin_models_lists_every_provider_without_dedup() {
         cooldown,
         http: reqwest::Client::new(),
         copilot: None,
-    });
+    
+        usage: llmproxy::usage::UsageStats::new(0),});
 
     // Auth gate applies to /admin/* too.
     let unauth = app
@@ -1309,7 +1368,8 @@ async fn admin_models_reports_fetch_failed_for_provider_without_catalog() {
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-    };
+    
+        usage_capacity: 0,};
     let config = Arc::new(config);
     let cooldown = CooldownCache::new();
     let router = Arc::new(Router::new(config.clone(), providers, cooldown.clone()));
@@ -1319,7 +1379,8 @@ async fn admin_models_reports_fetch_failed_for_provider_without_catalog() {
         cooldown,
         http: reqwest::Client::new(),
         copilot: None,
-    });
+    
+        usage: llmproxy::usage::UsageStats::new(0),});
 
     let mut req = test_request(Method::GET, "/admin/models", None);
     req.headers_mut()
@@ -1342,4 +1403,1293 @@ async fn admin_models_reports_fetch_failed_for_provider_without_catalog() {
         "static rewrite entries survive a failed discovery"
     );
     assert_eq!(models[0]["id"], "static-upstream");
+}
+
+// ---------------------------------------------------------------------------
+// /admin/usage endpoint tests (plan §Tests L846-857)
+//
+// Coverage required:
+//   - 401 without bearer / 200 with (mirror /admin/status auth tests)
+//   - JSON shape snapshot (started_at, capacity, retained, evicted_total,
+//     filter, records, rollup)
+//   - filter params (since, until, model, provider, group_by, limit)
+//   - since=bogus → 400
+//   - capacity-0 zero-body invariant
+//   - collection path coverage: non-streaming + streaming record a row
+// ---------------------------------------------------------------------------
+
+use chrono::{DateTime, Utc};
+use llmproxy::usage::StreamUsage;
+
+fn ts(s: &str) -> DateTime<Utc> {
+    // RFC 3339 fixed timestamp; the offset is normalized to UTC.
+    DateTime::parse_from_rfc3339(s)
+        .unwrap()
+        .with_timezone(&Utc)
+}
+
+fn mk_record(
+    started_at: &str,
+    provider: &str,
+    model: &str,
+    input: Option<u32>,
+    output: Option<u32>,
+    cache_read: Option<u32>,
+    cache_creation: Option<u32>,
+    reasoning: Option<u32>,
+) -> UsageRecord {
+    let sa = ts(started_at);
+    let usage = StreamUsage {
+        input_tokens: input,
+        output_tokens: output,
+        cache_creation_input_tokens: cache_creation,
+        cache_read_input_tokens: cache_read,
+        thinking_tokens: reasoning,
+        server_tool_use: None,
+    };
+    let total_tokens = UsageRecord::compute_total_tokens(Some(&usage));
+    UsageRecord {
+        started_at: sa,
+        ended_at: sa + chrono::Duration::milliseconds(100),
+        elapsed_ms: 100,
+        provider: provider.into(),
+        model: model.into(),
+        stream: false,
+        outcome: Outcome::Success,
+        usage: Some(usage),
+        failed_providers: vec![],
+        total_tokens,
+    }
+}
+
+#[tokio::test]
+async fn admin_usage_requires_auth_when_api_key_set() {
+    let app = build_app_with_usage(
+        Some("secret"),
+        provider(
+            "primary",
+            CompleteBehavior::Json,
+            StreamBehavior::Bytes("unused"),
+        ),
+        None,
+        UsageStats::new(8),
+    );
+    let resp = app
+        .oneshot(test_request(Method::GET, "/admin/usage", None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn admin_usage_open_when_api_key_unset() {
+    let app = build_app_with_usage(
+        None,
+        provider(
+            "primary",
+            CompleteBehavior::Json,
+            StreamBehavior::Bytes("unused"),
+        ),
+        None,
+        UsageStats::new(8),
+    );
+    let resp = app
+        .oneshot(test_request(Method::GET, "/admin/usage", None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn admin_usage_capacity_zero_returns_empty_body() {
+    // Plan L432/777-780: capacity==0 ⇒ the feature is off, so the
+    // endpoint returns the empty-store invariant shape.
+    let app = build_app_with_usage(
+        Some("secret"),
+        provider(
+            "primary",
+            CompleteBehavior::Json,
+            StreamBehavior::Bytes("unused"),
+        ),
+        None,
+        UsageStats::new(0),
+    );
+    let mut req = test_request(Method::GET, "/admin/usage", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["capacity"], 0);
+    assert_eq!(body["retained"], 0);
+    assert_eq!(body["evicted_total"], 0);
+    assert_eq!(body["records"].as_array().unwrap().len(), 0);
+    assert_eq!(body["rollup"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn admin_usage_shape_snapshot_when_records_present() {
+    let usage = UsageStats::new(8);
+    usage.record(mk_record(
+        "2026-09-09T10:00:00Z",
+        "p1",
+        "m1",
+        Some(100),
+        Some(20),
+        Some(0),
+        None,
+        None,
+    ));
+    let app = build_app_with_usage(
+        Some("secret"),
+        provider(
+            "primary",
+            CompleteBehavior::Json,
+            StreamBehavior::Bytes("unused"),
+        ),
+        None,
+        usage,
+    );
+    let mut req = test_request(Method::GET, "/admin/usage", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("cache-control").unwrap(),
+        "no-store",
+        "endpoint must disable intermediate caches"
+    );
+    let body = body_json(resp).await;
+    // Top-level bookkeeping
+    assert_eq!(body["capacity"], 8);
+    assert_eq!(body["retained"], 1);
+    assert_eq!(body["evicted_total"], 0);
+    assert!(
+        body["started_at"].is_string(),
+        "started_at must always be present"
+    );
+    // Filter echo (defaults)
+    assert!(body["filter"]["since"].is_null());
+    assert!(body["filter"]["until"].is_null());
+    assert!(body["filter"]["model"].is_null());
+    assert!(body["filter"]["provider"].is_null());
+    assert_eq!(body["filter"]["group_by"], "model_provider");
+    assert_eq!(body["filter"]["limit"], 1000);
+    // Records page — token fields live at top level via #[serde(flatten)]
+    // on the optional `usage: Option<StreamUsage>`. Fields whose
+    // underlying value is None are simply absent (additive contract).
+    let rec = &body["records"][0];
+    assert_eq!(rec["model"], "m1");
+    assert_eq!(rec["provider"], "p1");
+    assert_eq!(rec["input_tokens"], 100);
+    assert_eq!(rec["output_tokens"], 20);
+    assert_eq!(rec["total_tokens"], 120);
+    // Wire field is `cache_read_input_tokens` (additive — matches the
+    // upstream Messages-API `usage` block); plan §Endpoint uses
+    // `cache_read_tokens` as a short alias in the example shape.
+    assert_eq!(rec["cache_read_input_tokens"], 0);
+    assert!(
+        rec.get("cache_creation_tokens").is_none(),
+        "absent (None in source) rather than null on the wire"
+    );
+    assert!(
+        rec.get("cache_creation_input_tokens").is_none(),
+        "absent (None in source) rather than null on the wire"
+    );
+    assert!(
+        rec.get("thinking_tokens").is_none(),
+        "absent (None in source) rather than null on the wire"
+    );
+    // Rollup aggregation (single bucket)
+    let roll = &body["rollup"][0];
+    assert_eq!(roll["model"], "m1");
+    assert_eq!(roll["provider"], "p1");
+    assert_eq!(roll["requests"], 1);
+    assert_eq!(roll["input_tokens"], 100);
+    assert_eq!(roll["output_tokens"], 20);
+    assert_eq!(roll["total_tokens"], 120);
+    // cache_read_ratio == null because cache_read_tokens == 0 (plan L1039-1042)
+    assert!(roll["cache_read_ratio"].is_null());
+}
+
+#[tokio::test]
+async fn admin_usage_filter_by_since_until_half_open() {
+    let usage = UsageStats::new(8);
+    // 3 rows across a 3-day window
+    usage.record(mk_record(
+        "2026-09-07T10:00:00Z",
+        "p1",
+        "m1",
+        Some(1),
+        Some(1),
+        None,
+        None,
+        None,
+    ));
+    usage.record(mk_record(
+        "2026-09-08T10:00:00Z",
+        "p1",
+        "m1",
+        Some(1),
+        Some(1),
+        None,
+        None,
+        None,
+    ));
+    usage.record(mk_record(
+        "2026-09-09T10:00:00Z",
+        "p1",
+        "m1",
+        Some(1),
+        Some(1),
+        None,
+        None,
+        None,
+    ));
+    let app = build_app_with_usage(
+        Some("secret"),
+        provider(
+            "primary",
+            CompleteBehavior::Json,
+            StreamBehavior::Bytes("unused"),
+        ),
+        None,
+        usage,
+    );
+    // since=2026-09-08 inclusive, until=2026-09-09 exclusive
+    // → only the 09-08 row should match.
+    let uri = "/admin/usage?since=2026-09-08T00:00:00Z&until=2026-09-09T00:00:00Z";
+    let mut req = test_request(Method::GET, uri, None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let recs = body["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 1, "half-open window should pick exactly one row");
+    let at = recs[0]["started_at"].as_str().unwrap();
+    assert!(
+        at.starts_with("2026-09-08T10:00:00"),
+        "expected 09-08 record, got {at}"
+    );
+    // Rollup must reflect the filtered set too.
+    let roll = &body["rollup"][0];
+    assert_eq!(roll["requests"], 1);
+}
+
+#[tokio::test]
+async fn admin_usage_filter_by_model_and_provider() {
+    let usage = UsageStats::new(16);
+    usage.record(mk_record("2026-09-09T10:00:00Z", "p1", "m1", Some(1), Some(1), None, None, None));
+    usage.record(mk_record("2026-09-09T10:00:01Z", "p2", "m1", Some(1), Some(1), None, None, None));
+    usage.record(mk_record("2026-09-09T10:00:02Z", "p1", "m2", Some(1), Some(1), None, None, None));
+    let app = build_app_with_usage(
+        Some("secret"),
+        provider("primary", CompleteBehavior::Json, StreamBehavior::Bytes("unused")),
+        None,
+        usage,
+    );
+    // Filter to provider=p1
+    let mut req = test_request(Method::GET, "/admin/usage?provider=p1", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let body = body_json(app.clone().oneshot(req).await.unwrap()).await;
+    let recs = body["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 2, "provider filter keeps p1 rows");
+    assert!(recs.iter().all(|r| r["provider"] == "p1"));
+    // Filter to model=m2
+    let mut req = test_request(Method::GET, "/admin/usage?model=m2", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let body = body_json(app.oneshot(req).await.unwrap()).await;
+    let recs = body["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0]["model"], "m2");
+}
+
+#[tokio::test]
+async fn admin_usage_group_by_model_only() {
+    let usage = UsageStats::new(16);
+    usage.record(mk_record("2026-09-09T10:00:00Z", "p1", "m1", Some(1), Some(1), None, None, None));
+    usage.record(mk_record("2026-09-09T10:00:01Z", "p2", "m1", Some(1), Some(1), None, None, None));
+    usage.record(mk_record("2026-09-09T10:00:02Z", "p1", "m2", Some(1), Some(1), None, None, None));
+    let app = build_app_with_usage(
+        Some("secret"),
+        provider("primary", CompleteBehavior::Json, StreamBehavior::Bytes("unused")),
+        None,
+        usage,
+    );
+    let mut req = test_request(Method::GET, "/admin/usage?group_by=model", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let body = body_json(app.oneshot(req).await.unwrap()).await;
+    let roll = body["rollup"].as_array().unwrap();
+    assert_eq!(roll.len(), 2, "two distinct models");
+    let m1 = roll.iter().find(|r| r["model"] == "m1").unwrap();
+    let m2 = roll.iter().find(|r| r["model"] == "m2").unwrap();
+    assert_eq!(m1["requests"], 2, "m1 served by both p1 and p2");
+    assert_eq!(m2["requests"], 1);
+    // provider field is suppressed in model-only mode
+    assert!(m1["provider"].is_null());
+}
+
+#[tokio::test]
+async fn admin_usage_cache_read_ratio_when_cache_hit_present() {
+    let usage = UsageStats::new(8);
+    usage.record(mk_record(
+        "2026-09-09T10:00:00Z",
+        "p1",
+        "m1",
+        Some(100),
+        Some(20),
+        Some(40),
+        None,
+        None,
+    ));
+    let app = build_app_with_usage(
+        Some("secret"),
+        provider("primary", CompleteBehavior::Json, StreamBehavior::Bytes("unused")),
+        None,
+        usage,
+    );
+    let mut req = test_request(Method::GET, "/admin/usage", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let body = body_json(app.oneshot(req).await.unwrap()).await;
+    let roll = &body["rollup"][0];
+    // input=100, cache_read=40. Anthropic counts cache reads inside
+    // input_tokens, so the ratio is 40/100 = 0.4 — NOT 40/140 (the old
+    // double-counting denominator; see C4).
+    let ratio = roll["cache_read_ratio"].as_f64().unwrap();
+    assert!((ratio - 0.4).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn admin_usage_cache_read_ratio_is_one_for_fully_cached_request() {
+    // C4 regression: a request whose input is entirely served from
+    // cache (input_tokens == cache_read_input_tokens) must report a
+    // cache hit ratio of 1.0. The old `cache_read / (cache_read +
+    // input)` denominator double-counted the cache portion and froze
+    // full-cache requests at 0.5.
+    let usage = UsageStats::new(8);
+    usage.record(mk_record(
+        "2026-09-09T10:00:00Z",
+        "p1",
+        "m1",
+        Some(100),
+        Some(20),
+        Some(100),
+        None,
+        None,
+    ));
+    let app = build_app_with_usage(
+        Some("secret"),
+        provider("primary", CompleteBehavior::Json, StreamBehavior::Bytes("unused")),
+        None,
+        usage,
+    );
+    let mut req = test_request(Method::GET, "/admin/usage", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let body = body_json(app.oneshot(req).await.unwrap()).await;
+    let roll = &body["rollup"][0];
+    let ratio = roll["cache_read_ratio"].as_f64().unwrap();
+    assert!(
+        (ratio - 1.0).abs() < 1e-9,
+        "fully-cached request must report ratio 1.0, got {ratio}"
+    );
+}
+
+#[tokio::test]
+async fn admin_usage_cache_read_ratio_absent_when_no_cache_hits() {
+    // Review #6 regression. When the group has no cache reads AND no
+    // cache creation, `cache_read_ratio` is `None` and must serialize
+    // as field-absent (skip_serializing_if = Option::is_none) — the
+    // same convention as the sibling `model`/`provider` `Option`s.
+    // Mixing absent-with-null in the same response shape breaks
+    // consumer field-presence logic.
+    let usage = UsageStats::new(8);
+    // No cache_read_input_tokens, no cache_creation_input_tokens.
+    usage.record(mk_record(
+        "2026-09-09T10:00:00Z",
+        "p1",
+        "m1",
+        Some(100),
+        Some(20),
+        None,
+        None,
+        None,
+    ));
+    let app = build_app_with_usage(
+        Some("secret"),
+        provider("primary", CompleteBehavior::Json, StreamBehavior::Bytes("unused")),
+        None,
+        usage,
+    );
+    let mut req = test_request(Method::GET, "/admin/usage", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let resp = app.oneshot(req).await.unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let raw = std::str::from_utf8(&bytes).unwrap();
+    let roll = &body_json_from_bytes(&bytes)["rollup"][0];
+    // Parsed Value: `cache_read_ratio` is missing entirely (not null).
+    assert!(
+        roll.get("cache_read_ratio").is_none(),
+        "cache_read_ratio must be absent when group has no cache activity, got: {raw}"
+    );
+    // Defensive belt-and-suspenders: confirm the raw JSON doesn't even
+    // contain the substring. Catches accidental serialization as null.
+    assert!(
+        !raw.contains("cache_read_ratio"),
+        "raw JSON unexpectedly contained cache_read_ratio: {raw}"
+    );
+}
+
+fn body_json_from_bytes(bytes: &bytes::Bytes) -> serde_json::Value {
+    serde_json::from_slice(bytes).unwrap()
+}
+
+#[tokio::test]
+async fn admin_usage_limit_caps_records_but_not_rollup() {
+    // Plan §Endpoint L465-466 + L591: limit is a records-page cap, but
+    // rollup aggregates over the FULL filtered set.
+    let usage = UsageStats::new(16);
+    for i in 0..5 {
+        let stamp = format!("2026-09-09T10:00:0{}Z", i);
+        usage.record(mk_record(
+            &stamp,
+            "p1",
+            "m1",
+            Some(10),
+            Some(2),
+            None,
+            None,
+            None,
+        ));
+    }
+    let app = build_app_with_usage(
+        Some("secret"),
+        provider("primary", CompleteBehavior::Json, StreamBehavior::Bytes("unused")),
+        None,
+        usage,
+    );
+    let mut req = test_request(Method::GET, "/admin/usage?limit=2", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let body = body_json(app.oneshot(req).await.unwrap()).await;
+    let recs = body["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 2, "records page is capped by limit");
+    // Newest-first: 10:00:04 then 10:00:03
+    assert!(recs[0]["started_at"].as_str().unwrap().contains("10:00:04"));
+    assert!(recs[1]["started_at"].as_str().unwrap().contains("10:00:03"));
+    let roll = &body["rollup"][0];
+    assert_eq!(
+        roll["requests"], 5,
+        "rollup aggregates over the full filtered set, ignoring limit"
+    );
+    assert_eq!(roll["input_tokens"], 50);
+}
+
+#[tokio::test]
+async fn admin_usage_limit_clamps_to_max_limit() {
+    let usage = UsageStats::new(8);
+    let app = build_app_with_usage(
+        Some("secret"),
+        provider("primary", CompleteBehavior::Json, StreamBehavior::Bytes("unused")),
+        None,
+        usage,
+    );
+    // Asking for limit=999_999 should be clamped to MAX_LIMIT=10_000.
+    let mut req = test_request(Method::GET, "/admin/usage?limit=999999", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let body = body_json(app.oneshot(req).await.unwrap()).await;
+    assert_eq!(body["filter"]["limit"], 10_000);
+}
+
+#[tokio::test]
+async fn admin_usage_invalid_since_returns_400() {
+    let usage = UsageStats::new(8);
+    let app = build_app_with_usage(
+        Some("secret"),
+        provider("primary", CompleteBehavior::Json, StreamBehavior::Bytes("unused")),
+        None,
+        usage,
+    );
+    let mut req = test_request(Method::GET, "/admin/usage?since=bogus", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    // The shape is the project-wide Anthropic-error envelope (C5 fix).
+    assert_eq!(body["type"], "error");
+}
+
+#[tokio::test]
+async fn admin_usage_invalid_group_by_returns_400() {
+    let usage = UsageStats::new(8);
+    let app = build_app_with_usage(
+        Some("secret"),
+        provider("primary", CompleteBehavior::Json, StreamBehavior::Bytes("unused")),
+        None,
+        usage,
+    );
+    let mut req = test_request(Method::GET, "/admin/usage?group_by=day", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn admin_usage_since_greater_than_until_returns_empty() {
+    // Plan §Endpoint L608: since > until is an HTTP 200 with empty
+    // records/rollup, not a special-case error.
+    let usage = UsageStats::new(8);
+    usage.record(mk_record(
+        "2026-09-09T10:00:00Z",
+        "p1",
+        "m1",
+        Some(1),
+        Some(1),
+        None,
+        None,
+        None,
+    ));
+    let app = build_app_with_usage(
+        Some("secret"),
+        provider("primary", CompleteBehavior::Json, StreamBehavior::Bytes("unused")),
+        None,
+        usage,
+    );
+    let uri = "/admin/usage?since=2026-09-10T00:00:00Z&until=2026-09-09T00:00:00Z";
+    let mut req = test_request(Method::GET, uri, None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["records"].as_array().unwrap().len(), 0);
+    assert_eq!(body["rollup"].as_array().unwrap().len(), 0);
+    // retained still reflects the unfiltered store size (plan L591).
+    assert_eq!(body["retained"], 1);
+}
+
+#[tokio::test]
+async fn admin_usage_evicted_total_surfaces_in_body() {
+    let usage = UsageStats::new(2);
+    // Three rows in a buffer of capacity 2 ⇒ 1 eviction.
+    usage.record(mk_record("2026-09-09T10:00:00Z", "p1", "m1", Some(1), Some(1), None, None, None));
+    usage.record(mk_record("2026-09-09T10:00:01Z", "p1", "m1", Some(1), Some(1), None, None, None));
+    usage.record(mk_record("2026-09-09T10:00:02Z", "p1", "m1", Some(1), Some(1), None, None, None));
+    assert_eq!(usage.evicted_total(), 1);
+    let app = build_app_with_usage(
+        Some("secret"),
+        provider("primary", CompleteBehavior::Json, StreamBehavior::Bytes("unused")),
+        None,
+        usage,
+    );
+    let mut req = test_request(Method::GET, "/admin/usage", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let body = body_json(app.oneshot(req).await.unwrap()).await;
+    assert_eq!(body["evicted_total"], 1);
+    assert_eq!(body["retained"], 2);
+    assert_eq!(body["capacity"], 2);
+}
+
+#[tokio::test]
+async fn admin_usage_collects_via_messages_handler() {
+    // End-to-end: a non-streaming /v1/messages request records one
+    // UsageRecord visible at /admin/usage. Same Arc wiring the
+    // plan prescribes (L850-857).
+    let usage = UsageStats::new(8);
+    let usage_for_state = usage.clone();
+    let app = build_app_with_usage(
+        Some("secret"),
+        provider("primary", CompleteBehavior::Json, StreamBehavior::Bytes("unused")),
+        None,
+        usage_for_state,
+    );
+    // Fire a non-streaming request first; the row lands in the
+    // shared Arc<UsageStats> that the admin endpoint also reads.
+    let mut msg_req = test_request(
+        Method::POST,
+        "/v1/messages",
+        Some(messages_request(false)),
+    );
+    msg_req
+        .headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let msg_resp = app.clone().oneshot(msg_req).await.unwrap();
+    assert_eq!(msg_resp.status(), StatusCode::OK);
+    // The handler used the TestProvider's default JSON response
+    // (input_tokens=2, output_tokens=1), so a row should be visible.
+    let mut req = test_request(Method::GET, "/admin/usage", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let body = body_json(app.oneshot(req).await.unwrap()).await;
+    let recs = body["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 1, "non-streaming request recorded one row");
+    let rec = &recs[0];
+    assert_eq!(rec["model"], "claude-test");
+    assert_eq!(rec["provider"], "primary");
+    assert_eq!(rec["input_tokens"], 2);
+    assert_eq!(rec["output_tokens"], 1);
+    assert_eq!(rec["total_tokens"], 3);
+    assert_eq!(rec["outcome"], "success");
+}
+
+#[tokio::test]
+async fn admin_usage_records_errored_when_provider_returns_stream_for_json_request() {
+    // review #5 regression. A non-streaming request whose provider
+    // returns a `ProviderOutput::Stream` used to short-circuit on
+    // the `else` branch (`?`) before reaching `record()`, so the
+    // request left NO row in /admin/usage — even though upstream
+    // may have billed. Now we must record `outcome: "errored"`.
+    let usage = UsageStats::new(8);
+    let usage_for_state = usage.clone();
+    let app = build_app_with_usage(
+        Some("secret"),
+        // Complete → Stream: the non-streaming handler sees a stream
+        // where it expected JSON, hitting the new error branch.
+        provider("primary", CompleteBehavior::Stream, StreamBehavior::Bytes("x")),
+        None,
+        usage_for_state,
+    );
+    let mut msg_req = test_request(
+        Method::POST,
+        "/v1/messages",
+        Some(messages_request(false)),
+    );
+    msg_req
+        .headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let msg_resp = app.clone().oneshot(msg_req).await.unwrap();
+    assert_eq!(msg_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    // The row must still exist, tagged errored.
+    let mut req = test_request(Method::GET, "/admin/usage", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let body = body_json(app.oneshot(req).await.unwrap()).await;
+    let recs = body["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 1, "errored non-streaming request records one row");
+    let rec = &recs[0];
+    assert_eq!(rec["model"], "claude-test");
+    assert_eq!(rec["provider"], "primary");
+    assert_eq!(rec["outcome"], "errored");
+    assert_eq!(rec["stream"], false);
+    // No usage parsed on the error path → usage is null on the wire.
+    assert!(rec["usage"].is_null(), "error row carries no usage");
+}
+
+#[tokio::test]
+async fn admin_usage_records_errored_when_provider_returns_malformed_json() {
+    // review #5 second shape: provider returns JSON that fails to
+    // parse as a MessagesResponse. Same expectation — one errored
+    // row, not zero.
+    let usage = UsageStats::new(8);
+    let usage_for_state = usage.clone();
+    let app = build_app_with_usage(
+        Some("secret"),
+        provider(
+            "primary",
+            CompleteBehavior::MalformedJson,
+            StreamBehavior::Bytes("x"),
+        ),
+        None,
+        usage_for_state,
+    );
+    let mut msg_req = test_request(
+        Method::POST,
+        "/v1/messages",
+        Some(messages_request(false)),
+    );
+    msg_req
+        .headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let msg_resp = app.clone().oneshot(msg_req).await.unwrap();
+    assert_eq!(msg_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    // One errored row must be recorded despite the parse failure.
+    let mut req = test_request(Method::GET, "/admin/usage", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let body = body_json(app.oneshot(req).await.unwrap()).await;
+    let recs = body["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 1, "malformed-JSON request records one row");
+    let rec = &recs[0];
+    assert_eq!(rec["outcome"], "errored");
+    assert!(rec["usage"].is_null());
+}
+
+#[tokio::test]
+async fn admin_usage_records_errored_when_router_complete_fails() {
+    // Review #11 regression: `state.router.complete(...).await?` at
+    // src/server.rs:95 used to propagate `AllProvidersFailed` without
+    // writing a row. Now the leak is plugged — every router-level
+    // failure must still record exactly one `errored` row.
+    let usage = UsageStats::new(8);
+    let usage_for_state = usage.clone();
+    // Single provider, returns 503 → router exhausts the chain with
+    // `AllProvidersFailed` → handler must call `record_errored`
+    // before propagating.
+    let app = build_app_with_usage(
+        Some("secret"),
+        provider(
+            "primary",
+            CompleteBehavior::Error(503),
+            StreamBehavior::Bytes("x"),
+        ),
+        None,
+        usage_for_state,
+    );
+    let mut msg_req = test_request(
+        Method::POST,
+        "/v1/messages",
+        Some(messages_request(false)),
+    );
+    msg_req
+        .headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let msg_resp = app.clone().oneshot(msg_req).await.unwrap();
+    assert_eq!(
+        msg_resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "router.complete failure must surface as 5xx"
+    );
+    let mut req = test_request(Method::GET, "/admin/usage", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let body = body_json(app.oneshot(req).await.unwrap()).await;
+    let recs = body["records"].as_array().unwrap();
+    assert_eq!(
+        recs.len(),
+        1,
+        "router.complete failure records one errored row"
+    );
+    let rec = &recs[0];
+    assert_eq!(rec["model"], "claude-test");
+    assert_eq!(rec["outcome"], "errored");
+    assert_eq!(rec["stream"], false);
+    assert!(rec["usage"].is_null());
+    // C3: the `<router>` row must carry the per-provider attempts that
+    // actually fired, not an empty list — otherwise the failure is
+    // invisible to rollups.
+    assert_eq!(
+        rec["failed_providers"],
+        json!(["primary:503"]),
+        "router-level failure row carries the attempted provider:status"
+    );
+}
+
+#[tokio::test]
+async fn admin_usage_records_errored_when_stream_response_guard_fires() {
+    // C9 regression. Symmetric to the complete→stream guard at
+    // review #5: when the client asks for a stream but the provider's
+    // `stream` method returns `ProviderOutput::Json` (or anything
+    // non-Stream), `stream_response`'s `else` branch used to return a
+    // 500 with NO usage row. The request then vanished from
+    // /admin/usage even though the proxy did receive it. Now the
+    // guard records an `errored` row before returning.
+    let usage = UsageStats::new(8);
+    let usage_for_state = usage.clone();
+    let app = build_app_with_usage(
+        Some("secret"),
+        // stream → Json: the streaming handler sees JSON where it
+        // expected a Stream, hitting the C9 guard.
+        provider(
+            "primary",
+            CompleteBehavior::Json,
+            StreamBehavior::Json,
+        ),
+        None,
+        usage_for_state,
+    );
+    let mut msg_req = test_request(
+        Method::POST,
+        "/v1/messages",
+        Some(messages_request(true)),
+    );
+    msg_req
+        .headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let msg_resp = app.clone().oneshot(msg_req).await.unwrap();
+    assert_eq!(
+        msg_resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "stream_response guard must surface as 500"
+    );
+    let mut req = test_request(Method::GET, "/admin/usage", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let body = body_json(app.oneshot(req).await.unwrap()).await;
+    let recs = body["records"].as_array().unwrap();
+    assert_eq!(
+        recs.len(),
+        1,
+        "stream_response guard must still record one errored row"
+    );
+    let rec = &recs[0];
+    assert_eq!(rec["provider"], "primary");
+    assert_eq!(rec["model"], "claude-test");
+    assert_eq!(rec["outcome"], "errored");
+    assert_eq!(
+        rec["stream"],
+        true,
+        "stream-shaped client request keeps stream=true on the error row"
+    );
+    assert!(rec["usage"].is_null());
+}
+
+#[tokio::test]
+async fn admin_usage_records_errored_when_router_stream_fails() {
+    // Review #11 second half: same regression for the streaming path.
+    // Single provider returns a 429 from `stream` → router exhausts
+    // the chain → handler must record before propagating.
+    let usage = UsageStats::new(8);
+    let usage_for_state = usage.clone();
+    let app = build_app_with_usage(
+        Some("secret"),
+        provider(
+            "primary",
+            CompleteBehavior::Json,
+            StreamBehavior::Error(429),
+        ),
+        None,
+        usage_for_state,
+    );
+    let mut msg_req = test_request(
+        Method::POST,
+        "/v1/messages",
+        Some(messages_request(true)),
+    );
+    msg_req
+        .headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let msg_resp = app.clone().oneshot(msg_req).await.unwrap();
+    assert_eq!(
+        msg_resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "router.stream failure must surface as 429"
+    );
+    let mut req = test_request(Method::GET, "/admin/usage", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let body = body_json(app.oneshot(req).await.unwrap()).await;
+    let recs = body["records"].as_array().unwrap();
+    assert_eq!(
+        recs.len(),
+        1,
+        "router.stream failure records one errored row"
+    );
+    let rec = &recs[0];
+    assert_eq!(rec["model"], "claude-test");
+    assert_eq!(rec["outcome"], "errored");
+    // Reviewed in debug-env against the mock: the router.stream error
+    // row must carry the client's `stream: true`, not the old
+    // hardcoded `false` that mislabeled failed streams as non-stream.
+    assert_eq!(rec["stream"], true, "failed stream row keeps stream=true");
+    // C3: same as the complete path — the `<router>` row carries the
+    // per-provider attempts that fired.
+    assert_eq!(
+        rec["failed_providers"],
+        json!(["primary:429"]),
+        "router-level stream failure row carries the attempted provider:status"
+    );
+}
+
+#[tokio::test]
+async fn admin_usage_excludes_serving_provider_from_failed_providers_on_retry() {
+    // C6 regression: when the serving provider had to be retried
+    // in-place (max_retries_per_provider > 1, primary fails N-1 times
+    // then succeeds), the SUCCESS row's `failed_providers` must drop
+    // the serving provider's own failure attempts — that field is
+    // for the failed *fallback chain*, not for in-place retries
+    // against the eventual winner.
+    //
+    // Manually build the app (build_app_with_usage hardcodes
+    // max_retries_per_provider = 1) so primary gets 3 attempts:
+    // 2 failures + 1 success.
+    let counter = Arc::new(AtomicU32::new(0));
+    let mut providers = HashMap::new();
+    providers.insert(
+        "primary".to_string(),
+        Arc::new(TestProvider {
+            name: "primary".into(),
+            complete: CompleteBehavior::FailThenSucceed {
+                status: 429,
+                fail_count: 2,
+                counter: counter.clone(),
+            },
+            stream: StreamBehavior::Bytes("unused"),
+            models: None,
+        }) as SharedProvider,
+    );
+    let usage = UsageStats::new(8);
+    let usage_for_state = usage.clone();
+    let cfg = Config {
+        server: ServerConfig {
+            listen: "127.0.0.1:0".into(),
+            api_key: Some("secret".into()),
+        },
+        proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
+        providers: vec![ProviderConfig::OpenaiCompat {
+            name: "primary".into(),
+            api_key: "k".into(),
+            api_base: "http://x".into(),
+            model_rewrite: Default::default(),
+            use_proxy: false,
+            provider_ignore: Vec::new(),
+            reasoning_echo: false,
+        }],
+        models: vec![ModelConfig {
+            name: "claude-test".into(),
+            primary: "primary".into(),
+            fallback_chain: vec![],
+            cooldown_seconds: 60,
+            max_retries_per_provider: 3,
+            max_retries_total: 3,
+        }],
+        usage_capacity: usage.capacity(),
+    };
+    let cfg = Arc::new(cfg);
+    let cooldown = CooldownCache::new();
+    let router = Arc::new(Router::new(cfg.clone(), providers, cooldown.clone()));
+    let app = llmproxy::server::build_router(AppState {
+        config: cfg,
+        router,
+        cooldown,
+        http: reqwest::Client::new(),
+        copilot: None,
+        usage: usage_for_state,
+    });
+    let mut msg_req = test_request(
+        Method::POST,
+        "/v1/messages",
+        Some(messages_request(false)),
+    );
+    msg_req
+        .headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let msg_resp = app.clone().oneshot(msg_req).await.unwrap();
+    assert_eq!(msg_resp.status(), StatusCode::OK);
+    // Response header is also filtered — must be absent because the
+    // only attempt was against the (served) primary.
+    assert!(
+        msg_resp.headers().get("x-llmproxy-failed-providers").is_none(),
+        "serving provider's own retries must not appear in the header"
+    );
+    let mut req = test_request(Method::GET, "/admin/usage", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let body = body_json(app.oneshot(req).await.unwrap()).await;
+    let recs = body["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 1);
+    let rec = &recs[0];
+    assert_eq!(rec["provider"], "primary");
+    assert_eq!(rec["outcome"], "success");
+    assert_eq!(
+        rec["failed_providers"],
+        json!([]),
+        "serving provider's in-place retries must not appear in failed_providers"
+    );
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        3,
+        "primary should have been hit 3 times (2 fails + 1 success)"
+    );
+}
+
+#[tokio::test]
+async fn admin_usage_keeps_fallback_failures_when_serving_provider_is_different() {
+    // C6 second leg: when the failed chain contains a DIFFERENT
+    // provider than the eventual winner, that provider's failure
+    // MUST remain in failed_providers. The filter only drops the
+    // serving provider's own attempts — co-existing fallback
+    // failures pass through untouched.
+    //
+    // Build manually so primary returns 429 every time (max
+    // retries=1), backup returns a normal JSON, served_by = "backup".
+    let mut providers = HashMap::new();
+    providers.insert(
+        "primary".to_string(),
+        Arc::new(TestProvider {
+            name: "primary".into(),
+            complete: CompleteBehavior::Error(429),
+            stream: StreamBehavior::Bytes("unused"),
+            models: None,
+        }) as SharedProvider,
+    );
+    providers.insert(
+        "backup".to_string(),
+        Arc::new(TestProvider {
+            name: "backup".into(),
+            complete: CompleteBehavior::Json,
+            stream: StreamBehavior::Bytes("unused"),
+            models: None,
+        }) as SharedProvider,
+    );
+    let usage = UsageStats::new(8);
+    let usage_for_state = usage.clone();
+    let cfg = Config {
+        server: ServerConfig {
+            listen: "127.0.0.1:0".into(),
+            api_key: Some("secret".into()),
+        },
+        proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
+        providers: vec![
+            ProviderConfig::OpenaiCompat {
+                name: "primary".into(),
+                api_key: "k".into(),
+                api_base: "http://x".into(),
+                model_rewrite: Default::default(),
+                use_proxy: false,
+                provider_ignore: Vec::new(),
+                reasoning_echo: false,
+            },
+            ProviderConfig::OpenaiCompat {
+                name: "backup".into(),
+                api_key: "k".into(),
+                api_base: "http://x".into(),
+                model_rewrite: Default::default(),
+                use_proxy: false,
+                provider_ignore: Vec::new(),
+                reasoning_echo: false,
+            },
+        ],
+        models: vec![ModelConfig {
+            name: "claude-test".into(),
+            primary: "primary".into(),
+            fallback_chain: vec!["backup".into()],
+            cooldown_seconds: 60,
+            max_retries_per_provider: 1,
+            max_retries_total: 2,
+        }],
+        usage_capacity: usage.capacity(),
+    };
+    let cfg = Arc::new(cfg);
+    let cooldown = CooldownCache::new();
+    let router = Arc::new(Router::new(cfg.clone(), providers, cooldown.clone()));
+    let app = llmproxy::server::build_router(AppState {
+        config: cfg,
+        router,
+        cooldown,
+        http: reqwest::Client::new(),
+        copilot: None,
+        usage: usage_for_state,
+    });
+    let mut msg_req = test_request(
+        Method::POST,
+        "/v1/messages",
+        Some(messages_request(false)),
+    );
+    msg_req
+        .headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let msg_resp = app.clone().oneshot(msg_req).await.unwrap();
+    assert_eq!(msg_resp.status(), StatusCode::OK);
+    let mut req = test_request(Method::GET, "/admin/usage", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let body = body_json(app.oneshot(req).await.unwrap()).await;
+    let recs = body["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 1);
+    let rec = &recs[0];
+    assert_eq!(rec["provider"], "backup");
+    assert_eq!(rec["outcome"], "success");
+    // The serving provider (backup) is filtered out, primary's 429
+    // stays. This proves the filter is targeted (by served_by) and
+    // doesn't accidentally drop all attempts.
+    assert_eq!(
+        rec["failed_providers"],
+        json!(["primary:429"]),
+        "non-serving fallback provider's failure must remain"
+    );
+    // Header must agree with the record.
+    assert_eq!(
+        msg_resp.headers()["x-llmproxy-failed-providers"],
+        "primary:429"
+    );
+}
+
+#[tokio::test]
+async fn admin_usage_records_errored_when_model_is_unknown() {
+    // Review #11 third leg: `find_model` returning `None` used to
+    // return `BadRequest` via `?` before `start` was even captured,
+    // so the row couldn't be written at all. Now `start` is captured
+    // first and the unknown-model branch records before propagating.
+    let usage = UsageStats::new(8);
+    let usage_for_state = usage.clone();
+    let app = build_app_with_usage(
+        Some("secret"),
+        provider("primary", CompleteBehavior::Json, StreamBehavior::Bytes("x")),
+        None,
+        usage_for_state,
+    );
+    let mut req_body = messages_request(false);
+    req_body["model"] = json!("this-model-does-not-exist");
+    let mut msg_req = test_request(
+        Method::POST,
+        "/v1/messages",
+        Some(req_body),
+    );
+    msg_req
+        .headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let msg_resp = app.clone().oneshot(msg_req).await.unwrap();
+    assert_eq!(msg_resp.status(), StatusCode::BAD_REQUEST);
+    let mut req = test_request(Method::GET, "/admin/usage", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let body = body_json(app.oneshot(req).await.unwrap()).await;
+    let recs = body["records"].as_array().unwrap();
+    assert_eq!(
+        recs.len(),
+        1,
+        "unknown-model request records one errored row"
+    );
+    let rec = &recs[0];
+    assert_eq!(rec["model"], "this-model-does-not-exist");
+    assert_eq!(rec["outcome"], "errored");
+}
+
+#[tokio::test]
+async fn admin_usage_dropped_stream_does_not_record_phantom_success() {
+    // opus #4 regression. When the client TCP socket closes mid-stream
+    // (or axum's `Body::from_stream` drops the wrapper before
+    // `Ready(None)` ever fires), `MappedStream::Drop` runs without a
+    // normal completion. The previous behaviour wrote a row tagged
+    // `outcome: "success"` — phantom accounting for work the client
+    // never received. Plan L751-757 says v1 accepts the undercount
+    // rather than mislabel, so Drop must not write any row.
+    //
+    // We simulate by firing a streaming request whose provider emits
+    // exactly one chunk then `None` — we drop the response body
+    // without fully consuming it. axum's body-into-stream machinery
+    // plus our `MappedStream::Drop` then fires before the inner
+    // stream sees `Ready(None)`.
+    let usage = UsageStats::new(8);
+    let usage_for_state = usage.clone();
+    let app = build_app_with_usage(
+        Some("secret"),
+        provider(
+            "primary",
+            // The handler picks the JSON branch for `complete` and
+            // the stream branch for `stream`; we want the stream
+            // branch, so stream behavior matters here. We emit a
+            // tiny SSE chunk and let the stream complete normally
+            // — but we'll discard the response body, so the
+            // drop-on-the-floor scenario is what axum sees.
+            CompleteBehavior::Json,
+            StreamBehavior::Bytes(
+                "event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n",
+            ),
+        ),
+        None,
+        usage_for_state,
+    );
+    // Fire the request. We do NOT consume the body — we drop the
+    // response after the status check.
+    let mut msg_req = test_request(
+        Method::POST,
+        "/v1/messages",
+        Some(messages_request(true)),
+    );
+    msg_req
+        .headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let msg_resp = app.clone().oneshot(msg_req).await.unwrap();
+    assert_eq!(msg_resp.status(), StatusCode::OK);
+    // Discard the body without consuming it. axum will then drop
+    // the response-body stream → which drops `MappedStream` →
+    // which runs our `Drop` impl.
+    drop(msg_resp.into_body());
+
+    // Now query /admin/usage. There must be NO row: the stream
+    // never reached `Ready(None)`, so the only path that could
+    // have written a record was Drop, and we've now made Drop a
+    // no-op for incomplete streams.
+    let mut req = test_request(Method::GET, "/admin/usage", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let body = body_json(app.oneshot(req).await.unwrap()).await;
+    assert_eq!(
+        body["records"].as_array().unwrap().len(),
+        0,
+        "no phantom Success row from an incomplete stream"
+    );
+    assert_eq!(body["retained"], 0);
+    assert_eq!(
+        usage.evicted_total(),
+        0,
+        "undercount is the plan-aligned v1 behaviour"
+    );
+}
+
+#[tokio::test]
+async fn admin_usage_mid_stream_error_records_errored_outcome() {
+    // Opus #1 regression: a streaming request where upstream emits
+    // some bytes then errors must produce a UsageRecord with
+    // `outcome: "errored"`. Before the fix, the `Some(Err)` arm set
+    // `done=true` and relied on `MappedStream::Drop` to record — but
+    // Drop is a no-op for incomplete streams (opus #4), so the row
+    // never landed. Operators couldn't see mid-stream upstream
+    // failures or their token spend.
+    //
+    // The TestProvider's `ItemError` stream behavior emits one
+    // Bytes::from_static chunk then `Err(Internal)` — exactly the
+    // shape of an upstream mid-stream error. The proxy emits an
+    // `event: error` SSE chunk to the client; the UsageRecord should
+    // land with `outcome: "errored"`.
+    let usage = UsageStats::new(8);
+    let usage_for_state = usage.clone();
+    let app = build_app_with_usage(
+        Some("secret"),
+        provider(
+            "primary",
+            CompleteBehavior::Json,
+            StreamBehavior::ItemError,
+        ),
+        None,
+        usage_for_state,
+    );
+    let mut msg_req = test_request(
+        Method::POST,
+        "/v1/messages",
+        Some(messages_request(true)),
+    );
+    msg_req
+        .headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let msg_resp = app.clone().oneshot(msg_req).await.unwrap();
+    assert_eq!(msg_resp.status(), StatusCode::OK);
+    // Drain the body so the test doesn't leak the stream and Drop
+    // fires before we query /admin/usage.
+    let _ = msg_resp.into_body().collect().await.unwrap().to_bytes();
+
+    let mut req = test_request(Method::GET, "/admin/usage", None);
+    req.headers_mut()
+        .insert("authorization", "Bearer secret".parse().unwrap());
+    let body = body_json(app.oneshot(req).await.unwrap()).await;
+    let recs = body["records"].as_array().unwrap();
+    assert_eq!(
+        recs.len(),
+        1,
+        "mid-stream error must produce exactly one UsageRecord"
+    );
+    let rec = &recs[0];
+    assert_eq!(rec["model"], "claude-test");
+    assert_eq!(rec["provider"], "primary");
+    assert_eq!(
+        rec["outcome"], "errored",
+        "Outcome must reflect mid-stream upstream failure, not Success"
+    );
+    // The rollup should also reflect the row.
+    let roll = &body["rollup"][0];
+    assert_eq!(roll["requests"], 1);
 }

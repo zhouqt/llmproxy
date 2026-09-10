@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::{ProxyError, Result};
+use crate::usage::DEFAULT_USAGE_CAPACITY;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +28,16 @@ pub struct Config {
     pub providers: Vec<ProviderConfig>,
     #[serde(default)]
     pub models: Vec<ModelConfig>,
+    /// Capacity of the in-memory ring buffer that backs `/admin/usage`.
+    /// When the buffer is full, the oldest record is evicted (FIFO).
+    /// **Set to `0` to disable the feature entirely** (`UsageStats::new`
+    /// treats `0` as a no-op store — no allocation, `record` is a no-op,
+    /// `snapshot` returns empty). Any positive value is hard-clamped at
+    /// `usage::MAX_USAGE_CAPACITY` (one million rows) so a
+    /// misconfiguration can't pre-allocate gigabytes. Default:
+    /// `usage::DEFAULT_USAGE_CAPACITY` (100_000).
+    #[serde(default = "default_usage_capacity")]
+    pub usage_capacity: usize,
 }
 
 impl Default for Config {
@@ -37,8 +48,13 @@ impl Default for Config {
             user_agent: default_user_agent(),
             providers: Vec::new(),
             models: Vec::new(),
+            usage_capacity: default_usage_capacity(),
         }
     }
+}
+
+fn default_usage_capacity() -> usize {
+    DEFAULT_USAGE_CAPACITY
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

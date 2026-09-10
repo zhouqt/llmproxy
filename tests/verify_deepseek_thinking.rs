@@ -137,7 +137,8 @@ fn build_router(
             max_retries_per_provider: 1,
             max_retries_total: model_chain.len() as u32,
         }],
-    };
+            ..Config::default()
+        };
     Router::new(Arc::new(cfg), providers, CooldownCache::new())
 }
 
@@ -212,7 +213,7 @@ async fn cross_model_fallback_self_healing() {
     let router = build_router(providers, configs, vec!["claude", "deepseek"]);
 
     let model_cfg = router.find_model("claude-test").unwrap();
-    let (out, attempts) = router
+    let (out, attempts, _served) = router
         .complete(model_cfg, &make_thinking_history_req("claude-test"))
         .await
         .unwrap();
@@ -443,7 +444,7 @@ async fn pure_thinking_history_message_removed_after_strip() {
     let router = build_router(providers, configs, vec!["deepseek"]);
 
     let model_cfg = router.find_model("claude-test").unwrap();
-    let (out, _attempts) = router
+    let (out, _attempts, _served) = router
         .complete(model_cfg, &make_pure_thinking_history_req("claude-test"))
         .await
         .unwrap();
@@ -565,7 +566,7 @@ async fn top_level_thinking_param_completely_absent_in_retry() {
     }))
     .unwrap();
 
-    let (_out, _attempts) = router.complete(model_cfg, &req).await.unwrap();
+    let (_out, _attempts, _served) = router.complete(model_cfg, &req).await.unwrap();
 
     let sent = captured.lock().unwrap().clone().expect("second body captured");
 
