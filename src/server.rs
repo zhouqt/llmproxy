@@ -3,6 +3,7 @@
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::State;
@@ -11,15 +12,18 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{middleware, Json, Router as AxumRouter};
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use futures_util::Stream;
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::anthropic::{MessagesRequest, MessagesResponse};
 use crate::error::{ProxyError, Result};
-use crate::extractor::AppJson;
+use crate::extractor::{AppJson, AppQuery};
 use crate::providers::ProviderOutput;
 use crate::state::AppState;
 use crate::tokenize::estimate_request_tokens;
+use crate::usage::{Outcome, StreamUsage, UsageRecord, UsageScanner, UsageStats, DEFAULT_LIMIT, MAX_LIMIT};
 
 pub fn build_router(state: AppState) -> AxumRouter {
     let api = AxumRouter::new()
@@ -38,6 +42,7 @@ pub fn build_router(state: AppState) -> AxumRouter {
         .route("/admin/copilot/auth", post(admin_copilot_auth_handler))
         .route("/admin/status", get(admin_status_handler))
         .route("/admin/models", get(all_models_handler))
+        .route("/admin/usage", get(admin_usage_handler))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             crate::auth::require_auth,
@@ -58,69 +63,302 @@ async fn messages_handler(
     State(state): State<AppState>,
     AppJson(req): AppJson<MessagesRequest>,
 ) -> Result<Response> {
-    let model_cfg = state
-        .router
-        .find_model(&req.model)
-        .ok_or_else(|| ProxyError::BadRequest(format!("unknown model: {}", req.model)))?
-        .clone();
+    // StartedAt must be captured before find_model so even an
+    // "unknown model" early-return can record a row (Review #11).
+    // The model label is what we have, so use it directly with no
+    // resolved provider — `served_by` is None on this path.
+    let start = StartedAt::now();
 
-    let start = std::time::Instant::now();
+    let model_cfg = match state.router.find_model(&req.model) {
+        Some(c) => c.clone(),
+        None => {
+            record_errored(
+                &state.usage,
+                &start,
+                "<router>",
+                &req.model,
+                &[],
+                req.stream,
+                format!("unknown model: {}", req.model),
+            );
+            return Err(ProxyError::BadRequest(format!(
+                "unknown model: {}",
+                req.model
+            )));
+        }
+    };
 
     if req.stream {
-        let (provider, output, attempts) = state.router.stream(&model_cfg, &req).await?;
+        let stream_result = state.router.stream(&model_cfg, &req).await;
+        let (provider, output, attempts) = match stream_result {
+            Ok(t) => t,
+            Err(e) => {
+                // Router-level failure (e.g. AllProvidersCoolingDown)
+                // must still leave a row in /admin/usage — without
+                // this, the failure case disappears from rollups
+                // (Review #11). Carry the per-provider attempts so the
+                // row shows who failed (review final round C3).
+                let failed = extract_failed_providers(&e);
+                record_errored(
+                    &state.usage,
+                    &start,
+                    "<router>",
+                    &req.model,
+                    &failed,
+                    req.stream,
+                    format!("router.stream failed: {e}"),
+                );
+                return Err(e);
+            }
+        };
         let summary = format_attempts(&attempts);
         tracing::info!(
             model = req.model.as_str(),
             provider = provider.name(),
             stream = req.stream,
-            elapsed_ms = start.elapsed().as_millis() as u64,
+            elapsed_ms = start.elapsed_ms(),
             failed_providers = %summary,
             "request completed"
         );
-        return Ok(stream_response(provider.name(), req.model.as_str(), output, attempts));
+        return Ok(stream_response(
+            provider.name(),
+            req.model.as_str(),
+            output,
+            attempts,
+            start,
+            state.usage.clone(),
+        ));
     }
 
-    let (output, attempts) = state.router.complete(&model_cfg, &req).await?;
-    let ProviderOutput::Json(value) = output else {
-        return Err(ProxyError::Internal(
-            "non-streaming provider returned a stream".into(),
-        ));
+    let complete_result = state.router.complete(&model_cfg, &req).await;
+    let (output, attempts, served_by) = match complete_result {
+        Ok(t) => t,
+        Err(e) => {
+            // Router-level failure (e.g. AllProvidersFailed) must
+            // still leave a row in /admin/usage — every error path
+            // below this point calls `record_errored` already; this
+            // site used to be the lone leak (Review #5 partially
+            // addressed the post-resolution cases; #11 closes the
+            // last hole). Carry the per-provider attempts so the row
+            // shows who failed (review final round C3).
+            let failed = extract_failed_providers(&e);
+            record_errored(
+                &state.usage,
+                &start,
+                "<router>",
+                &req.model,
+                &failed,
+                req.stream,
+                format!("router.complete failed: {e}"),
+            );
+            return Err(e);
+        }
     };
-
-    let mut resp: MessagesResponse = serde_json::from_value(value)?;
-    resp.model = req.model.clone();
-
+    // From here on every error path records a row before returning.
+    let provider_label = served_by.unwrap_or_else(|| model_cfg.primary.clone());
+    // C6: serving provider's own in-place retries must NOT show up in
+    // the success row's failed_providers — that field is meant to
+    // report the failed fallback chain, not how many times we
+    // retried the eventual winner.
+    let failed_providers = filter_failed_providers_for(&attempts, &provider_label);
     let summary = format_attempts(&attempts);
-    // For non-streaming, infer the provider that served the request: when
-    // no attempts failed, it was the primary; otherwise it's the last
-    // chain entry that didn't appear in `attempts`.
-    let provider_label = if attempts.is_empty() {
-        model_cfg.primary.clone()
-    } else {
-        model_cfg
-            .chain()
-            .filter(|n| !attempts.iter().any(|a| a.provider == *n))
-            .last()
-            .unwrap_or("unknown")
-            .to_string()
+
+    // Parse the provider output into a MessagesResponse, recording
+    // an Errored UsageRecord on either shape mismatch.
+    let resp = match output {
+        ProviderOutput::Json(value) => match serde_json::from_value::<MessagesResponse>(value) {
+            Ok(mut r) => {
+                r.model = req.model.clone();
+                r
+            }
+            Err(e) => {
+                record_errored(
+                    &state.usage,
+                    &start,
+                    &provider_label,
+                    &req.model,
+                    &failed_providers,
+                    req.stream,
+                    format!("MessagesResponse parse failed: {e}"),
+                );
+                return Err(ProxyError::Internal(format!(
+                    "failed to parse provider response: {e}"
+                )));
+            }
+        },
+        ProviderOutput::Stream(_) => {
+            record_errored(
+                &state.usage,
+                &start,
+                &provider_label,
+                &req.model,
+                &failed_providers,
+                req.stream,
+                "non-streaming provider returned a stream".into(),
+            );
+            return Err(ProxyError::Internal(
+                "non-streaming provider returned a stream".into(),
+            ));
+        }
     };
+
+    let usage = StreamUsage::from_complete(&resp.usage);
+    let total_tokens = UsageRecord::compute_total_tokens(Some(&usage));
+    // Read elapsed_ms exactly once so the record's
+    // `started_at + elapsed_ms == ended_at` invariant holds (and the
+    // tracing field below matches the recorded value to the
+    // millisecond — Review #12).
+    let elapsed_ms = start.elapsed_ms();
+    state.usage.record(UsageRecord {
+        started_at: start.started_at(),
+        ended_at: Utc::now(),
+        elapsed_ms,
+        provider: provider_label.clone(),
+        model: req.model.clone(),
+        stream: false,
+        outcome: Outcome::Success,
+        usage: Some(usage),
+        failed_providers: failed_providers.clone(),
+        total_tokens,
+    });
     tracing::info!(
         model = req.model.as_str(),
         provider = %provider_label,
         stream = req.stream,
-        elapsed_ms = start.elapsed().as_millis() as u64,
+        elapsed_ms,
         failed_providers = %summary,
         "request completed"
     );
 
     let mut headers = HeaderMap::new();
-    if !attempts.is_empty() {
-        if let Ok(v) = format_attempts(&attempts).parse() {
-            headers.insert("x-llmproxy-failed-providers", v);
-        }
+    // C6: header mirrors the record's failed_providers (filtered for
+    // serving provider). Operators correlate the response header
+    // with /admin/usage rows by this string, so the two MUST agree.
+    if !failed_providers.is_empty() {
+        headers.insert(
+            "x-llmproxy-failed-providers",
+            failed_providers.join(",").parse().unwrap(),
+        );
     }
 
     Ok((StatusCode::OK, headers, Json(resp)).into_response())
+}
+
+/// Pair a monotonic `Instant` (for elapsed math) with the
+/// wall-clock `DateTime<Utc>` captured at the same moment. Review
+/// #4 forbids deriving wall-clock from `Instant` (NTP corrections
+/// and host suspend/resume would corrupt it). Review #1 caught that
+/// `start.elapsed()` was being read twice — once for `started_at`,
+/// once for `elapsed_ms` — causing `started_at + elapsed_ms > ended_at`.
+/// The pair is captured once and consumed by reference, so the
+/// monotonic read happens exactly once per record.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct StartedAt {
+    pub instant: Instant,
+    pub wall: DateTime<Utc>,
+}
+
+impl StartedAt {
+    pub fn now() -> Self {
+        // Capture wall-clock before the Instant so `wall` is the
+        // first observable timestamp — never behind `ended_at`.
+        let wall = Utc::now();
+        let instant = Instant::now();
+        Self { instant, wall }
+    }
+
+    /// Wall-clock start of the request. Review #4: never derived from
+    /// `Instant`. This is the snapshot we took at entry.
+    pub fn started_at(&self) -> DateTime<Utc> {
+        self.wall
+    }
+
+    /// Milliseconds since `started_at`. Review #1: read `elapsed`
+    /// exactly once so `started_at + elapsed_ms == ended_at` (modulo
+    /// the `as u64` truncation, which is the only acceptable
+    /// rounding). Callers MUST NOT call this more than once per record.
+    pub fn elapsed_ms(&self) -> u64 {
+        self.instant.elapsed().as_millis() as u64
+    }
+}
+
+fn parse_failed_providers(attempts: &[crate::router::RouteAttempt]) -> Vec<String> {
+    attempts
+        .iter()
+        .map(|a| format!("{}:{}", a.provider, a.status))
+        .collect()
+}
+
+/// Like [`parse_failed_providers`] but drops any attempt against the
+/// provider that ultimately served the request. C6 (code-review final
+/// round): without this filter, a primary that fails twice and then
+/// succeeds on the third try (within `max_retries_per_provider`)
+/// records `["primary:429", "primary:429"]` in the success row's
+/// `failed_providers` — conflating in-place retries against the
+/// eventual serving provider with fallback attempts against the
+/// failed chain. Operators reading `/admin/usage` would see the
+/// provider that *did* the work flagged as a failure.
+fn filter_failed_providers_for(
+    attempts: &[crate::router::RouteAttempt],
+    served_by: &str,
+) -> Vec<String> {
+    attempts
+        .iter()
+        .filter(|a| a.provider != served_by)
+        .map(|a| format!("{}:{}", a.provider, a.status))
+        .collect()
+}
+
+/// Per-provider failure labels from a router-level error, for the
+/// `/admin/usage` row written by `record_errored` for the `<router>`
+/// provider. Mirrors the response-header path
+/// (`ProxyError::failed_providers_header` → `x-llmproxy-failed-providers`)
+/// but keeps the structured Vec the record needs. Non-`AllProvidersFailed`
+/// errors return empty — they fired no upstream attempts worth reporting.
+fn extract_failed_providers(e: &ProxyError) -> Vec<String> {
+    match e {
+        ProxyError::AllProvidersFailed { attempts, .. } => parse_failed_providers(attempts),
+        _ => Vec::new(),
+    }
+}
+
+/// Review #5: the non-streaming `?` paths used to short-circuit
+/// before `record()`, so an upstream that returned a stream when the
+/// client asked for JSON (or returned malformed JSON) left no row in
+/// `/admin/usage`. This helper writes an `Outcome::Errored` row at
+/// every such site so the row count matches the request count.
+/// `stream` mirrors the client's `stream` flag so a failed *streaming*
+/// request isn't mislabeled as non-streaming (verified in debug-env
+/// against the mock — router.stream failure rows used to say
+/// `stream: false`).
+fn record_errored(
+    stats: &UsageStats,
+    start: &StartedAt,
+    provider: &str,
+    model: &str,
+    failed_providers: &[String],
+    stream: bool,
+    reason: String,
+) {
+    stats.record(UsageRecord {
+        started_at: start.started_at(),
+        ended_at: Utc::now(),
+        elapsed_ms: start.elapsed_ms(),
+        provider: provider.to_string(),
+        model: model.to_string(),
+        stream,
+        outcome: Outcome::Errored,
+        usage: None,
+        failed_providers: failed_providers.to_vec(),
+        total_tokens: 0,
+    });
+    tracing::warn!(
+        provider,
+        model,
+        stream,
+        reason = %reason,
+        "request recorded as Errored"
+    );
 }
 
 fn format_attempts(attempts: &[crate::router::RouteAttempt]) -> String {
@@ -145,15 +383,59 @@ fn stream_response(
     model: &str,
     output: ProviderOutput,
     attempts: Vec<crate::router::RouteAttempt>,
+    start: StartedAt,
+    stats: UsageStats,
 ) -> Response {
+    // C9: even when the router returns Ok with a non-Stream output
+    // (a provider that ignores `stream` mode and hands back JSON),
+    // the 500 guard MUST record a row — otherwise the request vanishes
+    // from /admin/usage (Review #5 spirit: every error path leaves a
+    // row). Compute failed_providers up-front so both the error row
+    // and the success stream path can share it.
+    //
+    // C6: `provider_name` is the serving provider (router.stream
+    // succeeded on it). Drop any attempt against the same provider
+    // before writing the row / building the response header.
+    let failed_providers =
+        filter_failed_providers_for(&attempts, provider_name);
     let ProviderOutput::Stream(stream) = output else {
+        record_errored(
+            &stats,
+            &start,
+            provider_name,
+            model,
+            &failed_providers,
+            true,
+            "stream_response: provider returned non-Stream output".to_string(),
+        );
         return ProxyError::Internal("expected stream output".into()).into_response();
     };
 
     let inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, ProxyError>> + Send>> =
         Box::into_pin(stream);
-    let mapped = MappedStream::new(provider_name, model, inner);
-    let body = Body::from_stream(mapped);
+
+    let mut resp_headers = HeaderMap::new();
+    // C6: header mirrors the record's failed_providers (filtered for
+    // serving provider). Operators correlate the response header with
+    // /admin/usage rows by this string, so the two MUST agree.
+    // Written BEFORE the MappedStream::new move below — the stream
+    // wrapper takes ownership of `failed_providers` so we can't borrow
+    // it after the move.
+    if !failed_providers.is_empty() {
+        resp_headers.insert(
+            "x-llmproxy-failed-providers",
+            failed_providers.join(",").parse().unwrap(),
+        );
+    }
+
+    let body = Body::from_stream(MappedStream::new(
+        provider_name,
+        model,
+        inner,
+        start,
+        stats,
+        failed_providers, // moved into the stream wrapper
+    ));
 
     let mut resp = Response::new(body);
     let h = resp.headers_mut();
@@ -163,11 +445,7 @@ fn stream_response(
     );
     h.insert("cache-control", "no-cache".parse().unwrap());
     h.insert("x-accel-buffering", "no".parse().unwrap());
-    if !attempts.is_empty() {
-        if let Ok(v) = format_attempts(&attempts).parse() {
-            h.insert("x-llmproxy-failed-providers", v);
-        }
-    }
+    h.extend(resp_headers);
     resp
 }
 
@@ -176,6 +454,12 @@ fn stream_response(
 /// Anthropic `event: error` SSE chunk before terminating so clients
 /// don't see an incomplete body with no signal that something went
 /// wrong.
+///
+/// Also drives a [`UsageScanner`] across the bytes so the
+/// `/admin/usage` endpoint can report per-request token counts even
+/// when the upstream is an Anthropic-shaped SSE source. Scanner state
+/// lives here (not in the upstream provider) so adding a new provider
+/// never has to thread a usage channel through the converter layer.
 pub struct MappedStream {
     /// Provider name, carried into the upstream-error log so operators
     /// can see which provider's stream failed in a multi-provider
@@ -185,20 +469,117 @@ pub struct MappedStream {
     model: String,
     inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, ProxyError>> + Send>>,
     done: bool,
+    /// Wall-clock start of the request; reused for the UsageRecord
+    /// written on stream termination so `started_at` is comparable
+    /// across streaming vs non-streaming rows. Review #4: this is
+    /// the captured-at-entry wall-clock, not a derivation from
+    /// `Instant` (which would be wrong under NTP corrections).
+    start: StartedAt,
+    /// Shared usage stats; the row is written on terminal `Ready(None)`.
+    stats: UsageStats,
+    /// Per-request fallback summary mirrored from the
+    /// `x-llmproxy-failed-providers` header so admin/usage rows
+    /// correlate with the response header.
+    ///
+    /// Review #9: this was `Arc<Vec<String>>` with zero concurrent
+    /// readers — the Arc added an allocation + refcount on every
+    /// streaming response even in the common no-failure case, then
+    /// `finalize_and_record` deref-cloned the whole inner Vec for the
+    /// single record. A plain `Vec<String>` moved out with
+    /// `std::mem::take` is cheaper and honest about the ownership.
+    failed_providers: Vec<String>,
+    /// SSE byte scanner. `Some` while we're driving the inner stream;
+    /// taken in `finalize_and_record` so the write path can be infallible.
+    usage_scanner: Option<UsageScanner>,
+    /// Set true when the upstream emits an error mid-stream, so the
+    /// UsageRecord's `outcome` reflects Errored rather than Success.
+    /// See plan sixth-round finding C3.
+    errored: bool,
 }
 
 impl MappedStream {
-    pub fn new(
+    pub(crate) fn new(
         provider: &str,
         model: &str,
         inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, ProxyError>> + Send>>,
+        start: StartedAt,
+        stats: UsageStats,
+        failed_providers: Vec<String>,
     ) -> Self {
         Self {
             provider: provider.to_string(),
             model: model.to_string(),
             inner,
             done: false,
+            start,
+            stats,
+            failed_providers,
+            usage_scanner: Some(UsageScanner::new()),
+            errored: false,
         }
+    }
+
+    /// On terminal poll, build the UsageRecord and push it to the
+    /// shared ring buffer. Splits the buffer out of `self` first so
+    /// the write path can't re-borrow the stream.
+    fn finalize_and_record(&mut self) {
+        let Some(scanner) = self.usage_scanner.take() else {
+            return;
+        };
+        let ended_at = Utc::now();
+        let saw_error = scanner.saw_error();
+        let usage = scanner.finalize();
+        let total_tokens = UsageRecord::compute_total_tokens(Some(&usage));
+        let stats = self.stats.clone();
+        let record = UsageRecord {
+            started_at: self.start.started_at(),
+            ended_at,
+            elapsed_ms: self.start.elapsed_ms(),
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            stream: true,
+            outcome: if self.errored || saw_error {
+                Outcome::Errored
+            } else {
+                Outcome::Success
+            },
+            usage: if usage == StreamUsage::default() {
+                None
+            } else {
+                Some(usage)
+            },
+            failed_providers: std::mem::take(&mut self.failed_providers),
+            total_tokens,
+        };
+        // Synchronous write. `UsageStats::record` is sync per plan
+        // L431/511-519 (std::sync::RwLock), so this is just a brief
+        // lock acquire — no scheduler trip, no spawn, no risk of
+        // the record landing after the request was already
+        // acknowledged to the client.
+        stats.record(record);
+    }
+}
+
+impl Drop for MappedStream {
+    /// Streams dropped before reaching `Poll::Ready(None)` — true
+    /// client disconnect mid-stream OR premature wrapper teardown
+    /// by axum's `Body::from_stream` — are NOT recorded. We have
+    /// no way to tell whether upstream tokens were billed for
+    /// bytes the client never saw, so writing a row would either
+    /// be (a) a phantom Success for work the client never
+    /// received, or (b) mislabel a disconnect as a normal
+    /// completion. Per plan L751-757 v1 accepts the undercount
+    /// rather than mislabel. The `Ready(None)` arm of `poll_next`
+    /// is the only path that calls `finalize_and_record` now
+    /// (opus review #4).
+    fn drop(&mut self) {
+        // Drop the scanner without recording. The previous
+        // behaviour called `finalize_and_record` from Drop as a
+        // fallback for streams that reached `Ready(None)` in
+        // `poll_next`, but that path already records via the
+        // `poll_next` arm — this Drop is now strictly a
+        // cleanup path.
+        let _ = self.usage_scanner.take();
     }
 }
 
@@ -210,7 +591,12 @@ impl Stream for MappedStream {
             return Poll::Ready(None);
         }
         match self.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(b))) => Poll::Ready(Some(Ok(b))),
+            Poll::Ready(Some(Ok(b))) => {
+                if let Some(s) = self.usage_scanner.as_mut() {
+                    s.observe(&b);
+                }
+                Poll::Ready(Some(Ok(b)))
+            }
             Poll::Ready(Some(Err(e))) => {
                 tracing::error!(
                     provider = %self.provider,
@@ -225,12 +611,22 @@ impl Stream for MappedStream {
                 // message_stop, which Anthropic SDKs report as a
                 // confusing parse error. Mark `done` so the next poll
                 // terminates the stream instead of emitting the chunk
-                // again.
+                // again. Flip errored so the UsageRecord reflects this.
+                //
+                // Finalize the usage record BEFORE flipping `done`,
+                // because once `done` is true the next poll returns
+                // `Ready(None)` immediately via the early-return at
+                // the top of `poll_next` and skips the finalize path
+                // (opus review #1: mid-stream upstream errors must
+                // produce a UsageRecord with `outcome: errored`).
+                self.errored = true;
+                self.finalize_and_record();
                 self.done = true;
                 Poll::Ready(Some(Ok(format_stream_error(&e))))
             }
             Poll::Ready(None) => {
                 self.done = true;
+                self.finalize_and_record();
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
@@ -600,6 +996,102 @@ async fn admin_status_handler(State(state): State<AppState>) -> impl IntoRespons
     }))
 }
 
+/// Query params for `/admin/usage`. All fields are optional and
+/// default to "no bound". Time bounds are RFC 3339 strings — the
+/// same shape `started_at` / `ended_at` use on the wire, so a row's
+/// `started_at` can be fed straight back in.
+#[derive(Debug, Default, Deserialize)]
+pub struct AdminUsageQuery {
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub limit: Option<usize>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    /// `model` / `provider` / `model_provider` (default). Any other
+    /// value returns 400 (Anthropic-shaped) rather than silently
+    /// defaulting.
+    pub group_by: Option<String>,
+}
+
+/// Serve the buffered usage ring buffer as JSON. Reads only — the
+/// admin endpoint never blocks other request handlers on the buffer
+/// lock for more than a microsecond, and `cache-control: no-store`
+/// signals the response is point-in-time. Operators pair this with
+/// `x-llmproxy-failed-providers` header correlation when chasing
+/// fallback incidents.
+async fn admin_usage_handler(
+    State(state): State<AppState>,
+    AppQuery(q): AppQuery<AdminUsageQuery>,
+) -> Response {
+    let since = match q.since.as_deref().map(parse_rfc3339).transpose() {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    let until = match q.until.as_deref().map(parse_rfc3339).transpose() {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    let group_by = match parse_group_by(q.group_by.as_deref().unwrap_or("model_provider")) {
+        Ok(g) => g,
+        Err(e) => return e.into_response(),
+    };
+
+    // 1. Single-pass query: builds both the records page AND the
+    //    rollup under one read lock with bounded allocation
+    //    (opus review #6 — the previous two-step flow cloned ALL
+    //    matching records just to keep `limit` of them). The
+    //    rollup aggregates over the FULL filtered set so `limit`
+    //    never skews totals (plan §Endpoint L591, L601).
+    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT).max(1);
+    let (records, rollup) = state.usage.query(
+        since,
+        until,
+        q.model.as_deref(),
+        q.provider.as_deref(),
+        group_by,
+        Some(limit),
+    );
+
+    let body = json!({
+        "started_at": state.usage.started_at(),
+        "capacity": state.usage.capacity(),
+        "retained": state.usage.retained(),
+        "evicted_total": state.usage.evicted_total(),
+        "filter": {
+            "since": q.since,
+            "until": q.until,
+            "model": q.model,
+            "provider": q.provider,
+            "group_by": group_by_label(group_by),
+            "limit": limit,
+        },
+        "records": records,
+        "rollup": rollup,
+    });
+    let mut resp = Json(body).into_response();
+    resp.headers_mut()
+        .insert("cache-control", "no-store".parse().unwrap());
+    resp
+}
+
+fn parse_group_by(s: &str) -> crate::error::Result<crate::usage::GroupBy> {
+    crate::usage::GroupBy::from_str(s)
+        .ok_or_else(|| ProxyError::BadRequest(format!("invalid group_by: {s:?}")))
+}
+
+fn group_by_label(g: crate::usage::GroupBy) -> &'static str {
+    match g {
+        crate::usage::GroupBy::Model => "model",
+        crate::usage::GroupBy::Provider => "provider",
+        crate::usage::GroupBy::ModelProvider => "model_provider",
+    }
+}
+
+fn parse_rfc3339(s: &str) -> crate::error::Result<chrono::DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|d| d.with_timezone(&Utc))
+        .map_err(|e| ProxyError::BadRequest(format!("invalid RFC3339 timestamp: {e}")))
+}
 /// Trigger GitHub Copilot OAuth bootstrap on demand.
 ///
 /// Returns 200 with the device code info (operator shows it to the user),
@@ -678,6 +1170,11 @@ mod tests {
             model: "test".to_string(),
             inner: make_stream(vec![]),
             done: false,
+            start: StartedAt::now(),
+            stats: UsageStats::new(8),
+            failed_providers: Vec::new(),
+            usage_scanner: Some(UsageScanner::new()),
+            errored: false,
         }
     }
 
@@ -711,6 +1208,11 @@ mod tests {
             model: "test".to_string(),
             inner: make_stream(vec![Err(ProxyError::Internal("unused".into()))]),
             done: true,
+            start: StartedAt::now(),
+            stats: UsageStats::new(8),
+            failed_providers: Vec::new(),
+            usage_scanner: Some(UsageScanner::new()),
+            errored: false,
         };
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
@@ -727,6 +1229,11 @@ mod tests {
             model: "test".to_string(),
             inner: Box::pin(stream::pending::<std::result::Result<Bytes, ProxyError>>()),
             done: false,
+            start: StartedAt::now(),
+            stats: UsageStats::new(8),
+            failed_providers: Vec::new(),
+            usage_scanner: Some(UsageScanner::new()),
+            errored: false,
         };
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
@@ -747,6 +1254,11 @@ mod tests {
             model: "test".to_string(),
             inner: make_stream(vec![Err(ProxyError::Internal("boom".into()))]),
             done: false,
+            start: StartedAt::now(),
+            stats: UsageStats::new(8),
+            failed_providers: Vec::new(),
+            usage_scanner: Some(UsageScanner::new()),
+            errored: false,
         };
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
@@ -774,6 +1286,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mapped_stream_records_errored_when_stream_ends_cleanly_after_inband_error() {
+        // C2 regression: a mid-stream failure arriving as an in-band
+        // Anthropic `event: error` frame (responses/OAI adapters emit
+        // these; see format_stream_error) terminates the byte stream
+        // HEALTHILY — no transport Err, body closes normally, HTTP 200.
+        // The UsageRecord must still be Errored so the operator doesn't
+        // see a "success" row for a failed generation.
+        let mut s = MappedStream {
+            provider: "test".to_string(),
+            model: "test".to_string(),
+            inner: make_stream(vec![Ok(Bytes::from_static(
+                b"event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":3}}}\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"upstream_error\",\"message\":\"boom\"}}\n\n",
+            ))]),
+            done: false,
+            start: StartedAt::now(),
+            stats: UsageStats::new(8),
+            failed_providers: Vec::new(),
+            usage_scanner: Some(UsageScanner::new()),
+            errored: false,
+        };
+        let waker = futures_util::task::noop_waker_ref();
+        let mut cx = std::task::Context::from_waker(waker);
+
+        let b1 = assert_poll_ready_some_ok(
+            Pin::new(&mut s).poll_next(&mut cx),
+            "first poll",
+        );
+        assert!(
+            std::str::from_utf8(&b1).unwrap().contains("event: error"),
+            "in-band error chunk must reach the client"
+        );
+
+        let p2 = Pin::new(&mut s).poll_next(&mut cx);
+        assert!(matches!(p2, Poll::Ready(None)));
+        assert!(s.done);
+
+        let recs = s.stats.snapshot(None, None, None);
+        assert_eq!(recs.len(), 1, "healthy end must still record one usage row");
+        assert_eq!(
+            recs[0].outcome,
+            Outcome::Errored,
+            "in-band event:error must record Errored, not Success"
+        );
+        assert_eq!(
+            recs[0].usage.as_ref().and_then(|u| u.input_tokens),
+            Some(3),
+            "input usage must survive the error frame"
+        );
+    }
+
+    #[tokio::test]
     async fn mapped_stream_emits_bytes_then_terminates() {
         let mut s = MappedStream {
             provider: "test".to_string(),
@@ -783,6 +1346,11 @@ mod tests {
                 Ok(Bytes::from_static(b"event: bar\n\n")),
             ]),
             done: false,
+            start: StartedAt::now(),
+            stats: UsageStats::new(8),
+            failed_providers: Vec::new(),
+            usage_scanner: Some(UsageScanner::new()),
+            errored: false,
         };
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
@@ -846,6 +1414,7 @@ mod tests {
         use crate::providers::copilot::CopilotProvider;
         use crate::router::Router;
         use crate::state::AppState;
+        use crate::usage::UsageStats;
         use axum::body::Body;
         use axum::http::{Method, Request, StatusCode};
         use http_body_util::BodyExt;
@@ -879,7 +1448,8 @@ mod tests {
                     max_retries_per_provider: 1,
                     max_retries_total: 1,
                 }],
-            };
+                    ..Config::default()
+                };
             let cfg = Arc::new(cfg);
             let cooldown = CooldownCache::new();
             let mut providers = HashMap::new();
@@ -891,6 +1461,7 @@ mod tests {
                 cooldown,
                 http: reqwest::Client::new(),
                 copilot: Some(provider),
+                usage: UsageStats::new(8),
             };
             crate::server::build_router(state)
         }
@@ -1154,7 +1725,8 @@ mod tests {
                     max_retries_per_provider: 1,
                     max_retries_total: 1,
                 }],
-            };
+                    ..Config::default()
+                };
             let cfg = Arc::new(cfg);
             let cooldown = CooldownCache::new();
             let mut providers = HashMap::new();
@@ -1166,6 +1738,7 @@ mod tests {
                 cooldown,
                 http: reqwest::Client::new(),
                 copilot: Some(provider),
+                usage: UsageStats::new(8),
             });
 
             let resp = app
@@ -1233,7 +1806,8 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 1,
             }],
-        };
+                ..Config::default()
+            };
         let providers: HashMap<String, crate::providers::SharedProvider> = HashMap::from([
             (
                 "copilot".to_string(),
@@ -1307,7 +1881,8 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 1,
             }],
-        };
+                ..Config::default()
+            };
         let providers: HashMap<String, crate::providers::SharedProvider> = HashMap::from([
             (
                 "copilot".to_string(),
@@ -1367,7 +1942,8 @@ mod tests {
                     max_retries_total: 1,
                 },
             ],
-        };
+                    ..Config::default()
+                };
         let providers: HashMap<String, crate::providers::SharedProvider> = HashMap::from([(
             "copilot".to_string(),
             crate::providers::build(&config.providers[0], reqwest::Client::new()).unwrap(),
