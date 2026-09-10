@@ -1,0 +1,63 @@
+# debug-env/docker-compose.perf.yaml
+#
+# Performance measurement stack: mock upstream + llmproxy debug image.
+# Shares debug-env/config.dev.yaml with the existing dev compose (which uses
+# dev.env and the prod-rooted localhost/llmproxy_llmproxy:latest image).
+#
+# Usage:
+#   podman-compose -f debug-env/docker-compose.perf.yaml up --build
+#   podman-compose -f debug-env/docker-compose.perf.yaml down
+#
+# Then run bench/bench.py against 127.0.0.1:1025 (proxy) and 127.0.0.1:9000
+# (mock direct, baseline).
+#
+# See plans/debug-env-mock-perf.md §7.3.
+
+version: "3.8"
+
+services:
+  mock:
+    build:
+      context: ./mock-upstream
+    container_name: llmperf-mock
+    # No `image:` line — built image is auto-named.
+    ports:
+      - "127.0.0.1:9000:9000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+      start_period: 2s
+
+  llmproxy:
+    build:
+      context: ..
+      dockerfile: debug-env/Dockerfile.debug
+      args:
+        BUILD_PROFILE: release-debug
+    # No explicit `image:` line — let podman-compose auto-name the built
+    # image (matches the existing root docker-compose.yaml pattern). The
+    # container_name below keeps the container itself addressable.
+    container_name: llmperf-llmproxy
+    depends_on:
+      mock:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:1025:1025"
+    volumes:
+      # Shared with the dev compose file — see plan §7.3.
+      - ./config.dev.yaml:/etc/llmproxy/config.yaml:ro
+    environment:
+      # Explicit override so the YAML's ${MOCK_BASE:-...} resolves inside
+      # this container. perf.env also sets this, but the env: block wins
+      # and keeps the dependency self-documenting if perf.env is removed.
+      MOCK_BASE: "http://mock:9000"
+    env_file:
+      - perf.env
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:1025/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s

@@ -1,0 +1,70 @@
+server:
+  listen: "0.0.0.0:1025"
+  api_key: "${LLMPROXY_API_KEY}"
+
+user_agent: "opencode/1.18.16 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+
+
+providers:
+  - name: local
+    api_key: "${LLMPROXY_API_KEY}"
+    api_base: "http://127.0.0.1:9999"
+    type: anthropic
+    model_rewrite:
+      "dev-model": "dev-model"
+
+  - name: local-openai
+    api_key: "${LLMPROXY_API_KEY}"
+    api_base: "http://127.0.0.1:9999"
+    type: openai_compat
+    model_rewrite:
+      "dev-model": "dev-model"
+
+  # ── mock providers (debug-env/mock-upstream/mock_server.py) ──────────
+  # api_base uses ${VAR:-default} so the same file works for both
+  # `cargo run` (default 127.0.0.1) and `docker-compose.perf.yaml`
+  # (env sets MOCK_BASE=http://mock:9000). No trailing slash on MOCK_BASE
+  # (see plans/debug-env-mock-perf.md §7.2).
+  # model_rewrite left empty = any model name passes through verbatim.
+  - name: mock_anthropic
+    type: anthropic
+    api_key: "mock-key-not-a-secret"
+    api_base: "${MOCK_BASE:-http://127.0.0.1:9000}"
+  - name: mock_chat
+    type: openai_compat
+    api_key: "mock-key-not-a-secret"
+    api_base: "${MOCK_BASE:-http://127.0.0.1:9000}/v1"
+  - name: mock_responses
+    type: openai_responses
+    api_key: "mock-key-not-a-secret"
+    api_base: "${MOCK_BASE:-http://127.0.0.1:9000}/v1"
+  - name: mock_flaky
+    type: anthropic
+    api_key: "mock-key-not-a-secret"
+    api_base: "${MOCK_BASE:-http://127.0.0.1:9000}/p2"
+
+models:
+  - name: dev-model
+    primary: local
+    cooldown_seconds: 300
+    max_retries_per_provider: 2
+
+  - name: dev-model-openai
+    primary: local
+    cooldown_seconds: 300
+    max_retries_per_provider: 2
+
+  # ── mock models (one per dialect chain; see plan §8.1) ───────────────
+  - name: mock-anthropic
+    primary: mock_anthropic
+    cooldown_seconds: 5
+  - name: mock-chat
+    primary: mock_chat
+    cooldown_seconds: 5
+  - name: mock-responses
+    primary: mock_responses
+    cooldown_seconds: 5
+  - name: mock-fallback
+    primary: mock_flaky
+    fallback_chain: [mock_anthropic]
+    cooldown_seconds: 2

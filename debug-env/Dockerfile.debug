@@ -1,0 +1,125 @@
+# debug-env/Dockerfile.debug
+#
+# Build a debug image for the llmproxy. Build context must be the repo root.
+#
+# Build profile (BUILD_PROFILE) — picked via `--build-arg BUILD_PROFILE=...`:
+#   release-debug (default) — `cargo build --release` with debug symbols kept
+#     (CARGO_PROFILE_RELEASE_DEBUG=2, CARGO_PROFILE_RELEASE_STRIP=none).
+#     Numbers approximate prod; stack traces are readable.
+#   release                  — `cargo build --release`, identical to the prod
+#     image. Control group.
+#   dev                      — `cargo build` (debug profile). Output numbers
+#     are NOT representative of prod. For functional debugging only.
+#
+# Image tag: `llmproxy-debug:release-debug` (default), `llmproxy-debug:dev`,
+# `llmproxy-debug:release`. The tag deliberately does NOT start with
+# `localhost/` so `podman-compose` won't try to pull it as if it lived on
+# the local docker registry.
+#
+# Why this Dockerfile lives in debug-env/ and the root Dockerfile is left alone:
+# the root Dockerfile's dependency-cache stub trick (`mkdir src && echo ...`)
+# breaks when Cargo.toml declares bench targets — cargo fails manifest parsing
+# before any dep compiles, so `|| true` swallows a real error and the cache
+# layer is dead weight. On branches that declare benches (e.g.
+# feat/internal-usage-stats), this one stubs both src/ and benches/.
+# On branches without benches (e.g. main), it stubs src/ only.
+# See plans/debug-env-mock-perf.md §2.5 for the empirical reproduction.
+#
+# We only touch debug-env/, never the root Dockerfile, to avoid colliding
+# with other agents working in parallel.
+#
+# ----
+# BRANCH-AWARE NOTE: this Dockerfile probes Cargo.toml for `[[bench]]`
+# entries and stubs the corresponding files. Branches without benches
+# (e.g. main) skip the benches stub AND skip the benches COPY in stage 2
+# entirely. The build succeeds on both kinds of branch.
+# ----
+
+ARG RUST_IMAGE=rust:1-alpine
+# Pin runtime to a specific cached alpine tag rather than :latest. The
+# project's podman 4.9.3 setup has no unqualified-search-registries entry
+# and docker.io is unreliable in this environment, so :latest pulls fail
+# with "pinging container registry ... connection refused". 3.22.4 is
+# already in the local podman cache.
+ARG RUNTIME_IMAGE=docker.io/library/alpine:3.22.4
+
+# ─────────────────────────────────────────────────────────────────────────
+# Stage 1: dependency cache. Stub src + benches (if benches exist in Cargo.toml)
+# so cargo's manifest parse succeeds; build deps; this layer only re-runs
+# when Cargo.toml/Cargo.lock change.
+# ─────────────────────────────────────────────────────────────────────────
+FROM ${RUST_IMAGE} AS deps
+WORKDIR /build
+
+RUN apk add --no-cache musl-dev pkgconfig
+
+COPY Cargo.toml Cargo.lock ./
+
+# Discover bench target names from Cargo.toml and stub each one. This is
+# branch-agnostic: works whether Cargo.toml has [[bench]] entries or not.
+RUN set -eux; \
+    mkdir -p src; \
+    echo 'fn main() {}' > src/main.rs; \
+    if grep -q '^\[\[bench\]\]' Cargo.toml; then \
+        mkdir -p benches; \
+        awk 'BEGIN{r=0} /^\[\[bench\]\]/{r=1; next} r && /^name *=/{name=$3; gsub(/"/,"",name); print name; r=0}' \
+            Cargo.toml | while read name; do echo 'fn main() {}' > "benches/${name}.rs"; done; \
+    fi
+
+RUN cargo build --release
+
+# ─────────────────────────────────────────────────────────────────────────
+# Stage 2: real build. Copy in real src/, re-use cached deps.
+# Benches are handled by the deps stage stub (above) since they don't
+# change between this build and the dep build — they're test-only files
+# that cargo won't compile into the binary. If your branch has benches
+# that need rebuilding on every src/ change, uncomment the COPY line.
+# ─────────────────────────────────────────────────────────────────────────
+FROM ${RUST_IMAGE} AS build
+ARG BUILD_PROFILE=release-debug
+ENV BUILD_PROFILE=${BUILD_PROFILE}
+
+WORKDIR /build
+RUN apk add --no-cache musl-dev pkgconfig
+
+COPY --from=deps /build/target /build/target
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+# COPY benches ./benches   # uncomment on branches that declare [[bench]]
+
+# Profile-specific knobs. CARGO_PROFILE_RELEASE_* overrides win over the
+# manifest's [profile.release] (which sets strip=true and no debug info).
+# release-debug keeps symbols (debug=2, strip=none); release matches prod.
+RUN if [ "${BUILD_PROFILE}" = "release-debug" ]; then \
+        CARGO_PROFILE_RELEASE_DEBUG=2 \
+        CARGO_PROFILE_RELEASE_STRIP=none \
+        cargo build --release; \
+    elif [ "${BUILD_PROFILE}" = "dev" ]; then \
+        cargo build; \
+    else \
+        cargo build --release; \
+    fi
+
+# Pick the binary path based on profile (debug → target/debug, else target/release).
+RUN if [ "${BUILD_PROFILE}" = "dev" ]; then \
+        cp /build/target/debug/llmproxy /build/llmproxy-bin; \
+    else \
+        cp /build/target/release/llmproxy /build/llmproxy-bin; \
+    fi
+
+# ─────────────────────────────────────────────────────────────────────────
+# Stage 3: minimal runtime. Alpine + ca-certificates + curl (for healthcheck).
+# ─────────────────────────────────────────────────────────────────────────
+FROM ${RUNTIME_IMAGE} AS runtime
+RUN apk add --no-cache ca-certificates curl
+WORKDIR /app
+COPY --from=build /build/llmproxy-bin /usr/local/bin/llmproxy
+
+# Default config path matches the compose volume mount. Override at run time
+# with --config /path/to/other.yaml.
+ENV RUST_LOG=llmproxy=info,tower_http=info
+EXPOSE 1025
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:1025/health || exit 1
+ENTRYPOINT ["llmproxy"]
+CMD ["--config", "/etc/llmproxy/config.yaml"]
