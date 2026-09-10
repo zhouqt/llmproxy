@@ -43,6 +43,7 @@ use llmproxy::error::{ProxyError, Result};
 use llmproxy::providers::{Provider, ProviderOutput, SharedProvider};
 use llmproxy::router::Router;
 use llmproxy::state::AppState;
+use llmproxy::usage::UsageStats;
 
 // ────────────────────────────────────────────────────────────────────────
 // Mock LLM provider that talks real HTTP via wiremock.
@@ -214,11 +215,12 @@ async fn mock_llm_provider_primary_succeeds_returns_anthropic_response() {
             max_retries_per_provider: 1,
             max_retries_total: 1,
         }],
-    };
+            ..Config::default()
+        };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
-    let (out, attempts) = router.complete(model_cfg, &make_req("claude-test")).await.unwrap();
+    let (out, attempts, _served) = router.complete(model_cfg, &make_req("claude-test")).await.unwrap();
     let ProviderOutput::Json(body) = out else {
         panic!("expected JSON output");
     };
@@ -288,11 +290,12 @@ async fn mock_llm_provider_falls_back_when_primary_returns_429() {
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-    };
+            ..Config::default()
+        };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
-    let (out, attempts) = router.complete(model_cfg, &make_req("claude-test")).await.unwrap();
+    let (out, attempts, _served) = router.complete(model_cfg, &make_req("claude-test")).await.unwrap();
     let ProviderOutput::Json(body) = out else {
         panic!("expected JSON output");
     };
@@ -371,11 +374,12 @@ async fn copilot_endpoint_rejection_400_triggers_fallback() {
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-    };
+            ..Config::default()
+        };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
-    let (out, attempts) = router.complete(model_cfg, &make_req("claude-test")).await.unwrap();
+    let (out, attempts, _served) = router.complete(model_cfg, &make_req("claude-test")).await.unwrap();
     let ProviderOutput::Json(body) = out else {
         panic!("expected JSON output");
     };
@@ -451,11 +455,12 @@ async fn mock_llm_provider_falls_back_when_primary_returns_402_quota() {
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-    };
+            ..Config::default()
+        };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
-    let (out, attempts) = router
+    let (out, attempts, _served) = router
         .complete(model_cfg, &make_req("claude-test"))
         .await
         .unwrap();
@@ -530,11 +535,12 @@ async fn mock_llm_provider_falls_back_when_primary_returns_empty_body_402() {
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-    };
+            ..Config::default()
+        };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
-    let (out, attempts) = router
+    let (out, attempts, _served) = router
         .complete(model_cfg, &make_req("claude-test"))
         .await
         .unwrap();
@@ -610,7 +616,8 @@ async fn mock_llm_provider_does_not_fall_back_on_403() {
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-    };
+            ..Config::default()
+        };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
@@ -689,7 +696,8 @@ async fn mock_llm_provider_chain_exhausted_returns_last_upstream_error() {
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-    };
+            ..Config::default()
+        };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
@@ -787,11 +795,12 @@ async fn mock_llm_provider_per_provider_retry_three_times_before_chain_advance()
             max_retries_per_provider: 3,
             max_retries_total: 5,
         }],
-    };
+            ..Config::default()
+        };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
-    let (out, attempts) = router.complete(model_cfg, &make_req("claude-test")).await.unwrap();
+    let (out, attempts, _served) = router.complete(model_cfg, &make_req("claude-test")).await.unwrap();
     let ProviderOutput::Json(body) = out else {
         panic!("expected JSON output");
     };
@@ -872,11 +881,12 @@ async fn http_end_to_end_anthropic_provider_strips_and_succeeds() {
             max_retries_per_provider: 1,
             max_retries_total: 1,
         }],
-    };
+            ..Config::default()
+        };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
-    let (out, attempts) = router
+    let (out, attempts, _served) = router
         .complete(model_cfg, &make_thinking_history_req("claude-test"))
         .await
         .unwrap();
@@ -977,7 +987,8 @@ async fn http_end_to_end_anthropic_provider_strip_max_attempts_then_passthrough(
             max_retries_per_provider: 1,
             max_retries_total: 1,
         }],
-    };
+            ..Config::default()
+        };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
@@ -1013,6 +1024,16 @@ fn build_axum_app(
     provider_configs: Vec<ProviderConfig>,
     model_chain: Vec<String>,
 ) -> axum::Router {
+    // Review #10: thread the usage stats capacity into both the
+    // Config and AppState. Using `Config::default()` for the rest is
+    // fine — the bug was `..Config::default()` setting
+    // `usage_capacity: DEFAULT_USAGE_CAPACITY (100_000)` while the
+    // AppState held `UsageStats::new(8)` — a 4-order-of-magnitude
+    // drift that would have surfaced as a confusing test failure if
+    // any future test asserted on `body["capacity"]` or
+    // `body["evicted_total"]`. Sibling `tests/server.rs:build_app`
+    // already threads correctly; this fixture now matches.
+    let usage = UsageStats::new(8);
     let cfg = Config {
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
@@ -1029,6 +1050,7 @@ fn build_axum_app(
             max_retries_per_provider: 1,
             max_retries_total: model_chain.len() as u32,
         }],
+        usage_capacity: usage.capacity(),
     };
     let cfg = Arc::new(cfg);
     let cooldown = CooldownCache::new();
@@ -1039,6 +1061,7 @@ fn build_axum_app(
         cooldown,
         http: reqwest::Client::new(),
         copilot: None,
+        usage,
     };
     llmproxy::server::build_router(state)
 }
@@ -1498,11 +1521,12 @@ async fn mock_llm_provider_short_cooldown_for_non_429_upstream_error() {
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-    };
+            ..Config::default()
+        };
     let router = Router::new(Arc::new(cfg), providers.clone(), CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
-    let (out, attempts) = router.complete(model_cfg, &make_req("claude-test")).await.unwrap();
+    let (out, attempts, _served) = router.complete(model_cfg, &make_req("claude-test")).await.unwrap();
     let ProviderOutput::Json(body) = out else {
         panic!("expected JSON output");
     };
@@ -1596,7 +1620,8 @@ async fn mock_llm_provider_402_uses_configured_cooldown_seconds_and_skips_primar
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-    };
+            ..Config::default()
+        };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
@@ -1605,7 +1630,7 @@ async fn mock_llm_provider_402_uses_configured_cooldown_seconds_and_skips_primar
     // First request: primary returns 402 → backup takes over. The
     // primary entry's remaining TTL must be close to the configured
     // 60s (allow scheduler drift), not the 5s transient window.
-    let (_out, _attempts) = router.complete(model_cfg, &req).await.unwrap();
+    let (_out, _attempts, _served) = router.complete(model_cfg, &req).await.unwrap();
     let active = router.cooldown().active().await;
     let primary_entry = active
         .iter()
@@ -1624,7 +1649,7 @@ async fn mock_llm_provider_402_uses_configured_cooldown_seconds_and_skips_primar
     // Second request: primary must be actively skipped (its call
     // count stays at 1 because the wiremock expectation already
     // pinned the limit).
-    let (_out, attempts2) = router.complete(model_cfg, &req).await.unwrap();
+    let (_out, attempts2, _served) = router.complete(model_cfg, &req).await.unwrap();
     assert!(
         attempts2.is_empty(),
         "primary must be skipped on the second request; got {attempts2:?}"
@@ -1700,21 +1725,22 @@ async fn mock_llm_provider_subsequent_request_skips_cooldown_provider_directly()
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-    };
+            ..Config::default()
+        };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
     let req = make_req("claude-test");
 
     // First request: primary should be hit once (429), backup takes over.
-    let (_out, attempts) = router.complete(model_cfg, &req).await.unwrap();
+    let (_out, attempts, _served) = router.complete(model_cfg, &req).await.unwrap();
     assert_eq!(attempts.len(), 1);
     assert_eq!(primary_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(backup_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     // Second request: primary is on cooldown — backup must be called
     // directly with no HTTP attempt against primary.
-    let (_out, attempts) = router.complete(model_cfg, &req).await.unwrap();
+    let (_out, attempts, _served) = router.complete(model_cfg, &req).await.unwrap();
     assert!(attempts.is_empty(), "primary must be skipped, no attempt recorded");
     assert_eq!(
         primary_calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -1819,11 +1845,12 @@ async fn mock_llm_provider_skips_provider_with_unsupported_model_via_runtime_400
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-    };
+            ..Config::default()
+        };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
-    let (out, attempts) = router.complete(model_cfg, &make_req("claude-test")).await.unwrap();
+    let (out, attempts, _served) = router.complete(model_cfg, &make_req("claude-test")).await.unwrap();
     let ProviderOutput::Json(body) = out else {
         panic!("expected JSON output");
     };

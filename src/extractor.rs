@@ -7,10 +7,18 @@
 //! request body as JSON..." — a format inconsistent with every other
 //! error response the proxy emits (auth, unknown model, cooldown, etc.).
 //!
+//! `AppQuery` mirrors axum's `Query<T>` with the same
+//! `ProxyError::BadRequest` mapping for malformed query strings, so
+//! the `/admin/usage` endpoint surfaces 400s in the project's error
+//! envelope rather than axum's `text/plain` "Failed to deserialize
+//! query string".
+//!
 //! See fix-R4 in docs/TEST_ISSUES.md.
 
 use axum::async_trait;
-use axum::extract::{FromRequest, Request};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{FromRequest, FromRequestParts, Query, Request};
+use axum::http::request::Parts;
 use axum::http::header;
 use axum::Json;
 use serde::de::DeserializeOwned;
@@ -45,6 +53,33 @@ where
     }
 }
 
+/// Query-string wrapper with the same `ProxyError::BadRequest`
+/// rejection mapping as `AppJson`. Use `FromRequestParts` (not
+/// `FromRequest`) because query parameters live on the request's
+/// parts — the body isn't needed and isn't read.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AppQuery<T>(pub T);
+
+#[async_trait]
+impl<S, T> FromRequestParts<S> for AppQuery<T>
+where
+    Query<T>: FromRequestParts<S, Rejection = QueryRejection>,
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ProxyError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        match Query::<T>::from_request_parts(parts, state).await {
+            Ok(Query(value)) => Ok(AppQuery(value)),
+            Err(rejection) => Err(map_query_rejection(rejection)),
+        }
+    }
+}
+
 fn is_json_content_type(headers: &axum::http::HeaderMap) -> bool {
     let Some(ct) = headers.get(header::CONTENT_TYPE) else {
         return false;
@@ -65,6 +100,13 @@ fn map_json_rejection(rejection: axum::extract::rejection::JsonRejection) -> Pro
     // rejecting the *request*, not relaying an upstream error.
     let detail = rejection.body_text();
     ProxyError::BadRequest(format!("invalid request body: {detail}"))
+}
+
+fn map_query_rejection(rejection: QueryRejection) -> ProxyError {
+    // Mirror the JSON mapping: always 400 + a uniform "invalid query"
+    // prefix so admin endpoints surface the project's error envelope.
+    let detail = rejection.body_text();
+    ProxyError::BadRequest(format!("invalid query string: {detail}"))
 }
 
 #[cfg(test)]
@@ -108,5 +150,55 @@ mod tests {
             axum::http::HeaderValue::from_bytes(b"application/json\xff").unwrap(),
         );
         assert!(!is_json_content_type(&h));
+    }
+
+    #[tokio::test]
+    async fn app_query_extracts_valid_query_string() {
+        use axum::extract::FromRequestParts;
+        use axum::http::Request;
+        use serde::Deserialize;
+
+        #[derive(Deserialize, PartialEq, Debug)]
+        struct Q {
+            n: u32,
+        }
+        let req = Request::builder()
+            .uri("/?n=42")
+            .body(())
+            .unwrap();
+        let (mut parts, _body) = req.into_parts();
+        let got = AppQuery::<Q>::from_request_parts(&mut parts, &())
+            .await
+            .expect("valid query parses");
+        assert_eq!(got.0, Q { n: 42 });
+    }
+
+    #[tokio::test]
+    async fn app_query_maps_malformed_query_to_bad_request() {
+        use axum::extract::FromRequestParts;
+        use axum::http::Request;
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        struct Q {
+            n: u32,
+        }
+        // `n=abc` cannot parse into u32 → must surface as
+        // ProxyError::BadRequest, not axum's default text/plain
+        // rejection.
+        let req = Request::builder()
+            .uri("/?n=abc")
+            .body(())
+            .unwrap();
+        let (mut parts, _body) = req.into_parts();
+        let err = AppQuery::<Q>::from_request_parts(&mut parts, &())
+            .await
+            .expect_err("malformed query must reject");
+        assert!(
+            matches!(err, ProxyError::BadRequest(_)),
+            "expected BadRequest, got {err:?}"
+        );
     }
 }

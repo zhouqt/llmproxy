@@ -13,6 +13,7 @@ use tower::ServiceExt;
 use llmproxy::auth::require_auth;
 use llmproxy::config::{Config, ServerConfig};
 use llmproxy::state::AppState;
+use llmproxy::usage::UsageStats;
 
 fn dummy_state(api_key: Option<String>) -> AppState {
     let cfg = Config {
@@ -24,6 +25,7 @@ fn dummy_state(api_key: Option<String>) -> AppState {
         user_agent: llmproxy::config::default_user_agent(),
         providers: vec![],
         models: vec![],
+        ..Config::default()
     };
     // We don't exercise providers here — just auth.
     AppState {
@@ -35,6 +37,7 @@ fn dummy_state(api_key: Option<String>) -> AppState {
                 user_agent: llmproxy::config::default_user_agent(),
                 providers: vec![],
                 models: vec![],
+                ..Config::default()
             }),
             Default::default(),
             llmproxy::cooldown::CooldownCache::new(),
@@ -42,6 +45,7 @@ fn dummy_state(api_key: Option<String>) -> AppState {
         cooldown: llmproxy::cooldown::CooldownCache::new(),
         http: reqwest::Client::new(),
         copilot: None,
+        usage: UsageStats::new(8),
     }
 }
 

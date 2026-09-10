@@ -84,6 +84,14 @@ fn build_state(
     proxied_http: reqwest::Client,
     direct_http: reqwest::Client,
 ) -> Result<(AppState, Vec<tokio::task::JoinHandle<()>>), llmproxy::error::ProxyError> {
+    let usage_capacity = cfg.usage_capacity;
+    if usage_capacity > llmproxy::usage::MAX_USAGE_CAPACITY {
+        tracing::warn!(
+            requested = usage_capacity,
+            max = llmproxy::usage::MAX_USAGE_CAPACITY,
+            "usage_capacity above ceiling; clamping to MAX_USAGE_CAPACITY"
+        );
+    }
     let mut provider_map: HashMap<String, SharedProvider> = HashMap::new();
     let mut bg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     // Track the Copilot provider separately so the admin endpoint can
@@ -128,6 +136,7 @@ fn build_state(
         // without re-resolving the proxy decision.
         http: direct_http,
         copilot,
+        usage: llmproxy::usage::UsageStats::new(usage_capacity),
     };
     Ok((state, bg_handles))
 }
