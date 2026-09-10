@@ -18,6 +18,7 @@ pub mod test_support;
 pub mod server;
 pub mod state;
 pub mod tokenize;
+pub mod usage;
 pub mod util;
 
 /// Test-only helper macro: match a value against a pattern, execute the

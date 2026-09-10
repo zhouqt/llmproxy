@@ -203,11 +203,19 @@ impl Router {
     }
 
     /// Execute a complete request with retries across the chain.
+    ///
+    /// Returns the response, the attempt log, and the **serving
+    /// provider's name** (the chain entry that actually produced
+    /// `resp`). The third tuple element is the explicit, non-inferred
+    /// answer to "which provider served this request?" — it lets
+    /// `messages_handler` record the serving provider in the
+    /// `UsageRecord` without re-deriving it from `attempts`. On
+    /// failure, the name is `None`.
     pub async fn complete(
         &self,
         model: &ModelConfig,
         req: &MessagesRequest,
-    ) -> Result<(ProviderOutput, Vec<RouteAttempt>)> {
+    ) -> Result<(ProviderOutput, Vec<RouteAttempt>, Option<String>)> {
         let mut attempts: Vec<RouteAttempt> = Vec::new();
         let mut last_error: Option<ProxyError> = None;
         let mut tried: Vec<String> = Vec::new();
@@ -266,7 +274,7 @@ impl Router {
             // the first error — that's the whole point of this counter.
             for _ in 0..model.max_retries_per_provider {
                 match provider.complete(req, &HashMap::new()).await {
-                    Ok(out) => return Ok((out, attempts)),
+                    Ok(out) => return Ok((out, attempts, Some(name.clone()))),
                     Err(e) if e.is_cooldownable() => {
                         if let ProxyError::Upstream { status, body } = &e {
                             attempts.push(RouteAttempt {
@@ -637,7 +645,8 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-        };
+                ..Config::default()
+            };
 
         Router::new(Arc::new(cfg), providers, CooldownCache::new())
     }
@@ -656,7 +665,7 @@ mod tests {
         let router = build_test_router();
         let model = router.find_model("m").unwrap();
         let req = dummy_request();
-        let (out, attempts) = router.complete(model, &req).await.unwrap();
+        let (out, attempts, _served) = router.complete(model, &req).await.unwrap();
         assert!(matches!(out, ProviderOutput::Json(_)));
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].provider, "primary");
@@ -717,11 +726,12 @@ mod tests {
                 max_retries_per_provider: 3,
                 max_retries_total: 3,
             }],
-        };
+                ..Config::default()
+            };
         let router = Router::new(Arc::new(cfg), providers.clone(), CooldownCache::new());
         let model = router.find_model("m").unwrap();
 
-        let (out, attempts) = router.complete(model, &dummy_request()).await.unwrap();
+        let (out, attempts, _served) = router.complete(model, &dummy_request()).await.unwrap();
         assert!(matches!(out, ProviderOutput::Json(_)));
         // Primary was hit exactly 3 times: 2 failures + 1 success.
         assert_eq!(call_count.load(Ordering::SeqCst), 3);
@@ -791,10 +801,10 @@ mod tests {
         let req = dummy_request();
 
         // First call: primary fails 429, fallback succeeds.
-        let _ = router.complete(model, &req).await.unwrap();
+        let (_out, _attempts, _served) = router.complete(model, &req).await.unwrap();
 
         // Second call: primary should be cooling down, backup used directly.
-        let (out, attempts) = router.complete(model, &req).await.unwrap();
+        let (out, attempts, _served) = router.complete(model, &req).await.unwrap();
         assert!(matches!(out, ProviderOutput::Json(_)));
         assert!(attempts.is_empty(), "primary should be on cooldown");
     }
@@ -1008,7 +1018,8 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-        };
+                ..Config::default()
+            };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
 
@@ -1079,7 +1090,8 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 1,
             }],
-        };
+                ..Config::default()
+            };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
 
@@ -1199,7 +1211,7 @@ mod tests {
         let mut model = base.find_model("m").unwrap().clone();
         model.fallback_chain = vec!["missing".into(), "backup".into()];
 
-        let (out, attempts) = router_clone_with(&base)
+        let (out, attempts, _served) = router_clone_with(&base)
             .complete(&model, &dummy_request())
             .await
             .unwrap();
@@ -1282,7 +1294,8 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 5,
             }],
-        };
+                ..Config::default()
+            };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
 
@@ -1352,7 +1365,8 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 5,
             }],
-        };
+                ..Config::default()
+            };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
 
@@ -1450,7 +1464,8 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-        };
+                ..Config::default()
+            };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
 
@@ -1511,7 +1526,7 @@ mod tests {
             CooldownCache::new(),
         );
         let model = router.find_model("m").unwrap();
-        let _ = router.complete(model, &dummy_request()).await.unwrap();
+        let (_out, _attempts, _served) = router.complete(model, &dummy_request()).await.unwrap();
 
         // Backup succeeded; primary should now be on a short cooldown.
         assert!(router.cooldown().is_cooling_down("primary").await);
@@ -1627,7 +1642,8 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-        };
+                ..Config::default()
+            };
         (
             Router::new(Arc::new(cfg), providers, CooldownCache::new()),
             primary_count,
@@ -1651,7 +1667,7 @@ mod tests {
         assert_eq!(router.providers.get("primary").unwrap().name(), "primary");
         assert_eq!(router.providers.get("backup").unwrap().name(), "backup");
 
-        let (out, attempts) = router.complete(model, &req).await.unwrap();
+        let (out, attempts, _served) = router.complete(model, &req).await.unwrap();
         assert!(matches!(out, ProviderOutput::Json(_)));
         assert_eq!(primary_count.load(Ordering::SeqCst), 0, "primary must be skipped, not called");
         assert_eq!(backup_count.load(Ordering::SeqCst), 1);
@@ -1701,7 +1717,7 @@ mod tests {
             build_restricted_router(vec!["other".into()], vec![]);
         let model = router.find_model("m").unwrap();
 
-        let (out, _attempts) = router.complete(model, &dummy_request()).await.unwrap();
+        let (out, _attempts, _served) = router.complete(model, &dummy_request()).await.unwrap();
         assert!(matches!(out, ProviderOutput::Json(_)));
         assert_eq!(primary_count.load(Ordering::SeqCst), 0);
         assert_eq!(backup_count.load(Ordering::SeqCst), 1);
@@ -1791,7 +1807,8 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-        };
+                ..Config::default()
+            };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
 
@@ -1989,7 +2006,8 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-        };
+                ..Config::default()
+            };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
 
@@ -1998,7 +2016,7 @@ mod tests {
         // a compiled-but-never-called method on the mock helper).
         assert_eq!(primary.name(), "primary");
 
-        let (out, attempts) = router.complete(model, &dummy_request()).await.unwrap();
+        let (out, attempts, _served) = router.complete(model, &dummy_request()).await.unwrap();
         assert!(matches!(out, ProviderOutput::Json(_)));
         // Primary was tried once (returned the 400), backup took over.
         assert_eq!(primary.call_count.load(Ordering::SeqCst), 1);
@@ -2065,7 +2083,8 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-        };
+                ..Config::default()
+            };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
 
@@ -2136,7 +2155,8 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-        };
+                ..Config::default()
+            };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
 
