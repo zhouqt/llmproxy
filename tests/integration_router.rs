@@ -41,7 +41,7 @@ use llmproxy::config::{Config, ModelConfig, ProviderConfig, ServerConfig};
 use llmproxy::cooldown::CooldownCache;
 use llmproxy::error::{ProxyError, Result};
 use llmproxy::providers::{Provider, ProviderOutput, SharedProvider};
-use llmproxy::router::Router;
+use llmproxy::router::{LocalSkipReason, RouteStep, Router};
 use llmproxy::state::AppState;
 use llmproxy::usage::UsageStats;
 
@@ -301,9 +301,14 @@ async fn mock_llm_provider_falls_back_when_primary_returns_429() {
     };
     assert_eq!(body["content"][0]["text"], "from backup");
     assert_eq!(attempts.len(), 1, "exactly one attempt (primary's 429)");
-    assert_eq!(attempts[0].provider, "primary");
-    assert_eq!(attempts[0].status, 429);
-    assert_eq!(attempts[0].body, "rate limited");
+    match &attempts[0] {
+        RouteStep::Failed { provider, status, body } => {
+            assert_eq!(provider, "primary");
+            assert_eq!(*status, 429);
+            assert_eq!(body, "rate limited");
+        }
+        other => panic!("expected RouteStep::Failed, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -385,8 +390,13 @@ async fn copilot_endpoint_rejection_400_triggers_fallback() {
     };
     assert_eq!(body["content"][0]["text"], "from backup");
     assert_eq!(attempts.len(), 1, "exactly one attempt (primary's 400)");
-    assert_eq!(attempts[0].provider, "primary");
-    assert_eq!(attempts[0].status, 400);
+    match &attempts[0] {
+        RouteStep::Failed { provider, status, .. } => {
+            assert_eq!(provider, "primary");
+            assert_eq!(*status, 400);
+        }
+        other => panic!("expected RouteStep::Failed, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -469,9 +479,14 @@ async fn mock_llm_provider_falls_back_when_primary_returns_402_quota() {
     };
     assert_eq!(body["content"][0]["text"], "from backup");
     assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].provider, "primary");
-    assert_eq!(attempts[0].status, 402);
-    assert_eq!(attempts[0].body, "You have exceeded your monthly quota");
+    match &attempts[0] {
+        RouteStep::Failed { provider, status, body } => {
+            assert_eq!(provider, "primary");
+            assert_eq!(*status, 402);
+            assert_eq!(body, "You have exceeded your monthly quota");
+        }
+        other => panic!("expected RouteStep::Failed, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -549,8 +564,13 @@ async fn mock_llm_provider_falls_back_when_primary_returns_empty_body_402() {
     };
     assert_eq!(body["content"][0]["text"], "from backup");
     assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].status, 402);
-    assert_eq!(attempts[0].body, "");
+    match &attempts[0] {
+        RouteStep::Failed { status, body, .. } => {
+            assert_eq!(*status, 402);
+            assert_eq!(body, "");
+        }
+        other => panic!("expected RouteStep::Failed, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -710,10 +730,18 @@ async fn mock_llm_provider_chain_exhausted_returns_last_upstream_error() {
     match err {
         ProxyError::AllProvidersFailed { attempts, last, .. } => {
             assert_eq!(attempts.len(), 2);
-            assert_eq!(attempts[0].provider, "primary");
-            assert_eq!(attempts[0].body, "primary-error");
-            assert_eq!(attempts[1].provider, "backup");
-            assert_eq!(attempts[1].body, "backup-error");
+            match (&attempts[0], &attempts[1]) {
+                (
+                    RouteStep::Failed { provider: p0, body: b0, .. },
+                    RouteStep::Failed { provider: p1, body: b1, .. },
+                ) => {
+                    assert_eq!(p0, "primary");
+                    assert_eq!(b0, "primary-error");
+                    assert_eq!(p1, "backup");
+                    assert_eq!(b1, "backup-error");
+                }
+                _ => panic!("expected two RouteStep::Failed entries"),
+            }
             match last.as_ref() {
                 ProxyError::Upstream { status, body } => {
                     assert_eq!(*status, 500);
@@ -807,7 +835,13 @@ async fn mock_llm_provider_per_provider_retry_three_times_before_chain_advance()
     assert_eq!(body["content"][0]["text"], "third time lucky");
     // Two 429 attempts before the success.
     assert_eq!(attempts.len(), 2);
-    assert_eq!(attempts.iter().filter(|a| a.status == 429).count(), 2);
+    assert_eq!(
+        attempts
+            .iter()
+            .filter(|a| matches!(a, RouteStep::Failed { status: 429, .. }))
+            .count(),
+        2
+    );
     assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 3);
 }
 
@@ -1552,7 +1586,10 @@ async fn mock_llm_provider_short_cooldown_for_non_429_upstream_error() {
         "non-429 cooldown must use the short default TTL (~5s), got {ttl:?}"
     );
     assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].status, 503);
+    match &attempts[0] {
+        RouteStep::Failed { status, .. } => assert_eq!(*status, 503),
+        other => panic!("expected RouteStep::Failed, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -1651,8 +1688,18 @@ async fn mock_llm_provider_402_uses_configured_cooldown_seconds_and_skips_primar
     // pinned the limit).
     let (_out, attempts2, _served) = router.complete(model_cfg, &req).await.unwrap();
     assert!(
-        attempts2.is_empty(),
-        "primary must be skipped on the second request; got {attempts2:?}"
+        attempts2.iter().any(|s| matches!(
+            s,
+            RouteStep::LocalSkip {
+                reason: LocalSkipReason::Cooldown,
+                ..
+            }
+        )),
+        "primary skip must be recorded as RouteStep::LocalSkip::Cooldown on second request; got {attempts2:?}"
+    );
+    assert!(
+        !attempts2.iter().any(|s| s.is_upstream_failure()),
+        "no upstream call should have fired against cooling-down primary"
     );
 }
 
@@ -1741,7 +1788,20 @@ async fn mock_llm_provider_subsequent_request_skips_cooldown_provider_directly()
     // Second request: primary is on cooldown — backup must be called
     // directly with no HTTP attempt against primary.
     let (_out, attempts, _served) = router.complete(model_cfg, &req).await.unwrap();
-    assert!(attempts.is_empty(), "primary must be skipped, no attempt recorded");
+    assert!(
+        attempts.iter().any(|s| matches!(
+            s,
+            RouteStep::LocalSkip {
+                reason: LocalSkipReason::Cooldown,
+                ..
+            }
+        )),
+        "primary skip must be recorded as RouteStep::LocalSkip::Cooldown; got {attempts:?}"
+    );
+    assert!(
+        !attempts.iter().any(|s| s.is_upstream_failure()),
+        "no upstream call should have fired against cooling-down primary"
+    );
     assert_eq!(
         primary_calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -1856,9 +1916,14 @@ async fn mock_llm_provider_skips_provider_with_unsupported_model_via_runtime_400
     };
     assert_eq!(body["content"][0]["text"], "backup ok");
     assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].provider, "primary");
-    assert_eq!(attempts[0].status, 400);
-    assert!(attempts[0].body.contains("model_not_supported"));
+    match &attempts[0] {
+        RouteStep::Failed { provider, status, body } => {
+            assert_eq!(provider, "primary");
+            assert_eq!(*status, 400);
+            assert!(body.contains("model_not_supported"));
+        }
+        other => panic!("expected RouteStep::Failed, got {other:?}"),
+    }
     // The model-unsupported branch puts primary on a short (60s) cooldown.
     assert!(router.cooldown().is_cooling_down("primary").await);
 }
