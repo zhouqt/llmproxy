@@ -171,3 +171,78 @@ mod tests {
         assert_eq!(summarize_for_log(mb, "<empty payload>"), mb);
     }
 }
+
+/// Truncate `body` to at most `cap` bytes, snapping to the previous
+/// UTF-8 char boundary if `cap` lands mid-codepoint so the result
+/// is always valid UTF-8. Plan §Phase 1 commit 7 — used at the
+/// `RouteStep::Failed` push site in `src/router.rs` to keep the
+/// upstream body that ends up in the WARN line bounded (otherwise a
+/// hundred-KiB Cloudflare HTML page would land in the log; the
+/// sanitized summary already runs downstream, but capping at the
+/// source stops the bloat earlier and keeps the structured field
+/// shape predictable).
+///
+/// Returns the input as-is when it already fits. With `cap = 0`
+/// returns an empty string. The contract: the returned slice is a
+/// prefix of `body` whose byte length is ≤ `cap` and whose byte
+/// length is `0` OR the char boundary immediately preceding `cap`.
+pub fn truncate_for_log(body: &str, cap: usize) -> &str {
+    if body.len() <= cap {
+        return body;
+    }
+    if cap == 0 {
+        return "";
+    }
+    let mut idx = cap;
+    while !body.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    &body[..idx]
+}
+
+#[cfg(test)]
+mod truncate_for_log_tests {
+    use super::truncate_for_log;
+
+    #[test]
+    fn len_leq_cap_returns_full_body() {
+        let s = "short body";
+        assert_eq!(truncate_for_log(s, 100), s);
+        assert_eq!(truncate_for_log(s, s.len()), s);
+    }
+
+    #[test]
+    fn len_gt_cap_at_char_boundary_truncates_to_cap() {
+        let s = "hello world"; // 11 ASCII bytes, all on char boundaries
+        let truncated = truncate_for_log(s, 5);
+        assert_eq!(truncated, "hello");
+        assert_eq!(truncated.len(), 5);
+    }
+
+    #[test]
+    fn len_gt_cap_lands_on_multibyte_char_snaps_back() {
+        // Each Chinese char is 3 bytes in UTF-8. With cap = 4 we'd
+        // land mid-codepoint at byte index 4 (one full char + 1 byte
+        // into the next); the snap-back should land at byte 3, the
+        // end of the first char.
+        let s = "模型限流"; // 4 chars × 3 bytes = 12 bytes
+        let truncated = truncate_for_log(s, 4);
+        assert_eq!(truncated, "模"); // first 3-byte char only
+        assert_eq!(truncated.len(), 3);
+    }
+
+    #[test]
+    fn empty_input_returns_empty_regardless_of_cap() {
+        assert_eq!(truncate_for_log("", 0), "");
+        assert_eq!(truncate_for_log("", 100), "");
+    }
+
+    #[test]
+    fn cap_zero_returns_empty_string_for_non_empty_input() {
+        // This is the only degenerate cap = 0 path with a non-empty
+        // input — without the early return, the char-boundary loop
+        // would underflow `idx`. The early return keeps the function
+        // total on `(&str, usize)`.
+        assert_eq!(truncate_for_log("anything", 0), "");
+    }
+}

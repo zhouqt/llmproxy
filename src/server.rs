@@ -72,6 +72,19 @@ async fn messages_handler(
     let model_cfg = match state.router.find_model(&req.model) {
         Some(c) => c.clone(),
         None => {
+            // Phase 2: emit `request started` even on the 4xx path so
+            // operators see every request that reached the handler.
+            // Without this, unknown-model requests vanish from the
+            // log entirely (only the terminal 400 surfaces). The
+            // `provider=unknown` literal distinguishes this from the
+            // normal path's `provider=<primary>` so the start+finish
+            // pair is always differentiable.
+            tracing::info!(
+                model = %req.model,
+                provider = "unknown",
+                stream = req.stream,
+                "request started"
+            );
             record_errored(
                 &state.usage,
                 &start,
@@ -79,6 +92,7 @@ async fn messages_handler(
                 &req.model,
                 &[],
                 req.stream,
+                false,
                 format!("unknown model: {}", req.model),
             );
             return Err(ProxyError::BadRequest(format!(
@@ -87,6 +101,19 @@ async fn messages_handler(
             )));
         }
     };
+
+    // Phase 2: emit `request started` on the success path. Placed
+    // BEFORE any router call so a long fallback chain can't push the
+    // start line past the finish line in the log tail. `provider` is
+    // the *intended* primary (not the eventual `served_by`) so the
+    // start+finish pair aligns via the model label rather than
+    // promising a specific provider will serve the request.
+    tracing::info!(
+        model = %req.model,
+        provider = %model_cfg.primary,
+        stream = req.stream,
+        "request started"
+    );
 
     if req.stream {
         let stream_result = state.router.stream(&model_cfg, &req).await;
@@ -99,27 +126,34 @@ async fn messages_handler(
                 // (Review #11). Carry the per-provider attempts so the
                 // row shows who failed (review final round C3).
                 let failed = extract_failed_providers(&e);
+                let is_all_providers_failed = matches!(
+                    e,
+                    ProxyError::AllProvidersFailed { .. }
+                        | ProxyError::AllProvidersCoolingDown { .. }
+                        | ProxyError::RouterBadRequest { .. }
+                );
+                emit_all_providers_failed_warn(&e, &req.model, true);
                 record_errored(
                     &state.usage,
                     &start,
-                    "<router>",
+                    &extract_provider_label(&e),
                     &req.model,
                     &failed,
                     req.stream,
+                    is_all_providers_failed,
                     format!("router.stream failed: {e}"),
                 );
                 return Err(e);
             }
         };
-        let summary = format_attempts(&attempts);
-        tracing::info!(
-            model = req.model.as_str(),
-            provider = provider.name(),
-            stream = req.stream,
-            elapsed_ms = start.elapsed_ms(),
-            failed_providers = %summary,
-            "request completed"
-        );
+        // Commit 5: the streaming path no longer emits its own
+        // `request completed` INFO line — that vocabulary is now
+        // reserved for the non-streaming handler below. The streaming
+        // terminal lines (`streaming fallback` / `streaming completed`
+        // / `streaming aborted`) are emitted from `stream_response` /
+        // `MappedStream::finalize_and_record` so the log order
+        // mirrors the wire timeline (header → first byte → last byte
+        // → done).
         return Ok(stream_response(
             provider.name(),
             req.model.as_str(),
@@ -142,13 +176,21 @@ async fn messages_handler(
             // last hole). Carry the per-provider attempts so the row
             // shows who failed (review final round C3).
             let failed = extract_failed_providers(&e);
+            let is_all_providers_failed = matches!(
+                e,
+                ProxyError::AllProvidersFailed { .. }
+                    | ProxyError::AllProvidersCoolingDown { .. }
+                    | ProxyError::RouterBadRequest { .. }
+            );
+            emit_all_providers_failed_warn(&e, &req.model, false);
             record_errored(
                 &state.usage,
                 &start,
-                "<router>",
+                &extract_provider_label(&e),
                 &req.model,
                 &failed,
                 req.stream,
+                is_all_providers_failed,
                 format!("router.complete failed: {e}"),
             );
             return Err(e);
@@ -156,12 +198,14 @@ async fn messages_handler(
     };
     // From here on every error path records a row before returning.
     let provider_label = served_by.unwrap_or_else(|| model_cfg.primary.clone());
-    // C6: serving provider's own in-place retries must NOT show up in
+    // The serving provider's own in-place retries must NOT show up in
     // the success row's failed_providers — that field is meant to
     // report the failed fallback chain, not how many times we
-    // retried the eventual winner.
+    // retried the eventual winner. Local skips (cooldown /
+    // model_rewrite) DO appear: they explain where the fallback came
+    // from (plan §三方 policy — the UsageRecord view keeps full
+    // history except `served_by`).
     let failed_providers = filter_failed_providers_for(&attempts, &provider_label);
-    let summary = format_attempts(&attempts);
 
     // Parse the provider output into a MessagesResponse, recording
     // an Errored UsageRecord on either shape mismatch.
@@ -179,6 +223,7 @@ async fn messages_handler(
                     &req.model,
                     &failed_providers,
                     req.stream,
+                    false,
                     format!("MessagesResponse parse failed: {e}"),
                 );
                 return Err(ProxyError::Internal(format!(
@@ -194,6 +239,7 @@ async fn messages_handler(
                 &req.model,
                 &failed_providers,
                 req.stream,
+                false,
                 "non-streaming provider returned a stream".into(),
             );
             return Err(ProxyError::Internal(
@@ -221,24 +267,91 @@ async fn messages_handler(
         failed_providers: failed_providers.clone(),
         total_tokens,
     });
-    tracing::info!(
-        model = req.model.as_str(),
-        provider = %provider_label,
-        stream = req.stream,
-        elapsed_ms,
-        failed_providers = %summary,
-        "request completed"
-    );
+    // Commit 6 Option-absent: only emit `failed_providers=` when the
+    // fallback chain actually recorded something. On the happy path
+    // (no fallback, no retries against the same provider) the field
+    // is absent rather than empty — operators grepping for
+    // `failed_providers=cp:429` would otherwise catch every line.
+    //
+    // `last_error` pairs with a non-empty chain: it carries the
+    // sanitized body of the last real upstream failure so the
+    // completion line reads as a closed loop ("fell back to backup
+    // because primary returned THIS"). Absent when the fallback was
+    // entirely local skips (plan §Phase 1 §2 schema).
+    //
+    // Hot-path short-circuit (code-review finding #1/#2/#9): when no
+    // fallback happened, `attempts` is empty and BOTH `format_attempts`
+    // (allocates a Vec<String> + join) and `last_failed_body`
+    // (sanitize scan over the body) would produce values that two of
+    // the three match arms discard. Skip them and the header builder
+    // entirely — this is the dominant happy-path traffic shape.
+    if attempts.is_empty() {
+        tracing::info!(
+            model = req.model.as_str(),
+            provider = %provider_label,
+            stream = req.stream,
+            elapsed_ms,
+            "request completed"
+        );
+    } else {
+        let summary = format_attempts(&attempts);
+        let last_error = crate::router::last_failed_body(&attempts)
+            .map(|body| crate::util::summarize_for_log(body, "<empty error message>"));
+        match (summary, last_error) {
+            (Some(s), Some(err)) => {
+                tracing::info!(
+                    model = req.model.as_str(),
+                    provider = %provider_label,
+                    stream = req.stream,
+                    elapsed_ms,
+                    failed_providers = %s,
+                    last_error = %err,
+                    "request completed"
+                );
+            }
+            (Some(s), None) => {
+                tracing::info!(
+                    model = req.model.as_str(),
+                    provider = %provider_label,
+                    stream = req.stream,
+                    elapsed_ms,
+                    failed_providers = %s,
+                    "request completed"
+                );
+            }
+            (None, _) => {
+                tracing::info!(
+                    model = req.model.as_str(),
+                    provider = %provider_label,
+                    stream = req.stream,
+                    elapsed_ms,
+                    "request completed"
+                );
+            }
+        }
+    }
 
     let mut headers = HeaderMap::new();
-    // C6: header mirrors the record's failed_providers (filtered for
-    // serving provider). Operators correlate the response header
-    // with /admin/usage rows by this string, so the two MUST agree.
-    if !failed_providers.is_empty() {
-        headers.insert(
-            "x-llmproxy-failed-providers",
-            failed_providers.join(",").parse().unwrap(),
-        );
+    // The `x-llmproxy-failed-providers` header is the upstream-only
+    // view of the chain (plan §三方 policy): real upstream failures
+    // only, minus the serving provider. This is NOT the same as the
+    // success row's `UsageRecord.failed_providers` (which keeps
+    // LocalSkip history) — header and record serve different
+    // consumers and deliberately differ. `format_attempts_header`
+    // (router) filters to `is_upstream_failure()` and returns `None`
+    // when every step is a LocalSkip, which means the header is
+    // absent for the all-cooldown / all-unmappable fallbacks —
+    // exactly the schema lock in plan §Phase 1 §2. With the
+    // `attempts.is_empty()` short-circuit above, the header path
+    // is also dead on the happy path (the function still iterates
+    // the empty slice and returns None, but skipping it costs a
+    // single branch on the hot path).
+    if !attempts.is_empty() {
+        if let Some(s) = crate::router::format_attempts_header(&attempts, Some(&provider_label)) {
+            if let Ok(v) = s.parse() {
+                headers.insert("x-llmproxy-failed-providers", v);
+            }
+        }
     }
 
     Ok((StatusCode::OK, headers, Json(resp)).into_response())
@@ -282,30 +395,36 @@ impl StartedAt {
     }
 }
 
-fn parse_failed_providers(attempts: &[crate::router::RouteAttempt]) -> Vec<String> {
-    attempts
-        .iter()
-        .map(|a| format!("{}:{}", a.provider, a.status))
-        .collect()
+fn parse_failed_providers(attempts: &[crate::router::RouteStep]) -> Vec<String> {
+    attempts.iter().map(crate::router::RouteStep::render).collect()
 }
 
 /// Like [`parse_failed_providers`] but drops any attempt against the
-/// provider that ultimately served the request. C6 (code-review final
-/// round): without this filter, a primary that fails twice and then
-/// succeeds on the third try (within `max_retries_per_provider`)
-/// records `["primary:429", "primary:429"]` in the success row's
-/// `failed_providers` — conflating in-place retries against the
-/// eventual serving provider with fallback attempts against the
-/// failed chain. Operators reading `/admin/usage` would see the
-/// provider that *did* the work flagged as a failure.
+/// provider that ultimately served the request. This is the
+/// `UsageRecord.failed_providers` view of the chain — it keeps **all**
+/// history including local skips (cooldown / model_unmapped), so an
+/// `/admin/usage` row explains where the fallback came from even when
+/// every skipped provider was a no-request skip. Plan §三方 policy:
+/// "`UsageRecord.failed_providers` — 全 history except `served_by`
+/// (不含 `is_upstream_failure()` filter — `LocalSkip` 也记入)".
+///
+/// This is deliberately a SEPARATE filter from
+/// [`crate::router::format_attempts_header`] (which is
+/// upstream-only, for the `x-llmproxy-failed-providers` response
+/// header). Plan §三方 policy §policy 单一来源: "HTTP header 的 filter
+/// 写在 `router::format_attempts_header` 内部… `UsageRecord` 的
+/// `provider() != served_by` filter 在 `record_errored` caller 处
+/// 内联(filter 出 `Vec<String>` 后传给 `record_errored`)。
+/// **两者不复用同一个 `filter_*` 函数** — 不同语义,不同抽象。这个表
+/// covers and supersedes 当前 main 的 C6 注释"。
 fn filter_failed_providers_for(
-    attempts: &[crate::router::RouteAttempt],
+    attempts: &[crate::router::RouteStep],
     served_by: &str,
 ) -> Vec<String> {
     attempts
         .iter()
-        .filter(|a| a.provider != served_by)
-        .map(|a| format!("{}:{}", a.provider, a.status))
+        .filter(|s| s.provider() != served_by)
+        .map(crate::router::RouteStep::render)
         .collect()
 }
 
@@ -313,12 +432,158 @@ fn filter_failed_providers_for(
 /// `/admin/usage` row written by `record_errored` for the `<router>`
 /// provider. Mirrors the response-header path
 /// (`ProxyError::failed_providers_header` → `x-llmproxy-failed-providers`)
-/// but keeps the structured Vec the record needs. Non-`AllProvidersFailed`
-/// errors return empty — they fired no upstream attempts worth reporting.
+/// but keeps the structured Vec the record needs. All three
+/// router-terminal variants carry `attempts` and must surface them
+/// here so the `UsageRecord.failed_providers` rollup sees the full
+/// chain — plan §Phase 1 round-9 MINOR #1 fix.
 fn extract_failed_providers(e: &ProxyError) -> Vec<String> {
     match e {
         ProxyError::AllProvidersFailed { attempts, .. } => parse_failed_providers(attempts),
+        ProxyError::AllProvidersCoolingDown { attempts, .. } => parse_failed_providers(attempts),
+        ProxyError::RouterBadRequest { attempts, .. } => parse_failed_providers(attempts),
         _ => Vec::new(),
+    }
+}
+
+/// Pick the `UsageRecord.provider` label for the row that
+/// `record_errored` writes on the `<router>` terminal path. Per plan
+/// §Phase 1 §三方 policy (round-7 NIT #8 fix):
+///
+/// - `AllProvidersFailed` → the **last** `RouteStep::Failed.provider`
+///   in the chain. This is the provider whose upstream error the
+///   caller will see in the response body; surfacing it as the row's
+///   `provider` lets `/admin/usage?group_by=provider` attribute the
+///   error correctly instead of dumping every all-failed row into the
+///   synthetic `<router>` bucket.
+/// - `AllProvidersCoolingDown` and `RouterBadRequest` → `"<router>"`.
+///   Both variants have zero real upstream calls (cooldown skips and
+///   model-rewrite misses respectively); using `last_failed_provider`
+///   would fall back to `None` and we'd be tempted to substitute
+///   `model_cfg.primary` — that would lie, because primary was never
+///   *tried* in either case. `<router>` correctly says "the router
+///   decided this request was unsendable".
+///
+/// Returns `Cow<'static, str>` so the `Failed` case can borrow from
+/// the `attempts` slice (no allocation) while the literal `"<router>"`
+/// stays `Cow::Borrowed` (also no allocation).
+fn extract_provider_label(e: &ProxyError) -> String {
+    match e {
+        ProxyError::AllProvidersFailed { attempts, .. } => crate::router::last_failed_provider(
+            attempts,
+        )
+        .expect("AllProvidersFailed.attempts must contain at least one Failed step")
+        .to_string(),
+        ProxyError::AllProvidersCoolingDown { .. } | ProxyError::RouterBadRequest { .. } => {
+            "<router>".to_string()
+        }
+        _ => "<router>".to_string(),
+    }
+}
+
+/// Emit the single terminal-state `WARN all providers failed` log line
+/// for the three router-terminal error variants. Centralized so the
+/// stream and complete paths emit the same shape, and so callers can
+/// pass `is_all_providers_failed = true` to suppress the redundant
+/// `request recorded as Errored` WARN in `record_errored`.
+///
+/// `fail_reason` is derived from the `attempts` chain (see
+/// `router::derive_fail_reason`): `upstream` if any real upstream
+/// failure fired, else `cooldown` if every entry was a cooldown skip,
+/// `model_skip` if every entry was `ModelUnmapped` (the
+/// `RouterBadRequest` case always lands here), or `mixed` for a chain
+/// holding both skip classes with no upstream attempt (possible for
+/// `AllProvidersCoolingDown`). An empty `AllProvidersCoolingDown`
+/// chain (no steps to classify) defaults to `cooldown`.
+///
+/// `last_error` is only attached when `fail_reason = upstream`; for
+/// `cooldown` / `model_skip` there's no real upstream body to log, so
+/// the field is absent (the schema contract per plan §Phase 1 commit 4).
+fn emit_all_providers_failed_warn(e: &ProxyError, model: &str, is_stream: bool) {
+    let (attempts, fail_reason) = match e {
+        ProxyError::AllProvidersFailed { attempts, .. } => {
+            let reason = crate::router::derive_fail_reason(attempts)
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "upstream".to_string());
+            (attempts.as_slice(), reason)
+        }
+        ProxyError::AllProvidersCoolingDown { attempts, .. } => {
+            // Derive from the carried skip chain: any upstream `Failed`
+            // wins (unlikely here since the all-cooldown terminal is
+            // reached after skips), both skip classes → `mixed`,
+            // all cooldown → `cooldown`. An empty chain (empty model
+            // chain or the admin `select_provider` path) has no steps
+            // to classify, so it defaults to `cooldown` — plan §空切片
+            // 语义 round-6 decision: "AllProvidersCoolingDown + empty
+            // attempts 默认为 cooldown, 无上游尝试信息".
+            let reason = crate::router::derive_fail_reason(attempts)
+                .unwrap_or(crate::router::FailReason::Cooldown);
+            (attempts.as_slice(), reason.to_string())
+        }
+        ProxyError::RouterBadRequest { attempts, .. } => {
+            // model_rewrite excluded every chain entry — by construction
+            // this branch contains only `ModelUnmapped` steps, so the
+            // fail_reason derivation is constant. We still call
+            // `derive_fail_reason` so future schema additions don't
+            // silently drift; the result is asserted to be
+            // `model_skip` to catch that drift in tests.
+            let reason = crate::router::derive_fail_reason(attempts)
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "model_skip".to_string());
+            (attempts.as_slice(), reason)
+        }
+        // Non-terminal errors should never reach here; ignore.
+        _ => return,
+    };
+    // `format_attempts` returns `None` for an empty chain, so the
+    // `failed_providers=` field stays absent on the not-a-real-chain
+    // edge (empty model chain, admin select_provider) — commit 6's
+    // Option-absent convention.
+    let summary = format_attempts(attempts);
+    if fail_reason == "upstream" {
+        // Sanitize the body for the log field. After the
+        // `last_failed_body` signature change (returns `Option<&str>`),
+        // the caller pays the `summarize_for_log` alloc + scan only
+        // when the field will actually be emitted (i.e. here, in the
+        // `fail_reason = upstream` arm).
+        let last_error = crate::router::last_failed_body(attempts)
+            .map(|b| crate::util::summarize_for_log(b, "<empty error message>"))
+            .unwrap_or_else(|| "<empty error message>".to_string());
+        match summary {
+            Some(s) => {
+                tracing::warn!(
+                    model = %model,
+                    stream = is_stream,
+                    failed_providers = %s,
+                    fail_reason = %fail_reason,
+                    last_error = %last_error,
+                    "all providers failed"
+                );
+            }
+            None => {
+                tracing::warn!(
+                    model = %model,
+                    stream = is_stream,
+                    fail_reason = %fail_reason,
+                    last_error = %last_error,
+                    "all providers failed"
+                );
+            }
+        }
+    } else if let Some(s) = summary {
+        tracing::warn!(
+            model = %model,
+            stream = is_stream,
+            failed_providers = %s,
+            fail_reason = %fail_reason,
+            "all providers failed"
+        );
+    } else {
+        tracing::warn!(
+            model = %model,
+            stream = is_stream,
+            fail_reason = %fail_reason,
+            "all providers failed"
+        );
     }
 }
 
@@ -327,17 +592,26 @@ fn extract_failed_providers(e: &ProxyError) -> Vec<String> {
 /// client asked for JSON (or returned malformed JSON) left no row in
 /// `/admin/usage`. This helper writes an `Outcome::Errored` row at
 /// every such site so the row count matches the request count.
-/// `stream` mirrors the client's `stream` flag so a failed *streaming*
+/// `is_stream` mirrors the client's `stream` flag so a failed *streaming*
 /// request isn't mislabeled as non-streaming (verified in debug-env
 /// against the mock — router.stream failure rows used to say
 /// `stream: false`).
+///
+/// `is_all_providers_failed` is the suppression flag for the
+/// terminal-state WARN — `messages_handler`'s three all-failed paths
+/// already emit their own `all providers failed ... fail_reason=...`
+/// WARN before calling this helper. When that flag is `true`, this
+/// helper only writes the `UsageRecord` (still required by Review #11
+/// for the `/admin/usage` rollups) and skips the redundant WARN
+/// emission — plan §Phase 1 commit 3.
 fn record_errored(
     stats: &UsageStats,
     start: &StartedAt,
     provider: &str,
     model: &str,
     failed_providers: &[String],
-    stream: bool,
+    is_stream: bool,
+    is_all_providers_failed: bool,
     reason: String,
 ) {
     stats.record(UsageRecord {
@@ -346,43 +620,164 @@ fn record_errored(
         elapsed_ms: start.elapsed_ms(),
         provider: provider.to_string(),
         model: model.to_string(),
-        stream,
+        stream: is_stream,
         outcome: Outcome::Errored,
         usage: None,
         failed_providers: failed_providers.to_vec(),
         total_tokens: 0,
     });
+    // Suppression: when the caller (messages_handler Err arm) has
+    // already emitted an `all providers failed` WARN, this WARN is
+    // redundant and would double-line the same terminal event.
+    if is_all_providers_failed {
+        return;
+    }
+    // Run the upstream body through `summarize_for_log` to keep
+    // multi-KB Cloudflare pages out of the log — was `reason = %reason`
+    // which emitted `status=503, body=<full Cloudflare page>` for a
+    // hundred-KiB HTML page (plan §Phase 1 commit 3).
+    let reason_summary = crate::util::summarize_for_log(&reason, "<empty error message>");
+    // Field name `stream=` (not `is_stream=`) — keeps the operator's
+    // `grep stream=` query consistent with every other log line
+    // emitted by `messages_handler`. Code review finding #2.
     tracing::warn!(
         provider,
         model,
-        stream,
-        reason = %reason,
+        stream = is_stream,
+        reason = %reason_summary,
         "request recorded as Errored"
     );
 }
 
-fn format_attempts(attempts: &[crate::router::RouteAttempt]) -> String {
-    attempts
-        .iter()
-        .map(|a| format!("{}:{}", a.provider, a.status))
-        .collect::<Vec<_>>()
-        .join(",")
+/// Render the attempt chain as `provider1:kind1,provider2:kind2` for
+/// use as a tracing field. Returns `None` when the chain is empty —
+/// the caller should skip the `failed_providers=` field entirely
+/// (commit 6's `Option`-absent convention) rather than emit a field
+/// with an empty value. The "render-once" half of commit 6: callers
+/// that need both the log field and the header derive both from a
+/// single render via [`router::format_attempts_header`] or by calling
+/// this once and reusing the result.
+pub fn format_attempts(attempts: &[crate::router::RouteStep]) -> Option<String> {
+    if attempts.is_empty() {
+        return None;
+    }
+    Some(
+        attempts
+            .iter()
+            .map(crate::router::RouteStep::render)
+            .collect::<Vec<_>>()
+            .join(","),
+    )
 }
 
-/// Public summary formatter for router attempts. Exposed for `Router` so
-/// fallback / "all providers failed" logs can render the same shape that
-/// the response header (`x-llmproxy-failed-providers`) emits. Keep the
-/// two formats in sync — operators correlate header + log entries by
-/// this string.
-pub fn format_attempts_summary(attempts: &[crate::router::RouteAttempt]) -> String {
-    format_attempts(attempts)
+// ---------------------------------------------------------------------------
+// Streaming log helpers — plan §Phase 1 §3 (streaming helpers).
+//
+// All three consume the same `(model, provider, elapsed_ms)` core and only
+// vary in which optional fields they emit, so the vocabulary stays stable
+// across the three terminal events:
+//   * `log_streaming_fallback` — emitted at `stream_response` start when
+//     the router had to skip / fail providers before settling on the
+//     serving one. Only fires when `failed` is non-empty (the
+//     `Option`-absence convention from commit 6 — fallback that didn't
+//     happen has no log to leave behind).
+//   * `log_streaming_completed` — emitted at `MappedStream::finalize`
+//     when the stream terminated cleanly (`Ready(None)`).
+//   * `log_streaming_aborted` — emitted at `MappedStream::finalize`
+//     when the stream terminated with an upstream error
+//     (`Ready(Some(Err))`) OR with a contract violation (Phase 2).
+//
+// Token fields never appear on any streaming terminal log; only
+// `request completed` (non-streaming) carries them. This matches the
+// pre-Phase-1 §A.3 invariant and the explicit "no tokens" plan.
+fn log_streaming_fallback(
+    model: &str,
+    provider: &str,
+    elapsed_ms: u64,
+    failed: &[crate::router::RouteStep],
+) {
+    // Commit 6's Option-absent convention: a fallback that didn't happen
+    // has no log line. Otherwise we'd emit `failed_providers=` with an
+    // empty value, which is exactly the noise the rework is removing.
+    let summary = match format_attempts(failed) {
+        Some(s) => s,
+        None => return,
+    };
+    // `last_error` only meaningful when at least one upstream actually
+    // fired — mirrors the `fail_reason=upstream` rule from the
+    // non-streaming terminal line (commit 4). Caller summarizes only
+    // when the field will actually be emitted (zero-cost when absent).
+    let last_error = crate::router::last_failed_body(failed)
+        .map(|b| crate::util::summarize_for_log(b, "<empty error message>"));
+    if let Some(err) = last_error {
+        tracing::info!(
+            model = %model,
+            provider = %provider,
+            stream = true,
+            elapsed_ms,
+            failed_providers = %summary,
+            last_error = %err,
+            "streaming fallback"
+        );
+    } else {
+        tracing::info!(
+            model = %model,
+            provider = %provider,
+            stream = true,
+            elapsed_ms,
+            failed_providers = %summary,
+            "streaming fallback"
+        );
+    }
+}
+
+fn log_streaming_completed(model: &str, provider: &str, elapsed_ms: u64) {
+    // §A.3 lock: completed never carries `failed_providers` or
+    // tokens. The replay of `failed_providers` on the response header
+    // is the source of truth for which providers were skipped before
+    // the stream started.
+    tracing::info!(
+        model = %model,
+        provider = %provider,
+        stream = true,
+        elapsed_ms,
+        "streaming completed"
+    );
+}
+
+fn log_streaming_aborted(
+    model: &str,
+    provider: &str,
+    elapsed_ms: u64,
+    reason: crate::router::AbortReason,
+) {
+    match reason {
+        crate::router::AbortReason::UpstreamError => {
+            tracing::info!(
+                model = %model,
+                provider = %provider,
+                stream = true,
+                elapsed_ms,
+                "streaming aborted (upstream error)"
+            );
+        }
+        crate::router::AbortReason::ContractViolation => {
+            tracing::info!(
+                model = %model,
+                provider = %provider,
+                stream = true,
+                elapsed_ms,
+                "streaming aborted (contract violation)"
+            );
+        }
+    }
 }
 
 fn stream_response(
     provider_name: &str,
     model: &str,
     output: ProviderOutput,
-    attempts: Vec<crate::router::RouteAttempt>,
+    attempts: Vec<crate::router::RouteStep>,
     start: StartedAt,
     stats: UsageStats,
 ) -> Response {
@@ -393,12 +788,38 @@ fn stream_response(
     // row). Compute failed_providers up-front so both the error row
     // and the success stream path can share it.
     //
-    // C6: `provider_name` is the serving provider (router.stream
+    // `provider_name` is the serving provider (router.stream
     // succeeded on it). Drop any attempt against the same provider
-    // before writing the row / building the response header.
+    // before writing the row / building the response header. Local
+    // skips remain — the row keeps full-history (plan §三方 policy).
     let failed_providers =
         filter_failed_providers_for(&attempts, provider_name);
     let ProviderOutput::Stream(stream) = output else {
+        // Phase 2 §3: contract-violation branch (router returned
+        // `ProviderOutput::Json` for a `stream:true` request). The
+        // request started line was already emitted in
+        // `messages_handler`; this site must NOT emit
+        // `streaming fallback` / `streaming completed` (we never
+        // reached the streaming path) — instead emit
+        // `streaming aborted (contract violation)` paired with an
+        // `ERROR` so operators can see the upstream misbehaviour, and
+        // `record_errored` writes the row (per round-2 MAJOR fix
+        // this branch still records with `is_all_providers_failed =
+        // false` so the existing
+        // `tests/server.rs::admin_usage_records_errored_when_stream_response_guard_fires`
+        // keeps passing).
+        log_streaming_aborted(
+            model,
+            provider_name,
+            start.elapsed_ms(),
+            crate::router::AbortReason::ContractViolation,
+        );
+        tracing::error!(
+            provider = %provider_name,
+            model = %model,
+            elapsed_ms = start.elapsed_ms(),
+            "streaming request returned non-stream output"
+        );
         record_errored(
             &stats,
             &start,
@@ -406,6 +827,7 @@ fn stream_response(
             model,
             &failed_providers,
             true,
+            false,
             "stream_response: provider returned non-Stream output".to_string(),
         );
         return ProxyError::Internal("expected stream output".into()).into_response();
@@ -414,10 +836,25 @@ fn stream_response(
     let inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, ProxyError>> + Send>> =
         Box::into_pin(stream);
 
+    // Commit 5: emit the streaming fallback snapshot BEFORE writing the
+    // response headers / wrapping the inner stream. Doing it here keeps
+    // log order = wire order (header → first byte → … → done) so
+    // operators see the fallback context before the first SSE event.
+    // Helper is no-op when `attempts` is empty (commit 6
+    // Option-absent convention) — no `failed_providers=` empty-string
+    // noise on the happy path.
+    log_streaming_fallback(
+        model,
+        provider_name,
+        start.elapsed_ms(),
+        &attempts,
+    );
+
     let mut resp_headers = HeaderMap::new();
-    // C6: header mirrors the record's failed_providers (filtered for
-    // serving provider). Operators correlate the response header with
-    // /admin/usage rows by this string, so the two MUST agree.
+    // Upstream-only view for the response header — see the
+    // non-streaming branch's comment. Deliberately different from the
+    // `UsageRecord.failed_providers` full-history view written above
+    // (plan §三方 policy).
     // Written BEFORE the MappedStream::new move below — the stream
     // wrapper takes ownership of `failed_providers` so we can't borrow
     // it after the move.
@@ -531,14 +968,24 @@ impl MappedStream {
         let usage = scanner.finalize();
         let total_tokens = UsageRecord::compute_total_tokens(Some(&usage));
         let stats = self.stats.clone();
+        // Capture terminal-state bookkeeping BEFORE moving it into the
+        // record so the streaming log helpers below can use it. Code
+        // review finding #8: `mem::take` the strings instead of cloning
+        // — `finalize_and_record` is terminal (we return right after),
+        // so the originals are dead and `take` is cheaper than
+        // allocating two fresh `String`s per stream completion.
+        let elapsed_ms = self.start.elapsed_ms();
+        let provider = std::mem::take(&mut self.provider);
+        let model = std::mem::take(&mut self.model);
+        let was_errored = self.errored || saw_error;
         let record = UsageRecord {
             started_at: self.start.started_at(),
             ended_at,
-            elapsed_ms: self.start.elapsed_ms(),
-            provider: self.provider.clone(),
-            model: self.model.clone(),
+            elapsed_ms,
+            provider: provider.clone(),
+            model: model.clone(),
             stream: true,
-            outcome: if self.errored || saw_error {
+            outcome: if was_errored {
                 Outcome::Errored
             } else {
                 Outcome::Success
@@ -557,21 +1004,40 @@ impl MappedStream {
         // the record landing after the request was already
         // acknowledged to the client.
         stats.record(record);
+        // Commit 5: streaming terminal log. `errored` reflects a
+        // mid-stream upstream `Ready(Some(Err))`; `saw_error` reflects
+        // an upstream-emitted `event: error` chunk the scanner caught.
+        // Either one routes to `streaming aborted (upstream error)` —
+        // both are "stream ended not because the client received
+        // message_stop, but because something upstream failed".
+        if was_errored {
+            log_streaming_aborted(
+                &model,
+                &provider,
+                elapsed_ms,
+                crate::router::AbortReason::UpstreamError,
+            );
+        } else {
+            log_streaming_completed(&model, &provider, elapsed_ms);
+        }
     }
 }
 
 impl Drop for MappedStream {
     /// Streams dropped before reaching `Poll::Ready(None)` — true
     /// client disconnect mid-stream OR premature wrapper teardown
-    /// by axum's `Body::from_stream` — are NOT recorded. We have
-    /// no way to tell whether upstream tokens were billed for
-    /// bytes the client never saw, so writing a row would either
-    /// be (a) a phantom Success for work the client never
-    /// received, or (b) mislabel a disconnect as a normal
-    /// completion. Per plan L751-757 v1 accepts the undercount
-    /// rather than mislabel. The `Ready(None)` arm of `poll_next`
-    /// is the only path that calls `finalize_and_record` now
-    /// (opus review #4).
+    /// by axum's `Body::from_stream` — are NOT recorded AND NOT
+    /// LOGGED. We have no way to tell whether upstream tokens were
+    /// billed for bytes the client never saw, so writing a row would
+    /// either be (a) a phantom Success for work the client never
+    /// received, or (b) mislabel a disconnect as a normal completion;
+    /// emitting a `streaming aborted (client disconnect)` line would
+    /// be equally misleading (operators can't act on a disconnect —
+    /// it's the client's choice, not an upstream fault). Per plan
+    /// §Phase 1 §client disconnect we accept the undercount rather
+    /// than mislabel. The `Ready(None)` arm of `poll_next` is the
+    /// only path that calls `finalize_and_record` (and therefore the
+    /// only path that emits a streaming terminal log) now.
     fn drop(&mut self) {
         // Drop the scanner without recording. The previous
         // behaviour called `finalize_and_record` from Drop as a
@@ -598,10 +1064,23 @@ impl Stream for MappedStream {
                 Poll::Ready(Some(Ok(b)))
             }
             Poll::Ready(Some(Err(e))) => {
+                // Sanitize the upstream body before logging it — the
+                // `%e` Display for `ProxyError::Upstream` embeds the
+                // full body verbatim, so a 100 KiB Cloudflare error
+                // page would land in the log line on every abort.
+                // `summarize_for_log` strips HTML/URLs and caps at
+                // ~200 chars (plan §Phase 1 §4: unstripped multi-KB
+                // bodies must never reach the log).
+                let status = e.status_code().as_u16();
+                let detail = crate::util::summarize_for_log(
+                    &e.to_string(),
+                    "<empty error message>",
+                );
                 tracing::error!(
                     provider = %self.provider,
                     model = %self.model,
-                    error = %e,
+                    status = %status,
+                    error = %detail,
                     "upstream stream error"
                 );
                 // Emit a synthetic Anthropic `event: error` SSE chunk so
@@ -636,14 +1115,32 @@ impl Stream for MappedStream {
 
 /// Encode a [`ProxyError`] as an Anthropic SSE `event: error` chunk.
 fn format_stream_error(err: &ProxyError) -> Bytes {
-    let payload = serde_json::json!({
+    // Code review finding #4: build the SSE error chunk in ONE pass.
+    // The previous shape paid for `serde_json::json!` (Value Map +
+    // nested Values) + `format!("data: {payload}")` (which calls
+    // Display on the Value, serializing it via `to_string()`) +
+    // `Bytes::from` (clones the resulting String). Now we write the
+    // JSON-shaped bytes via a single `write!` into a `BytesMut`, then
+    // freeze it once. One allocation, one walk, one conversion.
+    use std::fmt::Write;
+    let mut buf = bytes::BytesMut::with_capacity(96 + err.to_string().len());
+    buf.extend_from_slice(b"event: error\ndata: ");
+    // The shape mirrors the upstream Anthropic `error` event: a JSON
+    // object with `type` and an `error.{type,message}` payload. The
+    // message is the Display form of the ProxyError — must be
+    // JSON-escaped (quotes, backslashes, control chars) so we route
+    // through `serde_json::to_string` rather than hand-rolling
+    // escaping (which would re-introduce the same alloc cost).
+    let inner = serde_json::json!({
         "type": "error",
         "error": {
             "type": "upstream_error",
             "message": err.to_string(),
         }
     });
-    Bytes::from(format!("event: error\ndata: {payload}\n\n"))
+    let _ = write!(&mut buf, "{inner}");
+    buf.extend_from_slice(b"\n\n");
+    buf.freeze()
 }
 
 async fn count_tokens_handler(

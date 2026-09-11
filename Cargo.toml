@@ -37,6 +37,11 @@ wiremock = "0.6"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# Phase 2: per-binary ctor used to install a benign `tracing`
+# subscriber at process start so tests don't fight over the global
+# subscriber slot (see `src/tracing_capture.rs` for the callsite
+# Interest cache rationale).
+ctor = "0.2"
 
 [profile.release]
 opt-level = 3

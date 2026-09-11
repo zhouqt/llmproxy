@@ -5,7 +5,7 @@ use serde_json::json;
 use thiserror::Error;
 
 use crate::conversion::util::SchemaError;
-use crate::router::RouteAttempt;
+use crate::router::RouteStep;
 
 #[derive(Debug, Error)]
 pub enum ProxyError {
@@ -18,6 +18,16 @@ pub enum ProxyError {
     #[error("all providers cooling down for model {model}")]
     AllProvidersCoolingDown {
         model: String,
+        /// Every step taken before giving up — each entry is a
+        /// `RouteStep::LocalSkip` (cooldown or model_rewrite miss; no
+        /// upstream call fired for this chain) or an upstream `Failed`.
+        /// Populated by `Router::complete`/`stream` at the terminal arm
+        /// so the `fail_reason=` log field, the `/admin/usage` row and
+        /// the response header can all be derived from it (plan §Phase 1
+        /// §空切片语义: a chain of length > 0 always pushes at least one
+        /// step before reaching this arm; an empty chain leaves this
+        /// field empty and the terminal label defaults to `cooldown`).
+        attempts: Vec<RouteStep>,
         /// `Retry-After` hint (seconds) for the caller. `None` means
         /// every candidate provider is on cooldown but no further
         /// information is available (e.g. the chain has no known
@@ -35,7 +45,7 @@ pub enum ProxyError {
     #[error("all providers failed for model {model}: last error: {last}")]
     AllProvidersFailed {
         model: String,
-        attempts: Vec<RouteAttempt>,
+        attempts: Vec<RouteStep>,
         #[source]
         last: Box<ProxyError>,
     },
@@ -48,6 +58,17 @@ pub enum ProxyError {
 
     #[error("bad request: {0}")]
     BadRequest(String),
+
+    /// Router-side all-unmappable terminal: every chain entry was
+    /// excluded by `model_rewrite`, so no upstream call could fire.
+    /// Carries `attempts` so the header/log/UsageRecord paths can
+    /// share the same shape as `AllProvidersFailed` — see plan
+    /// §Phase 1 commit 4 (`BadRequest` split, round-6 BLOCKER fix).
+    #[error("{message}")]
+    RouterBadRequest {
+        message: String,
+        attempts: Vec<RouteStep>,
+    },
 
     /// PR-13: a schema that cannot be strictified for OpenAI strict mode
     /// (external URI `$ref`, circular `$ref`) is a client-side request
@@ -80,6 +101,7 @@ impl ProxyError {
         match self {
             ProxyError::Unauthorized => StatusCode::UNAUTHORIZED,
             ProxyError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ProxyError::RouterBadRequest { .. } => StatusCode::BAD_REQUEST,
             ProxyError::ProviderNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::AllProvidersCoolingDown { .. } => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::AllProvidersFailed { .. } => StatusCode::BAD_GATEWAY,
@@ -113,12 +135,8 @@ impl ProxyError {
     }
 }
 
-fn format_attempts_header(attempts: &[RouteAttempt]) -> String {
-    attempts
-        .iter()
-        .map(|a| format!("{}:{}", a.provider, a.status))
-        .collect::<Vec<_>>()
-        .join(",")
+fn format_attempts_header(attempts: &[RouteStep]) -> String {
+    crate::router::format_attempts_header(attempts, None).unwrap_or_default()
 }
 
 impl IntoResponse for ProxyError {
@@ -198,6 +216,7 @@ mod tests {
         assert_eq!(
             ProxyError::AllProvidersCoolingDown {
                 model: "x".into(),
+                attempts: vec![],
                 retry_after_secs: None,
             }
             .status_code(),
@@ -295,7 +314,7 @@ mod tests {
     fn all_providers_failed_status_is_bad_gateway() {
         let err = ProxyError::AllProvidersFailed {
             model: "m".into(),
-            attempts: vec![RouteAttempt {
+            attempts: vec![RouteStep::Failed {
                 provider: "primary".into(),
                 status: 503,
                 body: "x".into(),
@@ -313,12 +332,12 @@ mod tests {
         let err = ProxyError::AllProvidersFailed {
             model: "m".into(),
             attempts: vec![
-                RouteAttempt {
+                RouteStep::Failed {
                     provider: "primary".into(),
                     status: 429,
                     body: "x".into(),
                 },
-                RouteAttempt {
+                RouteStep::Failed {
                     provider: "backup".into(),
                     status: 503,
                     body: "y".into(),
@@ -339,6 +358,7 @@ mod tests {
     fn all_providers_cooling_down_with_retry_after_sets_header() {
         let err = ProxyError::AllProvidersCoolingDown {
             model: "m".into(),
+            attempts: vec![],
             retry_after_secs: Some(7),
         };
         let resp = err.into_response();
@@ -350,6 +370,7 @@ mod tests {
     fn all_providers_cooling_down_without_retry_after_omits_header() {
         let err = ProxyError::AllProvidersCoolingDown {
             model: "m".into(),
+            attempts: vec![],
             retry_after_secs: None,
         };
         let resp = err.into_response();
@@ -370,12 +391,12 @@ mod tests {
         let err = ProxyError::AllProvidersFailed {
             model: "m".into(),
             attempts: vec![
-                RouteAttempt {
+                RouteStep::Failed {
                     provider: "primary".into(),
                     status: 500,
                     body: "primary down".into(),
                 },
-                RouteAttempt {
+                RouteStep::Failed {
                     provider: "backup".into(),
                     status: 502,
                     body: "backup down".into(),
