@@ -21,7 +21,7 @@ use llmproxy::cooldown::CooldownCache;
 use llmproxy::error::ProxyError;
 use llmproxy::providers::anthropic::AnthropicProvider;
 use llmproxy::providers::{ProviderOutput, SharedProvider};
-use llmproxy::router::Router;
+use llmproxy::router::{RouteStep, Router};
 
 // ────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -227,10 +227,15 @@ async fn cross_model_fallback_self_healing() {
         "client must see deepseek's successful response"
     );
 
-    // -- Assert fallback happened (1 RouteAttempt for primary's 429) -----
+    // -- Assert fallback happened (1 RouteStep::Failed for primary's 429) -----
     assert_eq!(attempts.len(), 1, "exactly one attempt (primary's 429)");
-    assert_eq!(attempts[0].provider, "claude");
-    assert_eq!(attempts[0].status, 429);
+    match &attempts[0] {
+        RouteStep::Failed { provider, status, .. } => {
+            assert_eq!(provider, "claude");
+            assert_eq!(*status, 429);
+        }
+        other => panic!("expected RouteStep::Failed, got {other:?}"),
+    }
 
     // -- Assert deepseek was called exactly twice (strip+retry) -----------
     assert_eq!(
