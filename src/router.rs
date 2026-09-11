@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use crate::anthropic::MessagesRequest;
 use crate::config::{Config, ModelConfig};
+
 use crate::cooldown::CooldownCache;
 use crate::error::{ProxyError, Result};
 use crate::providers::{ProviderOutput, SharedProvider};
@@ -62,11 +63,278 @@ pub struct Router {
     cooldown: CooldownCache,
 }
 
+/// One step in a request's fallback chain. Three terminal facts we want
+/// to surface to operators:
+/// - `Failed`: an upstream call actually fired and returned a
+///   cooldownable error (or a runtime model-unsupported 400). `body`
+///   is the truncated, sanitized upstream body.
+/// - `LocalSkip::Cooldown`: the provider was skipped before any HTTP
+///   call because it was already on cooldown.
+/// - `LocalSkip::ModelUnmapped`: the provider was skipped because its
+///   `model_rewrite` table doesn't include the requested model.
+///
+/// `body` is captured at the push site (see `truncate_for_log` in
+/// `crate::util`); the cap exists so a 100 KiB Cloudflare page in the
+/// log doesn't blow past grep, while still preserving enough of the
+/// body to recognize the failure mode.
 #[derive(Debug, Clone)]
-pub struct RouteAttempt {
-    pub provider: String,
-    pub status: u16,
-    pub body: String,
+pub enum RouteStep {
+    /// Real upstream call returned a cooldownable or model-unsupported
+    /// response. `body` is the sanitized upstream body (≤ 4 KiB at
+    /// char boundary).
+    Failed {
+        provider: String,
+        status: u16,
+        body: String,
+    },
+    /// Local skip — no upstream call fired. The provider name and
+    /// reason are recorded for operator visibility.
+    LocalSkip {
+        provider: String,
+        reason: LocalSkipReason,
+    },
+}
+
+/// Why a `RouteStep::LocalSkip` was taken. Used by `derive_fail_reason`
+/// to label the `fail_reason=` log field and to drive
+/// `format_attempts_header`'s filter (only upstream failures surface
+/// in the `x-llmproxy-failed-providers` header — see plan §三方 policy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalSkipReason {
+    /// `cooldown.is_cooling_down(name)` was true at dispatch.
+    Cooldown,
+    /// `!provider.can_serve_model(&req.model)` (provider's
+    /// `model_rewrite` excludes the requested model).
+    ModelUnmapped,
+}
+
+/// Why a streaming response terminated before normal completion. The
+/// streaming helpers (`log_streaming_fallback` / `_completed` /
+/// `_aborted`) consume this enum so the log vocabulary stays
+/// consistent across `Router::stream` mid-stream failures and the
+/// `stream_response` contract-violation branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbortReason {
+    /// The upstream stream returned `Err(_)` mid-flow.
+    UpstreamError,
+    /// A streaming request was answered with non-stream output
+    /// (provider contract violation).
+    ContractViolation,
+}
+
+/// High-level classification of an "all providers failed" terminal
+/// state. Derived from `&[RouteStep]` at the emit site so the log
+/// vocabulary stays consistent across `messages_handler`'s three
+/// terminal paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailReason {
+    /// At least one `RouteStep::Failed` was recorded — a real upstream
+    /// call returned an error.
+    Upstream,
+    /// Every step was `LocalSkip::Cooldown` — no upstream call fired.
+    Cooldown,
+    /// Every step was `LocalSkip::ModelUnmapped` — no upstream call
+    /// fired (configuration gap).
+    ModelSkip,
+    /// Mixed `LocalSkip::Cooldown` + `LocalSkip::ModelUnmapped` —
+    /// chain contains both skip classes and no upstream attempt.
+    Mixed,
+}
+
+impl std::fmt::Display for FailReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            FailReason::Upstream => "upstream",
+            FailReason::Cooldown => "cooldown",
+            FailReason::ModelSkip => "model_skip",
+            FailReason::Mixed => "mixed",
+        })
+    }
+}
+
+impl RouteStep {
+    /// Provider name for any variant. Used as the unquoted `provider`
+    /// field in log lines and the `provider` component of `render`.
+    pub fn provider(&self) -> &str {
+        match self {
+            RouteStep::Failed { provider, .. } => provider,
+            RouteStep::LocalSkip { provider, .. } => provider,
+        }
+    }
+
+    /// Stable label for the `failure=` field on per-step fallback
+    /// lines. For a real upstream response this is the status code
+    /// as a decimal string (`"429"`, `"503"`); for a local skip it's
+    /// the reason name (`"cooldown"` / `"model_skip"`).
+    pub fn failure(&self) -> std::borrow::Cow<'static, str> {
+        match self {
+            RouteStep::Failed { status, .. } => std::borrow::Cow::Owned(status.to_string()),
+            RouteStep::LocalSkip { reason, .. } => std::borrow::Cow::Borrowed(match reason {
+                LocalSkipReason::Cooldown => "cooldown",
+                LocalSkipReason::ModelUnmapped => "model_skip",
+            }),
+        }
+    }
+
+    /// `"<provider>:<status>"` for `Failed`, `"<provider>:cooldown"` /
+    /// `"<provider>:model_skip"` for `LocalSkip`. Used by log
+    /// `failed_providers=` fields and the
+    /// `x-llmproxy-failed-providers` header.
+    pub fn render(&self) -> String {
+        format!("{}:{}", self.provider(), self.failure())
+    }
+
+    /// True iff this step records an actual upstream HTTP response
+    /// (i.e. `Failed`). Drives both `format_attempts_header`'s filter
+    /// (only upstream failures go in the HTTP header) and the
+    /// `max_retries_total` guard (only upstream calls count as cost).
+    pub fn is_upstream_failure(&self) -> bool {
+        matches!(self, RouteStep::Failed { .. })
+    }
+}
+
+/// Maximum byte length of the upstream body that we keep on
+/// `RouteStep::Failed` for logging. Pushed bodies are run through
+/// `crate::util::truncate_for_log` at the push site so a 100 KiB
+/// Cloudflare HTML page never reaches the WARN line. 4 KiB is the
+/// empirical "human-scannable upper bound" — anything longer was
+/// unreadable on the operator side anyway (plan §Phase 1 commit 7).
+const FAILED_BODY_LOG_CAP_BYTES: usize = 4096;
+
+/// Derive the high-level `FailReason` for a fallback chain that
+/// produced no successful response. Returns `None` only for an empty
+/// slice — callers that hold a terminal-state slice always have at
+/// least one step (the all-cooldown and all-unmappable paths both
+/// push at least one `LocalSkip` before reaching the terminal arm).
+///
+/// Classification:
+/// - any `Failed` → `Upstream` (a real upstream call returned an
+///   error and the chain gave up)
+/// - all `LocalSkip::Cooldown` → `Cooldown`
+/// - all `LocalSkip::ModelUnmapped` → `ModelSkip`
+/// - both skip classes, no `Failed` → `Mixed`
+pub fn derive_fail_reason(steps: &[RouteStep]) -> Option<FailReason> {
+    if steps.is_empty() {
+        return None;
+    }
+    // Single pass collecting both skip flags — code review #8. The
+    // upstream check short-circuits so a chain with any `Failed` skips
+    // the LocalSkip scan entirely.
+    let mut has_cooldown = false;
+    let mut has_unmapped = false;
+    for s in steps {
+        if s.is_upstream_failure() {
+            return Some(FailReason::Upstream);
+        }
+        match s {
+            RouteStep::LocalSkip {
+                reason: LocalSkipReason::Cooldown,
+                ..
+            } => has_cooldown = true,
+            RouteStep::LocalSkip {
+                reason: LocalSkipReason::ModelUnmapped,
+                ..
+            } => has_unmapped = true,
+            RouteStep::Failed { .. } => unreachable!("filtered above"),
+        }
+        // Early exit: once both flags are set we know the answer is
+        // `Mixed` without scanning the rest.
+        if has_cooldown && has_unmapped {
+            return Some(FailReason::Mixed);
+        }
+    }
+    match (has_cooldown, has_unmapped) {
+        (true, false) => Some(FailReason::Cooldown),
+        (false, true) => Some(FailReason::ModelSkip),
+        // The `(true, true)` arm is unreachable: the early-exit
+        // `if has_cooldown && has_unmapped` above returns
+        // `Some(Mixed)` before we reach this match. Listed here so
+        // the compiler accepts the exhaustive tuple pattern.
+        (true, true) => unreachable!("early-exit above returns Mixed when both flags are set"),
+        // Non-empty steps + no `Failed` implies at least one
+        // `LocalSkip`, which implies `Cooldown` or `ModelUnmapped`.
+        (false, false) => unreachable!("derive_fail_reason: non-empty steps with no Failed implies at least one LocalSkip"),
+    }
+}
+
+/// The most recent `RouteStep::Failed`'s provider, scanning the slice
+/// in reverse. Used by `messages_handler`'s
+/// `AllProvidersFailed` arm to pick the `UsageRecord.provider` for the
+/// error row — there must always be at least one `Failed` in that
+/// variant; the caller may `expect` `None` is unreachable.
+///
+/// Returns `None` if no `Failed` step is present (e.g. all-cooldown or
+/// all-unmappable slices — those rows use `"<router>"` for the
+/// `UsageRecord.provider`).
+pub fn last_failed_provider(steps: &[RouteStep]) -> Option<&str> {
+    steps.iter().rev().find_map(|s| match s {
+        RouteStep::Failed { provider, .. } => Some(provider.as_str()),
+        _ => None,
+    })
+}
+
+/// The most recent `RouteStep::Failed`'s body, as a borrowed slice —
+/// caller decides whether to render it (and pay the `summarize_for_log`
+/// alloc + scan cost). Returns `None` if no `Failed` step is present
+/// (all-skip slices have no upstream body to summarize). The reverse
+/// walk is O(N) but `N` is the chain length (typically 1–3), and the
+/// slice is already on the request's hot path through `attempts`.
+///
+/// Callers that need to log the body MUST run it through
+/// `crate::util::summarize_for_log(..., "<empty error message>")`
+/// themselves (returns the placeholder for empty bodies). The
+/// returned `&str` borrows from the `RouteStep::Failed.body` inside
+/// the caller's `attempts` slice, so the slice must outlive the
+/// caller (true everywhere in the success / streaming-fallback paths
+/// because the slice is on the handler stack frame).
+pub fn last_failed_body(steps: &[RouteStep]) -> Option<&str> {
+    steps.iter().rev().find_map(|s| match s {
+        RouteStep::Failed { body, .. } => Some(body.as_str()),
+        _ => None,
+    })
+}
+
+/// Render the failed-provider chain for the
+/// `x-llmproxy-failed-providers` HTTP response header. Filters to
+/// upstream failures only (`is_upstream_failure()`) so callers see
+/// real upstream errors, not local-skip bookkeeping. If `served_by`
+/// is `Some`, attempts against that provider are dropped (a
+/// successful primary after in-place retries must not show up in its
+/// own response header — plan §三方 policy).
+///
+/// Returns `None` when the slice is empty or every step is filtered
+/// out — the caller should skip setting the header in that case.
+pub fn format_attempts_header(steps: &[RouteStep], served_by: Option<&str>) -> Option<String> {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let mut first = true;
+    for step in steps {
+        if !step.is_upstream_failure() {
+            continue;
+        }
+        if let Some(skip) = served_by {
+            if step.provider() == skip {
+                continue;
+            }
+        }
+        if !first {
+            out.push(',');
+        }
+        // Unreachable: the `if !is_upstream_failure()` guard above
+        // narrows to the `Failed` arm, which has `status` and
+        // `provider`.
+        let (provider, status) = match step {
+            RouteStep::Failed { provider, status, .. } => (provider.as_str(), *status),
+            RouteStep::LocalSkip { .. } => unreachable!("filtered above"),
+        };
+        let _ = write!(out, "{provider}:{status}");
+        first = false;
+    }
+    if first {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// Serialized health state of a single provider for the `/admin/status`
@@ -193,11 +461,13 @@ impl Router {
         if let Some((_, _, remaining)) = best {
             return Err(ProxyError::AllProvidersCoolingDown {
                 model: model.name.clone(),
+                attempts: Vec::new(),
                 retry_after_secs: Some(remaining.as_secs().max(1)),
             });
         }
         Err(ProxyError::AllProvidersCoolingDown {
             model: model.name.clone(),
+            attempts: Vec::new(),
             retry_after_secs: None,
         })
     }
@@ -215,8 +485,8 @@ impl Router {
         &self,
         model: &ModelConfig,
         req: &MessagesRequest,
-    ) -> Result<(ProviderOutput, Vec<RouteAttempt>, Option<String>)> {
-        let mut attempts: Vec<RouteAttempt> = Vec::new();
+    ) -> Result<(ProviderOutput, Vec<RouteStep>, Option<String>)> {
+        let mut attempts: Vec<RouteStep> = Vec::new();
         let mut last_error: Option<ProxyError> = None;
         let mut tried: Vec<String> = Vec::new();
         let mut unmappable: Vec<String> = Vec::new();
@@ -230,6 +500,10 @@ impl Router {
             }
             if self.cooldown.is_cooling_down(name).await {
                 tried.push(name.clone());
+                attempts.push(RouteStep::LocalSkip {
+                    provider: name.clone(),
+                    reason: LocalSkipReason::Cooldown,
+                });
                 continue;
             }
             let Some(provider) = self.providers.get(name).cloned() else {
@@ -248,6 +522,10 @@ impl Router {
                 );
                 unmappable.push(name.clone());
                 tried.push(name.clone());
+                attempts.push(RouteStep::LocalSkip {
+                    provider: name.clone(),
+                    reason: LocalSkipReason::ModelUnmapped,
+                });
                 continue;
             }
             tried.push(name.clone());
@@ -258,10 +536,11 @@ impl Router {
             // provider that served the request — adding a "trying provider"
             // line here would just duplicate that.
             if !attempts.is_empty() {
+                let last = attempts.last().expect("non-empty checked above");
                 tracing::info!(
                     model = req.model.as_str(),
-                    failed_provider = attempts.last().map(|a| a.provider.as_str()).unwrap_or("unknown"),
-                    status = attempts.last().map(|a| a.status).unwrap_or(0),
+                    provider = %last.provider(),
+                    failure = %last.failure(),
                     "fallback triggered"
                 );
             }
@@ -277,10 +556,14 @@ impl Router {
                     Ok(out) => return Ok((out, attempts, Some(name.clone()))),
                     Err(e) if e.is_cooldownable() => {
                         if let ProxyError::Upstream { status, body } = &e {
-                            attempts.push(RouteAttempt {
+                            attempts.push(RouteStep::Failed {
                                 provider: name.clone(),
                                 status: *status,
-                                body: body.clone(),
+                                body: crate::util::truncate_for_log(
+                                    body,
+                                    FAILED_BODY_LOG_CAP_BYTES,
+                                )
+                                .to_string(),
                             });
                             let ttl = if matches!(*status, 402 | 429) {
                                 Duration::from_secs(model.cooldown_seconds)
@@ -306,10 +589,14 @@ impl Router {
                         // could change, but record the attempt so the
                         // operator can see *why* this provider was skipped.
                         if let ProxyError::Upstream { status, body } = &e {
-                            attempts.push(RouteAttempt {
+                            attempts.push(RouteStep::Failed {
                                 provider: name.clone(),
                                 status: *status,
-                                body: body.clone(),
+                                body: crate::util::truncate_for_log(
+                                    body,
+                                    FAILED_BODY_LOG_CAP_BYTES,
+                                )
+                                .to_string(),
                             });
                             self.cooldown
                                 .mark_cooldown(name, Duration::from_secs(60), *status, &body)
@@ -326,7 +613,14 @@ impl Router {
                 }
             }
 
-            if attempts.len() >= max_total {
+            // `max_total` only counts real upstream calls (RouteStep::Failed).
+            // Local skips (cooldown / model_rewrite miss) have no upstream
+            // cost and shouldn't trip the budget — plan §Phase 1.
+            let failed_count = attempts
+                .iter()
+                .filter(|s| s.is_upstream_failure())
+                .count();
+            if failed_count >= max_total {
                 break;
             }
         }
@@ -336,13 +630,6 @@ impl Router {
             // the *last* one so the operator can see what really happened,
             // instead of the generic "all cooling down" message that
             // would imply we never even tried.
-            let summary = crate::server::format_attempts_summary(&attempts);
-            tracing::warn!(
-                model = model.name.as_str(),
-                failed_providers = %summary,
-                last_error = %err,
-                "all providers failed"
-            );
             return Err(ProxyError::AllProvidersFailed {
                 model: model.name.clone(),
                 attempts,
@@ -354,18 +641,25 @@ impl Router {
         // already on cooldown". An unmappable-model error is a 400 with
         // a clear message; a generic cooldown is a 503.
         if !unmappable.is_empty() && unmappable.len() == chain.len() {
-            return Err(ProxyError::BadRequest(format!(
-                "no provider in chain '{}' can serve model '{}' (all {} entries have a model_rewrite that excludes it)",
-                model.name,
-                req.model,
-                unmappable.len()
-            )));
+            return Err(ProxyError::RouterBadRequest {
+                message: format!(
+                    "no provider in chain '{}' can serve model '{}' (all {} entries have a model_rewrite that excludes it)",
+                    model.name,
+                    req.model,
+                    unmappable.len()
+                ),
+                attempts: std::mem::take(&mut attempts),
+            });
         }
         // Every candidate was on cooldown from the start, or every
         // configured provider name was unknown — we never even fired a
-        // request, so the "all cooling down" framing is accurate.
+        // request, so the "all cooling down" framing is accurate. The
+        // skipped chain is carried so the terminal WARN / /admin/usage
+        // row can show which providers were skipped and why (plan
+        // §空切片语义).
         Err(ProxyError::AllProvidersCoolingDown {
             model: model.name.clone(),
+            attempts: std::mem::take(&mut attempts),
             retry_after_secs: None,
         })
     }
@@ -377,8 +671,8 @@ impl Router {
         &self,
         model: &ModelConfig,
         req: &MessagesRequest,
-    ) -> Result<(SharedProvider, ProviderOutput, Vec<RouteAttempt>)> {
-        let mut attempts: Vec<RouteAttempt> = Vec::new();
+    ) -> Result<(SharedProvider, ProviderOutput, Vec<RouteStep>)> {
+        let mut attempts: Vec<RouteStep> = Vec::new();
         let mut last_error: Option<ProxyError> = None;
         let mut tried: Vec<String> = Vec::new();
         let mut unmappable: Vec<String> = Vec::new();
@@ -391,6 +685,10 @@ impl Router {
             }
             if self.cooldown.is_cooling_down(name).await {
                 tried.push(name.clone());
+                attempts.push(RouteStep::LocalSkip {
+                    provider: name.clone(),
+                    reason: LocalSkipReason::Cooldown,
+                });
                 continue;
             }
             let Some(provider) = self.providers.get(name).cloned() else {
@@ -407,6 +705,10 @@ impl Router {
                 );
                 unmappable.push(name.clone());
                 tried.push(name.clone());
+                attempts.push(RouteStep::LocalSkip {
+                    provider: name.clone(),
+                    reason: LocalSkipReason::ModelUnmapped,
+                });
                 continue;
             }
             tried.push(name.clone());
@@ -417,10 +719,11 @@ impl Router {
             // provider that served the request — adding a "trying provider"
             // line here would just duplicate that.
             if !attempts.is_empty() {
+                let last = attempts.last().expect("non-empty checked above");
                 tracing::info!(
                     model = req.model.as_str(),
-                    failed_provider = attempts.last().map(|a| a.provider.as_str()).unwrap_or("unknown"),
-                    status = attempts.last().map(|a| a.status).unwrap_or(0),
+                    provider = %last.provider(),
+                    failure = %last.failure(),
                     "fallback triggered"
                 );
             }
@@ -434,10 +737,14 @@ impl Router {
                 Ok(out) => return Ok((provider, out, attempts)),
                 Err(e) if e.is_cooldownable() => {
                     if let ProxyError::Upstream { status, body } = &e {
-                        attempts.push(RouteAttempt {
+                        attempts.push(RouteStep::Failed {
                             provider: name.clone(),
                             status: *status,
-                            body: body.clone(),
+                            body: crate::util::truncate_for_log(
+                                body,
+                                FAILED_BODY_LOG_CAP_BYTES,
+                            )
+                            .to_string(),
                         });
                         let ttl = if matches!(*status, 402 | 429) {
                             Duration::from_secs(model.cooldown_seconds)
@@ -455,10 +762,14 @@ impl Router {
                     // Same model-unsupported skip as in `complete()` —
                     // see fix-R11.
                     if let ProxyError::Upstream { status, body } = &e {
-                        attempts.push(RouteAttempt {
+                        attempts.push(RouteStep::Failed {
                             provider: name.clone(),
                             status: *status,
-                            body: body.clone(),
+                            body: crate::util::truncate_for_log(
+                                body,
+                                FAILED_BODY_LOG_CAP_BYTES,
+                            )
+                            .to_string(),
                         });
                         self.cooldown
                             .mark_cooldown(name, Duration::from_secs(60), *status, &body)
@@ -474,13 +785,6 @@ impl Router {
         }
 
         if let Some(err) = last_error {
-            let summary = crate::server::format_attempts_summary(&attempts);
-            tracing::warn!(
-                model = model.name.as_str(),
-                failed_providers = %summary,
-                last_error = %err,
-                "all providers failed"
-            );
             return Err(ProxyError::AllProvidersFailed {
                 model: model.name.clone(),
                 attempts,
@@ -488,15 +792,19 @@ impl Router {
             });
         }
         if !unmappable.is_empty() && unmappable.len() == chain.len() {
-            return Err(ProxyError::BadRequest(format!(
-                "no provider in chain '{}' can serve model '{}' (all {} entries have a model_rewrite that excludes it)",
-                model.name,
-                req.model,
-                unmappable.len()
-            )));
+            return Err(ProxyError::RouterBadRequest {
+                message: format!(
+                    "no provider in chain '{}' can serve model '{}' (all {} entries have a model_rewrite that excludes it)",
+                    model.name,
+                    req.model,
+                    unmappable.len()
+                ),
+                attempts: std::mem::take(&mut attempts),
+            });
         }
         Err(ProxyError::AllProvidersCoolingDown {
             model: model.name.clone(),
+            attempts: std::mem::take(&mut attempts),
             retry_after_secs: None,
         })
     }
@@ -668,8 +976,13 @@ mod tests {
         let (out, attempts, _served) = router.complete(model, &req).await.unwrap();
         assert!(matches!(out, ProviderOutput::Json(_)));
         assert_eq!(attempts.len(), 1);
-        assert_eq!(attempts[0].provider, "primary");
-        assert_eq!(attempts[0].status, 429);
+        match &attempts[0] {
+            RouteStep::Failed { provider, status, .. } => {
+                assert_eq!(provider, "primary");
+                assert_eq!(*status, 429);
+            }
+            other => panic!("expected RouteStep::Failed, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -738,8 +1051,13 @@ mod tests {
         // The attempts vector records the two failures before the success.
         assert_eq!(attempts.len(), 2);
         for a in &attempts {
-            assert_eq!(a.provider, "primary");
-            assert_eq!(a.status, 429);
+            match a {
+                RouteStep::Failed { provider, status, .. } => {
+                    assert_eq!(provider, "primary");
+                    assert_eq!(*status, 429);
+                }
+                other => panic!("expected RouteStep::Failed, got {other:?}"),
+            }
         }
         // Touch `.name()` on each mock provider so the trait impl method
         // is not just compiled but actually exercised in this test.
@@ -806,7 +1124,20 @@ mod tests {
         // Second call: primary should be cooling down, backup used directly.
         let (out, attempts, _served) = router.complete(model, &req).await.unwrap();
         assert!(matches!(out, ProviderOutput::Json(_)));
-        assert!(attempts.is_empty(), "primary should be on cooldown");
+        assert!(
+            attempts.iter().any(|s| matches!(
+                s,
+                RouteStep::LocalSkip {
+                    reason: LocalSkipReason::Cooldown,
+                    ..
+                }
+            )),
+            "primary skip must be recorded as RouteStep::LocalSkip::Cooldown, got {attempts:?}"
+        );
+        assert!(
+            !attempts.iter().any(|s| s.is_upstream_failure()),
+            "no upstream call should have fired against cooling-down primary"
+        );
     }
 
     #[tokio::test]
@@ -912,8 +1243,9 @@ mod tests {
                 err,
                 ProxyError::AllProvidersCoolingDown {
                     ref model,
+                    ref attempts,
                     retry_after_secs: Some(secs),
-                } if model == "m" && (9..=10).contains(&secs)
+                } if model == "m" && (9..=10).contains(&secs) && attempts.is_empty()
             ),
             "expected AllProvidersCoolingDown with retry_after ~10, got: {err:?}"
         );
@@ -954,9 +1286,14 @@ mod tests {
         assert_eq!(provider.name(), "backup");
         assert!(matches!(output, ProviderOutput::Stream(_)));
         assert_eq!(attempts.len(), 1);
-        assert_eq!(attempts[0].provider, "primary");
-        assert_eq!(attempts[0].status, 429);
-        assert_eq!(attempts[0].body, "rate limited");
+        match &attempts[0] {
+            RouteStep::Failed { provider, status, body } => {
+                assert_eq!(provider, "primary");
+                assert_eq!(*status, 429);
+                assert_eq!(body, "rate limited");
+            }
+            other => panic!("expected RouteStep::Failed, got {other:?}"),
+        }
         assert!(router.cooldown().is_cooling_down("primary").await);
     }
 
@@ -1031,9 +1368,14 @@ mod tests {
         assert_eq!(provider.name(), "backup");
         assert!(matches!(output, ProviderOutput::Stream(_)));
         assert_eq!(attempts.len(), 1);
-        assert_eq!(attempts[0].provider, "primary");
-        assert_eq!(attempts[0].status, 402);
-        assert_eq!(attempts[0].body, "rate limited");
+        match &attempts[0] {
+            RouteStep::Failed { provider, status, body } => {
+                assert_eq!(provider, "primary");
+                assert_eq!(*status, 402);
+                assert_eq!(body, "rate limited");
+            }
+            other => panic!("expected RouteStep::Failed, got {other:?}"),
+        }
 
         // Quota cooldown must use the configured cooldown_seconds, not
         // the 5s transient fallback — mirrors the wire-level TTL test
@@ -1219,8 +1561,13 @@ mod tests {
         // Only the 429 attempt against primary is recorded; the missing
         // provider is silently skipped without recording an attempt.
         assert_eq!(attempts.len(), 1);
-        assert_eq!(attempts[0].provider, "primary");
-        assert_eq!(attempts[0].status, 429);
+        match &attempts[0] {
+            RouteStep::Failed { provider, status, .. } => {
+                assert_eq!(provider, "primary");
+                assert_eq!(*status, 429);
+            }
+            other => panic!("expected RouteStep::Failed, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1236,8 +1583,13 @@ mod tests {
         assert_eq!(provider.name(), "backup");
         assert!(matches!(output, ProviderOutput::Stream(_)));
         assert_eq!(attempts.len(), 1);
-        assert_eq!(attempts[0].provider, "primary");
-        assert_eq!(attempts[0].status, 429);
+        match &attempts[0] {
+            RouteStep::Failed { provider, status, .. } => {
+                assert_eq!(provider, "primary");
+                assert_eq!(*status, 429);
+            }
+            other => panic!("expected RouteStep::Failed, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1478,10 +1830,26 @@ mod tests {
             ProxyError::AllProvidersFailed { model, attempts, last } => {
                 assert_eq!(model, "m");
                 assert_eq!(attempts.len(), 2);
-                assert_eq!(attempts[0].provider, "primary");
-                assert_eq!(attempts[0].status, 503);
-                assert_eq!(attempts[1].provider, "backup");
-                assert_eq!(attempts[1].status, 503);
+                match (&attempts[0], &attempts[1]) {
+                    (
+                        RouteStep::Failed {
+                            provider: p0,
+                            status: s0,
+                            ..
+                        },
+                        RouteStep::Failed {
+                            provider: p1,
+                            status: s1,
+                            ..
+                        },
+                    ) => {
+                        assert_eq!(p0, "primary");
+                        assert_eq!(*s0, 503);
+                        assert_eq!(p1, "backup");
+                        assert_eq!(*s1, 503);
+                    }
+                    _ => panic!("expected two RouteStep::Failed entries"),
+                }
                 // `last` must be the last upstream error (backup's),
                 // not the legacy generic "all cooling down" message.
                 match last.as_ref() {
@@ -1671,8 +2039,22 @@ mod tests {
         assert!(matches!(out, ProviderOutput::Json(_)));
         assert_eq!(primary_count.load(Ordering::SeqCst), 0, "primary must be skipped, not called");
         assert_eq!(backup_count.load(Ordering::SeqCst), 1);
-        // No upstream call recorded against the skipped provider.
-        assert!(attempts.is_empty());
+        // Skipped provider recorded as RouteStep::LocalSkip::ModelUnmapped
+        // (no upstream call fired against it). See plan §Phase 1 commit 2.
+        assert!(
+            attempts.iter().any(|s| matches!(
+                s,
+                RouteStep::LocalSkip {
+                    reason: LocalSkipReason::ModelUnmapped,
+                    ..
+                }
+            )),
+            "primary skip must be recorded as LocalSkip::ModelUnmapped, got {attempts:?}"
+        );
+        assert!(
+            !attempts.iter().any(|s| s.is_upstream_failure()),
+            "no upstream call should have fired against the unmapped primary"
+        );
     }
 
     #[tokio::test]
@@ -1694,10 +2076,10 @@ mod tests {
             .err()
             .expect("request should fail");
         match err {
-            ProxyError::BadRequest(msg) => {
+            ProxyError::RouterBadRequest { message, .. } => {
                 assert!(
-                    msg.contains("m") && msg.contains("can serve"),
-                    "message should mention the model + cause: {msg}"
+                    message.contains("m") && message.contains("can serve"),
+                    "message should mention the model + cause: {message}"
                 );
             }
             other => panic!("expected BadRequest, got {other:?}"),
@@ -1815,7 +2197,23 @@ mod tests {
         let (provider, _output, attempts) =
             router.stream(model, &dummy_request()).await.unwrap();
         assert_eq!(provider.name(), "backup");
-        assert!(attempts.is_empty(), "no upstream attempts should be recorded");
+        // The streaming twin of `complete_skips_provider_...`:
+        // primary is unmappable, so it's recorded as a
+        // RouteStep::LocalSkip::ModelUnmapped and never called.
+        assert!(
+            attempts.iter().any(|s| matches!(
+                s,
+                RouteStep::LocalSkip {
+                    reason: LocalSkipReason::ModelUnmapped,
+                    ..
+                }
+            )),
+            "primary skip must be recorded as LocalSkip::ModelUnmapped, got {attempts:?}"
+        );
+        assert!(
+            !attempts.iter().any(|s| s.is_upstream_failure()),
+            "no upstream call should have fired against the unmapped primary"
+        );
     }
 
     #[tokio::test]
@@ -1832,8 +2230,11 @@ mod tests {
             .err()
             .expect("stream should fail");
         assert!(
-            matches!(err, ProxyError::BadRequest(ref msg) if msg.contains("can serve")),
-            "expected BadRequest, got {err:?}"
+            matches!(
+                err,
+                ProxyError::RouterBadRequest { ref message, .. } if message.contains("can serve")
+            ),
+            "expected RouterBadRequest, got {err:?}"
         );
     }
 
@@ -2023,9 +2424,14 @@ mod tests {
         // The skipped primary must be in the attempts list so the
         // operator can see why it was skipped.
         assert_eq!(attempts.len(), 1);
-        assert_eq!(attempts[0].provider, "primary");
-        assert_eq!(attempts[0].status, 400);
-        assert!(attempts[0].body.contains("model_not_supported"));
+        match &attempts[0] {
+            RouteStep::Failed { provider, status, body } => {
+                assert_eq!(provider, "primary");
+                assert_eq!(*status, 400);
+                assert!(body.contains("model_not_supported"));
+            }
+            other => panic!("expected RouteStep::Failed, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2095,9 +2501,14 @@ mod tests {
         assert_eq!(primary.call_count.load(Ordering::SeqCst), 1);
         // The skipped primary must appear in attempts with its 400 body.
         assert_eq!(attempts.len(), 1);
-        assert_eq!(attempts[0].provider, "primary");
-        assert_eq!(attempts[0].status, 400);
-        assert!(attempts[0].body.contains("model_not_supported"));
+        match &attempts[0] {
+            RouteStep::Failed { provider, status, body } => {
+                assert_eq!(provider, "primary");
+                assert_eq!(*status, 400);
+                assert!(body.contains("model_not_supported"));
+            }
+            other => panic!("expected RouteStep::Failed, got {other:?}"),
+        }
         // A model-unsupported skip cools the provider down (60s) so the
         // next request bypasses it entirely.
         assert!(router.cooldown().is_cooling_down("primary").await);
