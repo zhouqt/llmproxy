@@ -31,6 +31,19 @@ pub struct OpenAiCompatProvider {
     /// 非空 + `is_openrouter == true` 时，注入 `provider: {ignore: [...]}`
     /// 到请求体；非 OpenRouter 后端上忽略该配置并产生启动警告。
     provider_ignore: Vec<String>,
+    /// OpenRouter backend provider slugs to restrict routing to.
+    /// Non-empty + `is_openrouter == true` → the request carries
+    /// `provider: {only: [...]}`. OpenRouter treats `only` as a hard
+    /// ceiling: if no listed provider can serve the model the request
+    /// fails with 503, which llmproxy treats as cooldownable — so a
+    /// mistyped allowlist silently cools this provider down rather than
+    /// surfacing a config error. See plans/openrouter-provider-allow-plan.md
+    /// §7.11.
+    ///
+    /// Slugs are opaque, operator-supplied strings, forwarded verbatim.
+    /// Forwarded alongside `provider_ignore` in the same `provider`
+    /// object; the proxy never computes the intersection locally.
+    provider_allow: Vec<String>,
     /// 缓存的 `api_base` host 检测结果：`true` 当且仅当 host 是
     /// `openrouter.ai`（大小写不敏感，允许 `www.openrouter.ai` 等子域）。
     /// 在 `new()` 中计算一次，避免每请求重复解析。
@@ -52,6 +65,11 @@ impl OpenAiCompatProvider {
         api_key: String,
         model_rewrite: HashMap<String, String>,
         provider_ignore: Vec<String>,
+        // Placed immediately after `provider_ignore` (both `Vec<String>`,
+        // so a transposition at a call site would compile silently) rather
+        // than at the end of the parameter list, keeping the two OpenRouter
+        // routing lists adjacent at every call site.
+        provider_allow: Vec<String>,
         reasoning_echo: bool,
         http: reqwest::Client,
     ) -> Result<Self> {
@@ -65,13 +83,13 @@ impl OpenAiCompatProvider {
 
         // 启动时一次性警告：避免每请求刷日志。误配到 DeepSeek/opencode
         // 等严格校验后端时，请求体保持干净（不注入 provider 字段）。
-        if !provider_ignore.is_empty() && !is_openrouter {
+        if !is_openrouter && (!provider_ignore.is_empty() || !provider_allow.is_empty()) {
             tracing::warn!(
                 provider = %name,
                 api_base = %api_base,
-                "provider_ignore configured but api_base is not openrouter.ai; \
-                 field will be ignored (strict OpenAI-compat backends like \
-                 DeepSeek may reject unknown top-level fields)"
+                "provider_allow/provider_ignore configured but api_base is not \
+                 openrouter.ai; fields will be ignored (strict OpenAI-compat \
+                 backends like DeepSeek may reject unknown top-level fields)"
             );
         }
 
@@ -81,6 +99,7 @@ impl OpenAiCompatProvider {
             api_key,
             model_rewrite,
             provider_ignore,
+            provider_allow,
             is_openrouter,
             reasoning_echo,
             http,
@@ -95,31 +114,49 @@ impl OpenAiCompatProvider {
         format!("{}/models", self.api_base)
     }
 
-    /// 如果 `provider_ignore` 非空且 `api_base` 指向 OpenRouter，则将
-    /// `provider: {ignore: [...]}` 注入到 `ChatRequest.extra`。OpenRouter
-    /// 会用该字段在路由时跳过被排除的提供商。
+    /// Inject the OpenRouter routing preferences into `ChatRequest.extra` as a
+    /// single `provider` object, when at least one list is non-empty and
+    /// `api_base` points at OpenRouter.
     ///
-    /// 三种门控：
-    /// - `provider_ignore` 为空 → 无操作（默认行为）。
-    /// - 非空且是 OpenRouter → 注入。
-    /// - 非空且非 OpenRouter → 无操作（已在 `new()` 启动时记录警告）。
+    /// - `only` ← `provider_allow` (allowlist, hard ceiling)
+    /// - `ignore` ← `provider_ignore` (denylist)
     ///
-    /// 注入必须在 retry 循环之前，因为 `strip_reasoning_echo()` /
-    /// `downgrade_response_format()` 不触碰 `extra.provider`，retry
-    /// 请求体保持携带该字段（正确的语义——排除的提供商在每次尝试中都
-    /// 应被排除）。
+    /// When both are configured both sub-fields are written verbatim into the
+    /// same object; this function deliberately does NOT compute the
+    /// intersection locally (operator decision: `only` governs, `ignore`
+    /// applies beneath it — plans/openrouter-provider-allow-plan.md §1.4).
+    ///
+    /// Gate:
+    /// - both lists empty → no-op (default; never emits an empty `provider`).
+    /// - non-empty and OpenRouter → inject.
+    /// - non-empty and not OpenRouter → no-op (startup warning already logged).
+    ///
+    /// The injection must happen before the retry loop, because
+    /// `strip_reasoning_echo()` / `downgrade_response_format()` never touch
+    /// `extra.provider`, so retry bodies keep carrying it (the correct
+    /// semantic — the constrained/excluded providers apply to every attempt).
     fn inject_provider_ignore(&self, req: &mut ChatRequest) {
-        if self.provider_ignore.is_empty() || !self.is_openrouter {
+        if self.provider_allow.is_empty() && self.provider_ignore.is_empty() {
             return;
         }
-        // `extra` 由 `anthropic_to_openai_request` 初始化为
-        // `Value::Object(Map::new())`，所以 `as_object_mut()` 实际
-        // 路径上必然成功。`Value::Null` 分支仅为防御性 guard。
+        if !self.is_openrouter {
+            return;
+        }
+        // Only write non-empty sub-fields so an ignore-only (or allow-only)
+        // configuration never emits a half-populated `provider` object —
+        // field presence on the wire is correctness here.
+        let mut prefs = serde_json::Map::with_capacity(2);
+        if !self.provider_allow.is_empty() {
+            prefs.insert("only".to_string(), json!(self.provider_allow));
+        }
+        if !self.provider_ignore.is_empty() {
+            prefs.insert("ignore".to_string(), json!(self.provider_ignore));
+        }
+        // `extra` is initialized to `Value::Object(Map::new())` by
+        // `anthropic_to_openai_request`, so `as_object_mut()` always succeeds
+        // on the real path. The `Value::Null` case is a defensive guard.
         if let Some(obj) = req.extra.as_object_mut() {
-            obj.insert(
-                "provider".to_string(),
-                json!({"ignore": self.provider_ignore}),
-            );
+            obj.insert("provider".to_string(), Value::Object(prefs));
         }
     }
 
@@ -137,6 +174,7 @@ impl OpenAiCompatProvider {
         api_key: String,
         model_rewrite: HashMap<String, String>,
         provider_ignore: Vec<String>,
+        provider_allow: Vec<String>,
         reasoning_echo: bool,
         force_openrouter: bool,
         http: reqwest::Client,
@@ -148,6 +186,7 @@ impl OpenAiCompatProvider {
             api_key,
             model_rewrite,
             provider_ignore,
+            provider_allow,
             is_openrouter: force_openrouter,
             reasoning_echo,
             http,
@@ -783,6 +822,7 @@ mod tests {
             "test-key".to_string(),
             configured_rewrite,
             Vec::new(),
+            Vec::new(),
 
             false,
             reqwest::Client::new(),
@@ -820,6 +860,7 @@ mod tests {
             server.uri(),
             "key".to_string(),
             HashMap::new(),
+            Vec::new(),
             Vec::new(),
 
             false,
@@ -866,6 +907,7 @@ mod tests {
             "key".to_string(),
             HashMap::new(),
             Vec::new(),
+            Vec::new(),
 
             false,
             reqwest::Client::new(),
@@ -909,6 +951,7 @@ mod tests {
             server.uri(),
             "key".to_string(),
             HashMap::new(),
+            Vec::new(),
             Vec::new(),
 
             false,
@@ -1000,6 +1043,7 @@ mod tests {
             "key".to_string(),
             HashMap::new(),
             Vec::new(),
+            Vec::new(),
 
             false,
             reqwest::Client::new(),
@@ -1066,6 +1110,7 @@ mod tests {
             server.uri(),
             "key".to_string(),
             HashMap::new(),
+            Vec::new(),
             Vec::new(),
 
             false,
@@ -1276,6 +1321,7 @@ mod tests {
             "k".to_string(),
             rewrite,
             Vec::new(),
+            Vec::new(),
             false,
             reqwest::Client::new(),
         )
@@ -1357,6 +1403,7 @@ mod tests {
             "key".to_string(),
             HashMap::new(),
             Vec::new(),
+            Vec::new(),
 
             false,
             reqwest::Client::new(),
@@ -1391,6 +1438,7 @@ mod tests {
             format!("{}/v1/", server.uri()),
             "key".to_string(),
             HashMap::new(),
+            Vec::new(),
             Vec::new(),
 
             false,
@@ -1429,6 +1477,7 @@ mod tests {
             "key".to_string(),
             HashMap::new(),
             Vec::new(),
+            Vec::new(),
 
             false,
             reqwest::Client::new(),
@@ -1464,6 +1513,7 @@ mod tests {
             format!("{}/v1/", server.uri()),
             "key".to_string(),
             HashMap::new(),
+            Vec::new(),
             Vec::new(),
 
             false,
@@ -1578,6 +1628,7 @@ mod tests {
             "test-key".to_string(),
             HashMap::new(),
             Vec::new(),
+            Vec::new(),
 
             false,
             reqwest::Client::new(),
@@ -1619,6 +1670,7 @@ mod tests {
             "test-key".to_string(),
             HashMap::new(),
             Vec::new(),
+            Vec::new(),
 
             false,
             reqwest::Client::new(),
@@ -1639,6 +1691,7 @@ mod tests {
             uri,
             "test-key".to_string(),
             HashMap::new(),
+            Vec::new(),
             Vec::new(),
 
             false,
@@ -1664,6 +1717,7 @@ mod tests {
             server.uri(),
             "test-key".to_string(),
             HashMap::new(),
+            Vec::new(),
             Vec::new(),
 
             false,
@@ -1691,6 +1745,7 @@ mod tests {
             server.uri(),
             "test-key".to_string(),
             HashMap::new(),
+            Vec::new(),
             Vec::new(),
 
             false,
@@ -1931,6 +1986,7 @@ mod tests {
             "key".to_string(),
             HashMap::new(),
             Vec::new(),
+            Vec::new(),
 
             false,
             reqwest::Client::new(),
@@ -2012,6 +2068,7 @@ mod tests {
             "key".to_string(),
             HashMap::new(),
             Vec::new(),
+            Vec::new(),
 
             false,
             reqwest::Client::new(),
@@ -2070,6 +2127,7 @@ mod tests {
             "key".to_string(),
             HashMap::new(),
             Vec::new(),
+            Vec::new(),
 
             false,
             reqwest::Client::new(),
@@ -2110,6 +2168,7 @@ mod tests {
             server.uri(),
             "key".to_string(),
             HashMap::new(),
+            Vec::new(),
             Vec::new(),
 
             false,
@@ -2153,6 +2212,7 @@ mod tests {
             server.uri(),
             "key".to_string(),
             rewrite,
+            Vec::new(),
             Vec::new(),
 
             false,
@@ -2420,6 +2480,7 @@ mod tests {
             "key".to_string(),
             HashMap::new(),
             Vec::new(),
+            Vec::new(),
 
             false,
             reqwest::Client::new(),
@@ -2489,6 +2550,7 @@ mod tests {
             "key".to_string(),
             HashMap::new(),
             Vec::new(),
+            Vec::new(),
 
             false,
             reqwest::Client::new(),
@@ -2541,6 +2603,7 @@ mod tests {
             server.uri(),
             "key".to_string(),
             HashMap::new(),
+            Vec::new(),
             Vec::new(),
 
             false,
@@ -2595,6 +2658,7 @@ mod tests {
             server.uri(),
             "key".to_string(),
             HashMap::new(),
+            Vec::new(),
             Vec::new(),
 
             false,
@@ -2680,6 +2744,7 @@ mod tests {
             "key".to_string(),
             HashMap::new(),
             Vec::new(),
+            Vec::new(),
 
             false,
             reqwest::Client::new(),
@@ -2751,6 +2816,7 @@ mod tests {
             "key".to_string(),
             HashMap::new(),
             Vec::new(),
+            Vec::new(),
 
             false,
             reqwest::Client::new(),
@@ -2801,6 +2867,7 @@ mod tests {
             "key".to_string(),
             HashMap::new(),
             Vec::new(),
+            Vec::new(),
 
             false,
             reqwest::Client::new(),
@@ -2848,6 +2915,7 @@ mod tests {
             "key".to_string(),
             HashMap::new(),
             vec!["Azure".to_string()],
+            Vec::new(),
             false,
             true,  // force_openrouter
             reqwest::Client::new(),
@@ -2880,6 +2948,7 @@ mod tests {
             format!("{}/v1/", server.uri()),
             "key".to_string(),
             HashMap::new(),
+            Vec::new(),
             Vec::new(),
             false,
             false, // force_openrouter
@@ -2922,7 +2991,8 @@ mod tests {
             format!("{}/v1/", server.uri()),
             "key".to_string(),
             HashMap::new(),
-            vec!["Azure".to_string()], // non-empty list
+            vec!["Azure".to_string()],
+            Vec::new(), // non-empty list
             false,
             false, // force_openrouter=false → gate suppresses injection
             reqwest::Client::new(),
@@ -2954,6 +3024,7 @@ mod tests {
             format!("{}/v1/", server.uri()),
             "key".to_string(),
             HashMap::new(),
+            Vec::new(),
             Vec::new(),
             false,
             true,  // force_openrouter (even so, empty list means no injection)
@@ -3003,6 +3074,7 @@ mod tests {
             "key".to_string(),
             HashMap::new(),
             vec!["Azure".to_string()],
+            Vec::new(),
             false,
             true,  // force_openrouter
             reqwest::Client::new(),
@@ -3075,6 +3147,7 @@ mod tests {
             "key".to_string(),
             HashMap::new(),
             vec!["Azure".to_string()],
+            Vec::new(),
             false,
             true, // force_openrouter
             reqwest::Client::new(),
@@ -3138,6 +3211,7 @@ mod tests {
             "key".to_string(),
             HashMap::new(),
             vec!["Azure".to_string(), "Together".to_string()],
+            Vec::new(),
             false,
             true,  // force_openrouter
             reqwest::Client::new(),
@@ -3172,6 +3246,7 @@ mod tests {
             "k".to_string(),
             HashMap::new(),
             vec!["Azure".to_string()],
+            Vec::new(),
             false,
             reqwest::Client::new(),
         )
@@ -3191,10 +3266,534 @@ mod tests {
         );
     }
 
+    // ─── L group: provider_allow (OpenRouter /chat/completions allowlist) ──
+    //
+    // `provider_allow` is the allowlist half of the same `provider` object
+    // `provider_ignore` writes (OpenRouter's wire field is `only`). Both
+    // lists are forwarded verbatim into ONE `provider` key; the proxy
+    // never computes their intersection locally. See
+    // plans/openrouter-provider-allow-plan.md §1.4 for why.
+
+    /// `provider_allow` + `is_openrouter=true` → wire body carries
+    /// `provider: {only: [...]}`.
+    #[tokio::test]
+    async fn complete_injects_provider_only_for_openrouter() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(json!({
+                "provider": {"only": ["DeepInfra"]}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new_for_test(
+            "p".to_string(),
+            server.uri(),
+            "key".to_string(),
+            HashMap::new(),
+            Vec::new(),
+            vec!["DeepInfra".to_string()],
+            false,
+            true, // force_openrouter
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let _ = provider
+            .complete(&request(false), &HashMap::new())
+            .await
+            .unwrap();
+    }
+
+    /// Both lists non-empty → a SINGLE `provider` object carrying both
+    /// `only` and `ignore`. Captures the body rather than using
+    /// `body_partial_json`, because subset matching cannot prove that the
+    /// two sub-fields landed in the same object (a naive second injection
+    /// would clobber the first).
+    #[tokio::test]
+    async fn complete_injects_provider_only_and_ignore_together_for_openrouter() {
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |req: &wiremock::Request| {
+                *captured_for_responder.lock().unwrap() =
+                    Some(serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({})));
+                ResponseTemplate::new(200).set_body_json(chat_response())
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new_for_test(
+            "p".to_string(),
+            server.uri(),
+            "key".to_string(),
+            HashMap::new(),
+            vec!["Azure".to_string()],
+            vec!["DeepInfra".to_string(), "Together".to_string()],
+            false,
+            true,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let _ = provider
+            .complete(&request(false), &HashMap::new())
+            .await
+            .unwrap();
+
+        let sent = captured.lock().unwrap().clone().expect("body captured");
+        assert_eq!(
+            sent["provider"],
+            json!({
+                "only": ["DeepInfra", "Together"],
+                "ignore": ["Azure"]
+            }),
+            "both sub-fields must share one `provider` object"
+        );
+    }
+
+    /// A multi-entry `provider_allow` must reach the wire as a multi-entry
+    /// `only` array, in config order, with nothing dropped.
+    ///
+    /// This uses EXACT array equality rather than `body_partial_json`,
+    /// because subset matching treats `["DeepInfra"]` as satisfied by
+    /// `["DeepInfra", "DigitalOcean", ...]` — a truncation bug that
+    /// silently keeps only the first entry would still pass a
+    /// single-element assertion.
+    #[tokio::test]
+    async fn complete_forwards_every_allow_list_entry_in_order() {
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |req: &wiremock::Request| {
+                *captured_for_responder.lock().unwrap() =
+                    Some(serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({})));
+                ResponseTemplate::new(200).set_body_json(chat_response())
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let allow = vec![
+            "DeepInfra".to_string(),
+            "DigitalOcean".to_string(),
+            "CoreWeave".to_string(),
+            "Phala".to_string(),
+        ];
+        let provider = OpenAiCompatProvider::new_for_test(
+            "p".to_string(),
+            server.uri(),
+            "key".to_string(),
+            HashMap::new(),
+            Vec::new(),
+            allow.clone(),
+            false,
+            true,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let _ = provider
+            .complete(&request(false), &HashMap::new())
+            .await
+            .unwrap();
+
+        let sent = captured.lock().unwrap().clone().expect("body captured");
+        assert_eq!(
+            sent["provider"]["only"],
+            json!(["DeepInfra", "DigitalOcean", "CoreWeave", "Phala"]),
+            "every provider_allow entry must be forwarded, in order — \
+             a list that collapsed to its first entry would still satisfy \
+             any subset/prefix assertion"
+        );
+    }
+
+    /// Empty `provider_allow` + non-empty `provider_ignore` → the wire
+    /// carries `provider: {ignore: [...]}` with NO `only` key.
+    ///
+    /// This is the must-not-regress path: ignore-only is the default shape
+    /// for every existing user, so the extended helper must not start
+    /// emitting a half-populated object when the allowlist is empty.
+    /// `body_partial_json` alone cannot prove absence of `only` (subset
+    /// matching tolerates the extra key), hence the body capture.
+    #[tokio::test]
+    async fn complete_empty_allow_still_injects_ignore() {
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |req: &wiremock::Request| {
+                *captured_for_responder.lock().unwrap() =
+                    Some(serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({})));
+                ResponseTemplate::new(200).set_body_json(chat_response())
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new_for_test(
+            "p".to_string(),
+            server.uri(),
+            "key".to_string(),
+            HashMap::new(),
+            vec!["Azure".to_string()],
+            Vec::new(),
+            false,
+            true,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let _ = provider
+            .complete(&request(false), &HashMap::new())
+            .await
+            .unwrap();
+
+        let sent = captured.lock().unwrap().clone().expect("body captured");
+        assert_eq!(sent["provider"], json!({"ignore": ["Azure"]}));
+        assert!(
+            sent["provider"].get("only").is_none(),
+            "empty provider_allow must not emit a `only` key, got: {}",
+            sent["provider"]
+        );
+    }
+
+    /// Both lists empty + `is_openrouter=true` → no `provider` key at all.
+    /// Field-omission-is-correctness: never emit `"provider": {}`.
+    #[tokio::test]
+    async fn complete_omits_provider_field_when_allow_list_empty() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(JsonFieldAbsent("provider"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new_for_test(
+            "p".to_string(),
+            server.uri(),
+            "key".to_string(),
+            HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            true,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let _ = provider
+            .complete(&request(false), &HashMap::new())
+            .await
+            .unwrap();
+    }
+
+    /// Non-empty `provider_allow` + `is_openrouter=false` → no `provider`
+    /// key. Extends the existing ignore-only non-OpenRouter coverage to
+    /// the allowlist half: a strict OpenAI-compat backend would 400 on the
+    /// unknown top-level field.
+    #[tokio::test]
+    async fn complete_omits_provider_field_when_allow_set_on_non_openrouter() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(JsonFieldAbsent("provider"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new_for_test(
+            "p".to_string(),
+            server.uri(),
+            "key".to_string(),
+            HashMap::new(),
+            Vec::new(),
+            vec!["DeepInfra".to_string()],
+            false,
+            false, // force_openrouter = false → gate suppresses injection
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let _ = provider
+            .complete(&request(false), &HashMap::new())
+            .await
+            .unwrap();
+    }
+
+    /// `provider_allow` must survive the reasoning-echo strip-and-retry
+    /// loop: the downgrade clears reasoning signals but never `extra`
+    /// keys, so the allowlist still constrains the second attempt.
+    #[tokio::test]
+    async fn complete_provider_only_survives_reasoning_strip_retry() {
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured.clone();
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = counter.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |req: &wiremock::Request| {
+                let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    ResponseTemplate::new(400).set_body_string(REASONING_ECHO_400)
+                } else {
+                    *captured_for_responder.lock().unwrap() = Some(
+                        serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
+                    );
+                    ResponseTemplate::new(200).set_body_json(chat_response())
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new_for_test(
+            "p".to_string(),
+            server.uri(),
+            "key".to_string(),
+            HashMap::new(),
+            Vec::new(),
+            vec!["DeepInfra".to_string(), "Together".to_string()],
+            false,
+            true,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let _ = provider
+            .complete(&thinking_request(false), &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        assert_eq!(
+            sent["provider"]["only"],
+            json!(["DeepInfra", "Together"]),
+            "provider.only must survive the strip-and-retry, got: {sent}"
+        );
+        assert!(
+            sent.as_object().unwrap().get("reasoning_effort").is_none(),
+            "reasoning_effort must be gone after strip: {sent}"
+        );
+    }
+
+    /// Companion: `provider_allow` must also survive the response_format
+    /// downgrade retry. The downgrade rewrites `extra.response_format`
+    /// from json_schema to json_object but must not touch
+    /// `extra.provider` — otherwise the retry escapes the allowlist.
+    #[tokio::test]
+    async fn complete_provider_only_survives_response_format_downgrade_retry() {
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured.clone();
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = counter.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |req: &wiremock::Request| {
+                let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    ResponseTemplate::new(400).set_body_string(RESPONSE_FORMAT_400)
+                } else {
+                    *captured_for_responder.lock().unwrap() = Some(
+                        serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
+                    );
+                    ResponseTemplate::new(200).set_body_json(chat_response())
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new_for_test(
+            "p".to_string(),
+            server.uri(),
+            "key".to_string(),
+            HashMap::new(),
+            Vec::new(),
+            vec!["DeepInfra".to_string()],
+            false,
+            true,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4.6",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {
+                "format": {"type": "json_schema", "schema": {"type": "object"}}
+            }
+        }))
+        .unwrap();
+        let _ = provider.complete(&req, &HashMap::new()).await.unwrap();
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        assert_eq!(
+            sent["provider"]["only"],
+            json!(["DeepInfra"]),
+            "provider.only must survive the response_format downgrade, got: {sent}"
+        );
+        assert_eq!(
+            sent["response_format"]["type"],
+            json!("json_object"),
+            "response_format must be downgraded to json_object, got: {sent}"
+        );
+    }
+
+    /// Streaming path must also inject `provider: {only: [...]}`.
+    #[tokio::test]
+    async fn stream_injects_provider_only_for_openrouter() {
+        let server = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(json!({
+                "provider": {"only": ["DeepInfra"]}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new_for_test(
+            "p".to_string(),
+            server.uri(),
+            "key".to_string(),
+            HashMap::new(),
+            Vec::new(),
+            vec!["DeepInfra".to_string()],
+            false,
+            true,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let output = provider
+            .stream(&request(true), &HashMap::new())
+            .await
+            .unwrap();
+        expect_variant!(output, ProviderOutput::Stream(mut stream) => {
+            while let Some(_) = stream.next().await {}
+        });
+    }
+
+    /// Direct unit coverage of the helper's write rules, independent of
+    /// the HTTP layer: both sub-fields share one object, only the
+    /// non-empty ones are written, and both-empty writes nothing. Also
+    /// pins the defensive `extra: Value::Null` guard — the branch is
+    /// unreachable through `complete()`/`stream()` (the converter always
+    /// initialises `extra` to an empty object) but must not panic if a
+    /// future path hands the helper a `Null`.
+    #[test]
+    fn inject_provider_ignore_merges_allow_and_ignore_into_one_object() {
+        // Both lists set → one object with both keys.
+        let p = OpenAiCompatProvider::new_for_test(
+            "p".to_string(),
+            "https://example.test/v1".to_string(),
+            "k".to_string(),
+            HashMap::new(),
+            vec!["Azure".to_string()],
+            vec!["DeepInfra".to_string()],
+            false,
+            true,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let mut req = minimal_chat_request();
+        p.inject_provider_ignore(&mut req);
+        assert_eq!(
+            req.extra["provider"],
+            json!({"only": ["DeepInfra"], "ignore": ["Azure"]})
+        );
+
+        // Allow only → no `ignore` key.
+        let p = OpenAiCompatProvider::new_for_test(
+            "p".to_string(),
+            "https://example.test/v1".to_string(),
+            "k".to_string(),
+            HashMap::new(),
+            Vec::new(),
+            vec!["DeepInfra".to_string()],
+            false,
+            true,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let mut req = minimal_chat_request();
+        p.inject_provider_ignore(&mut req);
+        assert_eq!(req.extra["provider"], json!({"only": ["DeepInfra"]}));
+
+        // Both empty → no `provider` key at all.
+        let p = OpenAiCompatProvider::new_for_test(
+            "p".to_string(),
+            "https://example.test/v1".to_string(),
+            "k".to_string(),
+            HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            true,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let mut req = minimal_chat_request();
+        p.inject_provider_ignore(&mut req);
+        assert!(
+            req.extra.get("provider").is_none(),
+            "both lists empty must not emit an empty provider object"
+        );
+
+        // `extra: Value::Null` → defensive no-op, no panic.
+        let p = OpenAiCompatProvider::new_for_test(
+            "p".to_string(),
+            "https://example.test/v1".to_string(),
+            "k".to_string(),
+            HashMap::new(),
+            Vec::new(),
+            vec!["DeepInfra".to_string()],
+            false,
+            true,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let mut req = minimal_chat_request();
+        req.extra = Value::Null;
+        p.inject_provider_ignore(&mut req);
+        assert_eq!(req.extra, Value::Null);
+    }
+
+
     /// Build a `ChatRequest` carrying only the fields exercised by the
-    /// `provider_ignore` tests (everything else is `None` / empty).
-    /// Keeping the constructor inline avoids the ~25-field literal
-    /// that previously lived in `openrouter_host_detection_covers_subdomains_and_case`.
+    /// `provider_ignore` / `provider_allow` tests (everything else is
+    /// `None` / empty). Keeping the constructor inline avoids the ~25-field
+    /// literal that previously lived in
+    /// `openrouter_host_detection_covers_subdomains_and_case`.
     fn minimal_chat_request() -> crate::openai::ChatRequest {
         crate::openai::ChatRequest {
             model: "m".to_string(),
@@ -3283,6 +3882,7 @@ mod tests {
             "test-key".to_string(),
             HashMap::new(),
             Vec::new(),
+            Vec::new(),
             true, // reasoning_echo on
             reqwest::Client::new(),
         )
@@ -3322,6 +3922,7 @@ mod tests {
             format!("{}/v1/", server.uri()),
             "test-key".to_string(),
             HashMap::new(),
+            Vec::new(),
             Vec::new(),
             true, // reasoning_echo on
             reqwest::Client::new(),
@@ -3398,6 +3999,7 @@ mod tests {
             "test-key".to_string(),
             HashMap::new(),
             Vec::new(),
+            Vec::new(),
             false, // reasoning_echo off → strip-and-retry path active
             reqwest::Client::new(),
         )
@@ -3444,6 +4046,7 @@ mod tests {
             format!("{}/v1/", server.uri()),
             "test-key".to_string(),
             HashMap::new(),
+            Vec::new(),
             Vec::new(),
             true, // reasoning_echo on
             reqwest::Client::new(),
