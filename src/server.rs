@@ -2282,6 +2282,7 @@ mod tests {
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
                     provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
                     reasoning_echo: false,
                 },
                 ProviderConfig::GithubCopilot {
@@ -2360,6 +2361,7 @@ mod tests {
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
                     provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
                     reasoning_echo: false,
                 },
                 ProviderConfig::GithubCopilot {
@@ -2591,6 +2593,7 @@ mod tests {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
                 provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
                 reasoning_echo: false,
             },
             reqwest::Client::new(),
