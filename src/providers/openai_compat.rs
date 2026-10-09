@@ -3554,9 +3554,8 @@ mod tests {
                 if n == 0 {
                     ResponseTemplate::new(400).set_body_string(REASONING_ECHO_400)
                 } else {
-                    *captured_for_responder.lock().unwrap() = Some(
-                        serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
-                    );
+                    *captured_for_responder.lock().unwrap() =
+                        Some(serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({})));
                     ResponseTemplate::new(200).set_body_json(chat_response())
                 }
             })
@@ -3614,9 +3613,8 @@ mod tests {
                 if n == 0 {
                     ResponseTemplate::new(400).set_body_string(RESPONSE_FORMAT_400)
                 } else {
-                    *captured_for_responder.lock().unwrap() = Some(
-                        serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
-                    );
+                    *captured_for_responder.lock().unwrap() =
+                        Some(serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({})));
                     ResponseTemplate::new(200).set_body_json(chat_response())
                 }
             })
@@ -3787,7 +3785,6 @@ mod tests {
         p.inject_provider_ignore(&mut req);
         assert_eq!(req.extra, Value::Null);
     }
-
 
     /// Build a `ChatRequest` carrying only the fields exercised by the
     /// `provider_ignore` / `provider_allow` tests (everything else is
