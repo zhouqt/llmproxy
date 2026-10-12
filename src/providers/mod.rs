@@ -137,6 +137,7 @@ pub fn build(
             api_base,
             model_rewrite,
             provider_ignore,
+            provider_allow,
             ..
         } => {
             let inner = anthropic::AnthropicProvider::new(
@@ -145,6 +146,7 @@ pub fn build(
                 api_base.clone(),
                 model_rewrite.clone(),
                 provider_ignore.clone(),
+                provider_allow.clone(),
                 http,
             )?;
             Ok(Arc::new(inner))
@@ -155,6 +157,7 @@ pub fn build(
             api_base,
             model_rewrite,
             provider_ignore,
+            provider_allow,
             reasoning_echo,
             ..
         } => {
@@ -164,6 +167,7 @@ pub fn build(
                 api_key.clone(),
                 model_rewrite.clone(),
                 provider_ignore.clone(),
+                provider_allow.clone(),
                 reasoning_echo.clone(),
                 http,
             )?;
@@ -197,6 +201,7 @@ mod tests {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
                 provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
             reasoning_echo: false,
             },
             reqwest::Client::new(),
@@ -213,6 +218,7 @@ mod tests {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
                 provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
             },
             reqwest::Client::new(),
         )

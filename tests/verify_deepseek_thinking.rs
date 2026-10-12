@@ -97,6 +97,7 @@ fn make_anthropic_provider(name: &str, server: &MockServer) -> SharedProvider {
             format!("{}/v1", server.uri()),
             HashMap::new(),
             Vec::new(),
+            Vec::new(),
             reqwest::Client::new(),
         )
         .unwrap(),
@@ -112,6 +113,7 @@ fn make_anthropic_config(name: &str, server: &MockServer) -> ProviderConfig {
         model_rewrite: HashMap::new(),
         use_proxy: false,
         provider_ignore: Vec::new(),
+        provider_allow: Vec::new(),
     }
 }
 

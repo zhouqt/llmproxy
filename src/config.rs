@@ -153,6 +153,30 @@ pub enum ProviderConfig {
         /// 空列表（默认）不注入任何 `provider` 字段。
         #[serde(default)]
         provider_ignore: Vec<String>,
+        /// OpenRouter backend provider slugs to RESTRICT routing to.
+        /// Non-empty → the request body carries `provider: {only: [...]}`,
+        /// which OpenRouter treats as a hard ceiling: the request is only
+        /// routed to providers in the list, and if none of them can serve
+        /// the model it fails with 503 ("No available model provider meets
+        /// your routing requirements").
+        ///
+        /// Only active when `api_base` points at `openrouter.ai`; other
+        /// Anthropic-compatible backends ignore the config and emit a
+        /// startup warning, because strict backends 400 on unknown
+        /// top-level fields.
+        ///
+        /// Slugs are passed through verbatim — exact, operator-supplied
+        /// strings, no normalization or validation. Note that a base slug
+        /// (e.g. `deepinfra`) matches every endpoint of that provider,
+        /// including variants like `deepinfra/turbo`; use a suffixed slug
+        /// to pin a single endpoint.
+        ///
+        /// When both `provider_allow` and `provider_ignore` are set, both
+        /// sub-fields are forwarded verbatim in the same `provider` object;
+        /// the proxy does not compute the intersection locally.
+        /// Empty list (default) injects no `provider.only` key.
+        #[serde(default)]
+        provider_allow: Vec<String>,
     },
     #[serde(rename = "openai_compat")]
     OpenaiCompat {
@@ -172,6 +196,30 @@ pub enum ProviderConfig {
         /// 空列表（默认）不注入任何 `provider` 字段。
         #[serde(default)]
         provider_ignore: Vec<String>,
+        /// OpenRouter backend provider slugs to RESTRICT routing to.
+        /// Non-empty → the request body carries `provider: {only: [...]}`,
+        /// which OpenRouter treats as a hard ceiling: the request is only
+        /// routed to providers in the list, and if none of them can serve
+        /// the model it fails with 503 ("No available model provider meets
+        /// your routing requirements").
+        ///
+        /// Only active when `api_base` points at `openrouter.ai`; other
+        /// OpenAI-compat backends ignore the config and emit a startup
+        /// warning, because strict backends such as DeepSeek 400 on
+        /// unknown top-level fields.
+        ///
+        /// Slugs are passed through verbatim — exact, operator-supplied
+        /// strings, no normalization or validation. Note that a base slug
+        /// (e.g. `deepinfra`) matches every endpoint of that provider,
+        /// including variants like `deepinfra/turbo`; use a suffixed slug
+        /// to pin a single endpoint.
+        ///
+        /// When both `provider_allow` and `provider_ignore` are set, both
+        /// sub-fields are forwarded verbatim in the same `provider` object;
+        /// the proxy does not compute the intersection locally.
+        /// Empty list (default) injects no `provider.only` key.
+        #[serde(default)]
+        provider_allow: Vec<String>,
         /// 当为 `true` 时，thinking 请求里每条缺失 `reasoning_content`
         /// 的历史 assistant 消息（跨模型 thinking 轮 / redacted_thinking /
         /// 纯文本轮）以 `reasoning_content: ""` 发送，使 DeepSeek-V4 类
@@ -725,6 +773,7 @@ models:
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
                     provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
                 },
                 "anthropic",
             ),
@@ -736,6 +785,7 @@ models:
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
                     provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
                 reasoning_echo: false,
                 },
                 "openai_compat",
@@ -915,5 +965,92 @@ models:
         expect_variant!(&cfg.providers[0], ProviderConfig::OpenaiCompat { reasoning_echo, .. } => {
             assert!(!*reasoning_echo, "absent field must default to false");
         });
+    }
+
+    /// `provider_allow` round-trips through YAML into both variants that
+    /// support it, alongside `provider_ignore`. The list is preserved
+    /// verbatim (no normalization) because slugs are operator-supplied and
+    /// OpenRouter documents no case-folding.
+    #[test]
+    fn provider_allow_parses_from_yaml() {
+        let raw = r#"
+providers:
+  - name: or_anthropic
+    type: anthropic
+    api_key: k
+    api_base: https://openrouter.ai/api/v1
+    provider_allow: ["DeepInfra", "Together"]
+    provider_ignore: ["Azure"]
+  - name: or_compat
+    type: openai_compat
+    api_key: k
+    api_base: https://openrouter.ai/api/v1
+    provider_allow: ["DeepInfra"]
+models:
+  - name: m
+    primary: or_anthropic
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        expect_variant!(&cfg.providers[0], ProviderConfig::Anthropic { provider_allow, provider_ignore, .. } => {
+            assert_eq!(
+                provider_allow,
+                &vec!["DeepInfra".to_string(), "Together".to_string()]
+            );
+            assert_eq!(provider_ignore, &vec!["Azure".to_string()]);
+        });
+        expect_variant!(&cfg.providers[1], ProviderConfig::OpenaiCompat { provider_allow, .. } => {
+            assert_eq!(provider_allow, &vec!["DeepInfra".to_string()]);
+        });
+    }
+
+    /// An omitted `provider_allow` defaults to an empty list on both
+    /// variants, so every existing config keeps its current wire bytes
+    /// (no `provider.only` key is injected).
+    #[test]
+    fn provider_allow_defaults_to_empty() {
+        let raw = r#"
+providers:
+  - name: or_anthropic
+    type: anthropic
+    api_key: k
+    api_base: https://openrouter.ai/api/v1
+  - name: or_compat
+    type: openai_compat
+    api_key: k
+    api_base: https://openrouter.ai/api/v1
+models:
+  - name: m
+    primary: or_anthropic
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        expect_variant!(&cfg.providers[0], ProviderConfig::Anthropic { provider_allow, .. } => {
+            assert!(provider_allow.is_empty());
+        });
+        expect_variant!(&cfg.providers[1], ProviderConfig::OpenaiCompat { provider_allow, .. } => {
+            assert!(provider_allow.is_empty());
+        });
+    }
+
+    /// `deny_unknown_fields` on the variants means a typo like
+    /// `provider_allowed:` is a hard YAML parse error rather than a
+    /// silently-ignored key — which for a routing allowlist would be a
+    /// silent under-constraint.
+    #[test]
+    fn provider_allow_rejects_unknown_fields() {
+        let raw = r#"
+providers:
+  - name: or_anthropic
+    type: anthropic
+    api_key: k
+    api_base: https://openrouter.ai/api/v1
+    provider_allowed: ["DeepInfra"]
+models:
+  - name: m
+    primary: or_anthropic
+"#;
+        assert!(
+            Config::parse(raw).is_err(),
+            "a misspelled provider_allow key must fail to parse"
+        );
     }
 }

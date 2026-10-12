@@ -222,6 +222,7 @@ fn build_app_with_usage_and_cooldown(
         model_rewrite: HashMap::new(),
         use_proxy: false,
         provider_ignore: Vec::new(),
+        provider_allow: Vec::new(),
     reasoning_echo: false,
     }];
     let fallback_chain = if let Some(backup) = backup {
@@ -233,6 +234,7 @@ fn build_app_with_usage_and_cooldown(
             model_rewrite: HashMap::new(),
             use_proxy: false,
             provider_ignore: Vec::new(),
+            provider_allow: Vec::new(),
         reasoning_echo: false,
         });
         vec!["backup".to_string()]
@@ -1048,6 +1050,7 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
                 provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
             reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
@@ -1057,6 +1060,7 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
                 provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
             reasoning_echo: false,
             },
             // Declared but never registered in the router map: both model
@@ -1068,6 +1072,7 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
                 provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
                 reasoning_echo: false,
             },
         ],
@@ -1195,6 +1200,7 @@ async fn list_models_collision_winner_follows_chain_order_deterministically() {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
                 provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
                 reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
@@ -1204,6 +1210,7 @@ async fn list_models_collision_winner_follows_chain_order_deterministically() {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
                 provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
                 reasoning_echo: false,
             },
         ],
@@ -1296,6 +1303,7 @@ async fn admin_models_lists_every_provider_without_dedup() {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
                 provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
                 reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
@@ -1308,6 +1316,7 @@ async fn admin_models_lists_every_provider_without_dedup() {
                 ]),
                 use_proxy: false,
                 provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
                 reasoning_echo: false,
             },
             // Declared but absent from the router map: must appear as a
@@ -1319,6 +1328,7 @@ async fn admin_models_lists_every_provider_without_dedup() {
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
                 provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
                 reasoning_echo: false,
             },
         ],
@@ -1426,6 +1436,7 @@ async fn admin_models_reports_fetch_failed_for_provider_without_catalog() {
             model_rewrite: HashMap::from([("alias".to_string(), "static-upstream".to_string())]),
             use_proxy: false,
             provider_ignore: Vec::new(),
+            provider_allow: Vec::new(),
             reasoning_echo: false,
         }],
         models: vec![ModelConfig {
@@ -2412,6 +2423,7 @@ async fn admin_usage_excludes_serving_provider_from_failed_providers_on_retry() 
             model_rewrite: Default::default(),
             use_proxy: false,
             provider_ignore: Vec::new(),
+            provider_allow: Vec::new(),
             reasoning_echo: false,
         }],
         models: vec![ModelConfig {
@@ -2518,6 +2530,7 @@ async fn admin_usage_keeps_fallback_failures_when_serving_provider_is_different(
                 model_rewrite: Default::default(),
                 use_proxy: false,
                 provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
                 reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
@@ -2527,6 +2540,7 @@ async fn admin_usage_keeps_fallback_failures_when_serving_provider_is_different(
                 model_rewrite: Default::default(),
                 use_proxy: false,
                 provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
                 reasoning_echo: false,
             },
         ],
