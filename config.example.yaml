@@ -170,6 +170,24 @@ providers:
     # backends like DeepSeek reject unknown top-level fields with 400).
     provider_ignore:
       - "Inceptron"
+    # `provider_allow` is the allowlist counterpart, injected as
+    # `provider: {only: [...]}`. OpenRouter treats `only` as a HARD ceiling:
+    # if none of the listed providers can serve the requested model the
+    # request fails with 503 ("No available model provider meets your
+    # routing requirements"). llmproxy treats 503 as cooldownable, so a
+    # mistyped slug silently cools this provider down and the router falls
+    # through to the next provider in the chain rather than reporting a
+    # config error — watch `x-llmproxy-failed-providers` for
+    # `openrouter_anthropic:503` after changing this list.
+    # Slugs are passed through verbatim (no normalization); copy the exact
+    # slug from the model's page on openrouter.ai. Note a BASE slug such
+    # as "deepinfra" matches every endpoint of that provider including
+    # variants like "deepinfra/turbo" — use a suffixed slug to pin one
+    # endpoint. When both lists are set, both sub-fields are forwarded in
+    # the same `provider` object and the proxy does not intersect them.
+    provider_allow:
+      - "DeepInfra"
+      - "Together"
 
   - name: minimax
     type: anthropic
@@ -203,6 +221,14 @@ providers:
   #                  at openrouter.ai; ignored with a startup warning on
   #                  other backends (DeepSeek etc. 400 on unknown fields).
   #                  Default: empty (no injection).
+  #   provider_allow  — optional list of OpenRouter backend-provider slugs
+  #                  to RESTRICT routing to (allowlist). Injects
+  #                  `provider: {only: [...]}` only when api_base points
+  #                  at openrouter.ai; same host gate and startup warning
+  #                  as provider_ignore. `only` is a hard ceiling — an
+  #                  unsatisfiable list makes OpenRouter return 503, which
+  #                  llmproxy treats as cooldownable (silent fallback, not
+  #                  a config error). Default: empty (no injection).
   #   reasoning_echo — when true, thinking requests have every historical
   #                  assistant message padded with `reasoning_content: ""`
   #                  so DeepSeek-V4-style upstreams in thinking mode
@@ -257,6 +283,12 @@ providers:
     # allow all providers.
     provider_ignore:
       - "Azure"
+    # Allowlist counterpart — see the `openrouter_anthropic` block above
+    # for the full caveat. A base slug admits every endpoint variant of
+    # that provider, so this list restricts *which providers* may serve the
+    # request, not which single endpoint.
+    provider_allow:
+      - "DeepInfra"
     model_rewrite:
       "gpt-4o":            "openai/gpt-4o"
       "claude-haiku-4.6":  "anthropic/claude-haiku-4.5"
