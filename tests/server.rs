@@ -47,6 +47,10 @@ static REQUEST_STARTED_TESTS_LOCK: Mutex<()> = Mutex::new(());
 
 enum CompleteBehavior {
     Json,
+    /// Verbatim Anthropic-shaped success payload — lets a test pin an
+    /// exact wire shape (e.g. optional-field regressions) without
+    /// growing this enum per case.
+    JsonRaw(Value),
     Stream,
     MalformedJson,
     Error(u16),
@@ -103,6 +107,7 @@ impl Provider for TestProvider {
                 "stop_sequence": null,
                 "usage": {"input_tokens": 2, "output_tokens": 1}
             }))),
+            CompleteBehavior::JsonRaw(value) => Ok(ProviderOutput::Json(value.clone())),
             CompleteBehavior::MalformedJson => Ok(ProviderOutput::Json(json!({
                 "unexpected": true
             }))),
@@ -570,6 +575,58 @@ async fn complete_returns_anthropic_response_with_requested_model() {
     let body = body_json(response).await;
     assert_eq!(body["model"], "claude-test");
     assert_eq!(body["content"][0]["text"], "ok");
+}
+
+#[tokio::test]
+async fn complete_survives_upstream_5m_only_cache_creation_breakdown() {
+    // Regression: `CacheCreation` used to require both TTL sub-fields, so
+    // a non-streaming response from an upstream that only writes 5-minute
+    // cache entries (OpenRouter and most Anthropic-compat layers) failed
+    // to parse into MessagesResponse and surfaced as a 500.
+    let upstream_usage = json!({
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "cache_creation_input_tokens": 3,
+        "cache_creation": {"ephemeral_5m_input_tokens": 3}
+    });
+    let app = build_app(
+        None,
+        provider(
+            "primary",
+            CompleteBehavior::JsonRaw(json!({
+                "id": "msg_cache",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ok"}],
+                "model": "upstream-model",
+                "stop_reason": "end_turn",
+                "usage": upstream_usage,
+            })),
+            StreamBehavior::Bytes("unused"),
+        ),
+        None,
+    );
+
+    let response = app
+        .oneshot(test_request(
+            Method::POST,
+            "/v1/messages",
+            Some(messages_request(false)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    // Breakdown passes through verbatim: 5m stays, and no 1h field is
+    // invented (inventing one would bill a 5m cache write at the 1h tier).
+    assert_eq!(
+        body["usage"]["cache_creation"],
+        json!({"ephemeral_5m_input_tokens": 3})
+    );
+    assert!(body["usage"]["cache_creation"]
+        .get("ephemeral_1h_input_tokens")
+        .is_none());
 }
 
 #[tokio::test]
