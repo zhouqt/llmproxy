@@ -138,6 +138,7 @@ pub fn build(
             model_rewrite,
             provider_ignore,
             provider_allow,
+            thinking_when_absent,
             ..
         } => {
             let inner = anthropic::AnthropicProvider::new(
@@ -147,6 +148,7 @@ pub fn build(
                 model_rewrite.clone(),
                 provider_ignore.clone(),
                 provider_allow.clone(),
+                *thinking_when_absent,
                 http,
             )?;
             Ok(Arc::new(inner))
@@ -219,6 +221,7 @@ mod tests {
                 use_proxy: false,
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
+                thinking_when_absent: crate::config::ThinkingWhenAbsent::Omit,
             },
             reqwest::Client::new(),
         )

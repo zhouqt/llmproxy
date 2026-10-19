@@ -152,6 +152,9 @@ providers:
   #                   a non-empty table is an explicit allow-list (the
   #                   router skips this provider for unmapped names).
   #   use_proxy     — see proxy section. Default: false.
+  #   thinking_when_absent — `disabled` (default) | `omit` | `effort_low`.
+  #                   What to inject when the client sent no thinking
+  #                   field; see the detailed comment below.
 
   - name: openrouter_anthropic
     type: anthropic
@@ -188,11 +191,59 @@ providers:
     provider_allow:
       - "DeepInfra"
       - "Together"
+    # `thinking_when_absent` — what to send when the CLIENT request has
+    # no `thinking` field (or an explicit null). Values:
+    #   disabled (default) — inject {"type":"disabled"} into `thinking`.
+    #   omit               — leave the body untouched; wire-identical to
+    #                        the behavior before this option existed.
+    #   effort_low         — send NO `thinking` at all; inject
+    #                        {"output_config":{"effort":"low"}} when the
+    #                        request also has no `output_config`. For
+    #                        upstreams that force thinking on and reject
+    #                        `thinking:{type:"disabled"}` outright, but
+    #                        honor the effort knob — e.g. MiniMax
+    #                        M3.1-Flash, whose default effort is `max`
+    #                        and whose 141 KB classifier-shaped requests
+    #                        drop from ~20 s to ~3 s at `low`.
+    #
+    # Why: several third-party Anthropic-compatible backends (DeepSeek,
+    # GLM/Z.ai, MiniMax, Qwen compat layers) interpret an OMITTED
+    # `thinking` as "reasoning ON", so a non-streaming classifier-style
+    # request pays for a full thinking pass. The real Anthropic API
+    # treats omission and `disabled` as equivalent, so this is a no-op
+    # there; the benefit is entirely on compat backends. This is on by
+    # default — set `omit` per provider only when you need byte-identical
+    # legacy outbound requests.
+    #
+    # The trigger is strictly ABSENCE. Explicit `enabled`, `adaptive`
+    # (which Claude Code sends for its main requests) and `disabled` all
+    # pass through unchanged — rewriting `adaptive` to `disabled` would
+    # switch off the primary model's reasoning. `effort_low` additionally
+    # requires `output_config` to be absent too, so a client that chose
+    # an effort level is never overridden.
+    #
+    # Fallback: if the upstream answers 400 and the error blames the
+    # injected field (`thinking` for `disabled`, `output_config`/`effort`
+    # for `effort_low`), the proxy drops that field and retries once.
+    # That retry runs at the upstream's DEFAULT reasoning/effort setting,
+    # so it gets no latency benefit — check for the fallback log line
+    # before assuming this option is paying off for a given provider.
+    #
+    # OpenAI-family providers (openai_compat / openai_responses) do NOT
+    # support this key: their equivalent is `reasoning_effort:"none"` /
+    # `reasoning:{effort:"none"}`, which has a different (and
+    # model-dependent) support matrix. See
+    # plans/feat-disable-thinking-when-absent.md §3.7.
+    # thinking_when_absent: omit
 
   - name: minimax
     type: anthropic
     api_key: "${MINIMAX_API_KEY}"
     api_base: "https://api.minimaxi.com/anthropic"
+    # MiniMax M3.1-Flash always thinks and 400s on
+    # `thinking:{type:"disabled"}`; switch this provider to the effort
+    # knob instead:
+    # thinking_when_absent: effort_low
     model_rewrite:
       "claude-haiku-4.6":  "MiniMax-M2.7"
       "claude-sonnet-4.6": "MiniMax-M3"

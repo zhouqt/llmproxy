@@ -20,6 +20,7 @@ use futures_util::stream::Stream;
 use serde_json::{json, Value};
 
 use crate::anthropic::{ContentBlock, MessageContent, MessagesRequest};
+use crate::config::ThinkingWhenAbsent;
 use crate::error::{ProxyError, Result};
 use crate::providers::{Provider, ProviderOutput};
 
@@ -61,7 +62,29 @@ pub struct AnthropicProvider {
     /// `openrouter.ai`（大小写不敏感，允许 `www.openrouter.ai` 等子域）。
     /// 在 `new()` 中计算一次，避免每请求重复解析。
     is_openrouter: bool,
+    /// What to inject when the outbound request omits `thinking` (and,
+    /// in `EffortLow` mode, `output_config` too). Default is `Disabled`
+    /// (the feature is on by default); an explicit `omit` keeps the
+    /// outbound wire byte-identical to the pre-feature behavior;
+    /// `effort_low` sends no `thinking` and injects
+    /// `output_config:{effort:"low"}` for upstreams that force thinking
+    /// on at their default effort but honor the effort knob (MiniMax
+    /// M3.1-Flash). See the same-named field in config and
+    /// plans/feat-disable-thinking-when-absent.md.
+    thinking_when_absent: ThinkingWhenAbsent,
     http: reqwest::Client,
+}
+
+/// Which field `apply_thinking_when_absent` wrote into the outbound
+/// body, if any. The 400 rollback is armed on this value so it removes
+/// exactly the field the proxy injected — and nothing else. In
+/// particular, `EffortLow` never sends `thinking`, so its rollback must
+/// remove `output_config` only (and vice versa).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InjectedParam {
+    None,
+    ThinkingDisabled,
+    EffortLow,
 }
 
 impl AnthropicProvider {
@@ -72,6 +95,7 @@ impl AnthropicProvider {
         model_rewrite: HashMap<String, String>,
         provider_ignore: Vec<String>,
         provider_allow: Vec<String>,
+        thinking_when_absent: ThinkingWhenAbsent,
         http: reqwest::Client,
     ) -> Result<Self> {
         let api_base = api_base.trim_end_matches('/').to_string();
@@ -94,6 +118,21 @@ impl AnthropicProvider {
             );
         }
 
+        // Attribution for the wire change lives at debug level: the feature
+        // is on by default, so an info line per provider is startup noise.
+        match thinking_when_absent {
+            ThinkingWhenAbsent::Omit => {}
+            ThinkingWhenAbsent::Disabled => tracing::debug!(
+                provider = %name,
+                "thinking_when_absent=disabled (inject when client sends none)"
+            ),
+            ThinkingWhenAbsent::EffortLow => tracing::debug!(
+                provider = %name,
+                "thinking_when_absent=effort_low (inject output_config:{{effort:low}} \
+                 when client sends neither thinking nor output_config)"
+            ),
+        }
+
         Ok(Self {
             name,
             api_key,
@@ -102,6 +141,7 @@ impl AnthropicProvider {
             provider_ignore,
             provider_allow,
             is_openrouter,
+            thinking_when_absent,
             http,
         })
     }
@@ -122,6 +162,7 @@ impl AnthropicProvider {
         provider_ignore: Vec<String>,
         provider_allow: Vec<String>,
         force_openrouter: bool,
+        thinking_when_absent: ThinkingWhenAbsent,
         http: reqwest::Client,
     ) -> Result<Self> {
         let api_base = api_base.trim_end_matches('/').to_string();
@@ -133,8 +174,65 @@ impl AnthropicProvider {
             provider_ignore,
             provider_allow,
             is_openrouter: force_openrouter,
+            thinking_when_absent,
             http,
         })
+    }
+
+    /// Apply the configured `thinking_when_absent` mode to the outbound
+    /// body and report what was injected.
+    ///
+    /// - `Omit`: nothing, ever.
+    /// - `Disabled`: inject `{"thinking": {"type": "disabled"}}` when the
+    ///   request carries no `thinking` field (or an explicit `null`).
+    /// - `EffortLow`: leave `thinking` alone (never send it) and inject
+    ///   `{"output_config": {"effort": "low"}}` only when BOTH
+    ///   `thinking` and `output_config` are absent (or null) — the shape
+    ///   of Claude Code's classifier requests. A client that sent either
+    ///   field is passed through untouched.
+    ///
+    /// The trigger is strictly *absence*, never `kind != "enabled"`:
+    /// Claude Code's main request sends `thinking: {"type": "adaptive"}`
+    /// (plus `output_config: {"effort": "high"}`), and rewriting that to
+    /// `disabled` — or overwriting the effort — would change the primary
+    /// model's behavior, not normalize a default. Explicit `enabled` /
+    /// `adaptive` / `disabled` all pass through untouched.
+    ///
+    /// Returns what was injected, so callers can arm the matching 400
+    /// fallback only for requests this method altered.
+    fn apply_thinking_when_absent(&self, body: &mut Value) -> InjectedParam {
+        match self.thinking_when_absent {
+            ThinkingWhenAbsent::Omit => InjectedParam::None,
+            ThinkingWhenAbsent::Disabled => {
+                if !body.get("thinking").map_or(true, Value::is_null) {
+                    return InjectedParam::None;
+                }
+                body["thinking"] = json!({ "type": "disabled" });
+                tracing::debug!(
+                    provider = %self.name,
+                    "injected thinking:{{type:disabled}} (request had none)"
+                );
+                InjectedParam::ThinkingDisabled
+            }
+            ThinkingWhenAbsent::EffortLow => {
+                // Both fields must be absent: a client that sends either
+                // one has made an explicit choice this mode must not
+                // override.
+                if !body.get("thinking").map_or(true, Value::is_null) {
+                    return InjectedParam::None;
+                }
+                if !body.get("output_config").map_or(true, Value::is_null) {
+                    return InjectedParam::None;
+                }
+                body["output_config"] = json!({ "effort": "low" });
+                tracing::debug!(
+                    provider = %self.name,
+                    "injected output_config:{{effort:low}} (request had neither \
+                     thinking nor output_config)"
+                );
+                InjectedParam::EffortLow
+            }
+        }
     }
 
     fn messages_url(&self) -> String {
@@ -321,6 +419,10 @@ impl Provider for AnthropicProvider {
         // strip-think-and-retry passes — those only operate on the
         // `messages` array and the top-level `thinking` key.
         self.inject_provider_ignore(&mut body);
+        // Same constraint: arm the 400 fallback before the loop. Tracks
+        // whether — and what — *this* provider injected, so the rollback
+        // below never strips a field the client actually sent.
+        let injected = self.apply_thinking_when_absent(&mut body);
         let url = self.messages_url();
         let api_key = self.api_key.clone();
 
@@ -369,6 +471,53 @@ impl Provider for AnthropicProvider {
                 continue;
             }
 
+            // 400 fallback for OUR OWN injection. Both injected shapes
+            // are first-class in the Anthropic spec (so these are no-ops
+            // against the real API), but third-party compat backends
+            // routinely reject one or the other. Guard on "we injected
+            // it" so a client-sent field is never silently dropped;
+            // each arm removes exactly the field it added.
+            if attempt < max_attempts && status_code == 400 {
+                match injected {
+                    InjectedParam::ThinkingDisabled if has_thinking_param_error(&text) => {
+                        tracing::debug!(
+                            provider = %self.name,
+                            client_model = %req.model,
+                            attempt = attempt,
+                            "upstream rejected injected thinking:{{type:disabled}}; \
+                             dropping it and retrying once. NOTE: the retry runs at \
+                             the upstream's DEFAULT reasoning setting, so this \
+                             request gets no latency benefit."
+                        );
+                        if let Some(obj) = body.as_object_mut() {
+                            obj.remove("thinking");
+                        }
+                        continue;
+                    }
+                    InjectedParam::EffortLow if has_effort_param_error(&text) => {
+                        // WARN, unlike the `disabled` rollback above:
+                        // every observed MiniMax build accepts
+                        // `effort:low`, so this arm firing means the
+                        // upstream schema drifted — a signal an
+                        // operator needs to see.
+                        tracing::warn!(
+                            provider = %self.name,
+                            client_model = %req.model,
+                            attempt = attempt,
+                            "upstream rejected injected output_config:{{effort:low}}; \
+                             dropping it and retrying once. NOTE: the retry runs \
+                             at the upstream's DEFAULT effort setting, so this \
+                             request gets no latency benefit."
+                        );
+                        if let Some(obj) = body.as_object_mut() {
+                            obj.remove("output_config");
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+
             tracing::warn!(
                 status = status_code,
                 provider = %self.name,
@@ -398,20 +547,77 @@ impl Provider for AnthropicProvider {
         let merged = self.merged_rewrite(model_rewrite);
         let mut body = build_body(req, &merged, true)?;
         self.inject_provider_ignore(&mut body);
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&api_key)
-            .header("content-type", "application/json")
-            .header("anthropic-version", "2023-06-01")
-            .header("x-app", X_APP)
-            .header("accept", "text/event-stream")
-            .json(&body)
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
+        let injected = self.apply_thinking_when_absent(&mut body);
+
+        // A 400 arrives before any SSE byte flows, so retrying here does
+        // NOT violate the "no retry once streaming starts" contract
+        // (see the comment at the end of this function). Only the
+        // injection rollback uses that freedom — the strip-and-retry path
+        // stays disabled on the streaming side by design.
+        let mut attempt: u32 = 0;
+        let max_attempts: u32 = 2;
+        loop {
+            attempt += 1;
+            let resp = self
+                .http
+                .post(&url)
+                .bearer_auth(&api_key)
+                .header("content-type", "application/json")
+                .header("anthropic-version", "2023-06-01")
+                .header("x-app", X_APP)
+                .header("accept", "text/event-stream")
+                .json(&body)
+                .send()
+                .await?;
+            let status = resp.status();
+            if status.is_success() {
+                let stream = resp.bytes_stream();
+                return Ok(ProviderOutput::Stream(Box::new(PassthroughSse {
+                    inner: stream,
+                })));
+            }
             let text = resp.text().await?;
+
+            // 400 fallback for OUR OWN injection — see the matching block
+            // in `complete()`. Guarded on "we injected it" so a
+            // client-sent field is never silently dropped; each arm
+            // removes exactly the field it added.
+            if attempt < max_attempts && status.as_u16() == 400 {
+                match injected {
+                    InjectedParam::ThinkingDisabled if has_thinking_param_error(&text) => {
+                        tracing::debug!(
+                            provider = %self.name,
+                            client_model = %req.model,
+                            attempt = attempt,
+                            "upstream rejected injected thinking:{{type:disabled}}; \
+                             dropping it and retrying once. NOTE: the retry runs at \
+                             the upstream's DEFAULT reasoning setting, so this \
+                             request gets no latency benefit."
+                        );
+                        if let Some(obj) = body.as_object_mut() {
+                            obj.remove("thinking");
+                        }
+                        continue;
+                    }
+                    InjectedParam::EffortLow if has_effort_param_error(&text) => {
+                        tracing::warn!(
+                            provider = %self.name,
+                            client_model = %req.model,
+                            attempt = attempt,
+                            "upstream rejected injected output_config:{{effort:low}}; \
+                             dropping it and retrying once. NOTE: the retry runs \
+                             at the upstream's DEFAULT effort setting, so this \
+                             request gets no latency benefit."
+                        );
+                        if let Some(obj) = body.as_object_mut() {
+                            obj.remove("output_config");
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+
             // Streaming keeps the original friendly-error path on purpose:
             // once the SSE byte stream starts flowing, retrying would
             // double-emit content to the client. See Router::stream comment
@@ -431,8 +637,6 @@ impl Provider for AnthropicProvider {
                 body: text,
             });
         }
-        let stream = resp.bytes_stream();
-        Ok(ProviderOutput::Stream(Box::new(PassthroughSse { inner: stream })))
     }
 }
 
@@ -441,6 +645,69 @@ impl Provider for AnthropicProvider {
 ///   `The content[].thinking in the thinking mode must be passed back to the API.`
 fn has_thinking_error(body: &str) -> bool {
     body.contains("content[].thinking") && body.contains("must be passed back")
+}
+
+/// Detect a 400 that blames the top-level `thinking` *parameter* itself,
+/// as opposed to `has_thinking_error`'s cross-model signature problem.
+///
+/// This is the signal that a third-party Anthropic-compat backend rejects
+/// the `thinking` field outright — the risk `thinking_when_absent`
+/// introduces. Real Anthropic never does this (`disabled` is a
+/// first-class variant per `ThinkingConfigParam`), so this shape only
+/// shows up on compat layers with a stricter schema than the spec.
+///
+/// Deliberately narrow. A 400 whose body merely mentions "thinking" is
+/// NOT enough — that would swallow genuine config errors, and the
+/// retry-after-rollback runs at the upstream's *default* reasoning
+/// setting, i.e. it silently forfeits the feature's entire benefit.
+/// Requires both a reference to the parameter and a rejection verb /
+/// unknown-field framing.
+fn has_thinking_param_error(body: &str) -> bool {
+    // Case-insensitive: OpenAI-style errors say "Invalid value"/"Unknown
+    // parameter", DeepSeek-style lowercase it, and some compat layers
+    // title-case the field name.
+    let lower = body.to_ascii_lowercase();
+    // The word "thinking" alone is a safe name test because a rejection
+    // verb is independently required. The canonical cross-model error
+    // ("The content[].thinking in the thinking mode must be passed back
+    // to the API") contains "thinking" but no rejection verb, so it
+    // never arms this fallback — and the strip-retry branch above is
+    // checked first anyway.
+    lower.contains("thinking") && has_rejection_verb(&lower)
+}
+
+/// Detect a 400 that blames the injected `output_config.effort` knob (or
+/// the whole `output_config` object). This is the `effort_low` analogue
+/// of `has_thinking_param_error`: the fallback removes the injected
+/// field once and retries.
+///
+/// Deliberately narrow for the same reason: a 400 is only ours if it
+/// names the parameter AND carries a rejection verb. MiniMax's
+/// thinking-disabled rejection ("...requires adaptive thinking;
+/// thinking.type=\"disabled\" (including reasoning.effort=none) is not
+/// allowed (2013)") mentions `reasoning.effort` and `invalid params` —
+/// it must NOT arm this fallback, and it cannot: `effort_low` never
+/// sends `thinking`, so such an error can only be triggered by a
+/// client-sent field, for which no rollback is armed.
+fn has_effort_param_error(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    (lower.contains("effort") || lower.contains("output_config")) && has_rejection_verb(&lower)
+}
+
+/// Shared rejection-verb / unknown-field table for the injected-parameter
+/// 400 matchers. Kept in one place so the `thinking` and `output_config`
+/// fallbacks cannot drift apart.
+fn has_rejection_verb(lower: &str) -> bool {
+    lower.contains("not supported")
+        || lower.contains("unsupported")
+        || lower.contains("unknown")
+        || lower.contains("unexpected")
+        || lower.contains("unrecognized")
+        || lower.contains("invalid")
+        || lower.contains("not permitted")
+        // pydantic's `extra inputs are not permitted` is covered above,
+        // but keep the bare phrase in case the name framing differs.
+        || lower.contains("extra inputs")
 }
 
 /// Decide whether a 400 with a thinking-style body should trigger the
@@ -669,6 +936,7 @@ mod tests {
             rewrite,
             Vec::new(),
             Vec::new(),
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -773,6 +1041,7 @@ mod tests {
             empty_rewrite(),
             Vec::new(),
             Vec::new(),
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -826,6 +1095,7 @@ mod tests {
             rewrite,
             Vec::new(),
             Vec::new(),
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -873,6 +1143,7 @@ mod tests {
             configured,
             Vec::new(),
             Vec::new(),
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -914,6 +1185,7 @@ mod tests {
             rewrite,
             Vec::new(),
             Vec::new(),
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -947,6 +1219,7 @@ mod tests {
             empty_rewrite(),
             Vec::new(),
             Vec::new(),
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -977,6 +1250,7 @@ mod tests {
             empty_rewrite(),
             Vec::new(),
             Vec::new(),
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1316,6 +1590,7 @@ mod tests {
             empty_rewrite(),
             Vec::new(),
             Vec::new(),
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1383,6 +1658,7 @@ mod tests {
             empty_rewrite(),
             Vec::new(),
             Vec::new(),
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1447,6 +1723,7 @@ mod tests {
             empty_rewrite(),
             Vec::new(),
             Vec::new(),
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1519,6 +1796,7 @@ mod tests {
             empty_rewrite(),
             Vec::new(),
             Vec::new(),
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1575,6 +1853,7 @@ mod tests {
             empty_rewrite(),
             Vec::new(),
             Vec::new(),
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1652,6 +1931,7 @@ mod tests {
             empty_rewrite(),
             Vec::new(),
             Vec::new(),
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1696,6 +1976,7 @@ mod tests {
             empty_rewrite(),
             Vec::new(),
             Vec::new(),
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1737,6 +2018,7 @@ mod tests {
             rewrite,
             Vec::new(),
             Vec::new(),
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1784,6 +2066,7 @@ mod tests {
             empty_rewrite(),
             Vec::new(),
             Vec::new(),
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1825,6 +2108,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1870,6 +2154,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1895,6 +2180,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1915,6 +2201,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1939,6 +2226,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -1965,6 +2253,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2018,6 +2307,7 @@ mod tests {
             vec!["Inceptron".to_string()],
             Vec::new(),
             true, // force_openrouter
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2060,6 +2350,7 @@ mod tests {
             vec!["Inceptron".to_string()],
             Vec::new(),
             false, // force_openrouter
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2100,6 +2391,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             true, // force_openrouter — but empty list still means no injection
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2159,6 +2451,7 @@ mod tests {
             vec!["Inceptron".to_string(), "Azure".to_string()],
             Vec::new(),
             true,
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2206,6 +2499,7 @@ mod tests {
             vec!["Inceptron".to_string()],
             Vec::new(),
             true,
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2239,6 +2533,7 @@ mod tests {
             HashMap::new(),
             vec!["Azure".to_string()],
             Vec::new(),
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2290,6 +2585,7 @@ mod tests {
             Vec::new(),
             vec!["DeepInfra".to_string()],
             true, // force_openrouter
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2337,6 +2633,7 @@ mod tests {
             vec!["Azure".to_string()],
             vec!["DeepInfra".to_string(), "Together".to_string()],
             true,
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2404,6 +2701,7 @@ mod tests {
             Vec::new(),
             allow.clone(),
             true,
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2464,6 +2762,7 @@ mod tests {
             vec!["Inceptron".to_string()],
             Vec::new(),
             true,
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2511,6 +2810,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             true,
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2552,6 +2852,7 @@ mod tests {
             Vec::new(),
             vec!["DeepInfra".to_string()],
             false, // force_openrouter
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2609,6 +2910,7 @@ mod tests {
             Vec::new(),
             vec!["DeepInfra".to_string(), "Together".to_string()],
             true,
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2656,6 +2958,7 @@ mod tests {
             Vec::new(),
             vec!["DeepInfra".to_string()],
             true,
+            ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
@@ -2667,5 +2970,757 @@ mod tests {
         expect_variant!(output, ProviderOutput::Stream(mut stream) => {
             while let Some(_) = stream.next().await {}
         });
+    }
+    // ── thinking_when_absent: inject `disabled` when the request has
+    //    no `thinking` field ────────────────────────────────────────
+    //
+    // Trigger is strictly ABSENCE (or explicit null). Claude Code's
+    // main request sends `thinking: {"type":"adaptive"}` — rewriting
+    // that to `disabled` would switch off the primary model's
+    // reasoning, which is a semantic change, not a default
+    // normalization. Explicit enabled/adaptive/disabled all pass
+    // through untouched.
+
+    /// Helper: build a request whose top-level `thinking` is whatever
+    /// `raw` says (including `null` and "absent").
+    fn request_with_thinking(raw: Option<serde_json::Value>) -> MessagesRequest {
+        let mut v = json!({
+            "model": "claude-model",
+            "max_tokens": 32,
+            "stream": false,
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        match raw {
+            Some(t) => v["thinking"] = t,
+            None => {}
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// Helper for the `effort_low` mode: each argument is `None`
+    /// (field absent), `Some(Value::Null)` (explicit null) or a real
+    /// value.
+    fn request_with_thinking_and_output_config(
+        thinking: Option<serde_json::Value>,
+        output_config: Option<serde_json::Value>,
+    ) -> MessagesRequest {
+        let mut v = json!({
+            "model": "claude-model",
+            "max_tokens": 32,
+            "stream": false,
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        if let Some(t) = thinking {
+            v["thinking"] = t;
+        }
+        if let Some(o) = output_config {
+            v["output_config"] = o;
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn provider_with_thinking_setting(
+        server: &MockServer,
+        setting: ThinkingWhenAbsent,
+    ) -> AnthropicProvider {
+        AnthropicProvider::new_for_test(
+            "qwen".to_string(),
+            "k".to_string(),
+            format!("{}/", server.uri()),
+            HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            setting,
+            reqwest::Client::new(),
+        )
+        .unwrap()
+    }
+
+    fn ok_message_body() -> serde_json::Value {
+        json!({
+            "id": "msg_ok",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+            "model": "claude-model",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })
+    }
+
+    #[tokio::test]
+    async fn complete_injects_thinking_disabled_when_absent() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_partial_json(json!({
+                "thinking": {"type": "disabled"}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_message_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_with_thinking_setting(&server, ThinkingWhenAbsent::Disabled);
+        let out = provider
+            .complete(&request_with_thinking(None), &empty_rewrite())
+            .await
+            .unwrap();
+        expect_variant!(out, ProviderOutput::Json(v) => {
+            assert_eq!(v["content"][0]["text"], "ok");
+        });
+    }
+
+    /// An explicit `null` deserializes into `Option::is_none()` — the
+    /// same absence condition. Must be covered by the same injection.
+    #[tokio::test]
+    async fn complete_injects_thinking_disabled_when_null() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_partial_json(json!({
+                "thinking": {"type": "disabled"}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_message_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_with_thinking_setting(&server, ThinkingWhenAbsent::Disabled);
+        let _ = provider
+            .complete(&request_with_thinking(Some(Value::Null)), &empty_rewrite())
+            .await
+            .unwrap();
+    }
+
+    /// `adaptive` is what Claude Code actually sends for its main
+    /// request. It must reach upstream UNCHANGED — rewriting it to
+    /// `disabled` would turn off the primary model's reasoning.
+    #[tokio::test]
+    async fn complete_preserves_adaptive_thinking_verbatim() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_partial_json(json!({
+                "thinking": {"type": "adaptive", "display": "omitted"}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_message_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_with_thinking_setting(&server, ThinkingWhenAbsent::Disabled);
+        let _ = provider
+            .complete(
+                &request_with_thinking(Some(json!({"type": "adaptive", "display": "omitted"}))),
+                &empty_rewrite(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn complete_preserves_enabled_thinking_verbatim() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_partial_json(json!({
+                "thinking": {"type": "enabled", "budget_tokens": 4000}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_message_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_with_thinking_setting(&server, ThinkingWhenAbsent::Disabled);
+        let _ = provider
+            .complete(
+                &request_with_thinking(Some(json!({"type": "enabled", "budget_tokens": 4000}))),
+                &empty_rewrite(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn complete_preserves_client_disabled_thinking_verbatim() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_partial_json(json!({
+                "thinking": {"type": "disabled"}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_message_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_with_thinking_setting(&server, ThinkingWhenAbsent::Disabled);
+        let _ = provider
+            .complete(
+                &request_with_thinking(Some(json!({"type": "disabled"}))),
+                &empty_rewrite(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Explicit `omit` must leave the wire byte-identical to the
+    /// pre-feature behavior — the `thinking` key must be ABSENT, not
+    /// null, not disabled.
+    #[tokio::test]
+    async fn complete_omits_thinking_field_when_switch_is_off() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(JsonFieldAbsent("thinking"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_message_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_with_thinking_setting(&server, ThinkingWhenAbsent::Omit);
+        let _ = provider
+            .complete(&request_with_thinking(None), &empty_rewrite())
+            .await
+            .unwrap();
+    }
+
+    /// Streaming path gets the same injection.
+    #[tokio::test]
+    async fn stream_injects_thinking_disabled_when_absent() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_partial_json(json!({
+                "thinking": {"type": "disabled"}
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("event: message_start\ndata: {}\n\n", "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_with_thinking_setting(&server, ThinkingWhenAbsent::Disabled);
+        let mut req = request_with_thinking(None);
+        req.stream = true;
+        let output = provider.stream(&req, &empty_rewrite()).await.unwrap();
+        expect_variant!(output, ProviderOutput::Stream(mut stream) => {
+            while let Some(_) = stream.next().await {}
+        });
+    }
+
+    /// Streaming + switch off → `thinking` absent.
+    #[tokio::test]
+    async fn stream_omits_thinking_field_when_switch_is_off() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(JsonFieldAbsent("thinking"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("event: message_start\ndata: {}\n\n", "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_with_thinking_setting(&server, ThinkingWhenAbsent::Omit);
+        let mut req = request_with_thinking(None);
+        req.stream = true;
+        let output = provider.stream(&req, &empty_rewrite()).await.unwrap();
+        expect_variant!(output, ProviderOutput::Stream(mut stream) => {
+            while let Some(_) = stream.next().await {}
+        });
+    }
+
+    // ── thinking_when_absent: `effort_low` mode ─────────────────────
+    //
+    // MiniMax M3.1-Flash forces thinking on and 400s on
+    // `thinking:{type:disabled}`, but honors `output_config.effort`
+    // (default: max). This mode never sends `thinking` and injects
+    // `output_config:{effort:"low"}` — only when the client sent
+    // neither field.
+
+    /// Both fields absent → inject `output_config:{effort:"low"}` and
+    /// send NO `thinking` field (the upstream rejects it outright).
+    #[tokio::test]
+    async fn complete_injects_low_effort_when_absent() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_partial_json(json!({
+                "output_config": {"effort": "low"}
+            })))
+            .and(JsonFieldAbsent("thinking"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_message_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_with_thinking_setting(&server, ThinkingWhenAbsent::EffortLow);
+        let out = provider
+            .complete(
+                &request_with_thinking_and_output_config(None, None),
+                &empty_rewrite(),
+            )
+            .await
+            .unwrap();
+        expect_variant!(out, ProviderOutput::Json(v) => {
+            assert_eq!(v["content"][0]["text"], "ok");
+        });
+    }
+
+    /// Explicit `null` for both fields is the same absence condition.
+    #[tokio::test]
+    async fn complete_injects_low_effort_when_both_null() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_partial_json(json!({
+                "output_config": {"effort": "low"}
+            })))
+            .and(JsonFieldAbsent("thinking"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_message_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_with_thinking_setting(&server, ThinkingWhenAbsent::EffortLow);
+        let _ = provider
+            .complete(
+                &request_with_thinking_and_output_config(Some(Value::Null), Some(Value::Null)),
+                &empty_rewrite(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A client-sent `output_config` is an explicit choice: never
+    /// overwrite it, and do not inject `thinking` either.
+    #[tokio::test]
+    async fn complete_preserves_client_output_config_in_effort_mode() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_partial_json(json!({
+                "output_config": {"effort": "high"}
+            })))
+            .and(JsonFieldAbsent("thinking"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_message_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_with_thinking_setting(&server, ThinkingWhenAbsent::EffortLow);
+        let _ = provider
+            .complete(
+                &request_with_thinking_and_output_config(None, Some(json!({"effort": "high"}))),
+                &empty_rewrite(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A client-sent `thinking` (Claude Code's main request) blocks the
+    /// effort injection too: `effort_low` is a normalization for
+    /// requests that express no preference, not an override.
+    #[tokio::test]
+    async fn complete_preserves_thinking_in_effort_mode() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_partial_json(json!({
+                "thinking": {"type": "adaptive"}
+            })))
+            .and(JsonFieldAbsent("output_config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_message_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_with_thinking_setting(&server, ThinkingWhenAbsent::EffortLow);
+        let _ = provider
+            .complete(
+                &request_with_thinking_and_output_config(Some(json!({"type": "adaptive"})), None),
+                &empty_rewrite(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Streaming path gets the same injection.
+    #[tokio::test]
+    async fn stream_injects_low_effort_when_absent() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_partial_json(json!({
+                "output_config": {"effort": "low"}
+            })))
+            .and(JsonFieldAbsent("thinking"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("event: message_start\ndata: {}\n\n", "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_with_thinking_setting(&server, ThinkingWhenAbsent::EffortLow);
+        let mut req = request_with_thinking_and_output_config(None, None);
+        req.stream = true;
+        let output = provider.stream(&req, &empty_rewrite()).await.unwrap();
+        expect_variant!(output, ProviderOutput::Stream(mut stream) => {
+            while let Some(_) = stream.next().await {}
+        });
+    }
+
+    /// Explicit `omit` stays byte-identical to the pre-feature wire:
+    /// neither `thinking` nor `output_config` may appear.
+    #[tokio::test]
+    async fn complete_omits_everything_when_switch_off() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(JsonFieldAbsent("thinking"))
+            .and(JsonFieldAbsent("output_config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_message_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_with_thinking_setting(&server, ThinkingWhenAbsent::Omit);
+        let _ = provider
+            .complete(
+                &request_with_thinking_and_output_config(None, None),
+                &empty_rewrite(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // ── 400 fallback for the injected field ─────────────────────────
+    //
+    // An unknown third-party backend could reject `thinking` outright.
+    // When WE injected it, drop it and retry once. When the CLIENT
+    // sent it, never drop it — that would silently change the
+    // client's request.
+
+    /// 400 that blames the `thinking` parameter → retry once without
+    /// the field, succeed.
+    #[tokio::test]
+    async fn complete_retries_without_injected_thinking_after_400() {
+        let server = MockServer::start().await;
+        // First call: body carries the injected field → 400.
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_partial_json(json!({
+                "thinking": {"type": "disabled"}
+            })))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "thinking: extra inputs are not permitted"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Second call: field must be gone.
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(JsonFieldAbsent("thinking"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_message_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_with_thinking_setting(&server, ThinkingWhenAbsent::Disabled);
+        let out = provider
+            .complete(&request_with_thinking(None), &empty_rewrite())
+            .await
+            .unwrap();
+        expect_variant!(out, ProviderOutput::Json(v) => {
+            assert_eq!(v["id"], "msg_ok");
+        });
+    }
+
+    /// A 400 that does NOT blame the `thinking` parameter must NOT
+    /// trigger the rollback — the raw upstream error has to surface so
+    /// genuine config errors aren't hidden.
+    #[tokio::test]
+    async fn complete_surfaces_unrelated_400_without_retry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "max_tokens is too large: 999999"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_with_thinking_setting(&server, ThinkingWhenAbsent::Disabled);
+        let err = match provider
+            .complete(&request_with_thinking(None), &empty_rewrite())
+            .await
+        {
+            Ok(_) => panic!("expected the upstream 400 to surface"),
+            Err(e) => e,
+        };
+        expect_variant!(err, ProxyError::Upstream { status, body } => {
+            assert_eq!(status, 400);
+            assert!(body.contains("max_tokens is too large"));
+        });
+    }
+
+    /// When the CLIENT sent `thinking`, a 400 must never trigger the
+    /// rollback path — the proxy must not silently drop a field the
+    /// client asked for. (Here the client sent `adaptive`, the upstream
+    /// blames the `thinking` param: still no retry.)
+    #[tokio::test]
+    async fn complete_does_not_strip_client_sent_thinking_on_400() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_partial_json(json!({
+                "thinking": {"type": "adaptive"}
+            })))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "thinking: unsupported value"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_with_thinking_setting(&server, ThinkingWhenAbsent::Disabled);
+        let err = match provider
+            .complete(
+                &request_with_thinking(Some(json!({"type": "adaptive"}))),
+                &empty_rewrite(),
+            )
+            .await
+        {
+            Ok(_) => panic!("expected the upstream 400 to surface"),
+            Err(e) => e,
+        };
+        expect_variant!(err, ProxyError::Upstream { status, .. } => {
+            assert_eq!(status, 400);
+        });
+    }
+
+    /// Streaming: a 400 arrives before any SSE byte flows, so the
+    /// rollback-and-retry is safe here (it does not violate the
+    /// "no retry once streaming starts" contract).
+    #[tokio::test]
+    async fn stream_retries_without_injected_thinking_after_400() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_partial_json(json!({
+                "thinking": {"type": "disabled"}
+            })))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "thinking: extra inputs are not permitted"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(JsonFieldAbsent("thinking"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("event: message_start\ndata: {}\n\n", "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_with_thinking_setting(&server, ThinkingWhenAbsent::Disabled);
+        let mut req = request_with_thinking(None);
+        req.stream = true;
+        let output = provider.stream(&req, &empty_rewrite()).await.unwrap();
+        expect_variant!(output, ProviderOutput::Stream(mut stream) => {
+            while let Some(_) = stream.next().await {}
+        });
+    }
+
+    /// 400 that blames the injected `output_config.effort` → retry once
+    /// without the field, succeed. Expected never to fire against
+    /// MiniMax today; it exists so an upstream schema drift does not
+    /// leak a 400 to the client.
+    #[tokio::test]
+    async fn complete_retries_without_injected_effort_after_400() {
+        let server = MockServer::start().await;
+        // First call: body carries the injected field → 400.
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_partial_json(json!({
+                "output_config": {"effort": "low"}
+            })))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "output_config.effort is not supported"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Second call: field must be gone (and no thinking appeared).
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(JsonFieldAbsent("output_config"))
+            .and(JsonFieldAbsent("thinking"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_message_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_with_thinking_setting(&server, ThinkingWhenAbsent::EffortLow);
+        let out = provider
+            .complete(
+                &request_with_thinking_and_output_config(None, None),
+                &empty_rewrite(),
+            )
+            .await
+            .unwrap();
+        expect_variant!(out, ProviderOutput::Json(v) => {
+            assert_eq!(v["id"], "msg_ok");
+        });
+    }
+
+    /// When the CLIENT sent `output_config`, a 400 must never trigger
+    /// the rollback — the proxy must not silently drop a field the
+    /// client asked for.
+    #[tokio::test]
+    async fn complete_does_not_strip_client_effort_on_400() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_partial_json(json!({
+                "output_config": {"effort": "high"}
+            })))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "output_config.effort: unsupported value"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_with_thinking_setting(&server, ThinkingWhenAbsent::EffortLow);
+        let err = match provider
+            .complete(
+                &request_with_thinking_and_output_config(None, Some(json!({"effort": "high"}))),
+                &empty_rewrite(),
+            )
+            .await
+        {
+            Ok(_) => panic!("expected the upstream 400 to surface"),
+            Err(e) => e,
+        };
+        expect_variant!(err, ProxyError::Upstream { status, body } => {
+            assert_eq!(status, 400);
+            assert!(body.contains("unsupported value"));
+        });
+    }
+
+    /// Streaming: same rollback for the injected effort field (a 400
+    /// arrives before any SSE byte flows).
+    #[tokio::test]
+    async fn stream_retries_without_injected_effort_after_400() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_partial_json(json!({
+                "output_config": {"effort": "low"}
+            })))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "Unknown parameter: output_config"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(JsonFieldAbsent("output_config"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("event: message_start\ndata: {}\n\n", "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_with_thinking_setting(&server, ThinkingWhenAbsent::EffortLow);
+        let mut req = request_with_thinking_and_output_config(None, None);
+        req.stream = true;
+        let output = provider.stream(&req, &empty_rewrite()).await.unwrap();
+        expect_variant!(output, ProviderOutput::Stream(mut stream) => {
+            while let Some(_) = stream.next().await {}
+        });
+    }
+
+    /// Unit-level guard for the effort-parameter 400 matcher.
+    #[test]
+    fn has_effort_param_error_requires_parameter_and_rejection() {
+        // Real rejections.
+        assert!(has_effort_param_error(
+            r#"{"error":{"message":"output_config.effort is not supported"}}"#
+        ));
+        assert!(has_effort_param_error(
+            r#"{"error":{"message":"Unknown parameter: 'output_config'"}}"#
+        ));
+        assert!(has_effort_param_error(
+            r#"{"error":{"message":"Invalid value for effort: low"}}"#
+        ));
+        // Mentions effort/output_config but has no rejection verb.
+        assert!(!has_effort_param_error(
+            r#"{"error":{"message":"effort low not available, retry later"}}"#
+        ));
+        // A rejection verb but neither parameter name.
+        assert!(!has_effort_param_error(
+            r#"{"error":{"message":"max_tokens: extra inputs are not permitted"}}"#
+        ));
+        // Empty body.
+        assert!(!has_effort_param_error(""));
+    }
+
+    /// Unit-level guard for the 400 matcher. The word "thinking" alone is
+    /// not enough — a rejection verb must also be present — but the two
+    /// tests together must cover the common upstream phrasings.
+    #[test]
+    fn has_thinking_param_error_requires_parameter_and_rejection() {
+        // Real rejections.
+        assert!(has_thinking_param_error(
+            r#"{"error":{"message":"thinking: extra inputs are not permitted"}}"#
+        ));
+        assert!(has_thinking_param_error(
+            r#"{"error":{"message":"Unknown parameter: 'thinking'"}}"#
+        ));
+        assert!(has_thinking_param_error(
+            r#"{"error":{"message":"thinking.type is not supported"}}"#
+        ));
+        // Phrasings without quotes/colon around the name.
+        assert!(has_thinking_param_error(
+            r#"{"error":{"message":"thinking is not supported for this model"}}"#
+        ));
+        assert!(has_thinking_param_error(
+            r#"{"error":{"message":"Invalid field: thinking"}}"#
+        ));
+        // Mentions thinking but is not about the parameter.
+        assert!(!has_thinking_param_error(
+            r#"{"error":{"message":"model not found"}}"#
+        ));
+        // The canonical cross-model error mentions thinking but has no
+        // rejection verb — it must NOT arm this fallback.
+        assert!(!has_thinking_param_error(
+            r#"{"error":{"message":"The `content[].thinking` in the thinking mode must be passed back to the API."}}"#
+        ));
+        // Rejection but not about the thinking parameter.
+        assert!(!has_thinking_param_error(
+            r#"{"error":{"message":"max_tokens: extra inputs are not permitted"}}"#
+        ));
+        // Empty body.
+        assert!(!has_thinking_param_error(""));
     }
 }
