@@ -102,6 +102,51 @@ pub fn default_user_agent() -> String {
     "claude-cli/2.1.224 (external, claude-vscode, agent-sdk/0.3.224)".to_string()
 }
 
+/// What to do when an outbound Anthropic request carries no `thinking`
+/// field. See `ProviderConfig::Anthropic::thinking_when_absent`.
+///
+/// Deliberately an enum rather than a bool: each variant names the exact
+/// wire change it makes, and an operator opting out needs the config line
+/// to name that change. `disabled` is the default — the feature exists
+/// precisely because omission lets compat backends reason by default —
+/// and `omit` is the explicit opt-out that keeps the outbound wire
+/// byte-identical to the pre-feature behavior. `effort_low` covers the
+/// third case: backends that force thinking on (rejecting
+/// `thinking:{"type":"disabled"}`) but expose an effort knob.
+///
+/// OpenAI-family upstreams need a different vocabulary entirely
+/// (`reasoning_effort:"none"` vs. `thinking:{type:"disabled"}`, and
+/// `none` is rejected outright by o-series / gpt-5 / Kimi K3). That
+/// separate enum is deferred along with the `openai_compat` /
+/// `openai_responses` phases of
+/// `plans/feat-disable-thinking-when-absent.md` §3.7 — do not widen this
+/// one to cover them; the legal value sets differ per provider type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingWhenAbsent {
+    /// Leave the request body untouched. Opt-out for operators who need
+    /// the outbound wire to stay byte-identical to the pre-feature
+    /// behavior.
+    Omit,
+    /// Inject `{"thinking": {"type": "disabled"}}`. Default: the feature
+    /// is on for every anthropic provider unless explicitly disabled.
+    /// Only the *absence* (or explicit null) of `thinking` triggers it;
+    /// client-sent `enabled`/`adaptive`/`disabled` pass through.
+    #[default]
+    Disabled,
+    /// Send no `thinking` field at all; instead inject
+    /// `{"output_config": {"effort": "low"}}` when the request carries
+    /// neither `thinking` nor `output_config` (or both are explicit
+    /// null). For upstreams that force thinking on at their default
+    /// effort — typically `max` — and reject
+    /// `thinking:{"type":"disabled"}` outright, but honor
+    /// `output_config.effort` (e.g. MiniMax M3.1-Flash, which 400s on
+    /// `disabled` while accepting `low`/`medium`/`high`/`xhigh`/`max`).
+    /// Client-sent `thinking` or `output_config` passes through
+    /// untouched — the trigger is the absence of both.
+    EffortLow,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProviderConfig {
@@ -177,6 +222,37 @@ pub enum ProviderConfig {
         /// Empty list (default) injects no `provider.only` key.
         #[serde(default)]
         provider_allow: Vec<String>,
+        /// Inject `{"thinking": {"type": "disabled"}}` into the request
+        /// body when the outbound request has **no** `thinking` field
+        /// (or an explicit `null`). This suppresses third-party
+        /// Anthropic-compatible backends that read an omitted `thinking`
+        /// as "reasoning ON by default". Typical case: Claude Code Auto
+        /// Mode's non-streaming classifier request — it carries neither
+        /// `thinking` nor `output_config`, so the upstream used to spend
+        /// a whole thinking pass on it. See
+        /// plans/feat-disable-thinking-when-absent.md.
+        ///
+        /// The trigger is strictly *field absence or null*: an explicit
+        /// client-sent `enabled` / `adaptive` / `disabled` always passes
+        /// through untouched. Note that Claude Code's main request sends
+        /// `adaptive` (not `enabled`) — rewriting that to `disabled`
+        /// would switch off the main model's reasoning.
+        ///
+        /// Default is `disabled` (the feature is on without any
+        /// per-provider configuration). Set `omit` explicitly when the
+        /// outbound wire must stay byte-identical to the pre-feature
+        /// behavior. On the real Anthropic API `disabled` is a
+        /// first-class variant equivalent to omitting the field, so the
+        /// injection is a no-op there; the benefit comes entirely from
+        /// compat backends.
+        ///
+        /// Harmless on the real Anthropic API, but an **unknown**
+        /// third-party backend could still 400 on the field, so
+        /// `AnthropicProvider` has a fallback: if the upstream 400s and
+        /// the body blames the `thinking` parameter, the field is
+        /// removed and the request is retried once.
+        #[serde(default)]
+        thinking_when_absent: ThinkingWhenAbsent,
     },
     #[serde(rename = "openai_compat")]
     OpenaiCompat {
@@ -774,6 +850,7 @@ models:
                     use_proxy: false,
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
+                    thinking_when_absent: ThinkingWhenAbsent::Omit,
                 },
                 "anthropic",
             ),
@@ -1052,5 +1129,178 @@ models:
             Config::parse(raw).is_err(),
             "a misspelled provider_allow key must fail to parse"
         );
+    }
+
+    // ── thinking_when_absent ───────────────────────────────────────
+
+    /// The feature is on by default — an anthropic provider that omits
+    /// the key must inject `disabled`, so operators don't have to repeat
+    /// the option for every provider.
+    #[test]
+    fn thinking_when_absent_defaults_to_disabled() {
+        let raw = r#"
+providers:
+  - name: qwen
+    type: anthropic
+    api_key: k
+    api_base: https://example.com/anthropic
+models:
+  - name: m
+    primary: qwen
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        match &cfg.providers[0] {
+            ProviderConfig::Anthropic {
+                thinking_when_absent, ..
+            } => assert_eq!(*thinking_when_absent, ThinkingWhenAbsent::Disabled),
+            other => panic!("expected an anthropic provider, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thinking_when_absent_parses_disabled() {
+        let raw = r#"
+providers:
+  - name: qwen
+    type: anthropic
+    api_key: k
+    api_base: https://example.com/anthropic
+    thinking_when_absent: disabled
+models:
+  - name: m
+    primary: qwen
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        match &cfg.providers[0] {
+            ProviderConfig::Anthropic {
+                thinking_when_absent, ..
+            } => assert_eq!(*thinking_when_absent, ThinkingWhenAbsent::Disabled),
+            other => panic!("expected an anthropic provider, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thinking_when_absent_parses_omit() {
+        let raw = r#"
+providers:
+  - name: qwen
+    type: anthropic
+    api_key: k
+    api_base: https://example.com/anthropic
+    thinking_when_absent: omit
+models:
+  - name: m
+    primary: qwen
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        match &cfg.providers[0] {
+            ProviderConfig::Anthropic {
+                thinking_when_absent, ..
+            } => assert_eq!(*thinking_when_absent, ThinkingWhenAbsent::Omit),
+            other => panic!("expected an anthropic provider, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thinking_when_absent_parses_effort_low() {
+        let raw = r#"
+providers:
+  - name: mm
+    type: anthropic
+    api_key: k
+    api_base: https://api.minimaxi.com/anthropic
+    thinking_when_absent: effort_low
+models:
+  - name: m
+    primary: mm
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        match &cfg.providers[0] {
+            ProviderConfig::Anthropic {
+                thinking_when_absent, ..
+            } => assert_eq!(*thinking_when_absent, ThinkingWhenAbsent::EffortLow),
+            other => panic!("expected an anthropic provider, got {other:?}"),
+        }
+    }
+
+    /// A misspelled value is a hard error. `thinking_when_absent`
+    /// changes the outbound wire, so silently falling back to `disabled`
+    /// (or to `omit`) would be a silent misconfiguration.
+    #[test]
+    fn thinking_when_absent_rejects_unknown_value() {
+        for bad in ["disable", "none", "off", "true", "effort", "low"] {
+            let raw = format!(
+                r#"
+providers:
+  - name: qwen
+    type: anthropic
+    api_key: k
+    api_base: https://example.com/anthropic
+    thinking_when_absent: {bad}
+models:
+  - name: m
+    primary: qwen
+"#
+            );
+            assert!(
+                Config::parse(&raw).is_err(),
+                "thinking_when_absent: {bad} must fail to parse"
+            );
+        }
+    }
+
+    /// The setting must round-trip through serialization.
+    #[test]
+    fn thinking_when_absent_roundtrips() {
+        let raw = r#"
+providers:
+  - name: qwen
+    type: anthropic
+    api_key: k
+    api_base: https://example.com/anthropic
+    thinking_when_absent: disabled
+models:
+  - name: m
+    primary: qwen
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        let s = serde_yaml::to_string(&cfg).unwrap();
+        assert!(s.contains("thinking_when_absent: disabled"), "{s}");
+        let reparsed = Config::parse(&s).unwrap();
+        match &reparsed.providers[0] {
+            ProviderConfig::Anthropic {
+                thinking_when_absent, ..
+            } => assert_eq!(*thinking_when_absent, ThinkingWhenAbsent::Disabled),
+            other => panic!("expected an anthropic provider, got {other:?}"),
+        }
+    }
+
+    /// The new `effort_low` value must round-trip through serialization
+    /// as well — operators regenerate configs through `/admin/status`
+    /// tooling and a variant that serializes differently from its YAML
+    /// spelling would be silently rewritten.
+    #[test]
+    fn thinking_when_absent_effort_low_roundtrips() {
+        let raw = r#"
+providers:
+  - name: mm
+    type: anthropic
+    api_key: k
+    api_base: https://api.minimaxi.com/anthropic
+    thinking_when_absent: effort_low
+models:
+  - name: m
+    primary: mm
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        let s = serde_yaml::to_string(&cfg).unwrap();
+        assert!(s.contains("thinking_when_absent: effort_low"), "{s}");
+        let reparsed = Config::parse(&s).unwrap();
+        match &reparsed.providers[0] {
+            ProviderConfig::Anthropic {
+                thinking_when_absent, ..
+            } => assert_eq!(*thinking_when_absent, ThinkingWhenAbsent::EffortLow),
+            other => panic!("expected an anthropic provider, got {other:?}"),
+        }
     }
 }
