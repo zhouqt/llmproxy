@@ -14,11 +14,20 @@ RUN cargo build --release && \
     cp target/release/llmproxy /llmproxy
 
 FROM docker.io/library/alpine:3
-RUN apk update && apk add ca-certificates \
+# tpm2-tools provides tpm2_load/tpm2_unseal; tpm2-tss-tcti-device is the
+# device TCTI the tools need to talk to /dev/tpmrm0. The two are
+# separate packages on Alpine -- installing only the first fails at
+# runtime with `Could not load tcti, got: "(null)"`.
+RUN apk update && apk add --no-cache ca-certificates \
+        tpm2-tools tpm2-tss-tcti-device \
     && rm -rf /var/cache/apk/*
 
 COPY --from=builder /llmproxy /usr/local/bin/llmproxy
+COPY deploy/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod 0755 /usr/local/bin/entrypoint.sh
 
 EXPOSE 8080
-ENTRYPOINT ["llmproxy"]
-CMD ["--config", "/etc/llmproxy/config.yaml"]
+# The entrypoint unseals the TPM-sealed secrets into /run/secrets and
+# then execs the command below -- see deploy/entrypoint.sh.
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["llmproxy", "--config", "/etc/llmproxy/config.yaml"]
