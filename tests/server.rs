@@ -254,6 +254,7 @@ fn build_app_with_usage_and_cooldown(
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
         providers: provider_configs,
         models: vec![ModelConfig {
             name: "claude-test".to_string(),
@@ -1099,6 +1100,7 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
@@ -1249,6 +1251,7 @@ async fn list_models_collision_winner_follows_chain_order_deterministically() {
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
@@ -1352,6 +1355,7 @@ async fn admin_models_lists_every_provider_without_dedup() {
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
@@ -1486,6 +1490,7 @@ async fn admin_models_reports_fetch_failed_for_provider_without_catalog() {
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
         providers: vec![ProviderConfig::OpenaiCompat {
             name: "primary".to_string(),
             api_key: "unused".to_string(),
@@ -2473,6 +2478,7 @@ async fn admin_usage_excludes_serving_provider_from_failed_providers_on_retry() 
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
         providers: vec![ProviderConfig::OpenaiCompat {
             name: "primary".into(),
             api_key: "k".into(),
@@ -2579,6 +2585,7 @@ async fn admin_usage_keeps_fallback_failures_when_serving_provider_is_different(
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".into(),

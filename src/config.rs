@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::{ProxyError, Result};
+use crate::secrets::{deserialize_secrets_config, SecretsConfig};
 use crate::usage::DEFAULT_USAGE_CAPACITY;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -38,6 +39,16 @@ pub struct Config {
     /// `usage::DEFAULT_USAGE_CAPACITY` (100_000).
     #[serde(default = "default_usage_capacity")]
     pub usage_capacity: usize,
+    /// Where `${VAR}` placeholders resolve from.
+    ///
+    /// Absent (the default) means "process environment only" — the
+    /// pre-existing behavior, unchanged. `provider: file` adds a
+    /// `.env`-format file as the **highest-priority** source, which is
+    /// how the container deployment feeds the proxy keys that its
+    /// entrypoint unsealed from a TPM sealed object. See
+    /// `plans/feat-vault-secret-backend.md` §5.5.
+    #[serde(default, deserialize_with = "deserialize_secrets_config")]
+    pub secrets: SecretsConfig,
 }
 
 impl Default for Config {
@@ -49,6 +60,7 @@ impl Default for Config {
             providers: Vec::new(),
             models: Vec::new(),
             usage_capacity: default_usage_capacity(),
+            secrets: SecretsConfig::default(),
         }
     }
 }
@@ -420,8 +432,22 @@ impl Config {
         Self::parse(&raw)
     }
 
+    /// Parse a config from YAML text.
+    ///
+    /// Two phases, because the `secrets:` block decides *where* the
+    /// `${VAR}` values come from and the values decide the rest of the
+    /// config:
+    ///
+    /// 1. pick the `secrets:` block out of the raw text and load the
+    ///    overlay (an empty map unless `provider: file`);
+    /// 2. expand `${VAR}` against **overlay first, process environment
+    ///    second**, then deserialize and validate.
+    ///
+    /// With no `secrets:` block the overlay is empty and phase 2
+    /// behaves exactly as it did before the overlay existed.
     pub fn parse(raw: &str) -> Result<Self> {
-        let expanded = expand_env_vars(raw);
+        let overlay = load_secrets_overlay(raw)?;
+        let expanded = expand_env_vars_with_overlay(raw, &overlay);
         let cfg: Config = serde_yaml::from_str(&expanded)?;
         cfg.validate()?;
         Ok(cfg)
@@ -466,6 +492,53 @@ impl Config {
     }
 }
 
+/// Load the `${VAR}` overlay described by the config's `secrets:`
+/// block.
+///
+/// Returns an empty map unless `secrets.provider` is `file` — the
+/// common case, where the process environment remains the only source
+/// and the expansion behavior is exactly what it always was.
+fn load_secrets_overlay(raw: &str) -> Result<HashMap<String, String>> {
+    let secrets_cfg = extract_secrets_config(raw)?;
+    if !secrets_cfg.provider.uses_file() {
+        return Ok(HashMap::new());
+    }
+    let Some(path) = secrets_cfg.file_path() else {
+        return Err(ProxyError::Config(
+            "secrets.provider is 'file' but secrets.file.path is not set".into(),
+        ));
+    };
+    // The path itself may carry a `${VAR}` reference, resolved from
+    // the process environment only: the overlay cannot describe where
+    // the overlay lives.
+    let path = expand_env_vars(path);
+    secrets_cfg.read_overlay(Path::new(&path))
+}
+
+/// Pick the `secrets:` block out of the raw config text.
+///
+/// Deliberately lenient about everything *except* the block itself:
+/// the raw text is parsed into a generic YAML value so that a
+/// type error elsewhere in the config (say `max_retries: ${N}` where
+/// `N` is not set) is still reported by the real parse in
+/// `Config::parse`, with the message the operator expects. Only the
+/// `secrets:` block is type-checked here.
+fn extract_secrets_config(raw: &str) -> Result<SecretsConfig> {
+    // A YAML syntax error is reported verbatim by the main parse; this
+    // phase must not turn it into a different error.
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(raw) else {
+        return Ok(SecretsConfig::default());
+    };
+    let Some(block) = value.get("secrets") else {
+        return Ok(SecretsConfig::default());
+    };
+    if block.is_null() {
+        return Ok(SecretsConfig::default());
+    }
+    serde_yaml::from_value::<SecretsConfig>(block.clone())
+        .map_err(|e| ProxyError::Config(format!("secrets: {e}")))
+}
+
 /// Expand ${VAR} / $VAR references in a string using process environment.
 ///
 /// Supports bash-style `${VAR:-default}` for fallback values: when VAR is
@@ -474,6 +547,20 @@ impl Config {
 /// quotes (`${VAR:-"hello world"}`, `${VAR:-'hello world'}`); the wrapping
 /// characters are stripped. Unmatched quotes are kept verbatim.
 fn expand_env_vars(input: &str) -> String {
+    expand_env_vars_with_overlay(input, &HashMap::new())
+}
+
+/// Expand ${VAR} / $VAR references in a string.
+///
+/// Resolution order is **overlay first, process environment second**,
+/// then the `${VAR:-default}` fallback, then empty. The overlay wins
+/// because it is the current source of truth: an environment variable
+/// left over from the previous deployment must never silently
+/// override a key that the secret file just supplied.
+///
+/// The `${VAR:-default}` rules are the ones documented on
+/// [`expand_env_vars`], which is this function with an empty overlay.
+fn expand_env_vars_with_overlay(input: &str, overlay: &HashMap<String, String>) -> String {
     let mut out = String::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut i = 0;
@@ -492,11 +579,11 @@ fn expand_env_vars(input: &str) -> String {
                         None => (inner, None),
                     };
 
-                    match std::env::var(var_name) {
-                        Ok(val) if !val.is_empty() => {
+                    match lookup_var(var_name, overlay) {
+                        Some(val) if !val.is_empty() => {
                             out.push_str(&val);
                         }
-                        Ok(_) => {
+                        Some(_) => {
                             // Set but empty. Treat as unset for the
                             // purposes of `:-`. With no default, the
                             // original code emitted empty silently.
@@ -504,7 +591,7 @@ fn expand_env_vars(input: &str) -> String {
                                 out.push_str(d);
                             }
                         }
-                        Err(_) => match default {
+                        None => match default {
                             Some(d) => out.push_str(d),
                             None => {
                                 tracing::warn!("env var {} not set", var_name);
@@ -523,10 +610,13 @@ fn expand_env_vars(input: &str) -> String {
                     end += 1;
                 }
                 let var = &input[start..end];
-                if let Ok(val) = std::env::var(var) {
-                    out.push_str(&val);
-                } else {
-                    tracing::warn!("env var {} not set", var);
+                match lookup_var(var, overlay) {
+                    Some(val) => {
+                        out.push_str(&val);
+                    }
+                    None => {
+                        tracing::warn!("env var {} not set", var);
+                    }
                 }
                 i = end;
                 continue;
@@ -537,6 +627,36 @@ fn expand_env_vars(input: &str) -> String {
         i += ch.len_utf8();
     }
     out
+}
+
+/// Resolve `name` for expansion, overlay first.
+///
+/// Returns `None` when the name is set nowhere; `Some(value)` when it
+/// is — possibly the empty string, which the `${VAR:-default}` form
+/// treats as "unset" exactly like an empty environment variable does.
+///
+/// The source is logged, never the value: an operator needs to know
+/// *where* a key came from, and the key itself is the secret.
+fn lookup_var(name: &str, overlay: &HashMap<String, String>) -> Option<String> {
+    if let Some(val) = overlay.get(name) {
+        tracing::info!(
+            var = name,
+            source = "file",
+            "secret resolved from secrets file"
+        );
+        return Some(val.clone());
+    }
+    match std::env::var(name) {
+        Ok(val) => {
+            tracing::debug!(
+                var = name,
+                source = "env",
+                "secret resolved from environment"
+            );
+            Some(val)
+        }
+        Err(_) => None,
+    }
 }
 
 /// Strip matching outer single or double quotes from `s`. Unmatched
@@ -560,6 +680,7 @@ fn strip_outer_quotes(s: &str) -> &str {
 mod tests {
     use super::*;
     use crate::expect_variant;
+    use crate::secrets::SecretsProvider;
 
     #[test]
     fn env_var_expansion() {
@@ -1302,5 +1423,218 @@ models:
             } => assert_eq!(*thinking_when_absent, ThinkingWhenAbsent::EffortLow),
             other => panic!("expected an anthropic provider, got {other:?}"),
         }
+    }
+
+    // ── secrets overlay ────────────────────────────────────────────
+
+    /// A minimal config whose provider key comes from `${<var>}`.
+    ///
+    /// Each test uses its own variable name: the process environment
+    /// is global, and the test harness runs tests in parallel, so
+    /// sharing one name would make these tests race each other.
+    fn secret_config(var: &str, secrets_block: &str) -> String {
+        format!(
+            r#"
+{secrets_block}
+providers:
+  - name: compat
+    type: openai_compat
+    api_key: "${{{var}}}"
+    api_base: "https://example.test/v1"
+models:
+  - name: m
+    primary: compat
+"#
+        )
+    }
+
+    fn api_key_of(cfg: &Config) -> String {
+        match &cfg.providers[0] {
+            ProviderConfig::OpenaiCompat { api_key, .. } => api_key.clone(),
+            other => panic!("expected an openai_compat provider, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_secrets_block_keeps_env_behavior() {
+        std::env::set_var("LLMPROXY_SECRET_NOBLOCK", "from-env");
+        let cfg = Config::parse(&secret_config("LLMPROXY_SECRET_NOBLOCK", "")).unwrap();
+        assert_eq!(api_key_of(&cfg), "from-env");
+        assert_eq!(cfg.secrets.provider, SecretsProvider::None);
+    }
+
+    #[test]
+    fn null_secrets_block_is_ignored() {
+        std::env::set_var("LLMPROXY_SECRET_NULL", "from-env");
+        let cfg = Config::parse(&secret_config("LLMPROXY_SECRET_NULL", "secrets:")).unwrap();
+        assert_eq!(api_key_of(&cfg), "from-env");
+        assert_eq!(cfg.secrets.provider, SecretsProvider::None);
+    }
+
+    #[test]
+    fn file_overlay_wins_over_environment() {
+        let var = "LLMPROXY_SECRET_OVERRIDE";
+        std::env::set_var(var, "from-env");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.env");
+        std::fs::write(&path, format!("{var}=from-file\n")).unwrap();
+        let block = format!(
+            "secrets:\n  provider: file\n  file:\n    path: {}\n    required: true",
+            path.display()
+        );
+        let cfg = Config::parse(&secret_config(var, &block)).unwrap();
+        assert_eq!(api_key_of(&cfg), "from-file");
+    }
+
+    #[test]
+    fn file_overlay_supplies_keys_the_environment_lacks() {
+        let var = "LLMPROXY_SECRET_FILEONLY";
+        std::env::remove_var(var);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.env");
+        std::fs::write(&path, format!("{var}=from-file\n")).unwrap();
+        let block = format!(
+            "secrets:\n  provider: file\n  file:\n    path: {}",
+            path.display()
+        );
+        let cfg = Config::parse(&secret_config(var, &block)).unwrap();
+        assert_eq!(api_key_of(&cfg), "from-file");
+    }
+
+    #[test]
+    fn file_overlay_falls_back_to_environment_for_absent_keys() {
+        let var = "LLMPROXY_SECRET_FALLBACK";
+        std::env::set_var(var, "from-env");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.env");
+        // The file does not mention the key at all.
+        std::fs::write(&path, "SOMETHING_ELSE=1\n").unwrap();
+        let block = format!(
+            "secrets:\n  provider: file\n  file:\n    path: {}",
+            path.display()
+        );
+        let cfg = Config::parse(&secret_config(var, &block)).unwrap();
+        assert_eq!(api_key_of(&cfg), "from-env");
+    }
+
+    #[test]
+    fn missing_required_file_fails_startup() {
+        let var = "LLMPROXY_SECRET_REQUIRED";
+        std::env::set_var(var, "from-env");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.env");
+        let block = format!(
+            "secrets:\n  provider: file\n  file:\n    path: {}\n    required: true",
+            path.display()
+        );
+        let err = Config::parse(&secret_config(var, &block)).unwrap_err();
+        assert!(format!("{err}").contains("read secrets file"), "{err}");
+    }
+
+    #[test]
+    fn missing_optional_file_falls_back_to_environment() {
+        let var = "LLMPROXY_SECRET_OPTIONAL";
+        std::env::set_var(var, "from-env");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.env");
+        let block = format!(
+            "secrets:\n  provider: file\n  file:\n    path: {}\n    required: false",
+            path.display()
+        );
+        let cfg = Config::parse(&secret_config(var, &block)).unwrap();
+        assert_eq!(api_key_of(&cfg), "from-env");
+    }
+
+    #[test]
+    fn file_provider_without_path_is_a_config_error() {
+        let var = "LLMPROXY_SECRET_NOPATH";
+        let block = "secrets:\n  provider: file\n";
+        let err = Config::parse(&secret_config(var, block)).unwrap_err();
+        assert!(format!("{err}").contains("secrets.file.path"), "{err}");
+    }
+
+    #[test]
+    fn overlay_value_beats_the_default_form() {
+        let overlay = HashMap::from([("LLMPROXY_D".to_string(), "from-file".to_string())]);
+        assert_eq!(
+            expand_env_vars_with_overlay("k=${LLMPROXY_D:-fallback}", &overlay),
+            "k=from-file"
+        );
+    }
+
+    #[test]
+    fn overlay_empty_value_falls_through_to_the_default_form() {
+        // An empty overlay value behaves exactly like an empty
+        // environment variable: `${VAR:-default}` still uses the
+        // default.
+        let overlay = HashMap::from([("LLMPROXY_D".to_string(), String::new())]);
+        assert_eq!(
+            expand_env_vars_with_overlay("k=${LLMPROXY_D:-fallback}", &overlay),
+            "k=fallback"
+        );
+        // Without the `:-` form it expands to empty, like an empty
+        // environment variable does.
+        assert_eq!(
+            expand_env_vars_with_overlay("k=${LLMPROXY_D}", &overlay),
+            "k="
+        );
+    }
+
+    #[test]
+    fn overlay_covers_the_unbraced_form_too() {
+        let overlay = HashMap::from([("LLMPROXY_D".to_string(), "from-file".to_string())]);
+        assert_eq!(
+            expand_env_vars_with_overlay("k=$LLMPROXY_D", &overlay),
+            "k=from-file"
+        );
+    }
+
+    #[test]
+    fn secrets_path_may_come_from_the_environment() {
+        let var = "LLMPROXY_SECRET_VIAPATH";
+        let path_var = "LLMPROXY_SECRETS_PATH_VIAENV";
+        std::env::set_var(var, "from-env");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.env");
+        std::fs::write(&path, format!("{var}=from-file\n")).unwrap();
+        std::env::set_var(path_var, &path.display().to_string());
+        let quote = format!("\"${{{path_var}}}\"");
+        let block = format!("secrets:\n  provider: file\n  file:\n    path: {quote}\n");
+        let cfg = Config::parse(&secret_config(var, &block)).unwrap();
+        assert_eq!(api_key_of(&cfg), "from-file");
+    }
+
+    #[test]
+    fn secrets_block_round_trips_through_serde() {
+        let raw = secret_config(
+            "LLMPROXY_SECRET_ROUNDTRIP",
+            "secrets:\n  provider: file\n  file:\n    path: /run/secrets/llmproxy.env\n    required: false\n",
+        );
+        let cfg = Config::parse(&raw).unwrap();
+        let s = serde_yaml::to_string(&cfg).unwrap();
+        assert!(s.contains("provider: file"), "{s}");
+        let reparsed = Config::parse(&s).unwrap();
+        assert_eq!(reparsed.secrets.provider, SecretsProvider::File);
+        assert_eq!(
+            reparsed.secrets.file_path(),
+            Some("/run/secrets/llmproxy.env")
+        );
+        assert!(!reparsed.secrets.file.required);
+    }
+
+    #[test]
+    fn malformed_secrets_block_is_rejected() {
+        let var = "LLMPROXY_SECRET_BAD";
+        let block = "secrets:\n  provider: vault\n";
+        let err = Config::parse(&secret_config(var, block)).unwrap_err();
+        assert!(format!("{err}").contains("secrets:"), "{err}");
+    }
+
+    #[test]
+    fn unknown_key_in_secrets_block_is_rejected() {
+        let var = "LLMPROXY_SECRET_BOGUS";
+        let block = "secrets:\n  bogus: 1\n";
+        let err = Config::parse(&secret_config(var, block)).unwrap_err();
+        assert!(format!("{err}").contains("secrets:"), "{err}");
     }
 }

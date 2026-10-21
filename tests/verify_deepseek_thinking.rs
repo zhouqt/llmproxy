@@ -132,6 +132,7 @@ fn build_router(
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
         providers: provider_configs,
         models: vec![ModelConfig {
             name: "claude-test".to_string(),

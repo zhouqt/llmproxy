@@ -10,6 +10,54 @@
 # This is how API keys are typically injected.
 
 # ───────────────────────────────────────────────────────────────────────
+# secrets: where ${VAR} references resolve from
+# ───────────────────────────────────────────────────────────────────────
+# By default every `${VAR}` in this file is expanded from the process
+# environment at startup. The `secrets:` block adds a second, HIGHER
+# priority source: a `.env`-format file on disk.
+#
+#   provider — none (default) | env | file
+#       none — environment only. Same as `env`; `none` is what a config
+#              without a `secrets:` block gets.
+#       env  — environment only, spelled out explicitly.
+#       file — read the file named by `file.path` FIRST; any `${VAR}`
+#              found there resolves from the file. Variables NOT in the
+#              file still fall back to the process environment.
+#   file.path     — path of the `.env`-format file. Default: unset.
+#                   May itself contain a `${VAR}`, which is resolved from
+#                   the process environment (the overlay cannot describe
+#                   where the overlay lives).
+#   file.required — true (default) | false.
+#                   true  — a missing/unreadable file aborts startup
+#                           (fail fast: the proxy never silently starts
+#                           without its keys).
+#                   false — log a warning and continue with an empty
+#                           overlay, falling back to the environment.
+#
+# File format (NAME=VALUE per line, deliberately NOT docker-compose's
+# `env_file` rules — a secret is passed through byte-for-byte):
+#   - blank lines and `#` comments are skipped;
+#   - an optional `export ` prefix is stripped;
+#   - the line is split on the FIRST `=`, so values may contain `=`;
+#   - a value wrapped in a MATCHING pair of " or ' is unquoted;
+#   - NO variable interpolation and NO trailing-`#` stripping (a `#`
+#     inside a secret is a legal character);
+#   - a repeated key replaces the earlier one;
+#   - a line without `=` is skipped with a warning.
+#
+# Typical use: the container entrypoint unseals a TPM-sealed blob into
+# the container's tmpfs at /run/secrets/llmproxy.env and the proxy reads
+# it from there — so the plaintext key never sits in the container's
+# process environment (`podman inspect` would show it there) and never
+# lands in an image layer. See plans/feat-vault-secret-backend.md.
+#
+# secrets:
+#   provider: file
+#   file:
+#     path: /run/secrets/llmproxy.env
+#     required: true
+
+# ───────────────────────────────────────────────────────────────────────
 # server: incoming HTTP listener
 # ───────────────────────────────────────────────────────────────────────
 server:
