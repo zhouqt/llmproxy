@@ -5,21 +5,59 @@ services:
       - "127.0.0.1:9090:9090"
     volumes:
       - ./config.yaml:/etc/llmproxy/config.yaml:ro
+      # TPM sealed blob (ciphertext only) and the fallback placeholder.
+      # The placeholder is an EMPTY file in normal operation: fill it
+      # with a plaintext .env only while the TPM path is broken, then
+      # empty it again. See deploy/README.md.
+      - ./deploy/secrets/seal:/secrets/seal:ro
+      - ./deploy/secrets/llmproxy.env:/secrets/llmproxy.env:ro
       - llmproxy-data:/root/.local/share/llmproxy
-    # Secrets and per-host config come from .env (gitignored). Copy
-    # .env.example -> .env and fill in real values before `docker
-    # compose up`. `env_file` lets us keep this YAML free of any
-    # host-specific data so the file can be pushed without conflicts.
-    env_file:
-      - .env
+
+    # The unsealed secrets MUST land on a tmpfs. rootless podman does
+    # NOT give /run a tmpfs of its own, so without this line the
+    # entrypoint's /run/secrets/llmproxy.env is a regular file in the
+    # container's overlay diff layer -- i.e. plaintext on the host disk,
+    # readable by any local user through
+    # ~/.local/share/containers/storage/overlay/<id>/diff/run/secrets/.
+    tmpfs:
+      - /run:rw,noexec,nosuid,nodev,size=4m
+
+    # TPM access for the in-container unseal. The entrypoint refuses to
+    # run in TPM mode if /run is not a tmpfs.
+    devices:
+      - /dev/tpmrm0:/dev/tpmrm0
+    # keep-groups (crun only) carries the host's supplementary groups --
+    # notably `tss`, which owns /dev/tpmrm0 0660 -- into the container.
+    # A numeric gid would be re-mapped to a subgid instead. The
+    # annotation is crun's equivalent spelling; either one alone works.
+    group_add:
+      - keep-groups
+    annotations:
+      run.oci.keep_original_groups: "1"
+
+    # NOTE: no `env_file: .env` -- that would put every API key into
+    # `podman inspect`'s Config.Env. Secrets reach the proxy through
+    # /run/secrets/llmproxy.env (see config.yaml `secrets:` block).
+    #
+    # `${RUST_LOG}` below is interpolated from the host environment (or
+    # a .env file, for interpolation only); it is NOT injected as
+    # container environment.
     environment:
-      # Non-secret defaults only. Override per-host via .env if needed.
+      # Non-secret defaults only.
       #
       # Log level is controlled solely by RUST_LOG (there is no logging
       # section in config.yaml). Defaults to "info"; raise to
       # "llmproxy=debug" (or "llmproxy=trace") to debug routing/cache
       # internals. See README "Logging".
       - RUST_LOG=${RUST_LOG:-info}
+
+    # The image already declares ENTRYPOINT entrypoint.sh; do not repeat
+    # it here. podman-compose 1.3 drops the image CMD whenever the
+    # compose file sets `entrypoint:`, which leaves the entrypoint with
+    # no command to exec -- it then exits 0 and the container
+    # restart-loops with nothing in the log. Spelling the command out
+    # keeps this independent of the image's CMD.
+    command: ["llmproxy", "--config", "/etc/llmproxy/config.yaml"]
     restart: unless-stopped
 
 volumes:
