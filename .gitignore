@@ -16,6 +16,12 @@ config.local.yaml
 *.env
 !.env.example
 
+# Deployment secrets: the TPM sealed blob (ciphertext, but it is
+# machine-bound state that should not be cloned around) and the
+# fallback plaintext file. Only the templates are tracked.
+/deploy/secrets/*
+!/deploy/secrets/llmproxy.env.example
+
 # Claude Code session data (per-machine, not source)
 /.claude/
 

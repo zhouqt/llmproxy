@@ -165,6 +165,27 @@ Two of the `tracing::warn!` branches are asserted through
 a plain `warn!` call has no observable effect on coverage unless the
 emitted bytes are captured and checked.
 
+## 2026-10-21 — container-side unseal (`deploy/`, branch `feat/secrets-file-provider`)
+
+A-Phase 3 of the same plan adds `deploy/entrypoint.sh`, the TPM packages in
+the runtime image, and the compose wiring. Only one Rust behavior changed:
+
+| File | Tests | Covers |
+|---|---|---|
+| `src/config.rs` | 2 unit | `Config::validate` rejects a `server.api_key` that expanded to `""` (a `${VAR}` pointing at a missing secret must not leave the endpoint open to a bare `Authorization: Bearer `), and still accepts an absent one |
+
+`validate()` runs `Config::parse` for both tests so the expansion path is
+exercised, not just the struct field.
+
+The shell entrypoint is not unit-tested (no shell test harness in this
+repo); it was verified end to end on `loki` against a real vTPM —
+unseal, fallback, wrong-PCR failure, rotation, three consecutive restarts,
+`/run` tmpfs, and the overlay/`podman inspect` leak checks. The matrix is
+in `plans/feat-vault-secret-backend.md` §A-Phase 3.
+
+Coverage after the change: **TOTAL 97.67%** regions (`secrets.rs` 98.70%),
+above the 97% bar.
+
 ## 2026-10-24 — env-lock poisoning & refresh-loop determinism (branch `fix/env-lock-poison`)
 
 The suite carried an open flake: under `cargo llvm-cov` the library suite

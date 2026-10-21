@@ -70,6 +70,10 @@ server:
   # (or `x-api-key: <key>`). Supports ${ENV_VAR} expansion. Leave unset
   # to disable authentication — only safe when listen is bound to
   # 127.0.0.1, otherwise any reachable client can use the proxy.
+  # An api_key that expands to an EMPTY string is rejected at startup:
+  # that is what a `${VAR}` pointing at a missing secret looks like, and
+  # it would otherwise leave the endpoint open to a bare
+  # `Authorization: Bearer ` — remove the field to disable auth.
   api_key: "${LLMPROXY_API_KEY}"
 
 # ───────────────────────────────────────────────────────────────────────

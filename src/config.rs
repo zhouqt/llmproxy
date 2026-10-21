@@ -454,6 +454,19 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        // An api_key that expanded to "" is not "no auth configured" --
+        // it is auth configured with an empty token, which any client
+        // can satisfy with a bare `Authorization: Bearer `. That is
+        // exactly what a `${VAR}` pointing at a missing secret looks
+        // like, so refuse it instead of starting in a weak state.
+        if let Some(key) = &self.server.api_key {
+            if key.is_empty() {
+                return Err(ProxyError::Config(
+                    "server.api_key is empty after ${VAR} expansion; remove the field to disable auth, or point the variable at a value"
+                        .into(),
+                ));
+            }
+        }
         if self.providers.is_empty() {
             return Err(ProxyError::Config("at least one provider required".into()));
         }
@@ -868,6 +881,44 @@ models:
         .validate()
         .unwrap_err();
         assert!(no_models.to_string().contains("at least one model"));
+    }
+
+    #[test]
+    fn validation_rejects_an_api_key_that_expanded_to_empty() {
+        std::env::remove_var("LLMPROXY_TEST_UNSET_SERVER_KEY");
+        let raw = r#"
+server:
+  api_key: "${LLMPROXY_TEST_UNSET_SERVER_KEY}"
+providers:
+  - name: copilot
+    type: github_copilot
+models:
+  - name: model
+    primary: copilot
+"#;
+
+        let error = Config::parse(raw).unwrap_err();
+
+        assert!(
+            error.to_string().contains("server.api_key is empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn validation_accepts_an_absent_api_key() {
+        let raw = r#"
+providers:
+  - name: copilot
+    type: github_copilot
+models:
+  - name: model
+    primary: copilot
+"#;
+
+        let cfg = Config::parse(raw).unwrap();
+
+        assert_eq!(cfg.server.api_key, None);
     }
 
     #[test]
