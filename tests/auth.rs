@@ -23,6 +23,7 @@ fn dummy_state(api_key: Option<String>) -> AppState {
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
         providers: vec![],
         models: vec![],
         ..Config::default()
@@ -35,6 +36,7 @@ fn dummy_state(api_key: Option<String>) -> AppState {
                 server: Default::default(),
                 proxy: Default::default(),
                 user_agent: llmproxy::config::default_user_agent(),
+                secrets: Default::default(),
                 providers: vec![],
                 models: vec![],
                 ..Config::default()

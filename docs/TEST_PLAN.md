@@ -145,6 +145,26 @@ only exercise the `complete()` path. The `unimplemented!()` body
 plus the panic message string inside it are technically regions
 that cannot fire without breaking the test.
 
+## 2026-10-21 — secret overlay (`src/secrets.rs`, branch `feat/secrets-file-provider`)
+
+The TPM-sealed-secret plan (`plans/feat-vault-secret-backend.md`, A-Phase 2)
+adds a `.env`-format file as a second, higher-priority source for `${VAR}`
+references, plus a `secrets:` block in `config.yaml`.
+
+| File | Tests | Covers |
+|---|---|---|
+| `src/secrets.rs` | 26 unit | every `.env` parsing rule in plan §5.2: blank/comment lines, `export ` prefix, split on the **first** `=`, matching-quote stripping, **no** interpolation, **no** trailing-`#` stripping, duplicate keys, lines without `=`, empty values, CRLF endings, `provider: none/env/file`, unknown-key rejection, blank path, required vs optional missing file |
+| `src/config.rs` | 15 unit | two-phase `Config::parse`: overlay beats the process environment, overlay falls back to the environment, `secrets:` block absent ⇒ byte-identical to the pre-feature behavior, `provider: file` without `path` ⇒ config error, `secrets:` (null) ⇒ treated as "not configured" |
+| `tests/secrets_file.rs` | 5 integration | `Config::load` against a **real file on disk**: key read from the file, file beats the environment, missing + `required: true` ⇒ startup fails, missing + `required: false` ⇒ env still works, no `secrets:` block ⇒ unchanged |
+
+Coverage after the change: `secrets.rs` **98.70%** regions, `config.rs` 97.36%,
+**TOTAL 97.68%** — above the 97% bar.
+
+Two of the `tracing::warn!` branches are asserted through
+`crate::tracing_capture::capture_tracing` rather than by inspection:
+a plain `warn!` call has no observable effect on coverage unless the
+emitted bytes are captured and checked.
+
 ## 2026-10-24 — env-lock poisoning & refresh-loop determinism (branch `fix/env-lock-poison`)
 
 The suite carried an open flake: under `cargo llvm-cov` the library suite
