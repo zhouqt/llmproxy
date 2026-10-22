@@ -17,6 +17,7 @@ use std::task::{Context, Poll};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::Stream;
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::{json, Value};
 
 use crate::anthropic::{ContentBlock, MessageContent, MessagesRequest};
@@ -36,7 +37,7 @@ const X_APP: &str = "cli";
 
 pub struct AnthropicProvider {
     name: String,
-    api_key: String,
+    api_key: SecretString,
     api_base: String,
     model_rewrite: HashMap<String, String>,
     /// 要排除的 OpenRouter 后端提供商 slug 列表。
@@ -90,7 +91,7 @@ enum InjectedParam {
 impl AnthropicProvider {
     pub fn new(
         name: String,
-        api_key: String,
+        api_key: SecretString,
         api_base: String,
         model_rewrite: HashMap<String, String>,
         provider_ignore: Vec<String>,
@@ -156,7 +157,7 @@ impl AnthropicProvider {
     #[cfg(test)]
     fn new_for_test(
         name: String,
-        api_key: String,
+        api_key: SecretString,
         api_base: String,
         model_rewrite: HashMap<String, String>,
         provider_ignore: Vec<String>,
@@ -362,7 +363,7 @@ impl Provider for AnthropicProvider {
         let resp = self
             .http
             .get(&url)
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", self.api_key.expose_secret())
             .header("anthropic-version", "2023-06-01")
             .header("x-app", X_APP)
             .header("accept", "application/json")
@@ -433,7 +434,7 @@ impl Provider for AnthropicProvider {
             let resp = self
                 .http
                 .post(&url)
-                .bearer_auth(&api_key)
+                .bearer_auth(api_key.expose_secret())
                 .header("content-type", "application/json")
                 .header("anthropic-version", "2023-06-01")
                 .header("x-app", X_APP)
@@ -561,7 +562,7 @@ impl Provider for AnthropicProvider {
             let resp = self
                 .http
                 .post(&url)
-                .bearer_auth(&api_key)
+                .bearer_auth(api_key.expose_secret())
                 .header("content-type", "application/json")
                 .header("anthropic-version", "2023-06-01")
                 .header("x-app", X_APP)
@@ -811,6 +812,7 @@ where
 mod tests {
     use super::*;
     use crate::expect_variant;
+    use crate::secrets::secret_string;
     use crate::test_support::JsonFieldAbsent;
     use futures_util::StreamExt;
     use serde_json::json;
@@ -931,7 +933,7 @@ mod tests {
         rewrite.insert("claude-model".to_string(), "rewritten-model".to_string());
         let provider = AnthropicProvider::new(
             "router".to_string(),
-            "router-key".to_string(),
+            secret_string("router-key"),
             format!("{}/", server.uri()),
             rewrite,
             Vec::new(),
@@ -1036,7 +1038,7 @@ mod tests {
 
         let provider = AnthropicProvider::new(
             "router".to_string(),
-            "router-key".to_string(),
+            secret_string("router-key"),
             format!("{}/", server.uri()),
             empty_rewrite(),
             Vec::new(),
@@ -1090,7 +1092,7 @@ mod tests {
         rewrite.insert("claude-model".to_string(), "rewritten-model".to_string());
         let provider = AnthropicProvider::new(
             "router".to_string(),
-            "router-key".to_string(),
+            secret_string("router-key"),
             format!("{}/", server.uri()),
             rewrite,
             Vec::new(),
@@ -1138,7 +1140,7 @@ mod tests {
 
         let provider = AnthropicProvider::new(
             "r".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             "https://example.test/v1".to_string(),
             configured,
             Vec::new(),
@@ -1180,7 +1182,7 @@ mod tests {
         rewrite.insert("claude-model".to_string(), "rewritten-model".to_string());
         let provider = AnthropicProvider::new(
             "router".to_string(),
-            "router-key".to_string(),
+            secret_string("router-key"),
             format!("{}/api/v1/", server.uri()),
             rewrite,
             Vec::new(),
@@ -1214,7 +1216,7 @@ mod tests {
             .await;
         let provider = AnthropicProvider::new(
             "router".to_string(),
-            "key".to_string(),
+            secret_string("key"),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
             Vec::new(),
@@ -1245,7 +1247,7 @@ mod tests {
             .await;
         let provider = AnthropicProvider::new(
             "router".to_string(),
-            "key".to_string(),
+            secret_string("key"),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
             Vec::new(),
@@ -1585,7 +1587,7 @@ mod tests {
 
         let provider = AnthropicProvider::new(
             "deepseek".to_string(),
-            "key".to_string(),
+            secret_string("key"),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
             Vec::new(),
@@ -1653,7 +1655,7 @@ mod tests {
 
         let provider = AnthropicProvider::new(
             "no-history".to_string(),
-            "key".to_string(),
+            secret_string("key"),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
             Vec::new(),
@@ -1718,7 +1720,7 @@ mod tests {
 
         let provider = AnthropicProvider::new(
             "unrelated-400".to_string(),
-            "key".to_string(),
+            secret_string("key"),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
             Vec::new(),
@@ -1791,7 +1793,7 @@ mod tests {
 
         let provider = AnthropicProvider::new(
             "deepseek".to_string(),
-            "key".to_string(),
+            secret_string("key"),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
             Vec::new(),
@@ -1848,7 +1850,7 @@ mod tests {
 
         let provider = AnthropicProvider::new(
             "deepseek".to_string(),
-            "key".to_string(),
+            secret_string("key"),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
             Vec::new(),
@@ -1926,7 +1928,7 @@ mod tests {
 
         let provider = AnthropicProvider::new(
             "minimax".to_string(),
-            "key".to_string(),
+            secret_string("key"),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
             Vec::new(),
@@ -1971,7 +1973,7 @@ mod tests {
 
         let provider = AnthropicProvider::new(
             "no-retry".to_string(),
-            "key".to_string(),
+            secret_string("key"),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
             Vec::new(),
@@ -2013,7 +2015,7 @@ mod tests {
         rewrite.insert("claude-model".to_string(), "rewritten-claude".to_string());
         let provider = AnthropicProvider::new(
             "minimax".to_string(),
-            "key".to_string(),
+            secret_string("key"),
             format!("{}/v1", server.uri()),
             rewrite,
             Vec::new(),
@@ -2061,7 +2063,7 @@ mod tests {
 
         let provider = AnthropicProvider::new(
             "p".to_string(),
-            "key".to_string(),
+            secret_string("key"),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
             Vec::new(),
@@ -2103,7 +2105,7 @@ mod tests {
 
         let provider = AnthropicProvider::new(
             "test".to_string(),
-            "test-key".to_string(),
+            secret_string("test-key"),
             server.uri(),
             HashMap::new(),
             Vec::new(),
@@ -2149,7 +2151,7 @@ mod tests {
 
         let provider = AnthropicProvider::new(
             "test".to_string(),
-            "test-key".to_string(),
+            secret_string("test-key"),
             server.uri(),
             HashMap::new(),
             Vec::new(),
@@ -2175,7 +2177,7 @@ mod tests {
 
         let provider = AnthropicProvider::new(
             "test".to_string(),
-            "test-key".to_string(),
+            secret_string("test-key"),
             server.uri(),
             HashMap::new(),
             Vec::new(),
@@ -2200,7 +2202,7 @@ mod tests {
         // request would leak into whichever test reuses the port.
         let provider = AnthropicProvider::new(
             "test".to_string(),
-"test-key".to_string(),
+            secret_string("test-key"),
             "http://127.0.0.1:1".to_string(),
             HashMap::new(),
             Vec::new(),
@@ -2225,7 +2227,7 @@ mod tests {
 
         let provider = AnthropicProvider::new(
             "test".to_string(),
-            "test-key".to_string(),
+            secret_string("test-key"),
             server.uri(),
             HashMap::new(),
             Vec::new(),
@@ -2252,7 +2254,7 @@ mod tests {
 
         let provider = AnthropicProvider::new(
             "test".to_string(),
-            "test-key".to_string(),
+            secret_string("test-key"),
             server.uri(),
             HashMap::new(),
             Vec::new(),
@@ -2305,7 +2307,7 @@ mod tests {
 
         let provider = AnthropicProvider::new_for_test(
             "openrouter_ds".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             format!("{}/", server.uri()),
             HashMap::new(),
             vec!["Inceptron".to_string()],
@@ -2348,7 +2350,7 @@ mod tests {
 
         let provider = AnthropicProvider::new_for_test(
             "deepseek".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             format!("{}/", server.uri()),
             HashMap::new(),
             vec!["Inceptron".to_string()],
@@ -2389,7 +2391,7 @@ mod tests {
 
         let provider = AnthropicProvider::new_for_test(
             "openrouter_ds".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             format!("{}/", server.uri()),
             HashMap::new(),
             Vec::new(),
@@ -2449,7 +2451,7 @@ mod tests {
 
         let provider = AnthropicProvider::new_for_test(
             "openrouter_ds".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             format!("{}/v1", server.uri()),
             HashMap::new(),
             vec!["Inceptron".to_string(), "Azure".to_string()],
@@ -2497,7 +2499,7 @@ mod tests {
 
         let provider = AnthropicProvider::new_for_test(
             "openrouter_ds".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             server.uri(),
             HashMap::new(),
             vec!["Inceptron".to_string()],
@@ -2532,7 +2534,7 @@ mod tests {
     fn openrouter_host_detection_covers_subdomains_and_case() {
         let p = AnthropicProvider::new(
             "p".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             "https://openrouter.ai/api/v1".to_string(),
             HashMap::new(),
             vec!["Azure".to_string()],
@@ -2583,7 +2585,7 @@ mod tests {
 
         let provider = AnthropicProvider::new_for_test(
             "openrouter_ds".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             format!("{}/", server.uri()),
             HashMap::new(),
             Vec::new(),
@@ -2631,7 +2633,7 @@ mod tests {
 
         let provider = AnthropicProvider::new_for_test(
             "openrouter_ds".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             format!("{}/", server.uri()),
             HashMap::new(),
             vec!["Azure".to_string()],
@@ -2699,7 +2701,7 @@ mod tests {
         ];
         let provider = AnthropicProvider::new_for_test(
             "openrouter_ds".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             format!("{}/", server.uri()),
             HashMap::new(),
             Vec::new(),
@@ -2760,7 +2762,7 @@ mod tests {
 
         let provider = AnthropicProvider::new_for_test(
             "openrouter_ds".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             format!("{}/", server.uri()),
             HashMap::new(),
             vec!["Inceptron".to_string()],
@@ -2808,7 +2810,7 @@ mod tests {
 
         let provider = AnthropicProvider::new_for_test(
             "openrouter_ds".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             format!("{}/", server.uri()),
             HashMap::new(),
             Vec::new(),
@@ -2850,7 +2852,7 @@ mod tests {
 
         let provider = AnthropicProvider::new_for_test(
             "deepseek".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             format!("{}/", server.uri()),
             HashMap::new(),
             Vec::new(),
@@ -2908,7 +2910,7 @@ mod tests {
 
         let provider = AnthropicProvider::new_for_test(
             "openrouter_ds".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             format!("{}/v1", server.uri()),
             HashMap::new(),
             Vec::new(),
@@ -2956,7 +2958,7 @@ mod tests {
 
         let provider = AnthropicProvider::new_for_test(
             "openrouter_ds".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             server.uri(),
             HashMap::new(),
             Vec::new(),
@@ -3029,7 +3031,7 @@ mod tests {
     ) -> AnthropicProvider {
         AnthropicProvider::new_for_test(
             "qwen".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             format!("{}/", server.uri()),
             HashMap::new(),
             Vec::new(),

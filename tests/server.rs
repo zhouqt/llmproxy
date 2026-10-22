@@ -222,7 +222,7 @@ fn build_app_with_usage_and_cooldown(
     providers.insert("primary".to_string(), primary);
     let mut provider_configs = vec![ProviderConfig::OpenaiCompat {
         name: "primary".to_string(),
-        api_key: "unused".to_string(),
+        api_key: secret_string("unused"),
         api_base: "http://unused".to_string(),
         model_rewrite: HashMap::new(),
         use_proxy: false,
@@ -234,7 +234,7 @@ fn build_app_with_usage_and_cooldown(
         providers.insert("backup".to_string(), backup);
         provider_configs.push(ProviderConfig::OpenaiCompat {
             name: "backup".to_string(),
-            api_key: "unused".to_string(),
+            api_key: secret_string("unused"),
             api_base: "http://unused".to_string(),
             model_rewrite: HashMap::new(),
             use_proxy: false,
@@ -250,7 +250,7 @@ fn build_app_with_usage_and_cooldown(
     let config = Config {
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
-            api_key: api_key.map(str::to_string),
+            api_key: api_key.map(secret_string),
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -1096,7 +1096,7 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
     let config = Config {
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
-            api_key: Some("test-key".to_string()),
+            api_key: Some(secret_string("test-key")),
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -1104,7 +1104,7 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
-                api_key: "unused".to_string(),
+                api_key: secret_string("unused"),
                 api_base: "http://unused".to_string(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -1114,7 +1114,7 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
-                api_key: "unused".to_string(),
+                api_key: secret_string("unused"),
                 api_base: "http://unused".to_string(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -1126,7 +1126,7 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
             // endpoints must skip it gracefully instead of panicking.
             ProviderConfig::OpenaiCompat {
                 name: "ghost".to_string(),
-                api_key: "unused".to_string(),
+                api_key: secret_string("unused"),
                 api_base: "http://unused".to_string(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -1247,7 +1247,7 @@ async fn list_models_collision_winner_follows_chain_order_deterministically() {
     let config = Config {
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
-            api_key: Some("test-key".to_string()),
+            api_key: Some(secret_string("test-key")),
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -1255,7 +1255,7 @@ async fn list_models_collision_winner_follows_chain_order_deterministically() {
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
-                api_key: "unused".to_string(),
+                api_key: secret_string("unused"),
                 api_base: "http://unused".to_string(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -1265,7 +1265,7 @@ async fn list_models_collision_winner_follows_chain_order_deterministically() {
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
-                api_key: "unused".to_string(),
+                api_key: secret_string("unused"),
                 api_base: "http://unused".to_string(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -1351,7 +1351,7 @@ async fn admin_models_lists_every_provider_without_dedup() {
     let config = Config {
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
-            api_key: Some("test-key".to_string()),
+            api_key: Some(secret_string("test-key")),
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -1359,7 +1359,7 @@ async fn admin_models_lists_every_provider_without_dedup() {
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
-                api_key: "unused".to_string(),
+                api_key: secret_string("unused"),
                 api_base: "http://unused".to_string(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -1369,7 +1369,7 @@ async fn admin_models_lists_every_provider_without_dedup() {
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
-                api_key: "unused".to_string(),
+                api_key: secret_string("unused"),
                 api_base: "http://unused".to_string(),
                 model_rewrite: HashMap::from([
                     ("alias-a".to_string(), "gpt-4o".to_string()),
@@ -1384,7 +1384,7 @@ async fn admin_models_lists_every_provider_without_dedup() {
             // degraded group instead of breaking the endpoint.
             ProviderConfig::OpenaiCompat {
                 name: "ghost".to_string(),
-                api_key: "unused".to_string(),
+                api_key: secret_string("unused"),
                 api_base: "http://unused".to_string(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -1486,14 +1486,14 @@ async fn admin_models_reports_fetch_failed_for_provider_without_catalog() {
     let config = Config {
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
-            api_key: Some("test-key".to_string()),
+            api_key: Some(secret_string("test-key")),
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
         secrets: Default::default(),
         providers: vec![ProviderConfig::OpenaiCompat {
             name: "primary".to_string(),
-            api_key: "unused".to_string(),
+            api_key: secret_string("unused"),
             api_base: "http://unused".to_string(),
             model_rewrite: HashMap::from([("alias".to_string(), "static-upstream".to_string())]),
             use_proxy: false,
@@ -1560,6 +1560,7 @@ async fn admin_models_reports_fetch_failed_for_provider_without_catalog() {
 // ---------------------------------------------------------------------------
 
 use chrono::{DateTime, Utc};
+use llmproxy::secrets::secret_string;
 use llmproxy::usage::StreamUsage;
 
 fn ts(s: &str) -> DateTime<Utc> {
@@ -2474,14 +2475,14 @@ async fn admin_usage_excludes_serving_provider_from_failed_providers_on_retry() 
     let cfg = Config {
         server: ServerConfig {
             listen: "127.0.0.1:0".into(),
-            api_key: Some("secret".into()),
+            api_key: Some(secret_string("secret")),
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
         secrets: Default::default(),
         providers: vec![ProviderConfig::OpenaiCompat {
             name: "primary".into(),
-            api_key: "k".into(),
+            api_key: secret_string("k"),
             api_base: "http://x".into(),
             model_rewrite: Default::default(),
             use_proxy: false,
@@ -2581,7 +2582,7 @@ async fn admin_usage_keeps_fallback_failures_when_serving_provider_is_different(
     let cfg = Config {
         server: ServerConfig {
             listen: "127.0.0.1:0".into(),
-            api_key: Some("secret".into()),
+            api_key: Some(secret_string("secret")),
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -2589,7 +2590,7 @@ async fn admin_usage_keeps_fallback_failures_when_serving_provider_is_different(
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".into(),
-                api_key: "k".into(),
+                api_key: secret_string("k"),
                 api_base: "http://x".into(),
                 model_rewrite: Default::default(),
                 use_proxy: false,
@@ -2599,7 +2600,7 @@ async fn admin_usage_keeps_fallback_failures_when_serving_provider_is_different(
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".into(),
-                api_key: "k".into(),
+                api_key: secret_string("k"),
                 api_base: "http://x".into(),
                 model_rewrite: Default::default(),
                 use_proxy: false,

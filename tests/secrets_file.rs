@@ -14,6 +14,8 @@
 use std::fs;
 use std::path::Path;
 
+use secrecy::ExposeSecret;
+
 use llmproxy::config::{Config, ProviderConfig};
 use llmproxy::secrets::SecretsProvider;
 
@@ -43,7 +45,7 @@ models:
 
 fn api_key_of(cfg: &Config) -> String {
     match &cfg.providers[0] {
-        ProviderConfig::OpenaiCompat { api_key, .. } => api_key.clone(),
+        ProviderConfig::OpenaiCompat { api_key, .. } => api_key.expose_secret().clone(),
         other => panic!("expected an openai_compat provider, got {other:?}"),
     }
 }

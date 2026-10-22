@@ -22,6 +22,7 @@ use llmproxy::error::ProxyError;
 use llmproxy::providers::anthropic::AnthropicProvider;
 use llmproxy::providers::{ProviderOutput, SharedProvider};
 use llmproxy::router::{RouteStep, Router};
+use llmproxy::secrets::secret_string;
 
 // ────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -93,7 +94,7 @@ fn make_anthropic_provider(name: &str, server: &MockServer) -> SharedProvider {
     Arc::new(
         AnthropicProvider::new(
             name.to_string(),
-            "k".to_string(),
+            secret_string("k"),
             format!("{}/v1", server.uri()),
             HashMap::new(),
             Vec::new(),
@@ -109,7 +110,7 @@ fn make_anthropic_provider(name: &str, server: &MockServer) -> SharedProvider {
 fn make_anthropic_config(name: &str, server: &MockServer) -> ProviderConfig {
     ProviderConfig::Anthropic {
         name: name.to_string(),
-        api_key: "k".to_string(),
+        api_key: secret_string("k"),
         api_base: format!("{}/v1", server.uri()),
         model_rewrite: HashMap::new(),
         use_proxy: false,

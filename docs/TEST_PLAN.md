@@ -186,6 +186,27 @@ in `plans/feat-vault-secret-backend.md` §A-Phase 3.
 Coverage after the change: **TOTAL 97.67%** regions (`secrets.rs` 98.70%),
 above the 97% bar.
 
+## 2026-10-22 — credential redaction (`secrecy`, branch `feat/secrecy-redact-keys`)
+
+A-Phase 5 of the same plan replaces every `api_key` field with
+`secrecy::SecretString` so that neither `{:?}` nor a serialized config can
+print a credential. `secrecy` deliberately does not implement `Serialize`
+for `Secret<String>` (un-implementable under the orphan rule — it needs the
+`SerializableSecret` marker trait), so the serialized form is redacted by
+two field-level `serialize_with` helpers instead.
+
+| File | Tests | Covers |
+|---|---|---|
+| `src/config.rs` | 6 unit | `{:?}` of a provider/config hides the key; `serde_yaml` of a provider/config redacts it; an absent `server.api_key` still serializes as absent (auth-disabled must not become auth-configured-with-a-placeholder); the redacted YAML still re-parses |
+| `src/secrets.rs` | 2 unit | `secret_string()` prints `[REDACTED …]` under `{:?}`, and `expose_secret()` still returns the value |
+
+The remaining test churn is mechanical: every fixture that built a provider
+or a `ServerConfig` now calls `secret_string("…")`, and every provider
+assertion reads the key through `expose_secret()`.
+
+Coverage after the change: **TOTAL 97.68%** regions (`config.rs` 97.65%,
+`secrets.rs` 98.76%, `auth.rs` 100%), above the 97% bar.
+
 ## 2026-10-24 — env-lock poisoning & refresh-loop determinism (branch `fix/env-lock-poison`)
 
 The suite carried an open flake: under `cargo llvm-cov` the library suite
