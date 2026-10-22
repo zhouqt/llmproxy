@@ -217,6 +217,7 @@ mod tests {
         Config, ModelConfig, ProviderConfig, ServerConfig,
     };
     use llmproxy::expect_variant;
+    use secrecy::ExposeSecret;
 
     /// Single helper for asserting that a subprocess exited cleanly or was
     /// terminated by the expected signal. Consolidates the per-test panic
@@ -616,7 +617,13 @@ models:
         match &cfg.models[0] {
             ModelConfig { primary, .. } => assert_eq!(primary, "compat"),
         }
-        assert_eq!(cfg.server.api_key.as_deref(), Some("test-key"));
+        assert_eq!(
+            cfg.server
+                .api_key
+                .as_ref()
+                .map(|k| k.expose_secret().as_str()),
+            Some("test-key")
+        );
         let _ = ServerConfig::default();
     }
 }

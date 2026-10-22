@@ -1,3 +1,4 @@
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -5,6 +6,33 @@ use std::path::Path;
 use crate::error::{ProxyError, Result};
 use crate::secrets::{deserialize_secrets_config, SecretsConfig};
 use crate::usage::DEFAULT_USAGE_CAPACITY;
+
+/// Placeholder written instead of a credential whenever a config is
+/// serialized. `secrecy` deliberately does not implement `Serialize`
+/// for `Secret<String>` (it would be an exfiltration channel), so the
+/// redaction has to happen here — a serialized config is meant for
+/// inspection, never for reuse.
+const REDACTED: &str = "[REDACTED]";
+
+/// Serialize a credential as [`REDACTED`].
+fn serialize_redacted_secret<S: serde::Serializer>(
+    _secret: &SecretString,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(REDACTED)
+}
+
+/// Serialize an optional credential: `null` stays `null`, a value
+/// becomes [`REDACTED`].
+fn serialize_redacted_secret_option<S: serde::Serializer>(
+    secret: &Option<SecretString>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    match secret {
+        Some(_) => serializer.serialize_str(REDACTED),
+        None => serializer.serialize_none(),
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -75,7 +103,8 @@ pub struct ServerConfig {
     #[serde(default = "default_listen")]
     pub listen: String,
     #[serde(default)]
-    pub api_key: Option<String>,
+    #[serde(serialize_with = "serialize_redacted_secret_option")]
+    pub api_key: Option<SecretString>,
 }
 
 fn default_listen() -> String {
@@ -191,7 +220,8 @@ pub enum ProviderConfig {
     /// Anthropic Messages without translation.
     Anthropic {
         name: String,
-        api_key: String,
+        #[serde(serialize_with = "serialize_redacted_secret")]
+        api_key: SecretString,
         #[serde(default = "default_api_base_anthropic")]
         api_base: String,
         #[serde(default)]
@@ -269,7 +299,8 @@ pub enum ProviderConfig {
     #[serde(rename = "openai_compat")]
     OpenaiCompat {
         name: String,
-        api_key: String,
+        #[serde(serialize_with = "serialize_redacted_secret")]
+        api_key: SecretString,
         api_base: String,
         #[serde(default)]
         model_rewrite: HashMap<String, String>,
@@ -326,7 +357,8 @@ pub enum ProviderConfig {
     #[serde(rename = "openai_responses")]
     OpenaiResponses {
         name: String,
-        api_key: String,
+        #[serde(serialize_with = "serialize_redacted_secret")]
+        api_key: SecretString,
         api_base: String,
         #[serde(default)]
         model_rewrite: HashMap<String, String>,
@@ -460,7 +492,7 @@ impl Config {
         // exactly what a `${VAR}` pointing at a missing secret looks
         // like, so refuse it instead of starting in a weak state.
         if let Some(key) = &self.server.api_key {
-            if key.is_empty() {
+            if key.expose_secret().is_empty() {
                 return Err(ProxyError::Config(
                     "server.api_key is empty after ${VAR} expansion; remove the field to disable auth, or point the variable at a value"
                         .into(),
@@ -693,7 +725,7 @@ fn strip_outer_quotes(s: &str) -> &str {
 mod tests {
     use super::*;
     use crate::expect_variant;
-    use crate::secrets::SecretsProvider;
+    use crate::secrets::{secret_string, SecretsProvider};
 
     #[test]
     fn env_var_expansion() {
@@ -918,7 +950,7 @@ models:
 
         let cfg = Config::parse(raw).unwrap();
 
-        assert_eq!(cfg.server.api_key, None);
+        assert!(cfg.server.api_key.is_none());
     }
 
     #[test]
@@ -1016,7 +1048,7 @@ models:
             (
                 ProviderConfig::Anthropic {
                     name: "router".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "https://example.test/v1".into(),
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
@@ -1029,7 +1061,7 @@ models:
             (
                 ProviderConfig::OpenaiCompat {
                     name: "compat".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "https://example.test/v1".into(),
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
@@ -1042,7 +1074,7 @@ models:
             (
                 ProviderConfig::OpenaiResponses {
                     name: "responses".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "https://example.test/v1".into(),
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
@@ -1115,7 +1147,7 @@ models:
                 assert_eq!(api_base, "https://api.openai.com/v1");
                 // api_key is the env-expanded value of ${OPENAI_API_KEY}
                 // which is unset in test, so it expands to empty.
-                assert_eq!(api_key, "");
+                assert_eq!(api_key.expose_secret(), "");
                 assert!(model_rewrite.is_empty());
                 assert!(!use_proxy);
             }
@@ -1501,7 +1533,7 @@ models:
 
     fn api_key_of(cfg: &Config) -> String {
         match &cfg.providers[0] {
-            ProviderConfig::OpenaiCompat { api_key, .. } => api_key.clone(),
+            ProviderConfig::OpenaiCompat { api_key, .. } => api_key.expose_secret().clone(),
             other => panic!("expected an openai_compat provider, got {other:?}"),
         }
     }
@@ -1687,5 +1719,138 @@ models:
         let block = "secrets:\n  bogus: 1\n";
         let err = Config::parse(&secret_config(var, block)).unwrap_err();
         assert!(format!("{err}").contains("secrets:"), "{err}");
+    }
+
+    // ------------------------------------------------------------------
+    // A-Phase 5 — credentials must never appear in a `{:?}` dump or in a
+    // serialized config. Both are inspection formats: a log line, a
+    // `/admin/status` snapshot, a bug report. A credential in one of
+    // them is a credential in a log file that outlives the process.
+    // ------------------------------------------------------------------
+
+    /// A provider config carrying a recognizable credential.
+    fn provider_with_secret() -> ProviderConfig {
+        ProviderConfig::OpenaiCompat {
+            name: "compat".to_string(),
+            api_key: secret_string("sk-super-secret-value"),
+            api_base: "https://example.test/v1".to_string(),
+            model_rewrite: HashMap::new(),
+            use_proxy: false,
+            provider_ignore: Vec::new(),
+            provider_allow: Vec::new(),
+            reasoning_echo: false,
+        }
+    }
+
+    #[test]
+    fn provider_debug_output_hides_the_api_key() {
+        let cfg = provider_with_secret();
+        let dumped = format!("{cfg:?}");
+        assert!(
+            !dumped.contains("sk-super-secret-value"),
+            "the api key leaked into the Debug output: {dumped}"
+        );
+        // The redaction marker is still there, so a reader can tell the
+        // field was populated rather than empty.
+        assert!(dumped.contains("[REDACTED"), "{dumped}");
+    }
+
+    #[test]
+    fn serialized_provider_redacts_the_api_key() {
+        let cfg = provider_with_secret();
+        let dumped = serde_yaml::to_string(&cfg).unwrap();
+        assert!(
+            !dumped.contains("sk-super-secret-value"),
+            "the api key leaked into the serialized config: {dumped}"
+        );
+        assert!(dumped.contains("[REDACTED]"), "{dumped}");
+    }
+
+    #[test]
+    fn serialized_config_redacts_every_credential() {
+        let cfg = Config {
+            server: ServerConfig {
+                listen: "127.0.0.1:0".to_string(),
+                api_key: Some(secret_string("sk-server-secret-value")),
+            },
+            providers: vec![provider_with_secret()],
+            ..Config::default()
+        };
+        let dumped = serde_yaml::to_string(&cfg).unwrap();
+        assert!(
+            !dumped.contains("sk-server-secret-value"),
+            "server.api_key leaked into the serialized config: {dumped}"
+        );
+        assert!(
+            !dumped.contains("sk-super-secret-value"),
+            "provider api_key leaked into the serialized config: {dumped}"
+        );
+    }
+
+    #[test]
+    fn config_debug_output_hides_every_credential() {
+        let cfg = Config {
+            server: ServerConfig {
+                listen: "127.0.0.1:0".to_string(),
+                api_key: Some(secret_string("sk-server-secret-value")),
+            },
+            providers: vec![provider_with_secret()],
+            ..Config::default()
+        };
+        let dumped = format!("{cfg:?}");
+        assert!(
+            !dumped.contains("sk-server-secret-value"),
+            "server.api_key leaked into the Debug output: {dumped}"
+        );
+        assert!(
+            !dumped.contains("sk-super-secret-value"),
+            "provider api_key leaked into the Debug output: {dumped}"
+        );
+    }
+
+    #[test]
+    fn an_absent_server_api_key_stays_absent_when_serialized() {
+        // Redaction must not turn "auth disabled" into "auth configured
+        // with a placeholder" — the serialized form has to keep the
+        // `null` / absent distinction.
+        let cfg = Config::default();
+        let dumped = serde_yaml::to_string(&cfg).unwrap();
+        assert!(
+            !dumped.contains("[REDACTED]"),
+            "an unset api_key must not serialize as a redacted value: {dumped}"
+        );
+    }
+
+    #[test]
+    fn a_redacted_config_can_still_be_reparsed() {
+        // The redacted form is meant for inspection, but it must stay
+        // parseable — otherwise "dump the config to paste into an issue"
+        // would produce something that no longer loads.
+        let cfg = Config {
+            server: ServerConfig {
+                listen: "127.0.0.1:0".to_string(),
+                api_key: Some(secret_string("sk-server-secret-value")),
+            },
+            providers: vec![provider_with_secret()],
+            models: vec![ModelConfig {
+                name: "m".to_string(),
+                primary: "compat".to_string(),
+                fallback_chain: Vec::new(),
+                cooldown_seconds: default_cooldown_seconds(),
+                max_retries_per_provider: default_max_retries(),
+                max_retries_total: default_max_retries(),
+            }],
+            ..Config::default()
+        };
+        let dumped = serde_yaml::to_string(&cfg).unwrap();
+        let reparsed = Config::parse(&dumped).unwrap();
+        assert_eq!(
+            reparsed
+                .server
+                .api_key
+                .as_ref()
+                .map(|k| k.expose_secret().as_str()),
+            Some("[REDACTED]")
+        );
     }
 }

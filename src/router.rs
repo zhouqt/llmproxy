@@ -816,6 +816,7 @@ mod tests {
     use bytes::Bytes;
     use crate::config::{ModelConfig, ProviderConfig};
     use crate::providers::Provider;
+    use crate::secrets::secret_string;
     use async_trait::async_trait;
     use futures_util::stream;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -928,7 +929,7 @@ mod tests {
             providers: vec![
                 ProviderConfig::OpenaiCompat {
                     name: "primary".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
@@ -938,7 +939,7 @@ mod tests {
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
@@ -1016,7 +1017,7 @@ mod tests {
             providers: vec![
                 ProviderConfig::OpenaiCompat {
                     name: "primary".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
@@ -1026,7 +1027,7 @@ mod tests {
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
@@ -1334,7 +1335,7 @@ mod tests {
             providers: vec![
                 ProviderConfig::OpenaiCompat {
                     name: "primary".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
@@ -1344,7 +1345,7 @@ mod tests {
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
@@ -1423,7 +1424,7 @@ mod tests {
             user_agent: crate::config::default_user_agent(),
             providers: vec![ProviderConfig::OpenaiCompat {
                 name: "primary".into(),
-                api_key: "k".into(),
+                api_key: secret_string("k"),
                 api_base: "http://x".into(),
                 model_rewrite: Default::default(),
                 use_proxy: false,
@@ -1628,7 +1629,7 @@ mod tests {
             providers: vec![
                 ProviderConfig::OpenaiCompat {
                     name: "primary".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
@@ -1638,7 +1639,7 @@ mod tests {
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
@@ -1701,7 +1702,7 @@ mod tests {
             providers: vec![
                 ProviderConfig::OpenaiCompat {
                     name: "primary".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
@@ -1711,7 +1712,7 @@ mod tests {
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
@@ -1802,7 +1803,7 @@ mod tests {
             providers: vec![
                 ProviderConfig::OpenaiCompat {
                     name: "primary".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
@@ -1812,7 +1813,7 @@ mod tests {
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
@@ -1998,7 +1999,7 @@ mod tests {
             providers: vec![
                 ProviderConfig::OpenaiCompat {
                     name: "primary".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
@@ -2008,7 +2009,7 @@ mod tests {
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
@@ -2179,7 +2180,7 @@ mod tests {
             providers: vec![
                 ProviderConfig::OpenaiCompat {
                     name: "primary".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
@@ -2189,7 +2190,7 @@ mod tests {
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
@@ -2399,7 +2400,7 @@ mod tests {
             providers: vec![
                 ProviderConfig::OpenaiCompat {
                     name: "primary".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
@@ -2409,7 +2410,7 @@ mod tests {
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
@@ -2483,7 +2484,7 @@ mod tests {
             providers: vec![
                 ProviderConfig::OpenaiCompat {
                     name: "primary".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
@@ -2493,7 +2494,7 @@ mod tests {
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
@@ -2562,7 +2563,7 @@ mod tests {
             providers: vec![
                 ProviderConfig::OpenaiCompat {
                     name: "primary".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
@@ -2572,7 +2573,7 @@ mod tests {
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
-                    api_key: "k".into(),
+                    api_key: secret_string("k"),
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,

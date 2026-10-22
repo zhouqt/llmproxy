@@ -12,6 +12,7 @@ use tower::ServiceExt;
 
 use llmproxy::auth::require_auth;
 use llmproxy::config::{Config, ServerConfig};
+use llmproxy::secrets::secret_string;
 use llmproxy::state::AppState;
 use llmproxy::usage::UsageStats;
 
@@ -19,7 +20,7 @@ fn dummy_state(api_key: Option<String>) -> AppState {
     let cfg = Config {
         server: ServerConfig {
             listen: "127.0.0.1:0".into(),
-            api_key,
+            api_key: api_key.map(secret_string),
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),

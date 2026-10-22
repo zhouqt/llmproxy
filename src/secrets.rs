@@ -17,11 +17,26 @@
 //! See `plans/feat-vault-secret-backend.md` §5.2 (file format) and
 //! §5.5 (`secrets:` block) for the specification this implements.
 
+use secrecy::SecretString;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::{ProxyError, Result};
+
+/// Build a [`SecretString`] — the type every credential is stored in.
+///
+/// `secrecy::SecretString` keeps the value out of `{:?}` output and
+/// zeroes it on drop, so a credential can never be printed by accident
+/// (a `tracing::debug!("{cfg:?}")` used to dump every API key in the
+/// process). See `plans/feat-vault-secret-backend.md` §A-Phase 5.
+///
+/// This constructor exists because the crate's API takes a
+/// `SecretString` everywhere, and the construction sites (config
+/// parsing, provider construction, test fixtures) are numerous.
+pub fn secret_string(value: impl Into<String>) -> SecretString {
+    SecretString::from(value.into())
+}
 
 /// Where `${VAR}` placeholders resolve from.
 ///
@@ -227,6 +242,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::ExposeSecret;
 
     fn get<'a>(m: &'a HashMap<String, String>, k: &str) -> Option<&'a str> {
         m.get(k).map(String::as_str)
@@ -457,5 +473,22 @@ mod tests {
         let cfg = deserialize_secrets_config(serde_yaml::Value::Null).unwrap();
         assert_eq!(cfg.provider, SecretsProvider::None);
         assert!(cfg.file.required);
+    }
+
+    #[test]
+    fn secret_string_hides_its_value_in_debug_output() {
+        let s = secret_string("sk-not-for-logs");
+        let dumped = format!("{s:?}");
+        assert!(
+            !dumped.contains("sk-not-for-logs"),
+            "the secret leaked into the Debug output: {dumped}"
+        );
+        assert!(dumped.contains("[REDACTED"), "{dumped}");
+    }
+
+    #[test]
+    fn secret_string_exposes_its_value_on_demand() {
+        let s = secret_string("sk-the-real-value");
+        assert_eq!(s.expose_secret(), "sk-the-real-value");
     }
 }
