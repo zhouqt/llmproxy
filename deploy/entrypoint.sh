@@ -5,7 +5,7 @@
 # Two modes, decided by the fallback file:
 #
 #   TPM mode (normal)   /secrets/llmproxy.env is empty or absent ->
-#                       unseal the blob in /secrets/seal into tmpfs.
+#                       unseal the chunks in /secrets/seal into tmpfs.
 #   fallback mode       /secrets/llmproxy.env is non-empty -> copy it
 #                       into tmpfs and skip the TPM entirely.
 #
@@ -24,9 +24,22 @@
 
 set -eu
 
-KEYS=/run/secrets/llmproxy.env
-FALLBACK=/secrets/llmproxy.env
-SEAL=/secrets/seal
+# The paths are overridable so the unseal logic can be exercised on the
+# host (where /secrets and /run/secrets do not exist) without rebuilding
+# the image. The defaults are the production layout.
+KEYS=${LLMPROXY_KEYS:-/run/secrets/llmproxy.env}
+FALLBACK=${LLMPROXY_FALLBACK:-/secrets/llmproxy.env}
+SEAL=${LLMPROXY_SEAL:-/secrets/seal}
+
+# The PCRs the sealed chunks are bound to: 0 = firmware code,
+# 7 = Secure Boot policy. Must match deploy/seal.sh.
+PCR_LIST="sha256:0,7"
+
+# Glob expansion must be byte-ordered, not locale-ordered: the chunk
+# index is a zero-padded number, and "llmproxy.0010" has to sort after
+# "llmproxy.0009".
+LC_ALL=C
+export LC_ALL
 
 # `exec "$@"` with no arguments is a silent no-op that exits 0, which
 # turns a misconfigured compose file into an invisible restart loop.
@@ -36,7 +49,7 @@ if [ "$#" -eq 0 ]; then
     exit 1
 fi
 
-mkdir -p /run/secrets
+mkdir -p "$(dirname "$KEYS")"
 umask 077
 
 run_is_tmpfs() {
@@ -58,8 +71,9 @@ if [ -f "$FALLBACK" ] && [ -s "$FALLBACK" ]; then
         echo "WARN: /run is not a tmpfs; the copy lands in the container's" >&2
         echo "      writable layer as well" >&2
     fi
+    rm -f "$KEYS"
     cp "$FALLBACK" "$KEYS"
-elif [ -f "$SEAL/llmproxy.pub" ] && [ -f "$SEAL/llmproxy.priv" ]; then
+elif ls "$SEAL"/llmproxy.*.pub > /dev/null 2>&1; then
     if ! run_is_tmpfs; then
         echo "ERROR: /run is not a tmpfs; refusing to unseal onto the" >&2
         echo "       container's writable layer (the plaintext would end" >&2
@@ -80,18 +94,41 @@ elif [ -f "$SEAL/llmproxy.pub" ] && [ -f "$SEAL/llmproxy.priv" ]; then
     # while the first two look fine.
     trap 'tpm2_flushcontext -t 2>/dev/null || true; rm -f /tmp/seal.ctx' EXIT
 
-    tpm2_load -C 0x81000001 \
-        -u "$SEAL/llmproxy.pub" \
-        -r "$SEAL/llmproxy.priv" \
-        -c /tmp/seal.ctx
-    tpm2_unseal -c /tmp/seal.ctx -p pcr:sha256:0,7 > "$KEYS"
+    # The .env does not fit in one sealed object: a TPM caps a sealed
+    # payload at TPM2B_SENSITIVE_DATA, which is 128 bytes on Infineon
+    # parts. The file is therefore sealed as a series of 128-byte
+    # chunks, each with its own public/private pair, and the plaintext
+    # is the concatenation of the unsealed chunks in index order. See
+    # deploy/seal.sh.
+    #
+    # LC_ALL=C above makes the glob byte-ordered, and the index is
+    # zero-padded, so the chunks come back in the order they were
+    # sealed.
+    # The previous run left the file mode 0400; a plain truncate would
+    # fail for a non-root owner, so it is removed first. Inside the
+    # container the entrypoint runs as root and could overwrite it
+    # anyway -- but the same script is used on the host for checks, and
+    # "start twice in a row must work" has to hold in both places.
+    rm -f "$KEYS"
+    for pub in "$SEAL"/llmproxy.*.pub; do
+        priv="${pub%.pub}.priv"
+        if [ ! -f "$priv" ]; then
+            echo "ERROR: $priv is missing (private half of $pub)" >&2
+            exit 1
+        fi
+        tpm2_load -C 0x81000001 \
+            -u "$pub" \
+            -r "$priv" \
+            -c /tmp/seal.ctx > /dev/null
+        tpm2_unseal -c /tmp/seal.ctx -p "pcr:$PCR_LIST" >> "$KEYS"
+        tpm2_flushcontext -t
+        rm -f /tmp/seal.ctx
+    done
 
-    tpm2_flushcontext -t
-    rm -f /tmp/seal.ctx
     trap - EXIT
 else
-    echo "ERROR: no sealed blob in $SEAL and no fallback at $FALLBACK" >&2
-    echo "       either run the seal step (deploy/README.md) or put a" >&2
+    echo "ERROR: no sealed chunks in $SEAL and no fallback at $FALLBACK" >&2
+    echo "       either run the seal step (deploy/seal.sh) or put a" >&2
     echo "       plaintext .env at deploy/secrets/llmproxy.env" >&2
     exit 1
 fi
@@ -103,7 +140,7 @@ fi
 if [ ! -s "$KEYS" ] || ! grep -q '=' "$KEYS"; then
     echo "ERROR: $KEYS is empty or contains no NAME=VALUE lines" >&2
     echo "       (did the unseal or the fallback copy produce anything?" >&2
-    echo "       run the seal/unseal check in deploy/README.md)" >&2
+    echo "       run the seal/unseal check in docs/tpm-sealed-secrets-deploy.md)" >&2
     rm -f "$KEYS"
     exit 1
 fi

@@ -5,12 +5,16 @@ services:
       - "127.0.0.1:9090:9090"
     volumes:
       - ./config.yaml:/etc/llmproxy/config.yaml:ro
-      # TPM sealed blob (ciphertext only) and the fallback placeholder.
-      # The placeholder is an EMPTY file in normal operation: fill it
-      # with a plaintext .env only while the TPM path is broken, then
-      # empty it again. See deploy/README.md.
+      # TPM sealed chunks (ciphertext only), produced by deploy/seal.sh
+      # into ./deploy/secrets/seal. See docs/tpm-sealed-secrets-deploy.md.
       - ./deploy/secrets/seal:/secrets/seal:ro
-      - ./deploy/secrets/llmproxy.env:/secrets/llmproxy.env:ro
+      # Fallback plaintext. KEEP THIS LINE COMMENTED OUT in normal
+      # service: with the source file absent the bind-mount fails the
+      # container, and with any content in the file the entrypoint
+      # silently switches to fallback mode on the next recreate.
+      # Uncomment only while ./deploy/secrets/llmproxy.env actually
+      # exists (TPM path broken), and comment it again afterwards.
+      # - ./deploy/secrets/llmproxy.env:/secrets/llmproxy.env:ro
       - llmproxy-data:/root/.local/share/llmproxy
 
     # The unsealed secrets MUST land on a tmpfs. rootless podman does

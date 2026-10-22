@@ -272,6 +272,42 @@ After the fix, on the same builder:
   and point `XDG_DATA_HOME` at a tempdir** — `TokenStore::new` reads it, and
   without the lock the test writes the real user's token store.
 
+## 2026-10-22 — chunked TPM seal (branch `feat/tpm-chunked-seal`)
+
+A-Phase 1 on the real machine: the `.env` does not fit into a single
+sealed object. A TPM stores a sealed payload in `TPM2B_SENSITIVE_DATA`,
+which Infineon parts cap at **128 bytes** (measured on `loki`: 128 bytes
+seals, 129 fails with a TPM error; tpm2-tools' own "expected less than
+or equal to 256" message is misleading). The live `.env` is 1704 bytes,
+so `deploy/seal.sh` seals it as 14 chunks of ≤128 bytes, each with its
+own `.pub`/`.priv` pair, and `deploy/entrypoint.sh` unseals them in
+index order and concatenates them.
+
+The scripts are shell, so they have no unit tests; like the A-Phase 3
+entrypoint they are verified end to end on `loki` against the real
+vTPM:
+
+| Check | Result |
+|---|---|
+| `seal.sh` round trip on the live `.env` | 14 chunks, `sha256(source) == sha256(unsealed)` |
+| entrypoint TPM path, 3 runs in a row | byte-identical output each time (no transient-slot leak) |
+| entrypoint fallback path | copies the fallback file, exits 0 |
+| entrypoint with neither mode | exits 1 with a named error |
+| chunk order | `LC_ALL=C` + 4-digit zero-padded index ⇒ byte order == numeric order |
+| host reboot (2026-10-23) | `0x81000001` still present, PCR 0/7 byte-identical to pre-reboot, all 14 chunks unseal to the same digest |
+
+The real `.env` is never unsealed into a file on the host: its round
+trip is checked through a pipe (digests only), and the entrypoint
+script is exercised end to end with a **non-secret** payload. Writing
+the real plaintext back to the host disk is exactly what this mechanism
+exists to prevent.
+
+One pre-existing bug was found and fixed on the way: the entrypoint
+left the secrets file at mode `0400`, so the next start could not
+overwrite it. Inside the container that was invisible (the entrypoint
+runs as root), but the same script on the host failed with
+`Permission denied`. The file is now removed before it is written.
+
 ## Verification
 
 ```bash

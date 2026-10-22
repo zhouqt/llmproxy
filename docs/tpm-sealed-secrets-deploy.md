@@ -13,8 +13,8 @@ rather not pay it, see [Fallback mode](#fallback-mode).
 
 ```
 host                                    container (tmpfs)
-deploy/secrets/seal/llmproxy.pub  ┐
-deploy/secrets/seal/llmproxy.priv ┴─► tpm2_load + tpm2_unseal ─► /run/secrets/llmproxy.env
+deploy/secrets/seal/llmproxy.NNNN.* ┐
+  (one .pub/.priv pair per chunk)   ┴─► tpm2_load + tpm2_unseal ─► /run/secrets/llmproxy.env
                                         (parent 0x81000001)              │
                                                                          ▼
                                                     llmproxy --config /etc/llmproxy/config.yaml
@@ -25,9 +25,24 @@ deploy/secrets/seal/llmproxy.priv ┴─► tpm2_load + tpm2_unseal ─► /run/
 | Path | Role |
 |---|---|
 | `deploy/entrypoint.sh` | Unseals (or copies) the secrets, then `exec`s the proxy |
-| `deploy/secrets/seal/llmproxy.{pub,priv}` | The sealed blob — **ciphertext only**, gitignored |
+| `deploy/seal.sh` | Host-side: seals a plaintext `.env` into the chunked blob, then verifies the round trip |
+| `deploy/secrets/seal/llmproxy.NNNN.{pub,priv}` | The sealed chunks — **ciphertext only**, gitignored |
 | `deploy/secrets/llmproxy.env` | Fallback plaintext — **empty in normal operation**, gitignored |
 | `deploy/secrets/llmproxy.env.example` | Template for the fallback file (tracked) |
+
+### Why the blob is chunked
+
+A sealed object stores its payload in `TPM2B_SENSITIVE_DATA`, which
+Infineon parts cap at **128 bytes** (measured on this host: a 128-byte
+payload seals, 129 bytes fails with a TPM error). A real `.env` is
+~1.7 kB, so it does not fit in one object.
+
+`deploy/seal.sh` therefore splits the file into 128-byte pieces and
+seals each one as its own object under the same persistent parent. The
+entrypoint unseals the pieces in index order and concatenates them; the
+resulting byte stream is identical to the input file. The host still
+holds ciphertext only — chunking changes the file count, not the
+security property.
 
 ## Host prerequisites (once)
 
@@ -58,6 +73,20 @@ Keep a copy of the plaintext `.env` in your password manager first.
 the only way back.
 
 ```bash
+cd deploy
+./seal.sh /path/to/plaintext.env deploy/secrets/seal
+```
+
+The script creates the persistent parent if it is missing, seals the
+file chunk by chunk, and then unseals it again to compare digests — it
+fails loudly rather than leaving a half-sealed directory behind. The
+plaintext is piped, never copied: it is never written to a temporary
+file, never put on a command line, and never enters the shell history.
+
+<details>
+<summary>The manual equivalent (what the script runs)</summary>
+
+```bash
 mkdir -p deploy/secrets/seal && chmod 700 deploy/secrets deploy/secrets/seal
 cd deploy/secrets/seal
 
@@ -75,16 +104,29 @@ fi
 
 tpm2_createpolicy --policy-pcr -l sha256:0,7 -L pcr.policy
 
-# Paste the file contents at the prompt; nothing lands on disk.
-printf '%s' "$PLAINTEXT_ENV" \
-  | tpm2_create -C 0x81000001 -g sha256 \
-                -u llmproxy.pub -r llmproxy.priv \
-                -L pcr.policy -i-
+# Seal the file in 128-byte chunks (the TPM's TPM2B_SENSITIVE_DATA cap).
+# `dd` feeds each chunk straight into `tpm2_create`, so the plaintext
+# never reaches the filesystem. The index is zero-padded because the
+# entrypoint concatenates the chunks in byte order.
+size=$(wc -c < "$PLAINTEXT_ENV")
+nchunks=$(( (size + 127) / 128 ))
+i=0
+while [ "$i" -lt "$nchunks" ]; do
+    idx=$(printf '%04d' "$i")
+    dd if="$PLAINTEXT_ENV" bs=128 skip="$i" count=1 2>/dev/null \
+      | tpm2_create -C 0x81000001 -g sha256 \
+                    -u "llmproxy.$idx.pub" -r "llmproxy.$idx.priv" \
+                    -L pcr.policy -i- > /dev/null
+    tpm2_flushcontext -t
+    i=$((i + 1))
+done
 
 tpm2_flushcontext -t
 rm -f pcr.policy
-chmod 600 llmproxy.pub llmproxy.priv
+chmod 600 llmproxy.*.pub llmproxy.*.priv
 ```
+
+</details>
 
 Two details that are easy to get wrong:
 
@@ -100,10 +142,21 @@ Two details that are easy to get wrong:
 Verify the round trip before starting the container:
 
 ```bash
-tpm2_load -C 0x81000001 -u llmproxy.pub -r llmproxy.priv -c /tmp/seal.ctx
-tpm2_unseal -c /tmp/seal.ctx -p pcr:sha256:0,7 | diff - <(printf '%s' "$PLAINTEXT_ENV")
-tpm2_flushcontext -t && rm -f /tmp/seal.ctx
+# Unseal the chunks again and compare digests. The unsealed bytes go
+# into a pipe, never into a file.
+unseal_stream() {
+    for pub in llmproxy.*.pub; do
+        tpm2_load -C 0x81000001 -u "$pub" -r "${pub%.pub}.priv" -c /tmp/seal.ctx > /dev/null
+        tpm2_unseal -c /tmp/seal.ctx -p pcr:sha256:0,7
+        tpm2_flushcontext -t
+        rm -f /tmp/seal.ctx
+    done
+}
+[ "$(unseal_stream | sha256sum)" = "$(sha256sum < "$PLAINTEXT_ENV")" ] \
+    && echo "OK: seal/unseal round trip matches" || echo "MISMATCH"
 ```
+
+The same check is what `deploy/seal.sh` runs automatically after sealing.
 
 ### Which PCRs
 
@@ -156,8 +209,10 @@ namespace.
 
 ```bash
 # 1. Issue the new key and update the master copy in your password manager.
-# 2. Re-run the seal commands above with the new contents. The persistent
-#    parent is reused as-is; only tpm2_createpolicy + tpm2_create run again.
+# 2. Re-seal. The persistent parent is reused as-is; only the policy and
+#    the chunks are written again. seal.sh clears the old chunks first,
+#    so a shorter file cannot leave stale ones behind.
+./deploy/seal.sh /path/to/plaintext.env deploy/secrets/seal
 # 3. Recreate the container so the entrypoint unseals again.
 podman-compose up -d --force-recreate llmproxy
 ```
@@ -204,6 +259,7 @@ Run through this after the first deploy and after any seal change.
 | `grep -rl 'sk-' ~/.local/share/containers/storage/overlay/` | empty |
 | `podman-compose restart llmproxy` (twice in a row) | both starts succeed |
 | `tpm2_getcap handles-persistent` (host) | `0x81000001` present |
+| `ls deploy/secrets/seal/llmproxy.*.pub \| wc -l` (host) | the chunk count (a 1.7 kB `.env` → 14) |
 
 The `tmpfs` row is not optional. **rootless podman does not give `/run` a
 tmpfs of its own**; without the compose `tmpfs:` entry the unsealed file
@@ -225,6 +281,10 @@ The entrypoint refuses to unseal when `/run` is not a tmpfs.
 | Container restarts with empty API keys | `secrets.file.required: false` | Set it back to `true` |
 | `Permission denied` on `/dev/tpmrm0` | `keep-groups` unsupported (runc) or user not in `tss` | Use crun; re-login after `usermod -aG tss` |
 | `ERROR: no sealed blob ... and no fallback` | Neither mode is provisioned | Run the seal step, or fill the fallback file |
+| `File "..." size is larger than buffer, got 1704 expected less than or equal to 256` | The whole `.env` was handed to one `tpm2_create` | Seal it in chunks — `deploy/seal.sh` does that; a single object holds at most 128 bytes |
+| The TPM rejects a payload of 129 bytes | `TPM2B_SENSITIVE_DATA` is 128 bytes on Infineon parts | Same as above: chunk the file |
+| `ERROR: <file>.priv is missing (private half of <file>.pub)` | A chunk pair was deleted | Re-seal; the pairs are useless on their own |
+| The unsealed file is one key too long / truncated | A chunk is missing or the index order is broken | Re-seal; `seal.sh` verifies the round trip by digest |
 
 A plain restart does **not** lose the seal: the persistent handle lives
 in the vTPM's NV state, which survives VM reboots. Rebuilding the vTPM
