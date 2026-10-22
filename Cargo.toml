@@ -28,6 +28,11 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 bytes = "1"
 memchr = "2"
 
+# API keys are held in `SecretString` so that a `{:?}` of any config or
+# provider never prints them. See plans/feat-vault-secret-backend.md
+# (A-Phase 5).
+secrecy = { version = "0.8", features = ["serde"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
