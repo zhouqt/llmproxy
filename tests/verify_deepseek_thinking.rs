@@ -98,6 +98,7 @@ fn make_anthropic_provider(name: &str, server: &MockServer) -> SharedProvider {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
+            llmproxy::config::ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap(),
@@ -114,6 +115,7 @@ fn make_anthropic_config(name: &str, server: &MockServer) -> ProviderConfig {
         use_proxy: false,
         provider_ignore: Vec::new(),
         provider_allow: Vec::new(),
+        thinking_when_absent: llmproxy::config::ThinkingWhenAbsent::Omit,
     }
 }
 
