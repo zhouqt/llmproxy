@@ -902,6 +902,7 @@ async fn http_end_to_end_anthropic_provider_strips_and_succeeds() {
         HashMap::new(),
         Vec::new(),
         Vec::new(),
+        llmproxy::config::ThinkingWhenAbsent::Omit,
         reqwest::Client::new(),
     )
     .unwrap();
@@ -923,6 +924,7 @@ async fn http_end_to_end_anthropic_provider_strips_and_succeeds() {
             use_proxy: false,
             provider_ignore: Vec::new(),
             provider_allow: Vec::new(),
+            thinking_when_absent: llmproxy::config::ThinkingWhenAbsent::Omit,
         }],
         models: vec![ModelConfig {
             name: "claude-test".into(),
@@ -1010,6 +1012,7 @@ async fn http_end_to_end_anthropic_provider_strip_max_attempts_then_passthrough(
         HashMap::new(),
         Vec::new(),
         Vec::new(),
+        llmproxy::config::ThinkingWhenAbsent::Omit,
         reqwest::Client::new(),
     )
     .unwrap();
@@ -1031,6 +1034,7 @@ async fn http_end_to_end_anthropic_provider_strip_max_attempts_then_passthrough(
             use_proxy: false,
             provider_ignore: Vec::new(),
             provider_allow: Vec::new(),
+            thinking_when_absent: llmproxy::config::ThinkingWhenAbsent::Omit,
         }],
         models: vec![ModelConfig {
             name: "claude-test".into(),
