@@ -419,10 +419,20 @@ pub struct Usage {
     pub inference_geo: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Anthropic's `cache_creation` TTL breakdown fields are both optional:
+/// an upstream that only writes 5-minute cache entries omits
+/// `ephemeral_1h_input_tokens` entirely. Requiring them made the whole
+/// non-streaming response fail to parse into `MessagesResponse` (500)
+/// for any 5m-only upstream (OpenRouter and most Anthropic-compat
+/// layers). `skip_serializing_if` keeps the roundtrip faithful — never
+/// invent a 1h field the upstream didn't send, or clients would bill a
+/// 5m cache write at the 1h tier.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CacheCreation {
-    pub ephemeral_1h_input_tokens: u32,
-    pub ephemeral_5m_input_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_1h_input_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_5m_input_tokens: Option<u32>,
 }
 
 // ─── Streaming SSE events ────────────────────────────────────────────────
@@ -678,6 +688,48 @@ mod schema_tests {
     }
 
     #[test]
+    fn cache_creation_5m_only_breakdown_parses_and_stays_5m_only() {
+        // Regression: `ephemeral_1h_input_tokens` used to be required, so
+        // an upstream reporting only 5-minute cache writes (OpenRouter and
+        // most Anthropic-compat layers) failed the whole non-streaming
+        // response parse — the client saw a 500 instead of the message.
+        let raw = json!({"ephemeral_5m_input_tokens": 3});
+        let parsed: CacheCreation = serde_json::from_value(raw).unwrap();
+        assert_eq!(parsed.ephemeral_5m_input_tokens, Some(3));
+        assert_eq!(parsed.ephemeral_1h_input_tokens, None);
+        // Roundtrip must stay faithful: no 1h field invented on the way
+        // out, or clients would bill a 5m cache write at the 1h tier.
+        let v = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(v.get("ephemeral_5m_input_tokens"), Some(&json!(3)));
+        assert!(v.get("ephemeral_1h_input_tokens").is_none());
+    }
+
+    #[test]
+    fn cache_creation_1h_only_breakdown_parses_and_stays_1h_only() {
+        let raw = json!({"ephemeral_1h_input_tokens": 7});
+        let parsed: CacheCreation = serde_json::from_value(raw).unwrap();
+        assert_eq!(parsed.ephemeral_1h_input_tokens, Some(7));
+        assert_eq!(parsed.ephemeral_5m_input_tokens, None);
+        let v = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(v.get("ephemeral_1h_input_tokens"), Some(&json!(7)));
+        assert!(v.get("ephemeral_5m_input_tokens").is_none());
+    }
+
+    #[test]
+    fn usage_without_cache_creation_breakdown_omits_it_on_roundtrip() {
+        let raw = json!({
+            "input_tokens": 10,
+            "output_tokens": 20,
+            "cache_creation_input_tokens": 5
+        });
+        let parsed: Usage = serde_json::from_value(raw).unwrap();
+        assert!(parsed.cache_creation.is_none());
+        let v = serde_json::to_value(&parsed).unwrap();
+        assert!(v.get("cache_creation").is_none());
+        assert!(v.get("cache_creation_input_tokens").is_some());
+    }
+
+    #[test]
     fn thinking_block_signature_survives_anthropic_passthrough() {
         // Specifically guard against the regression that motivated this
         // work: ContentBlock::Thinking had no `signature` field, so the
@@ -745,7 +797,7 @@ mod schema_tests {
             output_tokens: 2,
             cache_creation_input_tokens: Some(3),
             cache_read_input_tokens: Some(4),
-            cache_creation: Some(CacheCreation { ephemeral_1h_input_tokens: 1, ephemeral_5m_input_tokens: 2 }),
+            cache_creation: Some(CacheCreation { ephemeral_1h_input_tokens: Some(1), ephemeral_5m_input_tokens: Some(2) }),
             server_tool_use: None,
             output_tokens_details: None,
             service_tier: None,
