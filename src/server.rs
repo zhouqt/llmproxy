@@ -1651,6 +1651,7 @@ async fn admin_copilot_auth_handler(State(state): State<AppState>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets::secret_string;
     use crate::test_support::env_lock;
     use futures_util::stream;
     use std::collections::HashMap;
@@ -2282,7 +2283,7 @@ mod tests {
             providers: vec![
                 ProviderConfig::OpenaiCompat {
                     name: "compat".to_string(),
-                    api_key: "k".to_string(),
+                    api_key: secret_string("k"),
                     api_base: "https://x.test".to_string(),
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
@@ -2367,7 +2368,7 @@ mod tests {
             providers: vec![
                 ProviderConfig::OpenaiCompat {
                     name: "compat".to_string(),
-                    api_key: "k".to_string(),
+                    api_key: secret_string("k"),
                     api_base: "https://x.test".to_string(),
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
@@ -2604,7 +2605,7 @@ mod tests {
         let provider = crate::providers::build(
             &crate::config::ProviderConfig::OpenaiCompat {
                 name: "slow".to_string(),
-                api_key: "k".to_string(),
+                api_key: secret_string("k"),
                 api_base: server.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
