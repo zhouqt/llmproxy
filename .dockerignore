@@ -3,3 +3,8 @@ target/
 *.md
 docs/
 tests/
+# The image needs only the entrypoint: seal.sh is host-side, and
+# deploy/secrets holds the sealed chunks / the fallback plaintext --
+# neither belongs in the build context.
+deploy/*
+!deploy/entrypoint.sh

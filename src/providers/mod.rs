@@ -175,7 +175,13 @@ pub fn build(
             )?;
             Ok(Arc::new(inner))
         }
-        ProviderConfig::OpenaiResponses { name, api_key, api_base, model_rewrite, .. } => {
+        ProviderConfig::OpenaiResponses {
+            name,
+            api_key,
+            api_base,
+            model_rewrite,
+            ..
+        } => {
             let inner = openai_responses::OpenaiResponsesProvider::new(
                 name.clone(),
                 api_base.clone(),
@@ -191,6 +197,7 @@ pub fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets::secret_string;
     use std::collections::HashMap;
 
     #[test]
@@ -198,7 +205,7 @@ mod tests {
         let compat = build(
             &ProviderConfig::OpenaiCompat {
                 name: "compat".to_string(),
-                api_key: "key".to_string(),
+                api_key: secret_string("key"),
                 api_base: "https://example.test/v1".to_string(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -215,7 +222,7 @@ mod tests {
         let router = build(
             &ProviderConfig::Anthropic {
                 name: "router".to_string(),
-                api_key: "key".to_string(),
+                api_key: secret_string("key"),
                 api_base: "https://openrouter.ai/api/v1".to_string(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -235,7 +242,7 @@ mod tests {
         let responses = build(
             &ProviderConfig::OpenaiResponses {
                 name: "responses".to_string(),
-                api_key: "key".to_string(),
+                api_key: secret_string("key"),
                 api_base: "https://example.test/v1".to_string(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,

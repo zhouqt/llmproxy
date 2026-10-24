@@ -42,6 +42,7 @@ use llmproxy::cooldown::CooldownCache;
 use llmproxy::error::{ProxyError, Result};
 use llmproxy::providers::{Provider, ProviderOutput, SharedProvider};
 use llmproxy::router::{LocalSkipReason, RouteStep, Router};
+use llmproxy::secrets::secret_string;
 use llmproxy::state::AppState;
 use llmproxy::usage::UsageStats;
 
@@ -198,9 +199,10 @@ async fn mock_llm_provider_primary_succeeds_returns_anthropic_response() {
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
         providers: vec![ProviderConfig::OpenaiCompat {
             name: "primary".to_string(),
-            api_key: "k".to_string(),
+            api_key: secret_string("k"),
             api_base: server.uri(),
             model_rewrite: HashMap::new(),
             use_proxy: false,
@@ -263,10 +265,11 @@ async fn mock_llm_provider_falls_back_when_primary_returns_429() {
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
-                api_key: "k".to_string(),
+                api_key: secret_string("k"),
                 api_base: primary.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -276,7 +279,7 @@ async fn mock_llm_provider_falls_back_when_primary_returns_429() {
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
-                api_key: "k".to_string(),
+                api_key: secret_string("k"),
                 api_base: backup.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -354,10 +357,11 @@ async fn copilot_endpoint_rejection_400_triggers_fallback() {
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
-                api_key: "k".to_string(),
+                api_key: secret_string("k"),
                 api_base: primary.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -367,7 +371,7 @@ async fn copilot_endpoint_rejection_400_triggers_fallback() {
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
-                api_key: "k".to_string(),
+                api_key: secret_string("k"),
                 api_base: backup.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -442,10 +446,11 @@ async fn mock_llm_provider_falls_back_when_primary_returns_402_quota() {
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
-                api_key: "k".to_string(),
+                api_key: secret_string("k"),
                 api_base: primary.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -455,7 +460,7 @@ async fn mock_llm_provider_falls_back_when_primary_returns_402_quota() {
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
-                api_key: "k".to_string(),
+                api_key: secret_string("k"),
                 api_base: backup.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -529,10 +534,11 @@ async fn mock_llm_provider_falls_back_when_primary_returns_empty_body_402() {
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
-                api_key: "k".to_string(),
+                api_key: secret_string("k"),
                 api_base: primary.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -542,7 +548,7 @@ async fn mock_llm_provider_falls_back_when_primary_returns_empty_body_402() {
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
-                api_key: "k".to_string(),
+                api_key: secret_string("k"),
                 api_base: backup.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -617,10 +623,11 @@ async fn mock_llm_provider_does_not_fall_back_on_403() {
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
-                api_key: "k".to_string(),
+                api_key: secret_string("k"),
                 api_base: primary.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -630,7 +637,7 @@ async fn mock_llm_provider_does_not_fall_back_on_403() {
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
-                api_key: "k".to_string(),
+                api_key: secret_string("k"),
                 api_base: backup.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -699,10 +706,11 @@ async fn mock_llm_provider_chain_exhausted_returns_last_upstream_error() {
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
-                api_key: "k".to_string(),
+                api_key: secret_string("k"),
                 api_base: primary.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -712,7 +720,7 @@ async fn mock_llm_provider_chain_exhausted_returns_last_upstream_error() {
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
-                api_key: "k".to_string(),
+                api_key: secret_string("k"),
                 api_base: backup.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -808,10 +816,11 @@ async fn mock_llm_provider_per_provider_retry_three_times_before_chain_advance()
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
-                api_key: "k".to_string(),
+                api_key: secret_string("k"),
                 api_base: primary.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -821,7 +830,7 @@ async fn mock_llm_provider_per_provider_retry_three_times_before_chain_advance()
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
-                api_key: "k".to_string(),
+                api_key: secret_string("k"),
                 api_base: primary.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -897,7 +906,7 @@ async fn http_end_to_end_anthropic_provider_strips_and_succeeds() {
 
     let real = llmproxy::providers::anthropic::AnthropicProvider::new(
         "deepseek".to_string(),
-        "k".to_string(),
+        secret_string("k"),
         format!("{}/v1", server.uri()),
         HashMap::new(),
         Vec::new(),
@@ -916,9 +925,10 @@ async fn http_end_to_end_anthropic_provider_strips_and_succeeds() {
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
         providers: vec![ProviderConfig::Anthropic {
             name: "deepseek".to_string(),
-            api_key: "k".to_string(),
+            api_key: secret_string("k"),
             api_base: format!("{}/v1", server.uri()),
             model_rewrite: HashMap::new(),
             use_proxy: false,
@@ -1007,7 +1017,7 @@ async fn http_end_to_end_anthropic_provider_strip_max_attempts_then_passthrough(
 
     let real = llmproxy::providers::anthropic::AnthropicProvider::new(
         "deepseek".to_string(),
-        "k".to_string(),
+        secret_string("k"),
         format!("{}/v1", server.uri()),
         HashMap::new(),
         Vec::new(),
@@ -1026,9 +1036,10 @@ async fn http_end_to_end_anthropic_provider_strip_max_attempts_then_passthrough(
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
         providers: vec![ProviderConfig::Anthropic {
             name: "deepseek".to_string(),
-            api_key: "k".to_string(),
+            api_key: secret_string("k"),
             api_base: format!("{}/v1", server.uri()),
             model_rewrite: HashMap::new(),
             use_proxy: false,
@@ -1098,6 +1109,7 @@ fn build_axum_app(
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
         providers: provider_configs,
         models: vec![ModelConfig {
             name: "claude-test".to_string(),
@@ -1174,7 +1186,7 @@ async fn http_end_to_end_primary_succeeds_returns_requested_model_name() {
     providers.insert("primary".to_string(), wiremock_provider("primary", &upstream));
     let configs = vec![ProviderConfig::OpenaiCompat {
         name: "primary".to_string(),
-        api_key: "k".to_string(),
+        api_key: secret_string("k"),
         api_base: upstream.uri(),
         model_rewrite: HashMap::new(),
         use_proxy: false,
@@ -1233,7 +1245,7 @@ async fn http_end_to_end_hosted_web_search_tool_passes_through_extractor() {
     let real_provider = llmproxy::providers::openai_compat::OpenAiCompatProvider::new(
         "primary".to_string(),
         upstream.uri(),
-        "wiremock-key".to_string(),
+        secret_string("wiremock-key"),
         HashMap::new(),
         Vec::new(),
         Vec::new(),
@@ -1247,7 +1259,7 @@ async fn http_end_to_end_hosted_web_search_tool_passes_through_extractor() {
 
     let configs = vec![ProviderConfig::OpenaiCompat {
         name: "primary".to_string(),
-        api_key: "k".to_string(),
+        api_key: secret_string("k"),
         api_base: upstream.uri(),
         model_rewrite: HashMap::new(),
         use_proxy: false,
@@ -1301,7 +1313,7 @@ async fn http_end_to_end_429_falls_back_to_backup_with_failed_providers_header()
     let configs = vec![
         ProviderConfig::OpenaiCompat {
             name: "primary".to_string(),
-            api_key: "k".to_string(),
+            api_key: secret_string("k"),
             api_base: primary.uri(),
             model_rewrite: HashMap::new(),
             use_proxy: false,
@@ -1311,7 +1323,7 @@ async fn http_end_to_end_429_falls_back_to_backup_with_failed_providers_header()
         },
         ProviderConfig::OpenaiCompat {
             name: "backup".to_string(),
-            api_key: "k".to_string(),
+            api_key: secret_string("k"),
             api_base: backup.uri(),
             model_rewrite: HashMap::new(),
             use_proxy: false,
@@ -1363,7 +1375,7 @@ async fn http_end_to_end_chain_exhausted_returns_status_and_failed_providers_hea
     let configs = vec![
         ProviderConfig::OpenaiCompat {
             name: "primary".to_string(),
-            api_key: "k".to_string(),
+            api_key: secret_string("k"),
             api_base: primary.uri(),
             model_rewrite: HashMap::new(),
             use_proxy: false,
@@ -1373,7 +1385,7 @@ async fn http_end_to_end_chain_exhausted_returns_status_and_failed_providers_hea
         },
         ProviderConfig::OpenaiCompat {
             name: "backup".to_string(),
-            api_key: "k".to_string(),
+            api_key: secret_string("k"),
             api_base: backup.uri(),
             model_rewrite: HashMap::new(),
             use_proxy: false,
@@ -1557,10 +1569,11 @@ async fn mock_llm_provider_short_cooldown_for_non_429_upstream_error() {
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
-                api_key: "k".to_string(),
+                api_key: secret_string("k"),
                 api_base: "http://x".into(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -1570,7 +1583,7 @@ async fn mock_llm_provider_short_cooldown_for_non_429_upstream_error() {
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
-                api_key: "k".to_string(),
+                api_key: secret_string("k"),
                 api_base: "http://x".into(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -1661,10 +1674,11 @@ async fn mock_llm_provider_402_uses_configured_cooldown_seconds_and_skips_primar
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
-                api_key: "k".to_string(),
+                api_key: secret_string("k"),
                 api_base: primary.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -1674,7 +1688,7 @@ async fn mock_llm_provider_402_uses_configured_cooldown_seconds_and_skips_primar
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
-                api_key: "k".to_string(),
+                api_key: secret_string("k"),
                 api_base: backup.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -1778,10 +1792,11 @@ async fn mock_llm_provider_subsequent_request_skips_cooldown_provider_directly()
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
-                api_key: "k".to_string(),
+                api_key: secret_string("k"),
                 api_base: primary.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -1791,7 +1806,7 @@ async fn mock_llm_provider_subsequent_request_skips_cooldown_provider_directly()
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
-                api_key: "k".to_string(),
+                api_key: secret_string("k"),
                 api_base: backup.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -1913,10 +1928,11 @@ async fn mock_llm_provider_skips_provider_with_unsupported_model_via_runtime_400
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
         providers: vec![
             ProviderConfig::OpenaiCompat {
                 name: "primary".to_string(),
-                api_key: "k".to_string(),
+                api_key: secret_string("k"),
                 api_base: primary_server.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -1926,7 +1942,7 @@ async fn mock_llm_provider_skips_provider_with_unsupported_model_via_runtime_400
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
-                api_key: "k".to_string(),
+                api_key: secret_string("k"),
                 api_base: backup_server.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
@@ -2028,7 +2044,7 @@ async fn output_config_propagation_through_router() {
     let provider = OpenAiCompatProvider::new(
         "primary".to_string(),
         api_base.clone(),
-        "k".to_string(),
+        secret_string("k"),
         HashMap::new(),
         Vec::new(),
         Vec::new(),
@@ -2041,7 +2057,7 @@ async fn output_config_propagation_through_router() {
     providers.insert("primary".to_string(), Arc::new(provider) as SharedProvider);
     let configs = vec![ProviderConfig::OpenaiCompat {
         name: "primary".to_string(),
-        api_key: "k".to_string(),
+        api_key: secret_string("k"),
         api_base,
         model_rewrite: HashMap::new(),
         use_proxy: false,
