@@ -27,9 +27,11 @@
 //! tests that want per-test capture must use `subscriber::set_default` (which
 //! is thread-local + scoped) rather than `set_global_default`. The latter
 //! would `set_global_default` would fail after the ctor's first install.
-//! All `#[tokio::test]` cases in this repo use `flavor = "current_thread"`,
-//! so the thread-local capture is sufficient — multi-threaded tests would
-//! silently miss events.
+//! Most `#[tokio::test]` cases in this repo use the default
+//! `flavor = "current_thread"`, so the thread-local capture is sufficient.
+//! The multi-threaded cases (`providers::copilot`) capture only the events
+//! emitted on the test thread — events logged from a worker thread are
+//! missed.
 //!
 //! What this module provides
 //! -------------------------

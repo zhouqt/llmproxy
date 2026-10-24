@@ -78,29 +78,17 @@ impl TokenStore {
 #[cfg(test)]
 mod tests_extra {
     use super::*;
+    use crate::test_support::env_lock;
 
     #[test]
     fn data_dir_falls_back_to_home_when_xdg_unset() {
-        // Snapshot process env so we can restore it. Modifying env vars in
-        // tests races with anything else that reads XDG_DATA_HOME / HOME, so
-        // we only assert on the path's tail shape and that the function
-        // returned Ok.
-        let saved_xdg = std::env::var_os("XDG_DATA_HOME");
-        let saved_home = std::env::var_os("HOME");
-        std::env::remove_var("XDG_DATA_HOME");
+        // data_dir() reads XDG_DATA_HOME / HOME, and other tests unset both.
+        // The guard serializes us against them and restores whatever we
+        // change, including when an assertion below fails.
+        let mut env = env_lock();
+        env.remove_var("XDG_DATA_HOME");
 
         let dir = StoredTokens::data_dir().unwrap();
-
-        if let Some(xdg) = saved_xdg {
-            std::env::set_var("XDG_DATA_HOME", xdg);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(home) = saved_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
 
         assert!(dir.ends_with("llmproxy"));
         assert!(dir.to_string_lossy().contains(".local/share"));
@@ -108,19 +96,11 @@ mod tests_extra {
 
     #[test]
     fn data_dir_errors_when_both_unset() {
-        let saved_xdg = std::env::var_os("XDG_DATA_HOME");
-        let saved_home = std::env::var_os("HOME");
-        std::env::remove_var("XDG_DATA_HOME");
-        std::env::remove_var("HOME");
+        let mut env = env_lock();
+        env.remove_var("XDG_DATA_HOME");
+        env.remove_var("HOME");
 
         let err = StoredTokens::data_dir().unwrap_err();
-
-        if let Some(xdg) = saved_xdg {
-            std::env::set_var("XDG_DATA_HOME", xdg);
-        }
-        if let Some(home) = saved_home {
-            std::env::set_var("HOME", home);
-        }
 
         assert!(err.to_string().contains("no XDG_DATA_HOME or HOME"));
     }
@@ -129,18 +109,12 @@ mod tests_extra {
     fn new_creates_data_dir_when_missing() {
         // Point XDG_DATA_HOME at a fresh nested path so TokenStore::new must
         // create the missing parent directory.
-        let saved_xdg = std::env::var_os("XDG_DATA_HOME");
+        let mut env = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let xdg_root = tmp.path().join("xdg").join("nested");
-        std::env::set_var("XDG_DATA_HOME", xdg_root.as_os_str());
+        env.set_var("XDG_DATA_HOME", xdg_root.as_os_str());
 
         let store = TokenStore::new().unwrap();
-
-        if let Some(prev) = saved_xdg {
-            std::env::set_var("XDG_DATA_HOME", prev);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
 
         assert!(xdg_root.join("llmproxy").exists());
         assert_eq!(

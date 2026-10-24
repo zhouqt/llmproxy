@@ -248,9 +248,12 @@ mod tests {
 
     #[tokio::test]
     async fn builds_copilot_without_reading_user_token_store() {
+        // CopilotProvider::new reads XDG_DATA_HOME via TokenStore::new; the
+        // guard serializes against the token-store tests (which unset it) and
+        // restores the variable on drop, including during a panic.
+        let mut env = crate::test_support::env_lock();
         let dir = tempfile::tempdir().unwrap();
-        let previous = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("XDG_DATA_HOME", dir.path());
+        env.set_var("XDG_DATA_HOME", dir.path());
 
         let copilot = build(
             &ProviderConfig::GithubCopilot {
@@ -263,12 +266,6 @@ mod tests {
             reqwest::Client::new(),
         )
         .unwrap();
-
-        if let Some(previous) = previous {
-            std::env::set_var("XDG_DATA_HOME", previous);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
 
         assert_eq!(copilot.name(), "copilot");
         let handle = copilot
