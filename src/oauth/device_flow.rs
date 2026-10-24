@@ -30,6 +30,12 @@ pub async fn request_device_code(http: &reqwest::Client) -> Result<DeviceCodeRes
     request_device_code_at(http, github_base_url()).await
 }
 
+/// GitHub's base URL, overridable in tests.
+///
+/// The override is read fresh on every call — tests flip it between requests,
+/// so a cache would defeat the seam — which means each call made while the
+/// override is set leaks one `String`. Test-only, and bounded by the number
+/// of calls in a test run.
 fn github_base_url() -> &'static str {
     #[cfg(test)]
     {
@@ -180,24 +186,13 @@ pub(crate) async fn device_flow_blocking_at(
     poll_loop(http, base_url, &dc).await
 }
 
-/// Process-wide lock guarding tests that mutate the
-    /// `LLMPROXY_TEST_GITHUB_BASE_URL` env var (or rely on the `Box::leak`
-    /// cache inside `github_base_url`). Cargo runs tests in parallel by
-    /// default; without this lock, two env-mutating tests can interleave
-    /// their setup and one will hit the wrong mock server. `copilot.rs`
-    /// tests use the same env var via `device_flow_blocking`, so they share
-    /// this lock.
-    #[cfg(test)]
-    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env_lock;
     use serde_json::json;
     use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    pub(crate) use super::ENV_LOCK;
 
     async fn poll_response(status: u16, body: Value) -> (MockServer, reqwest::Client) {
         let server = MockServer::start().await;
@@ -341,11 +336,11 @@ mod tests {
         // Combined test: covers the env-var-override path of all three
         // public wrappers (request_device_code, poll_access_token,
         // device_flow_blocking) within a single MockServer. They share the
-        // process-wide LLMPROXY_TEST_GITHUB_BASE_URL env var (and the
-        // `Box::leak` cache inside `github_base_url`), so we hold
-        // ENV_LOCK to serialize against other env-mutating tests in the
-        // crate (notably the copilot refresh_token tests).
-        let _env_guard = ENV_LOCK.lock().unwrap();
+        // process-wide LLMPROXY_TEST_GITHUB_BASE_URL env var, so we hold
+        // the shared env lock to serialize against other env-mutating tests
+        // in the crate (notably the copilot refresh_token tests). The guard
+        // restores the variable on drop, including during a panic.
+        let mut env = env_lock();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/login/device/code"))
@@ -377,7 +372,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        std::env::set_var("LLMPROXY_TEST_GITHUB_BASE_URL", &server.uri());
+        env.set_var("LLMPROXY_TEST_GITHUB_BASE_URL", &server.uri());
 
         let result = request_device_code(&reqwest::Client::new()).await.unwrap();
         assert_eq!(result.device_code, "public-device");
@@ -397,35 +392,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(token, "public-token");
-
-        std::env::remove_var("LLMPROXY_TEST_GITHUB_BASE_URL");
     }
 
     #[test]
     fn github_base_url_default_and_override_lifecycle() {
         // Combined test: covers the default fallback branch of
-        // `github_base_url()` plus exercises the production wrappers under
-        // the env-var override. Both halves mutate the process-wide env var
-        // and `Box::leak`-cached pointer, so we hold ENV_LOCK to serialize
-        // against other env-mutating tests in the crate.
-        let _env_guard = ENV_LOCK.lock().unwrap();
-        let saved = std::env::var_os("LLMPROXY_TEST_GITHUB_BASE_URL");
-        std::env::remove_var("LLMPROXY_TEST_GITHUB_BASE_URL");
+        // `github_base_url()` plus the override branch. The guard restores
+        // the variable on drop, including during a panic — the previous
+        // manual save/restore was skipped whenever an assertion failed.
+        let mut env = env_lock();
+        env.remove_var("LLMPROXY_TEST_GITHUB_BASE_URL");
 
         let default_url = github_base_url();
         assert_eq!(default_url, "https://github.com");
 
-        std::env::set_var("LLMPROXY_TEST_GITHUB_BASE_URL", "https://override.test");
+        env.set_var("LLMPROXY_TEST_GITHUB_BASE_URL", "https://override.test");
         let override_url = github_base_url();
         assert_eq!(override_url, "https://override.test");
-
-        std::env::remove_var("LLMPROXY_TEST_GITHUB_BASE_URL");
-
-        if let Some(value) = saved {
-            std::env::set_var("LLMPROXY_TEST_GITHUB_BASE_URL", value);
-        } else {
-            std::env::remove_var("LLMPROXY_TEST_GITHUB_BASE_URL");
-        }
     }
 
     async fn mount_device_code(server: &MockServer, expires_in: u64, interval: u64) {
