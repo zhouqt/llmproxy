@@ -1651,6 +1651,7 @@ async fn admin_copilot_auth_handler(State(state): State<AppState>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env_lock;
     use futures_util::stream;
     use std::collections::HashMap;
     use std::pin::Pin;
@@ -1901,8 +1902,9 @@ mod tests {
     // `CopilotProvider::new` which builds the state from the standard
     // TokenStore path (XDG_DATA_HOME). To redirect the device-flow URL
     // at the wiremock we use the crate-private
-    // `LLMPROXY_TEST_GITHUB_BASE_URL` env var; the existing
-    // `device_flow::ENV_LOCK` serializes this against parallel tests.
+    // `LLMPROXY_TEST_GITHUB_BASE_URL` env var; the shared
+    // `test_support::env_lock()` serializes this against parallel tests and
+    // restores both variables when the test ends.
     // ──────────────────────────────────────────────────────────────────
     mod admin_copilot {
         use crate::config::{Config, ModelConfig, ProviderConfig, ServerConfig};
@@ -1911,6 +1913,7 @@ mod tests {
         use crate::providers::copilot::CopilotProvider;
         use crate::router::Router;
         use crate::state::AppState;
+        use crate::test_support::{env_lock, EnvGuard};
         use crate::usage::UsageStats;
         use axum::body::Body;
         use axum::http::{Method, Request, StatusCode};
@@ -1964,14 +1967,19 @@ mod tests {
         }
 
         /// Build a real `CopilotProvider` whose token store lives in a
-        /// private tempdir. The caller is responsible for setting the
-        /// github-base-URL env var under `ENV_LOCK`.
-        fn new_copilot() -> Arc<CopilotProvider> {
+        /// private tempdir.
+        ///
+        /// `XDG_DATA_HOME` is set through the caller's `EnvGuard`, so it is
+        /// restored when the guard drops. The tempdir is returned rather than
+        /// dropped here: leaving `XDG_DATA_HOME` pointing at a path that no
+        /// longer exists would break every later `TokenStore::new` in this
+        /// process.
+        fn new_copilot(env: &mut EnvGuard) -> (tempfile::TempDir, Arc<CopilotProvider>) {
             let dir = tempfile::tempdir().expect("tempdir");
             // XDG_DATA_HOME must be set BEFORE `CopilotProvider::new`
             // is called — `TokenStore::new` reads it.
-            std::env::set_var("XDG_DATA_HOME", dir.path());
-            Arc::new(
+            env.set_var("XDG_DATA_HOME", dir.path());
+            let provider = Arc::new(
                 CopilotProvider::new(
                     "copilot".to_string(),
                     "1.95.0".to_string(),
@@ -1980,19 +1988,18 @@ mod tests {
                     reqwest::Client::new(),
                 )
                 .expect("copilot provider builds"),
-            )
+            );
+            (dir, provider)
         }
 
         #[tokio::test]
         async fn admin_copilot_auth_returns_200_with_device_code_when_bootstrap_starts() {
             // Hold the github-base-URL env lock and point it at the
             // wiremock for this test only.
-            let _env_guard = crate::oauth::device_flow::ENV_LOCK
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let mut env = env_lock();
 
             let server = MockServer::start().await;
-            std::env::set_var("LLMPROXY_TEST_GITHUB_BASE_URL", &server.uri());
+            env.set_var("LLMPROXY_TEST_GITHUB_BASE_URL", &server.uri());
 
             Mock::given(method("POST"))
                 .and(path("/login/device/code"))
@@ -2006,7 +2013,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let provider = new_copilot();
+            let (_dir, provider) = new_copilot(&mut env);
             let app = build_app_with_copilot(provider);
 
             let resp = app
@@ -2019,10 +2026,6 @@ mod tests {
                 )
                 .await
                 .unwrap();
-
-            // Drop the env override immediately so the rest of the
-            // suite isn't affected by a stale value.
-            std::env::remove_var("LLMPROXY_TEST_GITHUB_BASE_URL");
 
             assert_eq!(resp.status(), StatusCode::OK);
             let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -2060,12 +2063,10 @@ mod tests {
             // arrive during the spawned task's poll sleep, which is why
             // we await request 1 fully and then poll for the 409 with a
             // short retry budget (well under the ~6s hold window).
-            let _env_guard = crate::oauth::device_flow::ENV_LOCK
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let mut env = env_lock();
 
             let server = MockServer::start().await;
-            std::env::set_var("LLMPROXY_TEST_GITHUB_BASE_URL", &server.uri());
+            env.set_var("LLMPROXY_TEST_GITHUB_BASE_URL", &server.uri());
 
             Mock::given(method("POST"))
                 .and(path("/login/device/code"))
@@ -2089,7 +2090,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let provider = new_copilot();
+            let (_dir, provider) = new_copilot(&mut env);
             let app = build_app_with_copilot(provider);
 
             let mk_req = || {
@@ -2123,7 +2124,6 @@ mod tests {
                 // poll loop never completes). Give it a moment.
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
-            std::env::remove_var("LLMPROXY_TEST_GITHUB_BASE_URL");
 
             let conflict_resp =
                 conflict_resp.expect("a concurrent bootstrap must eventually return 409 Conflict");
@@ -2148,12 +2148,10 @@ mod tests {
         /// normal internal error response, not a 409.
         #[tokio::test]
         async fn admin_copilot_auth_returns_internal_error_when_bootstrap_fails_for_other_reason() {
-            let _env_guard = crate::oauth::device_flow::ENV_LOCK
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let mut env = env_lock();
 
             let server = MockServer::start().await;
-            std::env::set_var("LLMPROXY_TEST_GITHUB_BASE_URL", &server.uri());
+            env.set_var("LLMPROXY_TEST_GITHUB_BASE_URL", &server.uri());
 
             // GitHub returns 500 on the device-code endpoint. The error
             // message will not contain "already in progress", so the
@@ -2164,7 +2162,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let provider = new_copilot();
+            let (_dir, provider) = new_copilot(&mut env);
             let app = build_app_with_copilot(provider);
 
             let resp = app
@@ -2177,7 +2175,6 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            std::env::remove_var("LLMPROXY_TEST_GITHUB_BASE_URL");
 
             // 500 from the upstream device-code endpoint is propagated
             // through `ProxyError::into_response`, not 409 (which is the
@@ -2198,7 +2195,8 @@ mod tests {
             // catalog fetch returns None, so the group must degrade to
             // cache_state "cold" — routed through CopilotProvider's own
             // introspection rather than the generic "fetch_failed".
-            let provider = new_copilot();
+            let mut env = env_lock();
+            let (_dir, provider) = new_copilot(&mut env);
 
             let cfg = Config {
                 server: ServerConfig {
@@ -2264,6 +2262,13 @@ mod tests {
         use crate::config::{Config, ModelConfig, ProviderConfig, ServerConfig};
         use crate::providers::Provider;
         use std::sync::Arc;
+
+        // CopilotProvider::new reads XDG_DATA_HOME via TokenStore::new.
+        // Serialize against the token-store tests (which unset it) and keep
+        // the store inside a tempdir instead of the real home directory.
+        let mut env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        env.set_var("XDG_DATA_HOME", dir.path());
 
         // copilot has a non-empty rewrite table: client "claude" →
         // upstream "gpt-x". compat is a fallback with an empty table.
@@ -2341,7 +2346,13 @@ mod tests {
     }
 
     #[test]
-    fn build_routing_priority_skips_providers_that_cannot_serve() {        use crate::config::{Config, ModelConfig, ProviderConfig, ServerConfig};
+    fn build_routing_priority_skips_providers_that_cannot_serve() {
+        use crate::config::{Config, ModelConfig, ProviderConfig, ServerConfig};
+
+        // CopilotProvider::new reads XDG_DATA_HOME via TokenStore::new.
+        let mut env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        env.set_var("XDG_DATA_HOME", dir.path());
 
         // copilot can only serve "other" (rewrite key); the chain asks for
         // "claude", which it cannot serve — so no entry for copilot at all,
@@ -2400,6 +2411,11 @@ mod tests {
     #[test]
     fn build_routing_priority_takes_min_rank_on_duplicate_keys_and_skips_ghosts() {
         use crate::config::{Config, ModelConfig, ProviderConfig, ServerConfig};
+
+        // CopilotProvider::new reads XDG_DATA_HOME via TokenStore::new.
+        let mut env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        env.set_var("XDG_DATA_HOME", dir.path());
 
         // copilot's rewrite maps both "m1" and "m2" to the same upstream
         // id "u". Row1 uses copilot as fallback (pos 1), row2 as primary

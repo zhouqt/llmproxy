@@ -145,6 +145,71 @@ only exercise the `complete()` path. The `unimplemented!()` body
 plus the panic message string inside it are technically regions
 that cannot fire without breaking the test.
 
+## 2026-10-24 — env-lock poisoning & refresh-loop determinism (branch `fix/env-lock-poison`)
+
+The suite carried an open flake: under `cargo llvm-cov` the library suite
+occasionally failed a timing-sensitive test that raced on the process-global
+tokio clock or the mock server
+(`providers::copilot::tests::spawn_refresh_loop_runs_one_iteration_and_aborts`
+and `providers::anthropic::tests::list_models_returns_none_on_non_success_status`
+had both been seen), and when the copilot test panicked it poisoned
+`oauth::device_flow::ENV_LOCK`, so four other tests failed with `PoisonError`.
+
+Measured on the builder before the fix: the copilot test alone failed
+14–15 of 200 runs (~7%); the full lib suite failed **6 of 30** runs (20%);
+the `drop(server)` group failed 3 of 60.
+
+Three independent causes, all now fixed:
+
+1. **Lock poisoning cascaded.** `ENV_LOCK` was a plain `std::sync::Mutex`
+   and 14 of 17 acquisition sites used `.lock().unwrap()`. It moved to
+   `test_support::env_lock()`, which recovers from poisoning via
+   `into_inner()` (mutual exclusion preserved, only the poisoned flag is
+   discarded), and the manual `set_var` + trailing `remove_var` pattern
+   became an RAII `EnvGuard` that restores every variable it touched on
+   drop — including during panic unwinding.
+2. **A paused clock outran the real HTTP round-trip.** The four
+   refresh-loop tests used `#[tokio::test(start_paused = true)]` plus 300
+   `advance(60s)` calls: the whole loop ran in a few milliseconds of real
+   time, and the assertion raced the in-flight request, which the test then
+   aborted. They now await `refresh_once()` directly, with `.expect(1)`
+   proving the iteration really ran — two of them previously asserted
+   nothing at all and would have passed with the loop never running.
+3. **`drop(server)` did not close the listener.** wiremock's
+   `MockServer::start()` takes a server from a process-global pool; dropping
+   the public handle returns it to the pool but leaves the listener bound,
+   so the request was still served and its leftover count broke the next
+   test that reused the port.
+
+After the fix, on the same builder:
+
+| Check | Result |
+|---|---|
+| `cargo test --lib --bins --tests` | 960 tests, all pass (851 lib + 109 integration) |
+| `providers::copilot::tests` × 100 (`--test-threads=4`) | 100/100 pass (was ~7% failing) |
+| `providers::anthropic::tests::list_models` × 100 | 100/100 pass (was 2/100 failing) |
+| `oauth::` × 100 | 100/100 pass |
+| `server::` × 100 | 100/100 pass |
+| full lib suite × 30 | 30/30 pass (was 6/30 failing) |
+| `cargo llvm-cov --lib --bins --tests` | **TOTAL 97.75%** regions, above the 97% bar |
+
+### Regression guardrails
+
+- **Never send a request to a mock server you dropped.** `drop(server)` does
+  not close the listener. Use a dead port (`http://127.0.0.1:1`) when the
+  test needs a connection that must fail.
+- **Keep `.expect(N)` counts exact.** They are the detector for requests
+  leaking between tests. Relax to `1..` only when the loop may legitimately
+  iterate more than once (see `spawn_refresh_loop_with_delay_runs_an_iteration`).
+- **Do not use `#[tokio::test(start_paused = true)]` for "spawned task + real
+  I/O".** The paused clock does not wait for the spawned task's HTTP
+  round-trip; the test can abort the request mid-flight. Await the future in
+  the test task instead, or drive the task through a seam.
+- **Any test that builds a `CopilotProvider` (or calls
+  `providers::build(GithubCopilot)`) must hold `test_support::env_lock()`
+  and point `XDG_DATA_HOME` at a tempdir** — `TokenStore::new` reads it, and
+  without the lock the test writes the real user's token store.
+
 ## Verification
 
 ```bash

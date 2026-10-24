@@ -2190,14 +2190,18 @@ mod tests {
 
     #[tokio::test]
     async fn list_models_returns_none_on_network_error() {
-        let server = MockServer::start().await;
-        let uri = server.uri();
-        drop(server);
-
+        // A port nothing listens on: the connect fails right away with
+        // ECONNREFUSED, so `list_models` sees a transport error.
+        //
+        // Deliberately NOT `MockServer` + `drop(server)`: wiremock keeps
+        // the listener bound after the public handle is dropped (the handle
+        // only goes back to a process-global pool), so the request would
+        // still be served — the test would assert nothing, and the leftover
+        // request would leak into whichever test reuses the port.
         let provider = AnthropicProvider::new(
             "test".to_string(),
-            "test-key".to_string(),
-            uri,
+"test-key".to_string(),
+            "http://127.0.0.1:1".to_string(),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
