@@ -145,6 +145,68 @@ only exercise the `complete()` path. The `unimplemented!()` body
 plus the panic message string inside it are technically regions
 that cannot fire without breaking the test.
 
+## 2026-10-21 — secret overlay (`src/secrets.rs`, branch `feat/secrets-file-provider`)
+
+The TPM-sealed-secret plan (`plans/feat-vault-secret-backend.md`, A-Phase 2)
+adds a `.env`-format file as a second, higher-priority source for `${VAR}`
+references, plus a `secrets:` block in `config.yaml`.
+
+| File | Tests | Covers |
+|---|---|---|
+| `src/secrets.rs` | 26 unit | every `.env` parsing rule in plan §5.2: blank/comment lines, `export ` prefix, split on the **first** `=`, matching-quote stripping, **no** interpolation, **no** trailing-`#` stripping, duplicate keys, lines without `=`, empty values, CRLF endings, `provider: none/env/file`, unknown-key rejection, blank path, required vs optional missing file |
+| `src/config.rs` | 15 unit | two-phase `Config::parse`: overlay beats the process environment, overlay falls back to the environment, `secrets:` block absent ⇒ byte-identical to the pre-feature behavior, `provider: file` without `path` ⇒ config error, `secrets:` (null) ⇒ treated as "not configured" |
+| `tests/secrets_file.rs` | 5 integration | `Config::load` against a **real file on disk**: key read from the file, file beats the environment, missing + `required: true` ⇒ startup fails, missing + `required: false` ⇒ env still works, no `secrets:` block ⇒ unchanged |
+
+Coverage after the change: `secrets.rs` **98.70%** regions, `config.rs` 97.36%,
+**TOTAL 97.68%** — above the 97% bar.
+
+Two of the `tracing::warn!` branches are asserted through
+`crate::tracing_capture::capture_tracing` rather than by inspection:
+a plain `warn!` call has no observable effect on coverage unless the
+emitted bytes are captured and checked.
+
+## 2026-10-21 — container-side unseal (`deploy/`, branch `feat/secrets-file-provider`)
+
+A-Phase 3 of the same plan adds `deploy/entrypoint.sh`, the TPM packages in
+the runtime image, and the compose wiring. Only one Rust behavior changed:
+
+| File | Tests | Covers |
+|---|---|---|
+| `src/config.rs` | 2 unit | `Config::validate` rejects a `server.api_key` that expanded to `""` (a `${VAR}` pointing at a missing secret must not leave the endpoint open to a bare `Authorization: Bearer `), and still accepts an absent one |
+
+`validate()` runs `Config::parse` for both tests so the expansion path is
+exercised, not just the struct field.
+
+The shell entrypoint is not unit-tested (no shell test harness in this
+repo); it was verified end to end on `loki` against a real vTPM —
+unseal, fallback, wrong-PCR failure, rotation, three consecutive restarts,
+`/run` tmpfs, and the overlay/`podman inspect` leak checks. The matrix is
+in `plans/feat-vault-secret-backend.md` §A-Phase 3.
+
+Coverage after the change: **TOTAL 97.67%** regions (`secrets.rs` 98.70%),
+above the 97% bar.
+
+## 2026-10-22 — credential redaction (`secrecy`, branch `feat/secrecy-redact-keys`)
+
+A-Phase 5 of the same plan replaces every `api_key` field with
+`secrecy::SecretString` so that neither `{:?}` nor a serialized config can
+print a credential. `secrecy` deliberately does not implement `Serialize`
+for `Secret<String>` (un-implementable under the orphan rule — it needs the
+`SerializableSecret` marker trait), so the serialized form is redacted by
+two field-level `serialize_with` helpers instead.
+
+| File | Tests | Covers |
+|---|---|---|
+| `src/config.rs` | 6 unit | `{:?}` of a provider/config hides the key; `serde_yaml` of a provider/config redacts it; an absent `server.api_key` still serializes as absent (auth-disabled must not become auth-configured-with-a-placeholder); the redacted YAML still re-parses |
+| `src/secrets.rs` | 2 unit | `secret_string()` prints `[REDACTED …]` under `{:?}`, and `expose_secret()` still returns the value |
+
+The remaining test churn is mechanical: every fixture that built a provider
+or a `ServerConfig` now calls `secret_string("…")`, and every provider
+assertion reads the key through `expose_secret()`.
+
+Coverage after the change: **TOTAL 97.68%** regions (`config.rs` 97.65%,
+`secrets.rs` 98.76%, `auth.rs` 100%), above the 97% bar.
+
 ## 2026-10-24 — env-lock poisoning & refresh-loop determinism (branch `fix/env-lock-poison`)
 
 The suite carried an open flake: under `cargo llvm-cov` the library suite
@@ -209,6 +271,42 @@ After the fix, on the same builder:
   `providers::build(GithubCopilot)`) must hold `test_support::env_lock()`
   and point `XDG_DATA_HOME` at a tempdir** — `TokenStore::new` reads it, and
   without the lock the test writes the real user's token store.
+
+## 2026-10-22 — chunked TPM seal (branch `feat/tpm-chunked-seal`)
+
+A-Phase 1 on the real machine: the `.env` does not fit into a single
+sealed object. A TPM stores a sealed payload in `TPM2B_SENSITIVE_DATA`,
+which Infineon parts cap at **128 bytes** (measured on `loki`: 128 bytes
+seals, 129 fails with a TPM error; tpm2-tools' own "expected less than
+or equal to 256" message is misleading). The live `.env` is 1704 bytes,
+so `deploy/seal.sh` seals it as 14 chunks of ≤128 bytes, each with its
+own `.pub`/`.priv` pair, and `deploy/entrypoint.sh` unseals them in
+index order and concatenates them.
+
+The scripts are shell, so they have no unit tests; like the A-Phase 3
+entrypoint they are verified end to end on `loki` against the real
+vTPM:
+
+| Check | Result |
+|---|---|
+| `seal.sh` round trip on the live `.env` | 14 chunks, `sha256(source) == sha256(unsealed)` |
+| entrypoint TPM path, 3 runs in a row | byte-identical output each time (no transient-slot leak) |
+| entrypoint fallback path | copies the fallback file, exits 0 |
+| entrypoint with neither mode | exits 1 with a named error |
+| chunk order | `LC_ALL=C` + 4-digit zero-padded index ⇒ byte order == numeric order |
+| host reboot (2026-10-23) | `0x81000001` still present, PCR 0/7 byte-identical to pre-reboot, all 14 chunks unseal to the same digest |
+
+The real `.env` is never unsealed into a file on the host: its round
+trip is checked through a pipe (digests only), and the entrypoint
+script is exercised end to end with a **non-secret** payload. Writing
+the real plaintext back to the host disk is exactly what this mechanism
+exists to prevent.
+
+One pre-existing bug was found and fixed on the way: the entrypoint
+left the secrets file at mode `0400`, so the next start could not
+overwrite it. Inside the container that was invisible (the entrypoint
+runs as root), but the same script on the host failed with
+`Permission denied`. The file is now removed before it is written.
 
 ## Verification
 

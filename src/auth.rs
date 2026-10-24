@@ -4,6 +4,7 @@ use axum::extract::{Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use secrecy::ExposeSecret;
 
 use crate::state::AppState;
 
@@ -12,7 +13,13 @@ pub async fn require_auth(
     req: Request,
     next: Next,
 ) -> Response {
-    let Some(expected) = state.config.server.api_key.as_deref() else {
+    let Some(expected) = state
+        .config
+        .server
+        .api_key
+        .as_ref()
+        .map(|k| k.expose_secret().as_str())
+    else {
         // No api_key configured → auth disabled.
         return next.run(req).await;
     };

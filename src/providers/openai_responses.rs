@@ -18,6 +18,7 @@ use std::task::{Context, Poll};
 use async_trait::async_trait;
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::Stream;
+use secrecy::{ExposeSecret, SecretString};
 
 use crate::anthropic::{MessagesRequest, StreamEvent};
 use crate::conversion::responses::{
@@ -31,7 +32,7 @@ use crate::responses::ResponsesResponse;
 pub struct OpenaiResponsesProvider {
     name: String,
     api_base: String,
-    api_key: String,
+    api_key: SecretString,
     model_rewrite: HashMap<String, String>,
     http: reqwest::Client,
 }
@@ -40,7 +41,7 @@ impl OpenaiResponsesProvider {
     pub fn new(
         name: String,
         api_base: String,
-        api_key: String,
+        api_key: SecretString,
         model_rewrite: HashMap<String, String>,
         http: reqwest::Client,
     ) -> Result<Self> {
@@ -90,7 +91,7 @@ impl Provider for OpenaiResponsesProvider {
         let resp = self
             .http
             .get(&url)
-            .bearer_auth(&self.api_key)
+            .bearer_auth(self.api_key.expose_secret())
             .header("accept", "application/json")
             .send()
             .await
@@ -145,7 +146,7 @@ impl Provider for OpenaiResponsesProvider {
         let resp = self
             .http
             .post(self.responses_url())
-            .bearer_auth(&self.api_key)
+            .bearer_auth(self.api_key.expose_secret())
             .header("content-type", "application/json")
             .json(&responses_req)
             .send()
@@ -179,7 +180,7 @@ impl Provider for OpenaiResponsesProvider {
         let resp = self
             .http
             .post(self.responses_url())
-            .bearer_auth(&self.api_key)
+            .bearer_auth(self.api_key.expose_secret())
             .header("content-type", "application/json")
             .json(&responses_req)
             .send()
@@ -352,6 +353,7 @@ fn event_name(ev: &StreamEvent) -> &'static str {
 mod tests {
     use super::*;
     use crate::expect_variant;
+    use crate::secrets::secret_string;
     use futures_util::{stream, StreamExt};
     use serde_json::json;
     use serde_json::Value;
@@ -403,7 +405,7 @@ mod tests {
         let provider = OpenaiResponsesProvider::new(
             "test".to_string(),
             format!("{}/v1/", server.uri()),
-            "test-key".to_string(),
+            secret_string("test-key"),
             configured_rewrite,
             reqwest::Client::new(),
         )
@@ -438,7 +440,7 @@ mod tests {
         let provider = OpenaiResponsesProvider::new(
             "test".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             reqwest::Client::new(),
         )
@@ -479,7 +481,7 @@ mod tests {
         let provider = OpenaiResponsesProvider::new(
             "test".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             reqwest::Client::new(),
         )
@@ -516,7 +518,7 @@ mod tests {
         let provider = OpenaiResponsesProvider::new(
             "test".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             reqwest::Client::new(),
         )
@@ -570,7 +572,7 @@ mod tests {
         OpenaiResponsesProvider::new(
             "p".to_string(),
             "https://x/v1/".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             rewrite,
             reqwest::Client::new(),
         )
@@ -625,7 +627,7 @@ mod tests {
         let p = OpenaiResponsesProvider::new(
             "p".to_string(),
             "https://example.test/v1/".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             HashMap::new(),
             reqwest::Client::new(),
         )
@@ -638,7 +640,7 @@ mod tests {
         let p = OpenaiResponsesProvider::new(
             "p".to_string(),
             "https://example.test/v1///".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             HashMap::new(),
             reqwest::Client::new(),
         )
@@ -670,7 +672,7 @@ mod tests {
         let provider = OpenaiResponsesProvider::new(
             "p".to_string(),
             server.uri(),
-            "k".to_string(),
+            secret_string("k"),
             configured,
             reqwest::Client::new(),
         )
@@ -708,7 +710,7 @@ mod tests {
         let provider = OpenaiResponsesProvider::new(
             "p".to_string(),
             format!("{}/v1/", server.uri()),
-            "secret-key-xyz".to_string(),
+            secret_string("secret-key-xyz"),
             HashMap::new(),
             reqwest::Client::new(),
         )
@@ -737,7 +739,7 @@ mod tests {
         let provider = OpenaiResponsesProvider::new(
             "p".to_string(),
             server.uri(),
-            "k".to_string(),
+            secret_string("k"),
             HashMap::new(),
             reqwest::Client::new(),
         )
@@ -762,7 +764,7 @@ mod tests {
         let provider = OpenaiResponsesProvider::new(
             "p".to_string(),
             server.uri(),
-            "k".to_string(),
+            secret_string("k"),
             HashMap::new(),
             reqwest::Client::new(),
         )
@@ -797,7 +799,7 @@ mod tests {
         let provider = OpenaiResponsesProvider::new(
             "p".to_string(),
             server.uri(),
-            "k".to_string(),
+            secret_string("k"),
             HashMap::new(),
             reqwest::Client::new(),
         )
@@ -839,7 +841,7 @@ mod tests {
         let provider = OpenaiResponsesProvider::new(
             "p".to_string(),
             format!("{}/v1/", server.uri()),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             reqwest::Client::new(),
         )
@@ -871,7 +873,7 @@ mod tests {
         let provider = OpenaiResponsesProvider::new(
             "p".to_string(),
             format!("{}/v1/", server.uri()),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             reqwest::Client::new(),
         )
@@ -905,7 +907,7 @@ mod tests {
         let provider = OpenaiResponsesProvider::new(
             "p".to_string(),
             format!("{}/v1/", server.uri()),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             reqwest::Client::new(),
         )
@@ -938,7 +940,7 @@ mod tests {
         let provider = OpenaiResponsesProvider::new(
             "p".to_string(),
             format!("{}/v1/", server.uri()),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             reqwest::Client::new(),
         )
@@ -1332,7 +1334,7 @@ mod tests {
         let provider = OpenaiResponsesProvider::new(
             "test".to_string(),
             server.uri(),
-            "test-key".to_string(),
+            secret_string("test-key"),
             HashMap::new(),
             reqwest::Client::new(),
         )
@@ -1370,7 +1372,7 @@ mod tests {
         let provider = OpenaiResponsesProvider::new(
             "test".to_string(),
             server.uri(),
-            "test-key".to_string(),
+            secret_string("test-key"),
             HashMap::new(),
             reqwest::Client::new(),
         )
@@ -1391,8 +1393,8 @@ mod tests {
         // request would leak into whichever test reuses the port.
         let provider = OpenaiResponsesProvider::new(
             "test".to_string(),
-"http://127.0.0.1:1".to_string(),
-            "test-key".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            secret_string("test-key"),
             HashMap::new(),
             reqwest::Client::new(),
         )
@@ -1414,7 +1416,7 @@ mod tests {
         let provider = OpenaiResponsesProvider::new(
             "test".to_string(),
             server.uri(),
-            "test-key".to_string(),
+            secret_string("test-key"),
             HashMap::new(),
             reqwest::Client::new(),
         )
@@ -1438,7 +1440,7 @@ mod tests {
         let provider = OpenaiResponsesProvider::new(
             "test".to_string(),
             server.uri(),
-            "test-key".to_string(),
+            secret_string("test-key"),
             HashMap::new(),
             reqwest::Client::new(),
         )

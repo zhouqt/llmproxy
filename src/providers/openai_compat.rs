@@ -14,6 +14,7 @@ use std::task::{Context, Poll};
 use async_trait::async_trait;
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::Stream;
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::{json, Value};
 
 use crate::anthropic::{MessagesRequest, StreamEvent};
@@ -25,7 +26,7 @@ use crate::providers::{Provider, ProviderOutput};
 pub struct OpenAiCompatProvider {
     name: String,
     api_base: String,
-    api_key: String,
+    api_key: SecretString,
     model_rewrite: HashMap<String, String>,
     /// 要排除的 OpenRouter 后端提供商 slug 列表。
     /// 非空 + `is_openrouter == true` 时，注入 `provider: {ignore: [...]}`
@@ -62,7 +63,7 @@ impl OpenAiCompatProvider {
     pub fn new(
         name: String,
         api_base: String,
-        api_key: String,
+        api_key: SecretString,
         model_rewrite: HashMap<String, String>,
         provider_ignore: Vec<String>,
         // Placed immediately after `provider_ignore` (both `Vec<String>`,
@@ -171,7 +172,7 @@ impl OpenAiCompatProvider {
     fn new_for_test(
         name: String,
         api_base: String,
-        api_key: String,
+        api_key: SecretString,
         model_rewrite: HashMap<String, String>,
         provider_ignore: Vec<String>,
         provider_allow: Vec<String>,
@@ -345,7 +346,7 @@ impl Provider for OpenAiCompatProvider {
         let resp = self
             .http
             .get(&url)
-            .bearer_auth(&self.api_key)
+            .bearer_auth(self.api_key.expose_secret())
             .header("accept", "application/json")
             .send()
             .await
@@ -419,7 +420,7 @@ impl Provider for OpenAiCompatProvider {
             let resp = self
                 .http
                 .post(self.chat_url())
-                .bearer_auth(&self.api_key)
+                .bearer_auth(self.api_key.expose_secret())
                 .header("content-type", "application/json")
                 .json(&openai_req)
                 .send()
@@ -531,7 +532,7 @@ impl Provider for OpenAiCompatProvider {
             let resp = self
                 .http
                 .post(self.chat_url())
-                .bearer_auth(&self.api_key)
+                .bearer_auth(self.api_key.expose_secret())
                 .header("content-type", "application/json")
                 .json(&openai_req)
                 .send()
@@ -759,6 +760,7 @@ mod tests {
     use super::*;
     use crate::expect_variant;
     use crate::openai::{ChatTool, FunctionCall, FunctionDef, ToolCall, UserContent};
+    use crate::secrets::secret_string;
     use futures_util::{stream, StreamExt};
     use serde_json::json;
     use wiremock::matchers::{body_partial_json, header, method, path};
@@ -819,7 +821,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "test".to_string(),
             format!("{}/v1/", server.uri()),
-            "test-key".to_string(),
+            secret_string("test-key"),
             configured_rewrite,
             Vec::new(),
             Vec::new(),
@@ -858,7 +860,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "test".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -904,7 +906,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "test".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -949,7 +951,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "test".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -1040,7 +1042,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "test".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -1108,7 +1110,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "test".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -1318,7 +1320,7 @@ mod tests {
         OpenAiCompatProvider::new(
             "p".to_string(),
             "https://x/v1/".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             rewrite,
             Vec::new(),
             Vec::new(),
@@ -1400,7 +1402,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "p".to_string(),
             format!("{}/v1/", server.uri()),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -1436,7 +1438,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "p".to_string(),
             format!("{}/v1/", server.uri()),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -1474,7 +1476,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "p".to_string(),
             format!("{}/v1/", server.uri()),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -1511,7 +1513,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "p".to_string(),
             format!("{}/v1/", server.uri()),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -1625,7 +1627,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "test".to_string(),
             server.uri(),
-            "test-key".to_string(),
+            secret_string("test-key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -1667,7 +1669,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "test".to_string(),
             server.uri(),
-            "test-key".to_string(),
+            secret_string("test-key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -1692,8 +1694,8 @@ mod tests {
         // request would leak into whichever test reuses the port.
         let provider = OpenAiCompatProvider::new(
             "test".to_string(),
-"http://127.0.0.1:1".to_string(),
-            "test-key".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            secret_string("test-key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -1719,7 +1721,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "test".to_string(),
             server.uri(),
-            "test-key".to_string(),
+            secret_string("test-key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -1747,7 +1749,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "test".to_string(),
             server.uri(),
-            "test-key".to_string(),
+            secret_string("test-key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -1987,7 +1989,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "p".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -2069,7 +2071,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "p".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -2128,7 +2130,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "p".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -2170,7 +2172,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "p".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -2214,7 +2216,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "p".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             rewrite,
             Vec::new(),
             Vec::new(),
@@ -2481,7 +2483,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "p".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -2551,7 +2553,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "p".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -2605,7 +2607,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "p".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -2660,7 +2662,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "p".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -2745,7 +2747,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "p".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -2817,7 +2819,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "p".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -2868,7 +2870,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "p".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -2916,7 +2918,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new_for_test(
             "p".to_string(),
             format!("{}/v1/", server.uri()),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             vec!["Azure".to_string()],
             Vec::new(),
@@ -2950,7 +2952,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new_for_test(
             "deepseek-proxy".to_string(),
             format!("{}/v1/", server.uri()),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -2993,7 +2995,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new_for_test(
             "deepseek-proxy".to_string(),
             format!("{}/v1/", server.uri()),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             vec!["Azure".to_string()],
             Vec::new(), // non-empty list
@@ -3026,7 +3028,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new_for_test(
             "p".to_string(),
             format!("{}/v1/", server.uri()),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -3075,7 +3077,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new_for_test(
             "p".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             vec!["Azure".to_string()],
             Vec::new(),
@@ -3148,7 +3150,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new_for_test(
             "p".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             vec!["Azure".to_string()],
             Vec::new(),
@@ -3212,7 +3214,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new_for_test(
             "p".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             vec!["Azure".to_string(), "Together".to_string()],
             Vec::new(),
@@ -3247,7 +3249,7 @@ mod tests {
         let p = OpenAiCompatProvider::new(
             "p".to_string(),
             "https://openrouter.ai/api/v1".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             HashMap::new(),
             vec!["Azure".to_string()],
             Vec::new(),
@@ -3296,7 +3298,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new_for_test(
             "p".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             vec!["DeepInfra".to_string()],
@@ -3337,7 +3339,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new_for_test(
             "p".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             vec!["Azure".to_string()],
             vec!["DeepInfra".to_string(), "Together".to_string()],
@@ -3397,7 +3399,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new_for_test(
             "p".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             allow.clone(),
@@ -3450,7 +3452,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new_for_test(
             "p".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             vec!["Azure".to_string()],
             Vec::new(),
@@ -3490,7 +3492,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new_for_test(
             "p".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -3524,7 +3526,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new_for_test(
             "p".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             vec!["DeepInfra".to_string()],
@@ -3570,7 +3572,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new_for_test(
             "p".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             vec!["DeepInfra".to_string(), "Together".to_string()],
@@ -3629,7 +3631,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new_for_test(
             "p".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             vec!["DeepInfra".to_string()],
@@ -3686,7 +3688,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new_for_test(
             "p".to_string(),
             server.uri(),
-            "key".to_string(),
+            secret_string("key"),
             HashMap::new(),
             Vec::new(),
             vec!["DeepInfra".to_string()],
@@ -3718,7 +3720,7 @@ mod tests {
         let p = OpenAiCompatProvider::new_for_test(
             "p".to_string(),
             "https://example.test/v1".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             HashMap::new(),
             vec!["Azure".to_string()],
             vec!["DeepInfra".to_string()],
@@ -3738,7 +3740,7 @@ mod tests {
         let p = OpenAiCompatProvider::new_for_test(
             "p".to_string(),
             "https://example.test/v1".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             HashMap::new(),
             Vec::new(),
             vec!["DeepInfra".to_string()],
@@ -3755,7 +3757,7 @@ mod tests {
         let p = OpenAiCompatProvider::new_for_test(
             "p".to_string(),
             "https://example.test/v1".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -3775,7 +3777,7 @@ mod tests {
         let p = OpenAiCompatProvider::new_for_test(
             "p".to_string(),
             "https://example.test/v1".to_string(),
-            "k".to_string(),
+            secret_string("k"),
             HashMap::new(),
             Vec::new(),
             vec!["DeepInfra".to_string()],
@@ -3880,7 +3882,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "opencode_zen".to_string(),
             format!("{}/v1/", server.uri()),
-            "test-key".to_string(),
+            secret_string("test-key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -3921,7 +3923,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "opencode_zen".to_string(),
             format!("{}/v1/", server.uri()),
-            "test-key".to_string(),
+            secret_string("test-key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -3997,7 +3999,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "deepseek".to_string(),
             format!("{}/v1/", server.uri()),
-            "test-key".to_string(),
+            secret_string("test-key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
@@ -4045,7 +4047,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(
             "opencode_zen".to_string(),
             format!("{}/v1/", server.uri()),
-            "test-key".to_string(),
+            secret_string("test-key"),
             HashMap::new(),
             Vec::new(),
             Vec::new(),
