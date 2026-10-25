@@ -224,6 +224,47 @@ reused.
 Rotating a leaked LLM key takes about a minute and is almost always a
 better first response than investigating how it leaked.
 
+## Encrypting the token store
+
+The sealed `.env` protects the *provider* keys, but the Copilot OAuth
+token does not live there: it is written to
+`github_token.json` inside the `llmproxy-data` named volume, which sits
+on the **unencrypted** host disk. So the volume still holds a live
+GitHub access token and a live Copilot API token in the clear.
+
+Close that half of the story with `token_store_key`:
+
+```bash
+# 1. Generate a key and put it in the plaintext .env next to the others.
+openssl rand -hex 32
+# -> 64 hex characters, e.g. 9f2c...  (32 bytes)
+
+# 2. Add it to the source .env, then re-seal:
+#      LLMPROXY_TOKEN_STORE_KEY=<64 hex chars>
+./deploy/seal.sh /path/to/plaintext.env deploy/secrets/seal
+
+# 3. Point the provider at it in config.yaml:
+#      providers:
+#        - name: copilot
+#          type: github_copilot
+#          token_store_key: "${LLMPROXY_TOKEN_STORE_KEY}"
+
+# 4. Recreate the container so it re-unseals and re-encrypts.
+podman-compose up -d --force-recreate llmproxy
+```
+
+From then on the volume holds only ciphertext: the store is sealed with
+AES-256-GCM under that key, with a fresh nonce per write. A store
+written *before* the key was configured is still read as-is (plaintext
+is accepted on load) and is rewritten encrypted on the next successful
+authentication.
+
+**Back up the key in the same password manager as the `.env` backup.**
+Losing it means losing the stored tokens — which costs one device-flow
+re-authentication (`POST /admin/copilot/auth`), nothing more. The
+proxy never fails to start over a missing key: an encrypted store with
+no configured key is treated as empty, with a warning in the log.
+
 ## Fallback mode
 
 Fill `deploy/secrets/llmproxy.env` and recreate the container; the

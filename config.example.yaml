@@ -174,6 +174,20 @@ providers:
   #   account_type   — "individual" | "business" | "enterprise".
   #                    Determines which Copilot SKU the proxy targets.
   #                    Default: "individual".
+  #   token_store_key — optional. Encrypts the on-disk token store
+  #                    (github_token.json) with AES-256-GCM, so the
+  #                    volume holding it never contains a plaintext
+  #                    GitHub/Copilot token. Value format: 64 hex
+  #                    characters = 32 bytes, e.g.
+  #                    `openssl rand -hex 32`. Deliver it through the
+  #                    sealed .env like every other secret:
+  #                      token_store_key: "${LLMPROXY_TOKEN_STORE_KEY}"
+  #                    Unset (default) → the store is written as
+  #                    plaintext JSON, exactly as before. A plaintext
+  #                    store stays readable after the key is added —
+  #                    the next save rewrites it encrypted. An empty
+  #                    value is rejected at startup (it is a ${VAR}
+  #                    pointing at a missing secret, not "no key").
   #   model_rewrite  — optional map: incoming-model-name → upstream-model-name.
   #                    Empty (default) accepts any model name verbatim —
   #                    the proxy forwards the Anthropic `model` value as-is
@@ -187,6 +201,7 @@ providers:
     type: github_copilot
     vscode_version: "1.95.0"
     account_type: individual
+    # token_store_key: "${LLMPROXY_TOKEN_STORE_KEY}"
     model_rewrite: {}
     use_proxy: true
 
