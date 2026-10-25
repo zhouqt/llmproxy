@@ -1,0 +1,69 @@
+name: security-audit
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+  pull_request:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+  schedule:
+    # Weekly, Monday 03:17 UTC. The advisory DB changes with NO repo change,
+    # so the schedule is the trigger that actually catches new CVEs.
+    # (GitHub only runs scheduled workflows from the default branch.)
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write   # push/PR: create the failing status check
+      issues: write   # schedule: one issue per newly-found advisory
+    steps:
+      - uses: actions/checkout@v4
+
+      # `rustsec/audit-check` v2 wraps `cargo-audit` against the same RustSec
+      # advisory DB the local audit uses. It is a node24 action and needs no
+      # `cargo install` step. Inputs: `token` (required), `ignore`
+      # (comma-separated advisory IDs), `working-directory` (default `.`).
+      #
+      # Failure semantics: on push/PR it fails the status check when
+      # *vulnerabilities* are found. Informational advisories (unmaintained /
+      # unsound) do NOT affect the status -- that is exactly the two accepted
+      # warnings in plans/security-audit-2026-10-25.md L1 (unsafe-libyaml,
+      # RUSTSEC-2024-0449) and L9 (tokio, RUSTSEC-2026-0386). If a run ever
+      # fails on those two alone, uncomment:
+      #
+      #   ignore: RUSTSEC-2024-0449,RUSTSEC-2026-0386
+      #
+      # Never add a *vulnerability*-class ID to `ignore` without the same
+      # written rationale in the audit plan.
+      #
+      # On scheduled runs the action files issues instead of failing, so a
+      # cron run cannot go red. That is why the job needs `issues: write`;
+      # drop it only if you also drop the schedule trigger.
+      #
+      # Fork PRs: the action cannot create checks with the read-only fork
+      # token and falls back to printing findings to stdout. Acceptable here
+      # (we are the only merger) -- do not mark this job required in branch
+      # protection expecting fork-PR coverage.
+      #
+      # `Cargo.lock` is scanned as-is, including optional dependencies that
+      # are not compiled in (quinn-proto today). Policy: update them anyway
+      # (Phase 1 did) rather than maintaining an ignore list for unreachable
+      # code.
+      #
+      # Action versions are tag-pinned (`@v4`, `@v2.0.0`). SHA-pinning is
+      # audit finding L10, deferred; convert these two when L10 lands.
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
