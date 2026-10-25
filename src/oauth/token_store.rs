@@ -12,9 +12,11 @@ use crate::oauth::token_crypto::{open, parse_key, seal, TokenEnvelope};
 ///
 /// The two token fields are **plaintext `String`s on purpose**: they are
 /// the on-disk representation, and `write_atomic` has to persist the real
-/// bytes. `secrecy::SecretString` is therefore *not* usable here — its
-/// `Serialize` impl emits `"[REDACTED]"`, which would corrupt the
-/// persisted file (see the audit note in
+/// bytes. `secrecy::SecretString` is therefore *not* usable here — it
+/// has no `Serialize` impl at all (secrecy gates `Serialize` behind an
+/// opt-in marker trait that `str` cannot implement), so persisting a
+/// secret would require hand-writing a serializer that emits the real
+/// bytes anyway (see the audit note in
 /// plans/fix-security-audit-2026-10-25.md, phase 2).
 ///
 /// What we seal instead is the *log face*: `Debug` is hand-written below

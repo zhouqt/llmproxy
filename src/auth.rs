@@ -18,7 +18,7 @@ pub async fn require_auth(
         .server
         .api_key
         .as_ref()
-        .map(|k| k.expose_secret().as_str())
+        .map(|k| k.expose_secret())
     else {
         // No api_key configured → auth disabled.
         return next.run(req).await;

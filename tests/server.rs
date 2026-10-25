@@ -32,7 +32,10 @@ use llmproxy::usage::{Outcome, UsageRecord, UsageStats};
 // compiles the lib without `cfg(test)` for `tests/*.rs` binaries), so
 // integration tests must install their own. See
 // `src/tracing_capture.rs` for the full rationale.
-#[ctor::ctor]
+// ctor 1.0 requires the `unsafe` marker on every `#[ctor]` item: the
+// constructor runs before `main`, outside the usual Rust
+// initialization guarantees.
+#[ctor::ctor(unsafe)]
 fn __install_benign_tracing_default_for_integration_tests() {
     let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
 }

@@ -4,10 +4,10 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-axum = { version = "0.7", features = ["macros", "json"] }
+axum = { version = "0.8", features = ["macros", "json"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.7", features = ["trace"] }
 
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks", "gzip"] }
 
@@ -31,14 +31,21 @@ memchr = "2"
 # API keys are held in `SecretString` so that a `{:?}` of any config or
 # provider never prints them. See plans/feat-vault-secret-backend.md
 # (A-Phase 5).
-secrecy = { version = "0.8", features = ["serde"] }
+#
+# secrecy 0.10 reshaped the crate: `Secret<T>` is gone, `SecretString` is
+# now `SecretBox<str>` (heap-allocated, `Zeroize`d on drop). The wire
+# behaviour we depend on is unchanged: `SecretString` still does NOT
+# implement `Serialize` (0.10 gates it behind an opt-in marker trait,
+# `SerializableSecret`, that `str` cannot implement), so the redaction
+# helpers in `src/config.rs` stay mandatory.
+secrecy = { version = "0.10", features = ["serde"] }
 
 # AES-256-GCM envelope encryption for the on-disk Copilot token store.
 # `ring` was already in the tree as a rustls dependency; it is now a
 # direct dependency too. `base64` encodes the envelope's nonce and
 # ciphertext.
 ring = "0.17"
-base64 = "0.22"
+base64 = "0.23"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -53,7 +60,11 @@ http-body-util = "0.1"
 # subscriber at process start so tests don't fight over the global
 # subscriber slot (see `src/tracing_capture.rs` for the callsite
 # Interest cache rationale).
-ctor = "0.2"
+#
+# ctor 1.0 requires every `#[ctor]` item to be marked unsafe: the
+# constructor runs before `main`, where the usual Rust initialization
+# guarantees don't hold. `#[ctor::ctor(unsafe)]` is that marker.
+ctor = "1.0"
 
 [profile.release]
 opt-level = 3

@@ -10,9 +10,15 @@ use crate::usage::DEFAULT_USAGE_CAPACITY;
 
 /// Placeholder written instead of a credential whenever a config is
 /// serialized. `secrecy` deliberately does not implement `Serialize`
-/// for `Secret<String>` (it would be an exfiltration channel), so the
+/// for `SecretString` (it would be an exfiltration channel), so the
 /// redaction has to happen here — a serialized config is meant for
 /// inspection, never for reuse.
+///
+/// Since secrecy 0.10 the reason is stricter, not looser: `Serialize`
+/// is only implemented for `SecretBox<T>` where `T` opts in via the
+/// crate's `SerializableSecret` marker trait. `str` is a foreign type
+/// and cannot implement that marker, so `SecretString` stays
+/// non-serializable by construction.
 const REDACTED: &str = "[REDACTED]";
 
 /// Serialize a credential as [`REDACTED`].
@@ -1723,7 +1729,7 @@ models:
 
     fn api_key_of(cfg: &Config) -> String {
         match &cfg.providers[0] {
-            ProviderConfig::OpenaiCompat { api_key, .. } => api_key.expose_secret().clone(),
+            ProviderConfig::OpenaiCompat { api_key, .. } => api_key.expose_secret().to_string(),
             other => panic!("expected an openai_compat provider, got {other:?}"),
         }
     }
@@ -2039,7 +2045,7 @@ models:
                 .server
                 .api_key
                 .as_ref()
-                .map(|k| k.expose_secret().as_str()),
+                .map(|k| k.expose_secret()),
             Some("[REDACTED]")
         );
     }
