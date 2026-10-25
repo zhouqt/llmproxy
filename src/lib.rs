@@ -56,8 +56,11 @@ macro_rules! expect_variant {
 /// only; integration tests (`tests/*.rs`) get the lib compiled without
 /// `cfg(test)` and therefore do NOT pull in this ctor — they have
 /// their own at the top of `tests/server.rs`.
+// ctor 1.0 requires the `unsafe` marker on every `#[ctor]` item: the
+// constructor runs before `main`, outside the usual Rust
+// initialization guarantees.
 #[cfg(test)]
-#[ctor::ctor]
+#[ctor::ctor(unsafe)]
 fn __install_benign_tracing_default_for_lib_tests() {
     let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
 }
