@@ -15,7 +15,6 @@
 //!
 //! See fix-R4 in docs/TEST_ISSUES.md.
 
-use axum::async_trait;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{FromRequest, FromRequestParts, Query, Request};
 use axum::http::request::Parts;
@@ -28,7 +27,11 @@ use crate::error::ProxyError;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AppJson<T>(pub T);
 
-#[async_trait]
+// axum 0.8 replaced `#[async_trait]` with return-position `impl Trait`
+// in traits (RPITIT): `FromRequest` / `FromRequestParts` are now plain
+// `async fn` in the trait definition, so the impls below no longer need
+// (and must not use) the `#[async_trait]` attribute — axum 0.8 dropped
+// the `axum::async_trait` re-export entirely.
 impl<S, T> FromRequest<S> for AppJson<T>
 where
     Json<T>: FromRequest<S, Rejection = axum::extract::rejection::JsonRejection>,
@@ -60,7 +63,6 @@ where
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AppQuery<T>(pub T);
 
-#[async_trait]
 impl<S, T> FromRequestParts<S> for AppQuery<T>
 where
     Query<T>: FromRequestParts<S, Rejection = QueryRejection>,
