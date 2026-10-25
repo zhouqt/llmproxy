@@ -1,16 +1,51 @@
 //! Token persistence for GitHub OAuth + Copilot API tokens.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::error::{ProxyError, Result};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Persisted GitHub OAuth + Copilot API tokens.
+///
+/// The two token fields are **plaintext `String`s on purpose**: they are
+/// the on-disk representation, and `write_atomic` has to persist the real
+/// bytes. `secrecy::SecretString` is therefore *not* usable here — its
+/// `Serialize` impl emits `"[REDACTED]"`, which would corrupt the
+/// persisted file (see the audit note in
+/// plans/fix-security-audit-2026-10-25.md, phase 2).
+///
+/// What we seal instead is the *log face*: `Debug` is hand-written below
+/// so that a `{:?}` of anything holding tokens can never print them.
+/// Every other credential in the codebase lives in a `SecretString`; this
+/// is the one place where the secret has to exist in the clear, so the
+/// Debug impl is the invariant's enforcement point.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StoredTokens {
     pub github_access_token: String,
     pub copilot_token: String,
     pub copilot_expires_at: i64,
     pub refresh_in: i64,
+}
+
+impl fmt::Debug for StoredTokens {
+    /// Prints every field redacted. The token fields report their byte
+    /// length only — length is not secret and is useful when debugging a
+    /// truncated/rotated token.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StoredTokens")
+            .field(
+                "github_access_token",
+                &format_args!("[REDACTED {} bytes]", self.github_access_token.len()),
+            )
+            .field(
+                "copilot_token",
+                &format_args!("[REDACTED {} bytes]", self.copilot_token.len()),
+            )
+            .field("copilot_expires_at", &"[REDACTED]")
+            .field("refresh_in", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl StoredTokens {
@@ -248,6 +283,33 @@ mod tests {
     fn load_missing_file_returns_none() {
         let (_dir, store) = fresh_store();
         assert!(store.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn debug_never_contains_token() {
+        // The Debug impl is the only thing standing between a `{:?}` in a
+        // log line and a live GitHub/Copilot credential.
+        let tokens = StoredTokens {
+            github_access_token: "gh-secret-sentinel".into(),
+            copilot_token: "copilot-secret-sentinel".into(),
+            copilot_expires_at: 1234567890,
+            refresh_in: 1500,
+        };
+
+        let dumped = format!("{:?}", tokens);
+
+        assert!(!dumped.contains("gh-secret-sentinel"), "{dumped}");
+        assert!(!dumped.contains("copilot-secret-sentinel"), "{dumped}");
+        assert!(dumped.contains("[REDACTED"), "{dumped}");
+        // The byte length is not a secret and helps debug a truncated token.
+        assert!(
+            dumped.contains(&format!("[REDACTED {} bytes]", tokens.github_access_token.len())),
+            "{dumped}"
+        );
+        assert!(
+            dumped.contains(&format!("[REDACTED {} bytes]", tokens.copilot_token.len())),
+            "{dumped}"
+        );
     }
 
     #[test]
