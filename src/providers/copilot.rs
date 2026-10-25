@@ -859,12 +859,17 @@ impl CopilotProvider {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
+            // Sanitize the body before it reaches a log line or an error
+            // string: the raw text may be a multi-KB HTML error page with
+            // inline styles, image refs and links. Same treatment as the
+            // token-fetch path above.
+            let hint = crate::util::summarize_for_log(&text, "<empty body>");
             let code = status.as_u16();
             return Err(match code {
                 401 | 403 => {
                     tracing::warn!(
                         status = code,
-                        body = %text,
+                        body = %hint,
                         "copilot token rejected by /models; clearing cache"
                     );
                     CopilotFetchError::Auth(format!("copilot /models returned {status}"))
@@ -873,7 +878,7 @@ impl CopilotProvider {
                     CopilotFetchError::Transient(format!("copilot /models returned {s}"))
                 }
                 s => CopilotFetchError::Transient(format!(
-                    "copilot /models returned {s}: {text}"
+                    "copilot /models returned {s}: {hint}"
                 )),
             });
         }
