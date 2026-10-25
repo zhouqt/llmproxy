@@ -1,0 +1,28 @@
+version: 2
+
+# Dependency-drift backstop. `security-audit.yml` is the hard gate (fails the
+# check); Dependabot is what actually opens the fix PR. Both read the same
+# RustSec advisories (GitHub's advisory DB ingests RustSec), so the two agree
+# on what is vulnerable.
+#
+# The `cargo` entry groups every bump into one weekly PR instead of a dozen;
+# `github-actions` keeps the workflow actions from rotting.
+#
+# Manual step this file CANNOT do (repo admin): Settings -> Code security ->
+# enable "Dependabot alerts" and "Dependabot security updates". This config
+# only controls *version* update PRs; security alerts are a repo setting.
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      rust-dependencies:
+        patterns: ["*"]
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"

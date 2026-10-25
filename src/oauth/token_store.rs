@@ -1,16 +1,53 @@
 //! Token persistence for GitHub OAuth + Copilot API tokens.
 
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::error::{ProxyError, Result};
+use crate::oauth::token_crypto::{open, parse_key, seal, TokenEnvelope};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Persisted GitHub OAuth + Copilot API tokens.
+///
+/// The two token fields are **plaintext `String`s on purpose**: they are
+/// the on-disk representation, and `write_atomic` has to persist the real
+/// bytes. `secrecy::SecretString` is therefore *not* usable here — its
+/// `Serialize` impl emits `"[REDACTED]"`, which would corrupt the
+/// persisted file (see the audit note in
+/// plans/fix-security-audit-2026-10-25.md, phase 2).
+///
+/// What we seal instead is the *log face*: `Debug` is hand-written below
+/// so that a `{:?}` of anything holding tokens can never print them.
+/// Every other credential in the codebase lives in a `SecretString`; this
+/// is the one place where the secret has to exist in the clear, so the
+/// Debug impl is the invariant's enforcement point.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StoredTokens {
     pub github_access_token: String,
     pub copilot_token: String,
     pub copilot_expires_at: i64,
     pub refresh_in: i64,
+}
+
+impl fmt::Debug for StoredTokens {
+    /// Prints every field redacted. The token fields report their byte
+    /// length only — length is not secret and is useful when debugging a
+    /// truncated/rotated token.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StoredTokens")
+            .field(
+                "github_access_token",
+                &format_args!("[REDACTED {} bytes]", self.github_access_token.len()),
+            )
+            .field(
+                "copilot_token",
+                &format_args!("[REDACTED {} bytes]", self.copilot_token.len()),
+            )
+            .field("copilot_expires_at", &"[REDACTED]")
+            .field("refresh_in", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl StoredTokens {
@@ -48,17 +85,104 @@ impl TokenStore {
         Self { path }
     }
 
-    pub fn load(&self) -> Result<Option<StoredTokens>> {
+    /// Load the stored tokens.
+    ///
+    /// `key` is the provider's `token_store_key` — `None` means the
+    /// operator did not configure one and the store is (or should be)
+    /// plaintext.
+    ///
+    /// Three shapes are recognized, in this order:
+    ///
+    /// 1. **Plaintext** — the body parses as [`StoredTokens`]. It is
+    ///    returned as-is, *regardless of `key`*. This is the migration
+    ///    path: an existing plaintext store keeps working, and the next
+    ///    `save` rewrites it encrypted.
+    /// 2. **Envelope** — the body parses as a [`TokenEnvelope`] carrying
+    ///    our magic string. Decrypting it requires `key`:
+    ///    * `None` → warn and return `Ok(None)`. A device-flow re-auth
+    ///      beats bricking the process; the operator can fix the key
+    ///      and the next load succeeds.
+    ///    * `Some` → decrypt. A failure (wrong key, tampered file) also
+    ///      warns and returns `Ok(None)` — we deliberately do **not**
+    ///      delete the file, so the next successful authentication can
+    ///      overwrite it. This mirrors the existing 401/403
+    ///      clears-the-store behavior.
+    /// 3. **Neither** → the historical corrupt-file handling: the
+    ///    original parse error propagates and callers treat it as "no
+    ///    tokens".
+    pub fn load(&self, key: Option<&SecretString>) -> Result<Option<StoredTokens>> {
         if !self.path.exists() {
             return Ok(None);
         }
         let raw = std::fs::read_to_string(&self.path)?;
-        let parsed: StoredTokens = serde_json::from_str(&raw)?;
-        Ok(Some(parsed))
+
+        // (1) Legacy plaintext store.
+        if let Ok(tokens) = serde_json::from_str::<StoredTokens>(&raw) {
+            return Ok(Some(tokens));
+        }
+
+        // (2) Encrypted store.
+        if let Ok(envelope) = serde_json::from_str::<TokenEnvelope>(&raw) {
+            if envelope.is_ours() {
+                return self.load_encrypted(&envelope, key);
+            }
+        }
+
+        // (3) Neither — keep the historical corrupt-file behavior and
+        // surface the original parse error.
+        Err(ProxyError::Json(
+            serde_json::from_str::<StoredTokens>(&raw).unwrap_err(),
+        ))
     }
 
-    pub fn save(&self, tokens: &StoredTokens) -> Result<()> {
-        let raw = serde_json::to_string_pretty(tokens)?;
+    /// Decrypt an envelope. Never fails hard: a missing or wrong key
+    /// degrades to "no tokens" with a warning, because bricking the
+    /// proxy is worse than asking the operator to re-authenticate.
+    fn load_encrypted(
+        &self,
+        envelope: &TokenEnvelope,
+        key: Option<&SecretString>,
+    ) -> Result<Option<StoredTokens>> {
+        let Some(key) = key else {
+            tracing::warn!(
+                path = %self.path.display(),
+                "token store is encrypted but provider.token_store_key is not configured; \
+                 treating it as empty (re-authenticate via /admin/copilot/auth)"
+            );
+            return Ok(None);
+        };
+        let key_bytes = parse_key(key.expose_secret()).map_err(ProxyError::Config)?;
+        match open(&key_bytes, envelope) {
+            Ok(plain) => Ok(Some(serde_json::from_slice(&plain)?)),
+            Err(e) => {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    error = %e,
+                    "failed to decrypt the token store; treating it as empty \
+                     (the next successful authentication overwrites it)"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Persist the tokens.
+    ///
+    /// With a `key` the tokens are sealed into an AES-256-GCM envelope
+    /// (see [`crate::oauth::token_crypto`]); without one they are
+    /// written as plaintext JSON exactly as before. The file permissions
+    /// and atomicity are unchanged either way — `write_atomic` still
+    /// creates the file 0600 and renames it into place.
+    pub fn save(&self, tokens: &StoredTokens, key: Option<&SecretString>) -> Result<()> {
+        let raw = match key {
+            None => serde_json::to_string_pretty(tokens)?,
+            Some(key) => {
+                let key_bytes = parse_key(key.expose_secret()).map_err(ProxyError::Config)?;
+                let plaintext = serde_json::to_vec(tokens)?;
+                let envelope = seal(&key_bytes, &plaintext)?;
+                serde_json::to_string_pretty(&envelope)?
+            }
+        };
         write_atomic(&self.path, raw.as_bytes())?;
         Ok(())
     }
@@ -135,7 +259,7 @@ mod tests_extra {
             copilot_expires_at: 0,
             refresh_in: 1,
         };
-        store.save(&tokens).unwrap();
+        store.save(&tokens, None).unwrap();
         assert!(store.path().exists());
 
         store.clear().unwrap();
@@ -226,7 +350,7 @@ mod tests {
     #[test]
     fn round_trip_save_load() {
         let (_dir, store) = fresh_store();
-        assert!(store.load().unwrap().is_none());
+        assert!(store.load(None).unwrap().is_none());
 
         let tokens = StoredTokens {
             github_access_token: "gh-xxx".into(),
@@ -234,20 +358,50 @@ mod tests {
             copilot_expires_at: 1234567890,
             refresh_in: 1500,
         };
-        store.save(&tokens).unwrap();
-        let loaded = store.load().unwrap().expect("file should exist");
+        store.save(&tokens, None).unwrap();
+        let loaded = store.load(None).unwrap().expect("file should exist");
         assert_eq!(loaded.github_access_token, "gh-xxx");
         assert_eq!(loaded.copilot_token, "co-yyy");
         assert_eq!(loaded.copilot_expires_at, 1234567890);
 
         store.clear().unwrap();
-        assert!(store.load().unwrap().is_none());
+        assert!(store.load(None).unwrap().is_none());
     }
 
     #[test]
     fn load_missing_file_returns_none() {
         let (_dir, store) = fresh_store();
-        assert!(store.load().unwrap().is_none());
+        assert!(store.load(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn debug_never_contains_token() {
+        // The Debug impl is the only thing standing between a `{:?}` in a
+        // log line and a live GitHub/Copilot credential.
+        let tokens = StoredTokens {
+            github_access_token: "gh-secret-sentinel".into(),
+            copilot_token: "copilot-secret-sentinel".into(),
+            copilot_expires_at: 1234567890,
+            refresh_in: 1500,
+        };
+
+        let dumped = format!("{:?}", tokens);
+
+        assert!(!dumped.contains("gh-secret-sentinel"), "{dumped}");
+        assert!(!dumped.contains("copilot-secret-sentinel"), "{dumped}");
+        assert!(dumped.contains("[REDACTED"), "{dumped}");
+        // The byte length is not a secret and helps debug a truncated token.
+        assert!(
+            dumped.contains(&format!(
+                "[REDACTED {} bytes]",
+                tokens.github_access_token.len()
+            )),
+            "{dumped}"
+        );
+        assert!(
+            dumped.contains(&format!("[REDACTED {} bytes]", tokens.copilot_token.len())),
+            "{dumped}"
+        );
     }
 
     #[test]
@@ -259,12 +413,178 @@ mod tests {
             copilot_expires_at: 0,
             refresh_in: 1,
         };
-        store.save(&tokens).unwrap();
+        store.save(&tokens, None).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(store.path()).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "expected 0600, got {:o}", mode);
+        }
+    }
+
+    /// Envelope-encryption tests for the token store.
+    ///
+    /// No env vars are touched, so no `EnvGuard` is needed — the store
+    /// is addressed through an explicit path.
+    mod encryption {
+        use super::*;
+        use crate::secrets::secret_string;
+        use crate::tracing_capture::CaptureWriter;
+
+        const KEY_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+        const KEY_B: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+        fn sentinel_tokens() -> StoredTokens {
+            StoredTokens {
+                github_access_token: "gh-plaintext-sentinel".into(),
+                copilot_token: "copilot-plaintext-sentinel".into(),
+                copilot_expires_at: 1234567890,
+                refresh_in: 1500,
+            }
+        }
+
+        #[test]
+        fn encrypted_round_trip_hides_the_tokens_on_disk() {
+            let (_dir, store) = fresh_store();
+            let key = secret_string(KEY_A);
+            let tokens = sentinel_tokens();
+
+            store.save(&tokens, Some(&key)).unwrap();
+
+            let raw = std::fs::read_to_string(store.path()).unwrap();
+            assert!(
+                raw.contains(crate::oauth::token_crypto::ENVELOPE_MAGIC),
+                "{raw}"
+            );
+            assert!(!raw.contains("gh-plaintext-sentinel"), "{raw}");
+            assert!(!raw.contains("copilot-plaintext-sentinel"), "{raw}");
+
+            let loaded = store.load(Some(&key)).unwrap().expect("tokens load back");
+            assert_eq!(loaded.github_access_token, tokens.github_access_token);
+            assert_eq!(loaded.copilot_token, tokens.copilot_token);
+            assert_eq!(loaded.copilot_expires_at, tokens.copilot_expires_at);
+            assert_eq!(loaded.refresh_in, tokens.refresh_in);
+        }
+
+        #[test]
+        fn wrong_key_yields_no_tokens_and_warns() {
+            let (_dir, store) = fresh_store();
+            let key_a = secret_string(KEY_A);
+            let key_b = secret_string(KEY_B);
+            store.save(&sentinel_tokens(), Some(&key_a)).unwrap();
+
+            let writer = CaptureWriter::new();
+            let (loaded, captured) =
+                crate::tracing_capture::capture_tracing(&writer, || store.load(Some(&key_b)));
+
+            assert!(loaded.unwrap().is_none());
+            assert!(
+                captured.contains("failed to decrypt the token store"),
+                "captured = {captured:?}"
+            );
+        }
+
+        #[test]
+        fn encrypted_store_without_a_configured_key_yields_no_tokens_and_warns() {
+            let (_dir, store) = fresh_store();
+            let key = secret_string(KEY_A);
+            store.save(&sentinel_tokens(), Some(&key)).unwrap();
+
+            let writer = CaptureWriter::new();
+            let (loaded, captured) =
+                crate::tracing_capture::capture_tracing(&writer, || store.load(None));
+
+            assert!(loaded.unwrap().is_none());
+            assert!(
+                captured.contains(
+                    "token store is encrypted but provider.token_store_key is not configured"
+                ),
+                "captured = {captured:?}"
+            );
+        }
+
+        #[test]
+        fn plaintext_store_still_loads_when_a_key_is_configured() {
+            // The migration path: an existing plaintext store keeps
+            // working after the operator adds token_store_key, and the
+            // next save rewrites it encrypted.
+            let (_dir, store) = fresh_store();
+            let tokens = sentinel_tokens();
+            store.save(&tokens, None).unwrap();
+
+            let key = secret_string(KEY_A);
+            let loaded = store
+                .load(Some(&key))
+                .unwrap()
+                .expect("plaintext store loads");
+            assert_eq!(loaded.github_access_token, tokens.github_access_token);
+            assert_eq!(loaded.copilot_token, tokens.copilot_token);
+        }
+
+        #[test]
+        fn save_without_a_key_keeps_the_legacy_plaintext_wire() {
+            let (_dir, store) = fresh_store();
+            let tokens = sentinel_tokens();
+
+            store.save(&tokens, None).unwrap();
+
+            let raw = std::fs::read_to_string(store.path()).unwrap();
+            assert!(
+                !raw.contains(crate::oauth::token_crypto::ENVELOPE_MAGIC),
+                "{raw}"
+            );
+            let parsed: StoredTokens = serde_json::from_str(&raw).expect("plaintext StoredTokens");
+            assert_eq!(parsed.github_access_token, tokens.github_access_token);
+        }
+
+        #[test]
+        fn two_saves_with_the_same_key_use_different_nonces() {
+            let (_dir, store) = fresh_store();
+            let key = secret_string(KEY_A);
+            let tokens = sentinel_tokens();
+
+            store.save(&tokens, Some(&key)).unwrap();
+            let first = std::fs::read_to_string(store.path()).unwrap();
+            store.save(&tokens, Some(&key)).unwrap();
+            let second = std::fs::read_to_string(store.path()).unwrap();
+
+            let first_nonce = serde_json::from_str::<TokenEnvelope>(&first).unwrap().nonce;
+            let second_nonce = serde_json::from_str::<TokenEnvelope>(&second)
+                .unwrap()
+                .nonce;
+            assert_ne!(first_nonce, second_nonce);
+        }
+
+        #[test]
+        fn a_corrupt_store_surfaces_the_parse_error() {
+            // Neither plaintext nor an envelope → the historical
+            // corrupt-file behavior: the original parse error propagates.
+            let (_dir, store) = fresh_store();
+            std::fs::write(store.path(), b"{not json at all").unwrap();
+
+            let err = store.load(None).unwrap_err();
+
+            crate::expect_variant!(err, ProxyError::Json(_) => {});
+        }
+
+        #[test]
+        fn an_envelope_with_a_foreign_magic_is_treated_as_corrupt() {
+            // A file that *parses* as an envelope but carries someone
+            // else's magic must not be decrypted — and must not be
+            // silently ignored either. It falls through to the
+            // historical corrupt-file path.
+            let (_dir, store) = fresh_store();
+            let foreign = serde_json::json!({
+                "magic": "some-other-tool-v1",
+                "alg": "A256GCM",
+                "nonce": "",
+                "ct": "",
+            });
+            std::fs::write(store.path(), serde_json::to_vec(&foreign).unwrap()).unwrap();
+
+            let err = store.load(Some(&secret_string(KEY_A))).unwrap_err();
+
+            crate::expect_variant!(err, ProxyError::Json(_) => {});
         }
     }
 
@@ -278,8 +598,8 @@ mod tests {
             refresh_in: 1,
         };
 
-        store.save(&tokens).unwrap();
-        store.save(&tokens).unwrap();
+        store.save(&tokens, None).unwrap();
+        store.save(&tokens, None).unwrap();
 
         for entry in std::fs::read_dir(store.path().parent().unwrap()).unwrap() {
             let entry = entry.unwrap();

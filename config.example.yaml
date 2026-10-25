@@ -61,15 +61,23 @@
 # server: incoming HTTP listener
 # ───────────────────────────────────────────────────────────────────────
 server:
-  # Address:port the proxy binds to. Use 127.0.0.1 to keep it
-  # local-only; 0.0.0.0 to expose on all interfaces.
+  # Address:port the proxy binds to.
+  #
+  # In a CONTAINER, bind 0.0.0.0 — a loopback bind makes the published
+  # port unreachable. The container-side listen is NOT the trust
+  # boundary; restrict exposure on the HOST side instead, e.g.
+  #   ports: "127.0.0.1:9090:9090"
+  # and always set `api_key` below when the port is published.
+  # 127.0.0.1 is only for bare-metal, non-container runs.
   # Default if omitted: 127.0.0.1:8080.
   listen: "0.0.0.0:8080"
 
   # Shared bearer token clients send via `Authorization: Bearer <key>`
   # (or `x-api-key: <key>`). Supports ${ENV_VAR} expansion. Leave unset
-  # to disable authentication — only safe when listen is bound to
-  # 127.0.0.1, otherwise any reachable client can use the proxy.
+  # to disable authentication — the proxy then serves EVERY configured
+  # provider key to anyone who can reach the port, and logs a loud
+  # startup warning saying so. Only safe when the port is unreachable
+  # from anywhere but the local machine.
   # An api_key that expands to an EMPTY string is rejected at startup:
   # that is what a `${VAR}` pointing at a missing secret looks like, and
   # it would otherwise leave the endpoint open to a bare
@@ -166,6 +174,20 @@ providers:
   #   account_type   — "individual" | "business" | "enterprise".
   #                    Determines which Copilot SKU the proxy targets.
   #                    Default: "individual".
+  #   token_store_key — optional. Encrypts the on-disk token store
+  #                    (github_token.json) with AES-256-GCM, so the
+  #                    volume holding it never contains a plaintext
+  #                    GitHub/Copilot token. Value format: 64 hex
+  #                    characters = 32 bytes, e.g.
+  #                    `openssl rand -hex 32`. Deliver it through the
+  #                    sealed .env like every other secret:
+  #                      token_store_key: "${LLMPROXY_TOKEN_STORE_KEY}"
+  #                    Unset (default) → the store is written as
+  #                    plaintext JSON, exactly as before. A plaintext
+  #                    store stays readable after the key is added —
+  #                    the next save rewrites it encrypted. An empty
+  #                    value is rejected at startup (it is a ${VAR}
+  #                    pointing at a missing secret, not "no key").
   #   model_rewrite  — optional map: incoming-model-name → upstream-model-name.
   #                    Empty (default) accepts any model name verbatim —
   #                    the proxy forwards the Anthropic `model` value as-is
@@ -179,6 +201,7 @@ providers:
     type: github_copilot
     vscode_version: "1.95.0"
     account_type: individual
+    # token_store_key: "${LLMPROXY_TOKEN_STORE_KEY}"
     model_rewrite: {}
     use_proxy: true
 
