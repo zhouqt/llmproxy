@@ -38,12 +38,13 @@ jobs:
       #
       # Failure semantics: on push/PR it fails the status check when
       # *vulnerabilities* are found. Informational advisories (unmaintained /
-      # unsound) do NOT affect the status -- that is exactly the two accepted
-      # warnings in plans/security-audit-2026-10-25.md L1 (unsafe-libyaml,
-      # RUSTSEC-2024-0449) and L9 (tokio, RUSTSEC-2026-0386). If a run ever
-      # fails on those two alone, uncomment:
+      # unsound) do NOT affect the status. Both warnings accepted in
+      # plans/security-audit-2026-10-25.md are now gone: L1 (unsafe-libyaml,
+      # RUSTSEC-2024-0449) was removed by the serde-saphyr migration, and L9
+      # (tokio, RUSTSEC-2026-0386) was fixed by the tokio 1.54.1 bump. If a
+      # future informational advisory ever needs accepting, name its ID:
       #
-      #   ignore: RUSTSEC-2024-0449,RUSTSEC-2026-0386
+      #   ignore: RUSTSEC-XXXX-YYYY
       #
       # Never add a *vulnerability*-class ID to `ignore` without the same
       # written rationale in the audit plan.
