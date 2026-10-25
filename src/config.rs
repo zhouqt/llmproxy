@@ -498,6 +498,24 @@ impl Config {
                         .into(),
                 ));
             }
+        } else {
+            // No api_key at all → the proxy serves every request without
+            // authentication (see `auth::require_auth`). That is a
+            // deliberate design choice, but it used to be *silent*, so an
+            // operator who dropped the key (or never set one) could
+            // publish the port and expose every configured provider key
+            // without noticing.
+            //
+            // There is deliberately NO listen-address based refusal here:
+            // the proxy runs containerized, where it must bind a
+            // non-loopback address or published ports can never reach it.
+            // The container-side `listen` is not a trust boundary — the
+            // host-side port publication and the api_key are. The proxy
+            // cannot observe the former from inside the container, so the
+            // only thing it can do is make the weak state loud.
+            tracing::warn!(
+                "authentication is DISABLED (no server.api_key); any client that can reach the port can use every configured provider key"
+            );
         }
         if self.providers.is_empty() {
             return Err(ProxyError::Config("at least one provider required".into()));
@@ -951,6 +969,31 @@ models:
         let cfg = Config::parse(raw).unwrap();
 
         assert!(cfg.server.api_key.is_none());
+    }
+
+    #[test]
+    fn validation_warns_loudly_when_auth_is_disabled() {
+        // A missing api_key is a supported configuration, but it must not
+        // be silent: the proxy then serves every provider key to whoever
+        // can reach the port.
+        let raw = r#"
+providers:
+  - name: copilot
+    type: github_copilot
+models:
+  - name: model
+    primary: copilot
+"#;
+
+        let writer = crate::tracing_capture::CaptureWriter::new();
+        let (_, captured) = crate::tracing_capture::capture_tracing(&writer, || {
+            Config::parse(raw).expect("config without api_key is valid");
+        });
+
+        assert!(
+            captured.contains("authentication is DISABLED"),
+            "captured = {captured:?}"
+        );
     }
 
     #[test]
