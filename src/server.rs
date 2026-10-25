@@ -1938,6 +1938,7 @@ mod tests {
                     name: "copilot".to_string(),
                     vscode_version: "1.95.0".to_string(),
                     account_type: "individual".to_string(),
+                    token_store_key: None,
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
                 }],
@@ -1985,6 +1986,7 @@ mod tests {
                     "copilot".to_string(),
                     "1.95.0".to_string(),
                     "individual".to_string(),
+                    None,
                     HashMap::new(),
                     reqwest::Client::new(),
                 )
@@ -2210,6 +2212,7 @@ mod tests {
                     name: "copilot".to_string(),
                     vscode_version: "1.95.0".to_string(),
                     account_type: "individual".to_string(),
+                    token_store_key: None,
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
                 }],
@@ -2295,6 +2298,7 @@ mod tests {
                     name: "copilot".to_string(),
                     vscode_version: "1.95.0".to_string(),
                     account_type: "individual".to_string(),
+                    token_store_key: None,
                     model_rewrite: HashMap::from([
                         ("claude".to_string(), "gpt-x".to_string()),
                         ("other".to_string(), "gpt-y".to_string()),
@@ -2319,6 +2323,7 @@ mod tests {
                     "copilot".to_string(),
                     "1.95.0".to_string(),
                     "individual".to_string(),
+                    None,
                     config.providers[1].model_rewrite().clone(),
                     reqwest::Client::new(),
                 )
@@ -2380,6 +2385,7 @@ mod tests {
                     name: "copilot".to_string(),
                     vscode_version: "1.95.0".to_string(),
                     account_type: "individual".to_string(),
+                    token_store_key: None,
                     model_rewrite: HashMap::from([("other".to_string(), "gpt-x".to_string())]),
                     use_proxy: false,
                 },
@@ -2434,6 +2440,7 @@ mod tests {
                 name: "copilot".to_string(),
                 vscode_version: "1.95.0".to_string(),
                 account_type: "individual".to_string(),
+                token_store_key: None,
                 model_rewrite: HashMap::from([
                     ("m1".to_string(), "u".to_string()),
                     ("m2".to_string(), "u".to_string()),

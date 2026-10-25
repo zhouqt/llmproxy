@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::{ProxyError, Result};
+use crate::oauth::token_crypto::parse_key;
 use crate::secrets::{deserialize_secrets_config, SecretsConfig};
 use crate::usage::DEFAULT_USAGE_CAPACITY;
 
@@ -197,6 +198,29 @@ pub enum ProviderConfig {
         vscode_version: String,
         #[serde(default = "default_account_type")]
         account_type: String,
+        /// Key used to encrypt the on-disk Copilot token store
+        /// (`github_token.json`) at rest.
+        ///
+        /// The store holds a live GitHub OAuth token and a live Copilot
+        /// API token. It lives in the `llmproxy-data` volume, which is
+        /// usually on an unencrypted host disk — so a TPM-sealed `.env`
+        /// protecting the provider keys while the token store sits in
+        /// the clear next to it is only half a story. With this key set,
+        /// the store is sealed with AES-256-GCM and the disk only ever
+        /// holds ciphertext.
+        ///
+        /// Format: **64 hex characters = 32 bytes** (generate one with
+        /// `openssl rand -hex 32`). Deliver it the same way as the
+        /// other secrets — `${LLMPROXY_TOKEN_STORE_KEY}` resolved from
+        /// the sealed `.env` through the `secrets.provider: file`
+        /// overlay.
+        ///
+        /// Unset (the default) → the store is written as plaintext
+        /// JSON, exactly as before this feature existed. A store
+        /// written in plaintext is still readable after the key is
+        /// added — the next save rewrites it encrypted.
+        #[serde(default, serialize_with = "serialize_redacted_secret_option")]
+        token_store_key: Option<SecretString>,
         /// Optional map: incoming-model-name → upstream-model-name.
         /// Empty (default) accepts any model name verbatim (the proxy
         /// forwards the Anthropic `model` value as-is to Copilot); a
@@ -498,12 +522,58 @@ impl Config {
                         .into(),
                 ));
             }
+        } else {
+            // No api_key at all → the proxy serves every request without
+            // authentication (see `auth::require_auth`). That is a
+            // deliberate design choice, but it used to be *silent*, so an
+            // operator who dropped the key (or never set one) could
+            // publish the port and expose every configured provider key
+            // without noticing.
+            //
+            // There is deliberately NO listen-address based refusal here:
+            // the proxy runs containerized, where it must bind a
+            // non-loopback address or published ports can never reach it.
+            // The container-side `listen` is not a trust boundary — the
+            // host-side port publication and the api_key are. The proxy
+            // cannot observe the former from inside the container, so the
+            // only thing it can do is make the weak state loud.
+            tracing::warn!(
+                "authentication is DISABLED (no server.api_key); any client that can reach the port can use every configured provider key"
+            );
         }
         if self.providers.is_empty() {
             return Err(ProxyError::Config("at least one provider required".into()));
         }
         if self.models.is_empty() {
             return Err(ProxyError::Config("at least one model required".into()));
+        }
+
+        // The Copilot token store key must be present-and-well-formed or
+        // absent. An empty value is NOT "no key" — it is a
+        // `${VAR}` pointing at a missing secret, and starting with it
+        // would silently downgrade the store to plaintext.
+        for p in &self.providers {
+            let ProviderConfig::GithubCopilot {
+                name,
+                token_store_key,
+                ..
+            } = p
+            else {
+                continue;
+            };
+            let Some(key) = token_store_key else {
+                continue;
+            };
+            let raw = key.expose_secret();
+            if raw.is_empty() {
+                return Err(ProxyError::Config(format!(
+                    "provider '{name}': token_store_key is empty after ${{VAR}} expansion; \
+                     remove the field to keep the token store in plaintext, or point the \
+                     variable at a 64-hex-character value"
+                )));
+            }
+            parse_key(raw)
+                .map_err(|msg| ProxyError::Config(format!("provider '{name}': {msg}")))?;
         }
 
         let provider_names: std::collections::HashSet<&str> =
@@ -905,6 +975,7 @@ models:
                 name: "copilot".to_string(),
                 vscode_version: default_vscode_version(),
                 account_type: default_account_type(),
+                token_store_key: None,
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
             }],
@@ -953,6 +1024,123 @@ models:
         assert!(cfg.server.api_key.is_none());
     }
 
+    /// The Copilot token-store key: present-and-well-formed or absent.
+    /// An empty value is a missing secret, not "no key".
+    mod token_store_key_validation {
+        use super::*;
+
+        const VALID_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        fn config_with_key(value: &str) -> Config {
+            Config {
+                providers: vec![ProviderConfig::GithubCopilot {
+                    name: "copilot".to_string(),
+                    vscode_version: default_vscode_version(),
+                    account_type: default_account_type(),
+                    token_store_key: Some(secret_string(value)),
+                    model_rewrite: HashMap::new(),
+                    use_proxy: false,
+                }],
+                models: vec![ModelConfig {
+                    name: "model".to_string(),
+                    primary: "copilot".to_string(),
+                    fallback_chain: Vec::new(),
+                    cooldown_seconds: 300,
+                    max_retries_per_provider: 2,
+                    max_retries_total: 2,
+                }],
+                ..Config::default()
+            }
+        }
+
+        #[test]
+        fn an_absent_key_is_fine() {
+            let raw = r#"
+providers:
+  - name: copilot
+    type: github_copilot
+models:
+  - name: model
+    primary: copilot
+"#;
+            let cfg = Config::parse(raw).unwrap();
+            assert!(cfg.server.api_key.is_none());
+            match &cfg.providers[0] {
+                ProviderConfig::GithubCopilot {
+                    token_store_key, ..
+                } => {
+                    assert!(token_store_key.is_none());
+                }
+                other => panic!("expected a copilot provider, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_64_hex_char_key_is_accepted() {
+            config_with_key(VALID_KEY).validate().unwrap();
+        }
+
+        #[test]
+        fn an_empty_key_is_rejected() {
+            let err = config_with_key("").validate().unwrap_err();
+            assert!(
+                err.to_string().contains("token_store_key is empty"),
+                "unexpected error: {err}"
+            );
+        }
+
+        #[test]
+        fn a_63_char_key_is_rejected() {
+            let err = config_with_key(&VALID_KEY[..63]).validate().unwrap_err();
+            assert!(
+                err.to_string().contains("must be 64 characters long"),
+                "unexpected error: {err}"
+            );
+        }
+
+        #[test]
+        fn a_non_hex_key_is_rejected() {
+            let err = config_with_key(&"z".repeat(64)).validate().unwrap_err();
+            assert!(
+                err.to_string().contains("must be hexadecimal"),
+                "unexpected error: {err}"
+            );
+        }
+
+        #[test]
+        fn the_key_is_redacted_when_the_config_is_serialized() {
+            let cfg = config_with_key(VALID_KEY);
+            let dumped = serde_yaml::to_string(&cfg).expect("config serializes");
+            assert!(!dumped.contains(VALID_KEY), "{dumped}");
+            assert!(dumped.contains("[REDACTED]"), "{dumped}");
+        }
+    }
+
+    #[test]
+    fn validation_warns_loudly_when_auth_is_disabled() {
+        // A missing api_key is a supported configuration, but it must not
+        // be silent: the proxy then serves every provider key to whoever
+        // can reach the port.
+        let raw = r#"
+providers:
+  - name: copilot
+    type: github_copilot
+models:
+  - name: model
+    primary: copilot
+"#;
+
+        let writer = crate::tracing_capture::CaptureWriter::new();
+        let (_, captured) = crate::tracing_capture::capture_tracing(&writer, || {
+            Config::parse(raw).expect("config without api_key is valid");
+        });
+
+        assert!(
+            captured.contains("authentication is DISABLED"),
+            "captured = {captured:?}"
+        );
+    }
+
     #[test]
     fn validation_rejects_unknown_fallback() {
         let config = Config {
@@ -960,6 +1148,7 @@ models:
                 name: "copilot".to_string(),
                 vscode_version: default_vscode_version(),
                 account_type: default_account_type(),
+                token_store_key: None,
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
             }],
@@ -1040,6 +1229,7 @@ models:
                     name: "copilot".into(),
                     vscode_version: default_vscode_version(),
                     account_type: default_account_type(),
+                    token_store_key: None,
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
                 },

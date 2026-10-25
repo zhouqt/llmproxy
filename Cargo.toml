@@ -33,6 +33,13 @@ memchr = "2"
 # (A-Phase 5).
 secrecy = { version = "0.8", features = ["serde"] }
 
+# AES-256-GCM envelope encryption for the on-disk Copilot token store.
+# `ring` was already in the tree as a rustls dependency; it is now a
+# direct dependency too. `base64` encodes the envelope's nonce and
+# ciphertext.
+ring = "0.17"
+base64 = "0.22"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
