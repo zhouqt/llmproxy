@@ -490,7 +490,7 @@ to change the level without touching `config.yaml`.
 - **axum** HTTP server with Bearer-token middleware
 - **reqwest** HTTP client with `socks` feature for outgoing proxy
 - **tokio** async runtime + `RwLock` for in-memory state
-- **serde** + `serde_yaml` for config; `tracing` for logs
+- **serde** + `serde-saphyr` for config; `tracing` for logs
 - **No persistence** for cooldown state — restarts clear all cooldowns
 
 ## References

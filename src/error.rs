@@ -90,7 +90,7 @@ pub enum ProxyError {
     Io(#[from] std::io::Error),
 
     #[error(transparent)]
-    Yaml(#[from] serde_yaml::Error),
+    Yaml(#[from] serde_saphyr::Error),
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),

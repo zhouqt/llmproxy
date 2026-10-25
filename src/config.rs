@@ -510,7 +510,7 @@ impl Config {
     pub fn parse(raw: &str) -> Result<Self> {
         let overlay = load_secrets_overlay(raw)?;
         let expanded = expand_env_vars_with_overlay(raw, &overlay);
-        let cfg: Config = serde_yaml::from_str(&expanded)?;
+        let cfg: Config = serde_saphyr::from_str_with_options(&expanded, yaml_options())?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -636,6 +636,28 @@ fn load_secrets_overlay(raw: &str) -> Result<HashMap<String, String>> {
     secrets_cfg.read_overlay(Path::new(&path))
 }
 
+/// Parser options shared by every YAML entry point.
+///
+/// Each field pins a behavior that `serde-saphyr` does not default to
+/// but that this config format relies on:
+///
+/// - `LastWins` reproduces `serde_yaml`'s handling of duplicate keys in
+///   a mapping (the later value wins). `config.example.yaml` promises
+///   exactly that for `model_rewrite`; `serde-saphyr` errors instead.
+/// - `AsOrdinary` keeps YAML merge keys (`<<`) as ordinary keys, as
+///   `serde_yaml` did. The default (`Merge`) expands them, which would
+///   silently let one mapping inject fields into another.
+/// - `with_snippet = false` keeps source lines out of error messages. A
+///   parse error next to an `api_key:` line must never echo the secret
+///   into the startup log.
+fn yaml_options() -> serde_saphyr::Options {
+    let mut options = serde_saphyr::Options::default();
+    options.duplicate_keys = serde_saphyr::DuplicateKeyPolicy::LastWins;
+    options.merge_keys = serde_saphyr::MergeKeyPolicy::AsOrdinary;
+    options.with_snippet = false;
+    options
+}
+
 /// Pick the `secrets:` block out of the raw config text.
 ///
 /// Deliberately lenient about everything *except* the block itself:
@@ -646,8 +668,13 @@ fn load_secrets_overlay(raw: &str) -> Result<HashMap<String, String>> {
 /// `secrets:` block is type-checked here.
 fn extract_secrets_config(raw: &str) -> Result<SecretsConfig> {
     // A YAML syntax error is reported verbatim by the main parse; this
-    // phase must not turn it into a different error.
-    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(raw) else {
+    // phase must not turn it into a different error. Parsing into
+    // `serde_json::Value` (serde-saphyr has no generic YAML value) also
+    // means a file with non-string mapping keys lands here; the main
+    // parse still rejects it loudly.
+    let Ok(value) =
+        serde_saphyr::from_str_with_options::<serde_json::Value>(raw, yaml_options())
+    else {
         return Ok(SecretsConfig::default());
     };
     let Some(block) = value.get("secrets") else {
@@ -656,7 +683,7 @@ fn extract_secrets_config(raw: &str) -> Result<SecretsConfig> {
     if block.is_null() {
         return Ok(SecretsConfig::default());
     }
-    serde_yaml::from_value::<SecretsConfig>(block.clone())
+    serde_json::from_value::<SecretsConfig>(block.clone())
         .map_err(|e| ProxyError::Config(format!("secrets: {e}")))
 }
 
@@ -1116,7 +1143,7 @@ models:
         #[test]
         fn the_key_is_redacted_when_the_config_is_serialized() {
             let cfg = config_with_key(VALID_KEY);
-            let dumped = serde_yaml::to_string(&cfg).expect("config serializes");
+            let dumped = serde_saphyr::to_string(&cfg).expect("config serializes");
             assert!(!dumped.contains(VALID_KEY), "{dumped}");
             assert!(dumped.contains("[REDACTED]"), "{dumped}");
         }
@@ -1312,6 +1339,113 @@ models:
 
         let invalid = Config::parse("providers: [").unwrap_err();
         assert!(matches!(invalid, ProxyError::Yaml(_)));
+    }
+
+    #[test]
+    fn duplicate_mapping_keys_keep_the_last_value() {
+        // serde_yaml kept the later value for duplicate keys in a mapping,
+        // and `config.example.yaml` documents that for `model_rewrite`.
+        // serde-saphyr rejects duplicates by default; `yaml_options()`
+        // opts back into last-wins so an existing config keeps loading.
+        let raw = r#"
+providers:
+  - name: oa
+    type: openai_compat
+    api_key: "k"
+    api_base: "https://example.test/v1"
+    model_rewrite:
+      "claude-a": "first"
+      "claude-a": "second"
+models:
+  - name: m
+    primary: oa
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        let rewrite = cfg.find_provider("oa").unwrap().model_rewrite();
+        assert_eq!(rewrite.len(), 1);
+        assert_eq!(rewrite.get("claude-a").unwrap(), "second");
+    }
+
+    #[test]
+    fn yaml_merge_keys_are_not_expanded() {
+        // serde_yaml had no YAML 1.1 merge-key support: `<<` was an
+        // ordinary key. serde-saphyr expands merges by default, which
+        // would let one mapping silently inject entries into another
+        // inside a security-relevant config. `AsOrdinary` keeps the old
+        // behavior, so the merge key holds a mapping where a string is
+        // expected and the whole config is rejected. With the default
+        // policy this parse would succeed with the merged entry present.
+        let raw = r#"
+providers:
+  - name: oa
+    type: openai_compat
+    api_key: "k"
+    api_base: "https://example.test/v1"
+    model_rewrite: &base
+      "claude-a": "upstream-a"
+  - name: oa2
+    type: openai_compat
+    api_key: "k"
+    api_base: "https://example.test/v1"
+    model_rewrite:
+      <<: *base
+      "claude-b": "upstream-b"
+models:
+  - name: m
+    primary: oa
+"#;
+        let err = Config::parse(raw).unwrap_err();
+        assert!(matches!(err, ProxyError::Yaml(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn parse_errors_never_echo_the_source_line() {
+        // `with_snippet` defaults to true in serde-saphyr: the error
+        // would quote the offending line *and its neighbours*, so an
+        // error on the line after `api_key:` writes the key into the
+        // startup log. `yaml_options()` turns snippets off; this test
+        // fails if that ever regresses.
+        let raw = r#"
+server:
+  api_key: "sk-SUPERSECRET-SENTINEL"
+bogus: 1
+providers:
+  - name: copilot
+    type: github_copilot
+models:
+  - name: gpt-4
+    primary: copilot
+"#;
+        let err = Config::parse(raw).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            !message.contains("sk-SUPERSECRET-SENTINEL"),
+            "the parse error leaked the api_key value: {message}"
+        );
+        assert!(
+            message.contains("bogus"),
+            "expected the offending field to be named: {message}"
+        );
+    }
+
+    #[test]
+    fn non_string_mapping_key_fails_loudly() {
+        // The generic pre-pass parses into `serde_json::Value`, which
+        // only has string keys, so a numeric top-level key makes it fall
+        // back to the default `secrets:` config. The main parse must
+        // still reject the file rather than start with the block
+        // silently ignored.
+        let raw = r#"
+1: nope
+providers:
+  - name: copilot
+    type: github_copilot
+models:
+  - name: gpt-4
+    primary: copilot
+"#;
+        let err = Config::parse(raw).unwrap_err();
+        assert!(matches!(err, ProxyError::Yaml(_)), "got: {err:?}");
     }
 
     #[test]
@@ -1664,7 +1798,7 @@ models:
     primary: qwen
 "#;
         let cfg = Config::parse(raw).unwrap();
-        let s = serde_yaml::to_string(&cfg).unwrap();
+        let s = serde_saphyr::to_string(&cfg).unwrap();
         assert!(s.contains("thinking_when_absent: disabled"), "{s}");
         let reparsed = Config::parse(&s).unwrap();
         match &reparsed.providers[0] {
@@ -1693,7 +1827,7 @@ models:
     primary: mm
 "#;
         let cfg = Config::parse(raw).unwrap();
-        let s = serde_yaml::to_string(&cfg).unwrap();
+        let s = serde_saphyr::to_string(&cfg).unwrap();
         assert!(s.contains("thinking_when_absent: effort_low"), "{s}");
         let reparsed = Config::parse(&s).unwrap();
         match &reparsed.providers[0] {
@@ -1890,7 +2024,7 @@ models:
             "secrets:\n  provider: file\n  file:\n    path: /run/secrets/llmproxy.env\n    required: false\n",
         );
         let cfg = Config::parse(&raw).unwrap();
-        let s = serde_yaml::to_string(&cfg).unwrap();
+        let s = serde_saphyr::to_string(&cfg).unwrap();
         assert!(s.contains("provider: file"), "{s}");
         let reparsed = Config::parse(&s).unwrap();
         assert_eq!(reparsed.secrets.provider, SecretsProvider::File);
@@ -1954,7 +2088,7 @@ models:
     #[test]
     fn serialized_provider_redacts_the_api_key() {
         let cfg = provider_with_secret();
-        let dumped = serde_yaml::to_string(&cfg).unwrap();
+        let dumped = serde_saphyr::to_string(&cfg).unwrap();
         assert!(
             !dumped.contains("sk-super-secret-value"),
             "the api key leaked into the serialized config: {dumped}"
@@ -1972,7 +2106,7 @@ models:
             providers: vec![provider_with_secret()],
             ..Config::default()
         };
-        let dumped = serde_yaml::to_string(&cfg).unwrap();
+        let dumped = serde_saphyr::to_string(&cfg).unwrap();
         assert!(
             !dumped.contains("sk-server-secret-value"),
             "server.api_key leaked into the serialized config: {dumped}"
@@ -2010,7 +2144,7 @@ models:
         // with a placeholder" — the serialized form has to keep the
         // `null` / absent distinction.
         let cfg = Config::default();
-        let dumped = serde_yaml::to_string(&cfg).unwrap();
+        let dumped = serde_saphyr::to_string(&cfg).unwrap();
         assert!(
             !dumped.contains("[REDACTED]"),
             "an unset api_key must not serialize as a redacted value: {dumped}"
@@ -2038,7 +2172,7 @@ models:
             }],
             ..Config::default()
         };
-        let dumped = serde_yaml::to_string(&cfg).unwrap();
+        let dumped = serde_saphyr::to_string(&cfg).unwrap();
         let reparsed = Config::parse(&dumped).unwrap();
         assert_eq!(
             reparsed

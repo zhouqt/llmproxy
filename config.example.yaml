@@ -466,8 +466,10 @@ providers:
 # The proxy walks the chain [primary, fallback_chain...] in order,
 # skipping any provider currently in cooldown, and returns the first
 # successful response.
-# YAML parsers accept duplicate keys; the last one wins. Left in to
-# preserve any operator overrides that target this exact slot.
+# YAML allows duplicate keys; the last one wins — for entries in a map
+# (e.g. two identical `model_rewrite` keys) and for a repeated field in
+# one block (e.g. two `name:` lines), which older versions rejected.
+# Left in to preserve any operator overrides that target this exact slot.
 #
 # Fields:
 #   name                    — client-facing model name (the value clients
