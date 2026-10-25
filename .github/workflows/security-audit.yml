@@ -29,7 +29,7 @@ jobs:
       checks: write   # push/PR: create the failing status check
       issues: write   # schedule: one issue per newly-found advisory
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # `rustsec/audit-check` v2 wraps `cargo-audit` against the same RustSec
       # advisory DB the local audit uses. It is a node24 action and needs no
