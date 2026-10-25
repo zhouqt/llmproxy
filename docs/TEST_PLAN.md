@@ -197,7 +197,7 @@ two field-level `serialize_with` helpers instead.
 
 | File | Tests | Covers |
 |---|---|---|
-| `src/config.rs` | 6 unit | `{:?}` of a provider/config hides the key; `serde_yaml` of a provider/config redacts it; an absent `server.api_key` still serializes as absent (auth-disabled must not become auth-configured-with-a-placeholder); the redacted YAML still re-parses |
+| `src/config.rs` | 6 unit | `{:?}` of a provider/config hides the key; `serde-saphyr` of a provider/config redacts it; an absent `server.api_key` still serializes as absent (auth-disabled must not become auth-configured-with-a-placeholder); the redacted YAML still re-parses |
 | `src/secrets.rs` | 2 unit | `secret_string()` prints `[REDACTED …]` under `{:?}`, and `expose_secret()` still returns the value |
 
 The remaining test churn is mechanical: every fixture that built a provider

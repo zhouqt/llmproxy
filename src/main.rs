@@ -321,7 +321,7 @@ models:
   - name: m
     primary: proxied
 "#;
-        let cfg: Config = serde_yaml::from_str(yaml).expect("parses");
+        let cfg: Config = serde_saphyr::from_str(yaml).expect("parses");
         let direct = reqwest::Client::new();
         let proxied = reqwest::Client::new();
         let (state, bg_handles) =
