@@ -6,7 +6,16 @@ version: 2
 # on what is vulnerable.
 #
 # The `cargo` entry groups every bump into one weekly PR instead of a dozen;
-# `github-actions` keeps the workflow actions from rotting.
+# `github-actions` does the same for the workflow actions. Both ecosystems
+# are grouped with a `patterns: ["*"]` catch-all, so a week yields exactly
+# two PRs (one cargo, one actions) no matter how many actions are stale.
+# Ungrouped, five actions meant five separate PRs (#46-#50) -- five CI runs
+# and five reviews for the same one-line version bump.
+#
+# The `cargo` group deliberately does NOT use `update-types`/semver pinning:
+# a group merges a major bump (axum 0.7 -> 0.8) with the routine patch
+# bumps, so the PR is no longer auto-mergeable and has to be read. That is
+# intended -- those majors are real migrations, not noise.
 #
 # Manual step this file CANNOT do (repo admin): Settings -> Code security ->
 # enable "Dependabot alerts" and "Dependabot security updates". This config
@@ -26,3 +35,6 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
+    groups:
+      action-dependencies:
+        patterns: ["*"]
