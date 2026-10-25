@@ -621,7 +621,7 @@ models:
             cfg.server
                 .api_key
                 .as_ref()
-                .map(|k| k.expose_secret().as_str()),
+                .map(|k| k.expose_secret()),
             Some("test-key")
         );
         let _ = ServerConfig::default();

@@ -45,7 +45,7 @@ models:
 
 fn api_key_of(cfg: &Config) -> String {
     match &cfg.providers[0] {
-        ProviderConfig::OpenaiCompat { api_key, .. } => api_key.expose_secret().clone(),
+        ProviderConfig::OpenaiCompat { api_key, .. } => api_key.expose_secret().to_string(),
         other => panic!("expected an openai_compat provider, got {other:?}"),
     }
 }
