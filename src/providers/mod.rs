@@ -119,6 +119,7 @@ pub fn build(
             name,
             vscode_version,
             account_type,
+            token_store_key,
             model_rewrite,
             ..
         } => {
@@ -126,6 +127,7 @@ pub fn build(
                 name.clone(),
                 vscode_version.clone(),
                 account_type.clone(),
+                token_store_key.clone(),
                 model_rewrite.clone(),
                 http,
             )?;
@@ -267,6 +269,7 @@ mod tests {
                 name: "copilot".to_string(),
                 vscode_version: "1.95.0".to_string(),
                 account_type: "individual".to_string(),
+                token_store_key: None,
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
             },

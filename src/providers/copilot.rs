@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use secrecy::SecretString;
 use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
 
@@ -54,6 +55,9 @@ pub struct CopilotProvider {
     name: String,
     vscode_version: String,
     account_type: String,
+    /// Key used to encrypt the on-disk token store at rest. `None`
+    /// keeps the legacy plaintext behavior, byte for byte.
+    token_store_key: Option<SecretString>,
     model_rewrite: HashMap<String, String>,
     http: reqwest::Client,
     state: Arc<CopilotState>,
@@ -231,6 +235,7 @@ impl CopilotProvider {
         name: String,
         vscode_version: String,
         account_type: String,
+        token_store_key: Option<SecretString>,
         model_rewrite: HashMap<String, String>,
         http: reqwest::Client,
     ) -> Result<Self> {
@@ -240,6 +245,7 @@ impl CopilotProvider {
             name,
             vscode_version,
             account_type,
+            token_store_key,
             model_rewrite,
             http,
         ))
@@ -255,6 +261,26 @@ impl CopilotProvider {
             "copilot".to_string(),
             "1.95.0".to_string(),
             "individual".to_string(),
+            None,
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+    }
+
+    /// Test-only: like [`Self::new_with_store`] but with a token-store
+    /// encryption key, so the encrypted read/write path can be
+    /// exercised end to end.
+    #[cfg(test)]
+    pub(crate) fn new_with_store_and_key(
+        store: TokenStore,
+        token_store_key: Option<SecretString>,
+    ) -> Self {
+        Self::from_store(
+            store,
+            "copilot".to_string(),
+            "1.95.0".to_string(),
+            "individual".to_string(),
+            token_store_key,
             HashMap::new(),
             reqwest::Client::new(),
         )
@@ -265,10 +291,11 @@ impl CopilotProvider {
         name: String,
         vscode_version: String,
         account_type: String,
+        token_store_key: Option<SecretString>,
         model_rewrite: HashMap<String, String>,
         http: reqwest::Client,
     ) -> Self {
-        let initial = store.load().unwrap_or_else(|e| {
+        let initial = store.load(token_store_key.as_ref()).unwrap_or_else(|e| {
             tracing::warn!(
                 provider = "copilot",
                 error = %e,
@@ -288,6 +315,7 @@ impl CopilotProvider {
             name,
             vscode_version,
             account_type,
+            token_store_key,
             model_rewrite,
             http,
             state,
@@ -398,15 +426,19 @@ impl CopilotProvider {
     pub async fn refresh_token(&self) -> Result<()> {
         let _guard = self.state.refresh_lock.lock().await;
 
-        let existing = self.state.store.load().unwrap_or_else(|e| {
-            tracing::warn!(
-                provider = "copilot",
-                error = %e,
-                path = %self.state.store.path().display(),
-                "failed to read token store; treating as empty"
-            );
-            None
-        });
+        let existing = self
+            .state
+            .store
+            .load(self.token_store_key.as_ref())
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    provider = "copilot",
+                    error = %e,
+                    path = %self.state.store.path().display(),
+                    "failed to read token store; treating as empty"
+                );
+                None
+            });
         let github_token = match existing.as_ref() {
             Some(t) => t.github_access_token.clone(),
             None => {
@@ -426,7 +458,9 @@ impl CopilotProvider {
 
         match self.fetch_copilot_token(&github_token).await {
             Ok(new_tokens) => {
-                self.state.store.save(&new_tokens)?;
+                self.state
+                    .store
+                    .save(&new_tokens, self.token_store_key.as_ref())?;
                 *self.state.tokens.write().await = Some(new_tokens);
                 Ok(())
             }
@@ -534,7 +568,9 @@ impl CopilotProvider {
             ))
         })?;
         let copilot_token = new_tokens.copilot_token.clone();
-        self.state.store.save(&new_tokens)?;
+        self.state
+            .store
+            .save(&new_tokens, self.token_store_key.as_ref())?;
         *self.state.tokens.write().await = Some(new_tokens);
 
         // A fresh OAuth cycle may belong to a different account with a
@@ -655,7 +691,7 @@ impl CopilotProvider {
             let has_credentials = self
                 .state
                 .store
-                .load()
+                .load(self.token_store_key.as_ref())
                 .ok()
                 .flatten()
                 .is_some();
@@ -694,7 +730,7 @@ impl CopilotProvider {
         let has_credentials = self
             .state
             .store
-            .load()
+            .load(self.token_store_key.as_ref())
             .ok()
             .flatten()
             .is_some();
@@ -877,9 +913,7 @@ impl CopilotProvider {
                 s if s >= 500 => {
                     CopilotFetchError::Transient(format!("copilot /models returned {s}"))
                 }
-                s => CopilotFetchError::Transient(format!(
-                    "copilot /models returned {s}: {hint}"
-                )),
+                s => CopilotFetchError::Transient(format!("copilot /models returned {s}: {hint}")),
             });
         }
         let body: Value = resp.json().await.map_err(|e| {
@@ -1496,7 +1530,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = TokenStore::from_path(dir.path().join("github_token.json"));
         if let Some(tokens) = &initial {
-            store.save(tokens).unwrap();
+            store.save(tokens, None).unwrap();
         }
         let state = Arc::new(CopilotState {
             tokens: RwLock::new(initial),
@@ -1506,6 +1540,7 @@ mod tests {
         });
         let provider = CopilotProvider {
             name: "copilot".to_string(),
+            token_store_key: None,
             vscode_version: "1.95.0".to_string(),
             account_type: "individual".to_string(),
             model_rewrite: HashMap::new(),
@@ -1790,6 +1825,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         let store = TokenStore::from_path(dir.path().join("github_token.json"));
         let provider = CopilotProvider {
             name: "copilot".to_string(),
+            token_store_key: None,
             vscode_version: "1.95.0".to_string(),
             account_type: "individual".to_string(),
             model_rewrite: HashMap::new(),
@@ -1833,7 +1869,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         let dir = tempfile::tempdir().unwrap();
         let store = TokenStore::from_path(dir.path().join("github_token.json"));
         store
-            .save(&stored_tokens("github-token", "stale", 600))
+            .save(&stored_tokens("github-token", "stale", 600), None)
             .unwrap();
         let state = Arc::new(CopilotState {
             tokens: RwLock::new(None),
@@ -1843,6 +1879,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         });
         let provider = CopilotProvider {
             name: "copilot".to_string(),
+            token_store_key: None,
             vscode_version: "1.95.0".to_string(),
             account_type: "individual".to_string(),
             model_rewrite: HashMap::new(),
@@ -1880,7 +1917,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         let memory = provider.state.tokens.read().await;
         assert_eq!(memory.as_ref().unwrap().copilot_token, "refreshed-token");
         drop(memory);
-        let disk = provider.state.store.load().unwrap().unwrap();
+        let disk = provider.state.store.load(None).unwrap().unwrap();
         assert_eq!(disk.copilot_token, "refreshed-token");
         assert_eq!(disk.refresh_in, 800);
     }
@@ -3033,7 +3070,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         let dir = tempfile::tempdir().unwrap();
         let store = TokenStore::from_path(dir.path().join("github_token.json"));
         store
-            .save(&stored_tokens("github-token", "stale", 600))
+            .save(&stored_tokens("github-token", "stale", 600), None)
             .unwrap();
         // Memory cache starts empty (the branch this test is about).
         let state = Arc::new(CopilotState {
@@ -3044,6 +3081,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         });
         let provider = Arc::new(CopilotProvider {
             name: "copilot".to_string(),
+            token_store_key: None,
             vscode_version: "1.95.0".to_string(),
             account_type: "individual".to_string(),
             model_rewrite: HashMap::new(),
@@ -3100,7 +3138,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         // The store must still hold the original credentials — the
         // refresh failure was transient, so the loop must not have
         // cleared it.
-        let disk = provider.state.store.load().unwrap().expect("store intact");
+        let disk = provider.state.store.load(None).unwrap().expect("store intact");
         assert_eq!(disk.github_access_token, "loop-fail-github");
     }
 
@@ -3135,6 +3173,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         });
         let provider = Arc::new(CopilotProvider {
             name: "copilot".to_string(),
+            token_store_key: None,
             vscode_version: "1.95.0".to_string(),
             account_type: "individual".to_string(),
             model_rewrite: HashMap::new(),
@@ -3157,7 +3196,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         // No tokens got persisted — bootstrap failed and the loop just
         // logs and retries.
         assert!(
-            store.load().unwrap().is_none(),
+            store.load(None).unwrap().is_none(),
             "store must remain empty after a failed bootstrap attempt"
         );
     }
@@ -3261,6 +3300,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         });
         let provider = CopilotProvider {
             name: "copilot".to_string(),
+            token_store_key: None,
             vscode_version: "1.95.0".to_string(),
             account_type: "individual".to_string(),
             model_rewrite: HashMap::new(),
@@ -3284,7 +3324,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         let memory = provider.state.tokens.read().await;
         assert!(memory.is_none(), "refresh_token must not populate cache on fast-fail");
         // Store stays empty (no file written).
-        assert!(provider.state.store.load().unwrap().is_none());
+        assert!(provider.state.store.load(None).unwrap().is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -3325,6 +3365,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         });
         let provider = CopilotProvider {
             name: "copilot".to_string(),
+            token_store_key: None,
             vscode_version: "1.95.0".to_string(),
             account_type: "individual".to_string(),
             model_rewrite: HashMap::new(),
@@ -3387,7 +3428,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         // Start with a stale github token so refresh_token will try the
         // endpoint and fail.
         store
-            .save(&stored_tokens("stale-github", "old-copilot", -10))
+            .save(&stored_tokens("stale-github", "old-copilot", -10), None)
             .unwrap();
         let state = Arc::new(CopilotState {
             tokens: RwLock::new(Some(stored_tokens(
@@ -3401,6 +3442,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         });
         let provider = CopilotProvider {
             name: "copilot".to_string(),
+            token_store_key: None,
             vscode_version: "1.95.0".to_string(),
             account_type: "individual".to_string(),
             model_rewrite: HashMap::new(),
@@ -3426,7 +3468,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         // Store is cleared so the background loop sees no-token and
         // triggers bootstrap on its next iteration.
         assert!(
-            store.load().unwrap().is_none(),
+            store.load(None).unwrap().is_none(),
             "store must be cleared after AuthRejected"
         );
         // In-memory state stays stale (not overwritten with Err).
@@ -3505,6 +3547,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         });
         let provider = Arc::new(CopilotProvider {
             name: "copilot".to_string(),
+            token_store_key: None,
             vscode_version: "1.95.0".to_string(),
             account_type: "individual".to_string(),
             model_rewrite: HashMap::new(),
@@ -3560,7 +3603,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             "bootstrap-github"
         );
         drop(memory);
-        let disk = store.load().unwrap().unwrap();
+        let disk = store.load(None).unwrap().unwrap();
         assert_eq!(disk.copilot_token, "bootstrap-copilot");
         assert_eq!(disk.github_access_token, "bootstrap-github");
 
@@ -3606,6 +3649,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         });
         let provider = Arc::new(CopilotProvider {
             name: "copilot".to_string(),
+            token_store_key: None,
             vscode_version: "1.95.0".to_string(),
             account_type: "individual".to_string(),
             model_rewrite: HashMap::new(),
@@ -3660,7 +3704,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         let dir = tempfile::tempdir().unwrap();
         let store = TokenStore::from_path(dir.path().join("github_token.json"));
         let pre_existing = stored_tokens("still-valid-github", "still-valid-copilot", 900);
-        store.save(&pre_existing).unwrap();
+        store.save(&pre_existing, None).unwrap();
         let state = Arc::new(CopilotState {
             tokens: RwLock::new(Some(pre_existing.clone())),
             store: store.clone(),
@@ -3669,6 +3713,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         });
         let provider = CopilotProvider {
             name: "copilot".to_string(),
+            token_store_key: None,
             vscode_version: "1.95.0".to_string(),
             account_type: "individual".to_string(),
             model_rewrite: HashMap::new(),
@@ -3688,7 +3733,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
 
         // Store must NOT have been cleared — the credentials are still
         // valid, only the network/upstream blipped.
-        let disk = store.load().unwrap().expect("store must still exist");
+        let disk = store.load(None).unwrap().expect("store must still exist");
         assert_eq!(disk.github_access_token, "still-valid-github");
         assert_eq!(disk.copilot_token, "still-valid-copilot");
     }
@@ -4437,7 +4482,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         let store = TokenStore::from_path(dir.path().join("github_token.json"));
         // Pre-seed a token so one is already in memory.
         let existing = stored_tokens("existing-gh", "existing-cp", 3600);
-        store.save(&existing).unwrap();
+        store.save(&existing, None).unwrap();
         let state = Arc::new(CopilotState {
             tokens: RwLock::new(Some(existing)),
             store,
@@ -4446,6 +4491,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         });
         let provider = Arc::new(CopilotProvider {
             name: "copilot".to_string(),
+            token_store_key: None,
             vscode_version: "1.95.0".to_string(),
             account_type: "individual".to_string(),
             model_rewrite: HashMap::new(),
@@ -4564,5 +4610,77 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             }
         });
         Stopper(Some(tx))
+    }
+
+    /// The provider threads `token_store_key` into every token-store
+    /// read and write: with a key configured, the on-disk file is an
+    /// encrypted envelope, and a provider started with the same key
+    /// reads the tokens back.
+    #[tokio::test]
+    async fn the_provider_encrypts_the_token_store_when_a_key_is_configured() {
+        const KEY: &str =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github_token.json");
+
+        let provider = CopilotProvider::new_with_store_and_key(
+            TokenStore::from_path(path.clone()),
+            Some(crate::secrets::secret_string(KEY)),
+        );
+        provider
+            .state
+            .store
+            .save(
+                &stored_tokens("gh-secret-sentinel", "co-secret-sentinel", 600),
+                provider.token_store_key.as_ref(),
+            )
+            .unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("llmproxy-token-v1"), "{raw}");
+        assert!(!raw.contains("gh-secret-sentinel"), "{raw}");
+        assert!(!raw.contains("co-secret-sentinel"), "{raw}");
+
+        // A provider built with the same key reads the tokens back.
+        let reader = CopilotProvider::new_with_store_and_key(
+            TokenStore::from_path(path.clone()),
+            Some(crate::secrets::secret_string(KEY)),
+        );
+        let tokens = reader.state.tokens.read().await;
+        assert_eq!(
+            tokens.as_ref().expect("tokens loaded").github_access_token,
+            "gh-secret-sentinel"
+        );
+    }
+
+    /// Without a key the store is read but not written in the clear:
+    /// a provider that has no `token_store_key` finds no tokens in an
+    /// encrypted store and reports "no credentials" rather than
+    /// failing to start.
+    #[tokio::test]
+    async fn a_provider_without_a_key_cannot_read_an_encrypted_store() {
+        const KEY: &str =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github_token.json");
+
+        let writer = CopilotProvider::new_with_store_and_key(
+            TokenStore::from_path(path.clone()),
+            Some(crate::secrets::secret_string(KEY)),
+        );
+        writer
+            .state
+            .store
+            .save(
+                &stored_tokens("gh-secret-sentinel", "co-secret-sentinel", 600),
+                writer.token_store_key.as_ref(),
+            )
+            .unwrap();
+
+        let reader = CopilotProvider::new_with_store(TokenStore::from_path(path));
+
+        assert!(reader.state.tokens.read().await.is_none());
     }
 }
