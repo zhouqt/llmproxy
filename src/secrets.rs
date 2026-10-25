@@ -351,7 +351,7 @@ mod tests {
     #[test]
     fn provider_deserializes_from_yaml() {
         let cfg: SecretsConfig =
-            serde_yaml::from_str("provider: file\nfile:\n  path: /x\n").unwrap();
+            serde_saphyr::from_str("provider: file\nfile:\n  path: /x\n").unwrap();
         assert_eq!(cfg.provider, SecretsProvider::File);
         assert!(cfg.provider.uses_file());
         assert_eq!(cfg.file_path(), Some("/x"));
@@ -360,8 +360,8 @@ mod tests {
 
     #[test]
     fn provider_none_and_env_are_distinct_but_both_non_file() {
-        let none: SecretsConfig = serde_yaml::from_str("provider: none\n").unwrap();
-        let env: SecretsConfig = serde_yaml::from_str("provider: env\n").unwrap();
+        let none: SecretsConfig = serde_saphyr::from_str("provider: none\n").unwrap();
+        let env: SecretsConfig = serde_saphyr::from_str("provider: env\n").unwrap();
         assert_eq!(none.provider, SecretsProvider::None);
         assert_eq!(env.provider, SecretsProvider::Env);
         assert!(!none.provider.uses_file());
@@ -370,12 +370,12 @@ mod tests {
 
     #[test]
     fn unknown_provider_is_rejected() {
-        assert!(serde_yaml::from_str::<SecretsConfig>("provider: vault\n").is_err());
+        assert!(serde_saphyr::from_str::<SecretsConfig>("provider: vault\n").is_err());
     }
 
     #[test]
     fn unknown_key_in_secrets_block_is_rejected() {
-        assert!(serde_yaml::from_str::<SecretsConfig>("provider: file\nbogus: 1\n").is_err());
+        assert!(serde_saphyr::from_str::<SecretsConfig>("provider: file\nbogus: 1\n").is_err());
     }
 
     #[test]
@@ -464,13 +464,13 @@ mod tests {
         // The `Option` wrapper in `deserialize_secrets_config` is what
         // turns an explicitly-null `secrets:` into "not configured".
         let parsed: Option<SecretsConfig> =
-            serde_yaml::from_value(serde_yaml::Value::Null).unwrap();
+            serde_json::from_value(serde_json::Value::Null).unwrap();
         assert!(parsed.is_none());
     }
 
     #[test]
     fn deserialize_secrets_config_maps_null_to_default() {
-        let cfg = deserialize_secrets_config(serde_yaml::Value::Null).unwrap();
+        let cfg = deserialize_secrets_config(serde_json::Value::Null).unwrap();
         assert_eq!(cfg.provider, SecretsProvider::None);
         assert!(cfg.file.required);
     }
