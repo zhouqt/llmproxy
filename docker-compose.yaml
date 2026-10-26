@@ -25,6 +25,30 @@ services:
     # ~/.local/share/containers/storage/overlay/<id>/diff/run/secrets/.
     tmpfs:
       - /run:rw,noexec,nosuid,nodev,size=4m
+      # With `read_only` below the rootfs has no writable layer at all,
+      # and the entrypoint's TPM unseal needs one scratch file
+      # (/tmp/seal.ctx, the loaded policy session, rm'd on exit). Give
+      # it a tmpfs instead of making the rootfs writable: same
+      # no-plaintext-on-disk guarantee as /run, and /tmp is not a place
+      # anything here needs to execute from.
+      - /tmp:rw,noexec,nosuid,nodev,size=4m
+
+    # Hardening (security audit L5): the proxy is a self-contained Rust
+    # binary that needs no privileges beyond its bind-mounts, the TPM
+    # device, and the two tmpfs mounts above.
+    # - read_only: an exploited process cannot persist a payload or
+    #   tamper with the image; everything it may legitimately write
+    #   (token store, /run, /tmp) lives on a volume or tmpfs.
+    # - cap_drop ALL: rootless podman grants no capabilities that the
+    #   binary uses; /dev/tpmrm0 access rides on keep-groups below
+    #   (0660 + tss group), not on any capability.
+    # - no-new-privileges: even if something in the container could
+    #   exec a setuid helper, it would not gain more than it has.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges
 
     # TPM access for the in-container unseal. The entrypoint refuses to
     # run in TPM mode if /run is not a tmpfs.

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::auth::AuthRateLimiter;
 use crate::config::Config;
 use crate::cooldown::CooldownCache;
 use crate::providers::copilot::CopilotProvider;
@@ -21,4 +22,8 @@ pub struct AppState {
     /// surfaced through `/admin/usage`. Capacity comes from
     /// `Config::usage_capacity` (default `usage::DEFAULT_USAGE_CAPACITY`).
     pub usage: UsageStats,
+    /// Fixed-window counter of failed authentications, consulted by the
+    /// `require_auth` middleware to answer 429 on brute-force bursts
+    /// (audit L7). Shared by every `AppState` clone (`Arc` inside).
+    pub auth_limiter: AuthRateLimiter,
 }

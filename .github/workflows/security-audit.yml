@@ -29,7 +29,11 @@ jobs:
       checks: write   # push/PR: create the failing status check
       issues: write   # schedule: one issue per newly-found advisory
     steps:
-      - uses: actions/checkout@v7
+      # Actions are SHA-pinned (audit L10): a mutable tag can be moved to
+      # an arbitrary commit, so the pin is the full commit SHA with the
+      # `# vX` comment naming the tag it was resolved from. To upgrade an
+      # action, resolve the new tag's SHA and replace both.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # `rustsec/audit-check` v2 wraps `cargo-audit` against the same RustSec
       # advisory DB the local audit uses. It is a node24 action and needs no
@@ -62,9 +66,6 @@ jobs:
       # are not compiled in (quinn-proto today). Policy: update them anyway
       # (Phase 1 did) rather than maintaining an ignore list for unreachable
       # code.
-      #
-      # Action versions are tag-pinned (`@v4`, `@v2.0.0`). SHA-pinning is
-      # audit finding L10, deferred; convert these two when L10 lands.
-      - uses: rustsec/audit-check@v2.0.0
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
