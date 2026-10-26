@@ -107,6 +107,36 @@ impl std::fmt::Display for CopilotFetchError {
 
 impl std::error::Error for CopilotFetchError {}
 
+/// Why [`CopilotProvider::headers`] could not build a legal header map
+/// (audit L2). The two variants are distinguished so callers only wipe
+/// the token store when the *token* is the problem — a config typo in
+/// `vscode_version` would otherwise trigger a pointless re-bootstrap
+/// loop, because a freshly fetched token could not be put on the wire
+/// either. The `Display` strings are safe for logs: they never contain
+/// the offending value.
+#[derive(Debug)]
+enum HeaderBuildError {
+    /// The stored copilot token is not a valid HTTP header value.
+    CorruptToken,
+    /// The configured `vscode_version` is not a valid HTTP header value.
+    CorruptVersion,
+}
+
+impl std::fmt::Display for HeaderBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HeaderBuildError::CorruptToken => write!(
+                f,
+                "stored copilot token is not a valid HTTP header value"
+            ),
+            HeaderBuildError::CorruptVersion => write!(
+                f,
+                "configured vscode_version is not a valid HTTP header value"
+            ),
+        }
+    }
+}
+
 /// Whether `/responses` triggers malformed `EnterWorktree` tool arguments
 /// for this model — empty `name`s, absolute paths, or both mutex keys
 /// non-empty, all of which fail Claude Code's `Kor(name)` validator. When
@@ -360,30 +390,97 @@ impl CopilotProvider {
         }
     }
 
-    fn headers(&self, token: &str) -> reqwest::header::HeaderMap {
+    /// Build the Copilot request headers. Fails (rather than panicking)
+    /// when a value is not a legal HTTP header value — the bearer token
+    /// comes from the on-disk token store and `vscode_version` from the
+    /// config, and a corrupt file or config typo must surface as a
+    /// rejected-credentials error, not a request-path panic (audit L2).
+    /// The error never echoes the offending value: the token is a
+    /// credential, `vscode_version` is operator input.
+    fn headers(
+        &self,
+        token: &str,
+    ) -> std::result::Result<reqwest::header::HeaderMap, HeaderBuildError> {
+        use reqwest::header::HeaderValue;
         let mut h = reqwest::header::HeaderMap::new();
-        h.insert("authorization", format!("Bearer {token}").parse().unwrap());
-        h.insert("copilot-integration-id", "vscode-chat".parse().unwrap());
+        h.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|_| HeaderBuildError::CorruptToken)?,
+        );
+        h.insert(
+            "copilot-integration-id",
+            HeaderValue::from_static("vscode-chat"),
+        );
         h.insert(
             "editor-version",
-            format!("vscode/{}", self.vscode_version).parse().unwrap(),
+            HeaderValue::from_str(&format!("vscode/{}", self.vscode_version))
+                .map_err(|_| HeaderBuildError::CorruptVersion)?,
         );
         h.insert(
             "editor-plugin-version",
-            EDITOR_PLUGIN_VERSION.parse().unwrap(),
+            HeaderValue::from_static(EDITOR_PLUGIN_VERSION),
         );
-        h.insert("user-agent", USER_AGENT.parse().unwrap());
-        h.insert("openai-intent", "conversation-panel".parse().unwrap());
-        h.insert("x-github-api-version", GITHUB_API_VERSION.parse().unwrap());
+        h.insert("user-agent", HeaderValue::from_static(USER_AGENT));
+        h.insert(
+            "openai-intent",
+            HeaderValue::from_static("conversation-panel"),
+        );
+        h.insert(
+            "x-github-api-version",
+            HeaderValue::from_static(GITHUB_API_VERSION),
+        );
+        // A v4 UUID is always ASCII, so the fallback arm is unreachable —
+        // it exists to keep the function total (no unwrap on a request
+        // path).
         h.insert(
             "x-request-id",
-            uuid::Uuid::new_v4().to_string().parse().unwrap(),
+            HeaderValue::from_str(&uuid::Uuid::new_v4().to_string()).unwrap_or_else(|_| {
+                HeaderValue::from_static("00000000-0000-0000-0000-000000000000")
+            }),
         );
         h.insert(
             "x-vscode-user-agent-library-version",
-            "electron-fetch".parse().unwrap(),
+            HeaderValue::from_static("electron-fetch"),
         );
-        h
+        Ok(h)
+    }
+
+    /// [`Self::headers`] mapped to the request-path error contract
+    /// (audit L2): a value that cannot be put on the wire is rejected
+    /// credentials. A corrupt *token* wipes the store so the background
+    /// loop re-bootstraps — the same contract as `refresh_token`'s
+    /// `AuthRejected` arm. A corrupt `vscode_version` is a config error:
+    /// the store stays (a fresh token could not be put on the wire
+    /// either), and the message points at the config.
+    fn request_headers(&self, token: &str) -> Result<reqwest::header::HeaderMap> {
+        match self.headers(token) {
+            Ok(h) => Ok(h),
+            Err(err @ HeaderBuildError::CorruptToken) => {
+                tracing::warn!(
+                    provider = "copilot",
+                    reason = %err,
+                    "copilot credentials unusable; clearing store and signalling bootstrap needed"
+                );
+                self.state.store.clear().ok();
+                Err(ProxyError::Upstream {
+                    status: 401,
+                    body: "copilot token is corrupt; trigger bootstrap via /admin/copilot/auth"
+                        .to_string(),
+                })
+            }
+            Err(err @ HeaderBuildError::CorruptVersion) => {
+                tracing::warn!(
+                    provider = "copilot",
+                    reason = %err,
+                    "copilot vscode_version unusable; fix the provider config"
+                );
+                Err(ProxyError::Upstream {
+                    status: 401,
+                    body: format!("{err}; fix the github_copilot provider config"),
+                })
+            }
+        }
     }
 
     /// Returns true when the copilot token has expired.
@@ -587,10 +684,21 @@ impl CopilotProvider {
     }
 
     async fn fetch_copilot_token(&self, github_token: &str) -> std::result::Result<StoredTokens, CopilotFetchError> {
+        // A github token read from a corrupt store file can itself be
+        // non-header-safe; reqwest's `.header()` panics on that, so
+        // build the value explicitly and classify it as rejected
+        // credentials (the store is unusable) instead of panicking.
+        let authorization = reqwest::header::HeaderValue::from_str(&format!(
+            "token {github_token}"
+        ))
+        .map_err(|_| CopilotFetchError::AuthRejected {
+            status: 401,
+            body: "stored github token is not a valid HTTP header value".to_string(),
+        })?;
         let resp = match self
             .http
             .get(self.token_url())
-            .header("authorization", format!("token {github_token}"))
+            .header("authorization", authorization)
             .header("user-agent", USER_AGENT)
             .header("accept", "application/json")
             .header("x-github-api-version", GITHUB_API_VERSION)
@@ -831,6 +939,21 @@ impl CopilotProvider {
                 // account can actually have changed.
                 *self.state.cached_models.write().await = None;
             }
+            Err(CopilotFetchError::AuthRejected { status, body }) => {
+                // AuthRejected on this path can only come from a header
+                // value that cannot be put on the wire (audit L2) — the
+                // stored token is corrupt. Same contract as
+                // `refresh_token`'s AuthRejected arm: wipe the store so
+                // the background loop re-bootstraps, and drop the memory
+                // cache so `/v1/models` stops advertising.
+                tracing::warn!(
+                    status,
+                    body = %body,
+                    "copilot credentials unusable; clearing store and model cache"
+                );
+                self.state.store.clear().ok();
+                *self.state.cached_models.write().await = None;
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "copilot /models fetch failed; keeping stale cache");
             }
@@ -877,10 +1000,23 @@ impl CopilotProvider {
         token: &str,
     ) -> std::result::Result<Vec<CopilotModel>, CopilotFetchError> {
         let url = self.models_url();
+        // A corrupt stored token (or a non-header-safe vscode_version)
+        // cannot be put on the wire at all — classify it as rejected
+        // credentials so the caller clears the store/cache instead of
+        // panicking or retrying forever (audit L2).
+        let headers = match self.headers(token) {
+            Ok(h) => h,
+            Err(err) => {
+                return Err(CopilotFetchError::AuthRejected {
+                    status: 401,
+                    body: err.to_string(),
+                })
+            }
+        };
         let resp = match self
             .http
             .get(&url)
-            .headers(self.headers(token))
+            .headers(headers)
             .header("accept", "application/json")
             .send()
             .await
@@ -965,10 +1101,11 @@ impl CopilotProvider {
         body: &Value,
     ) -> Result<reqwest::Response> {
         let token = self.ensure_token().await?;
+        let headers = self.request_headers(&token)?;
         let resp = self
             .http
             .post(url)
-            .headers(self.headers(&token))
+            .headers(headers)
             .header("content-type", "application/json")
             .json(body)
             .send()
@@ -976,10 +1113,11 @@ impl CopilotProvider {
         if resp.status().as_u16() == 401 {
             self.refresh_token().await?;
             let token = self.ensure_token().await?;
+            let headers = self.request_headers(&token)?;
             let resp2 = self
                 .http
                 .post(url)
-                .headers(self.headers(&token))
+                .headers(headers)
                 .header("content-type", "application/json")
                 .json(body)
                 .send()
@@ -1629,7 +1767,7 @@ mod tests {
             "https://api.business.githubcopilot.com/chat/completions"
         );
 
-        let headers = provider.headers("token-1");
+        let headers = provider.headers("token-1").unwrap();
         assert_eq!(headers["authorization"], "Bearer token-1");
         assert_eq!(headers["copilot-integration-id"], "vscode-chat");
         assert_eq!(headers["editor-version"], "vscode/1.95.0");
@@ -1642,6 +1780,89 @@ mod tests {
             "electron-fetch"
         );
         uuid::Uuid::parse_str(headers["x-request-id"].to_str().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn corrupt_copilot_token_is_rejected_and_clears_store() {
+        // Audit L2: a token that cannot be a legal HTTP header value must
+        // surface as rejected credentials, not a request-path panic. The
+        // failure happens in `request_headers`, before any network call,
+        // so the dead URL is never contacted.
+        let (_dir, provider) = test_provider(
+            None,
+            Some(stored_tokens("github-token", "bad\u{0}token", 600)),
+        );
+        let err = provider
+            .send_with_token("http://127.0.0.1:1/chat/completions", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        expect_variant!(err, ProxyError::Upstream { status, body } => {
+            assert_eq!(status, 401);
+            assert!(
+                body.contains("copilot token is corrupt"),
+                "unexpected body: {body}"
+            );
+        });
+        assert!(
+            provider.state.store.load(None).unwrap().is_none(),
+            "store must be cleared so the background loop re-bootstraps"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_models_with_corrupt_token_clears_cache_and_store() {
+        let (_dir, provider) = test_provider(None, None);
+        seed_chat_only_cache(&provider, "gpt-5").await;
+
+        provider.cache_models_with_token("bad\u{0}token").await;
+
+        assert!(provider.cached_models().await.is_none());
+        assert!(provider.state.store.load(None).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn corrupt_vscode_version_is_rejected_but_keeps_the_store() {
+        // A config typo in vscode_version must fail closed (401) without
+        // panicking — and without wiping the store: a freshly bootstrapped
+        // token could not be put on the wire either, so clearing it would
+        // only trigger a pointless re-auth loop.
+        let (_dir, mut provider) = test_provider(
+            None,
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+        provider.vscode_version = "bad\u{0}".to_string();
+        let err = provider
+            .send_with_token("http://127.0.0.1:1/chat/completions", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        expect_variant!(err, ProxyError::Upstream { status, body } => {
+            assert_eq!(status, 401);
+            assert!(
+                body.contains("vscode_version is not a valid HTTP header value"),
+                "unexpected body: {body}"
+            );
+        });
+        assert!(
+            provider.state.store.load(None).unwrap().is_some(),
+            "the store is not the problem here — it must stay"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_github_token_rejects_refresh_and_clears_store() {
+        // Same L2 class one layer down: fetch_copilot_token's own
+        // authorization header must not panic on a corrupt store value —
+        // it is classified as rejected credentials instead.
+        let (_dir, provider) = test_provider(
+            None,
+            Some(stored_tokens("bad\u{0}github", "copilot-token", -10)),
+        );
+        let err = provider.ensure_token().await.unwrap_err();
+        assert!(
+            err.to_string().contains("credentials rejected"),
+            "unexpected error: {err}"
+        );
+        assert!(provider.state.store.load(None).unwrap().is_none());
     }
 
     #[tokio::test]

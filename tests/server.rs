@@ -280,6 +280,7 @@ fn build_app_with_usage_and_cooldown(
         copilot: None,
 
         usage,
+        auth_limiter: llmproxy::auth::AuthRateLimiter::new(),
     });
     (app, cooldown)
 }
@@ -1168,7 +1169,8 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
         http: reqwest::Client::new(),
         copilot: None,
     
-        usage: llmproxy::usage::UsageStats::new(0),});
+        usage: llmproxy::usage::UsageStats::new(0),
+        auth_limiter: llmproxy::auth::AuthRateLimiter::new(),});
 
     // Auth gate applies: /v1/models requires authentication.
     let unauth = app
@@ -1297,7 +1299,8 @@ async fn list_models_collision_winner_follows_chain_order_deterministically() {
         http: reqwest::Client::new(),
         copilot: None,
     
-        usage: llmproxy::usage::UsageStats::new(0),});
+        usage: llmproxy::usage::UsageStats::new(0),
+        auth_limiter: llmproxy::auth::AuthRateLimiter::new(),});
 
     let mut req = test_request(Method::GET, "/v1/models", None);
     req.headers_mut()
@@ -1416,7 +1419,8 @@ async fn admin_models_lists_every_provider_without_dedup() {
         http: reqwest::Client::new(),
         copilot: None,
     
-        usage: llmproxy::usage::UsageStats::new(0),});
+        usage: llmproxy::usage::UsageStats::new(0),
+        auth_limiter: llmproxy::auth::AuthRateLimiter::new(),});
 
     // Auth gate applies to /admin/* too.
     let unauth = app
@@ -1524,7 +1528,8 @@ async fn admin_models_reports_fetch_failed_for_provider_without_catalog() {
         http: reqwest::Client::new(),
         copilot: None,
     
-        usage: llmproxy::usage::UsageStats::new(0),});
+        usage: llmproxy::usage::UsageStats::new(0),
+        auth_limiter: llmproxy::auth::AuthRateLimiter::new(),});
 
     let mut req = test_request(Method::GET, "/admin/models", None);
     req.headers_mut()
@@ -2513,6 +2518,7 @@ async fn admin_usage_excludes_serving_provider_from_failed_providers_on_retry() 
         http: reqwest::Client::new(),
         copilot: None,
         usage: usage_for_state,
+        auth_limiter: llmproxy::auth::AuthRateLimiter::new(),
     });
     let mut msg_req = test_request(
         Method::POST,
@@ -2632,6 +2638,7 @@ async fn admin_usage_keeps_fallback_failures_when_serving_provider_is_different(
         http: reqwest::Client::new(),
         copilot: None,
         usage: usage_for_state,
+        auth_limiter: llmproxy::auth::AuthRateLimiter::new(),
     });
     let mut msg_req = test_request(
         Method::POST,

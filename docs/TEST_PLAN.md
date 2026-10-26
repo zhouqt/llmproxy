@@ -4,21 +4,28 @@ Goal: **>97% region coverage** across `src/`, with explicit attention to
 the fallback router, provider HTTP integrations, OAuth flow, and
 request/response format conversions.
 
-## Current state (2026-07-19, session 9)
+## Current state (2026-10-26, after the RUSTSEC-2024-0449 migration)
 
-Coverage as of last `cargo llvm-cov --lib --bins --tests` run:
+Coverage as of the last `cargo llvm-cov --lib --bins --tests` run on
+`main` (`2c28ee4`):
 
 | Dimension  | Covered  | Total   | Percent  |
 |-----------:|---------:|--------:|---------:|
-| regions    |   15394  |  15870  | **97.00%** |
-| lines      |   10021  |  10212  | **98.13%** |
-| functions  |     862  |    882  | **97.73%** |
+| regions    |   40960  |  41905  | **97.74%** |
+| lines      |   26378  |  26845  | **98.26%** |
+| functions  |    2193  |   2269  | **96.65%** |
 
-Test totals: 318 + 14 + 7 + 12 + 14 = **365** tests across all
-binaries, all passing in `cargo test --lib --bins --tests`.
+Test totals: 886 (lib) + 14 (bins) + 7 (`auth`) + 21
+(`integration_router`) + 5 (`secrets_file`) + 57 (`server`) + 5
+(`verify_deepseek_thinking`) = **995** tests across all binaries, all
+passing in `cargo test --lib --bins --tests`.
 
-**All three metrics now clear the 97% bar.** Session 9 closed the
-remaining region gap (session 8 ended at 96.84%) by:
+The standing bar is **>97% regions** (functions are reported for trend
+only). The session sections below are kept as historical records.
+
+### 2026-07-19 — session 9 (historical)
+
+Session 9 closed the remaining region gap (session 8 ended at 96.84%) by:
 - Touching mock-provider `name()` methods in three existing router
   tests (`complete_retries_per_provider_count`,
   `complete_and_stream_return_non_cooldownable_error_immediately`,
@@ -60,36 +67,59 @@ remaining region gap (session 8 ended at 96.84%) by:
    `.cargo/config.toml` (target-dir pinned to `/tmp/llmproxy-target`,
    `.cargo` outside the project so Dropbox-sync safe).
 
-## Test inventory (per file)
+## Test inventory (per file, 2026-10-26)
+
+Counted from `cargo test --lib --bins --tests -- --list` on `main`
+(`2c28ee4`). `test_support.rs` and `tracing_capture.rs` hold test-only
+helpers; their tests are counted with the lib tests.
 
 | File                                              | #Tests | Notes                                                                                       |
 |---------------------------------------------------|------:|---------------------------------------------------------------------------------------------|
-| `src/anthropic.rs` (types + serde)                |     3 | roundtrip                                                                                   |
-| `src/openai.rs` (types + serde)                   |     1 | roundtrip                                                                                   |
-| `src/conversion/cache_hint.rs`                    |   ~12  | Anthropic→OpenAI cache control translation                                                  |
-| `src/conversion/request.rs`                       |   ~25  | Anthropic→OpenAI request conversion (system blocks, tools, thinking, images)                 |
-| `src/conversion/response.rs`                      |   ~15  | OpenAI→Anthropic response conversion                                                        |
-| `src/conversion/stream.rs`                        |   ~20  | OpenAI→Anthropic SSE conversion                                                             |
-| `src/conversion/responses.rs`                     |   ~30  | Anthropic↔Responses API conversion                                                          |
-| `src/conversion/responses_stream.rs`              |   ~25  | Responses API SSE → Anthropic SSE                                                           |
-| `src/cooldown.rs`                                 |   ~5   | TTL boundaries, concurrent marks                                                            |
-| `src/error.rs`                                    |   ~12  | `status_code`, `is_cooldownable`, `IntoResponse` for every variant                          |
-| `src/oauth/token_store.rs`                        |     8 | fs isolation, xdg env handling                                                              |
-| `src/providers/anthropic.rs`                      |   ~10  | bearer auth, anthropic-version header, SSE pass-through                                     |
-| `src/providers/openai_compat.rs`                  |   ~25  | model rewriting, SSE adapter, full Anthropic→OpenAI conversion                              |
-| `src/providers/openai_responses.rs`               |   ~30  | Responses API: complete + stream, SSE adapter edge cases, error propagation                 |
-| `src/providers/copilot.rs`                        |   ~25  | headers, base URL, refresh, GPT-5 → /v1/responses routing, background loop                  |
-| `src/router.rs`                                   |   ~50  | full fallback chain, can_serve_model skip, model-unsupported heuristic, cooldown            |
-| `src/server.rs`                                   |   ~14  | MappedStream, /admin/copilot/auth 200/409/404 paths, every route                            |
-| `tests/integration_router.rs`                     |   ~13  | end-to-end fallback + provider mirroring                                                    |
-| `tests/auth.rs`                                   |     7  | bearer / x-api-key / no-key                                                                 |
-| `tests/server.rs`                                 |   ~14  | full axum stack, all routes                                                                 |
-| **TOTAL**                                         | **357**| + main.rs `build_tracing_filter` formatting test                                           |
+| `src/anthropic.rs` (types + serde)                |    20 | roundtrip + stream-event serde                                                              |
+| `src/openai.rs` (types + serde)                   |    19 | roundtrip                                                                                   |
+| `src/responses.rs` (types + serde)                |    26 | roundtrip                                                                                   |
+| `src/conversion/cache_hint.rs`                    |    13 | Anthropic→OpenAI cache control translation                                                  |
+| `src/conversion/request.rs`                       |    40 | Anthropic→OpenAI request conversion (system blocks, tools, thinking, images)                 |
+| `src/conversion/response.rs`                      |    18 | OpenAI→Anthropic response conversion                                                        |
+| `src/conversion/stream.rs`                        |    21 | OpenAI→Anthropic SSE conversion                                                             |
+| `src/conversion/responses.rs`                     |    68 | Anthropic↔Responses API conversion                                                          |
+| `src/conversion/responses_stream.rs`              |    51 | Responses API SSE → Anthropic SSE                                                           |
+| `src/conversion/util.rs`                          |    26 | strict-schema rewriting, web-search detection                                               |
+| `src/cooldown.rs`                                 |     9 | TTL boundaries, concurrent marks                                                            |
+| `src/config.rs`                                   |    69 | parse/validate, `${VAR}` expansion, secrets overlay, duplicate/merge-key semantics           |
+| `src/error.rs`                                    |    11 | `status_code`, `is_cooldownable`, `IntoResponse` for every variant                          |
+| `src/extractor.rs`                                |     4 | `AppJson` size/content-type rejection                                                       |
+| `src/auth.rs`                                     |     1 | constant-time bearer comparison                                                             |
+| `src/secrets.rs`                                  |    28 | `.env` parsing rules, overlay precedence, redaction                                          |
+| `src/tokenize.rs`                                 |     9 | token estimation heuristic                                                                  |
+| `src/usage.rs`                                    |    65 | ring buffer, rollups/grouping, SSE byte scanner                                             |
+| `src/util.rs`                                     |     9 | log sanitisation helpers                                                                    |
+| `src/oauth/device_flow.rs`                        |    14 | device-flow state machine                                                                   |
+| `src/oauth/token_crypto.rs`                       |    13 | AES-GCM token envelope                                                                      |
+| `src/oauth/token_store.rs`                        |    20 | fs isolation, xdg env handling                                                              |
+| `src/providers/anthropic.rs`                      |    73 | bearer auth, anthropic-version header, SSE pass-through, thinking retry                     |
+| `src/providers/openai_compat.rs`                  |    71 | model rewriting, SSE adapter, full Anthropic→OpenAI conversion                              |
+| `src/providers/openai_responses.rs`               |    36 | Responses API: complete + stream, SSE adapter edge cases, error propagation                 |
+| `src/providers/copilot.rs`                        |    80 | headers, base URL, refresh, GPT-5 → /v1/responses routing, background loop                  |
+| `src/providers/mod.rs`                            |     4 | provider construction                                                                       |
+| `src/proxy_client.rs`                             |     9 | proxied vs direct pool selection                                                            |
+| `src/router.rs`                                   |    32 | full fallback chain, can_serve_model skip, model-unsupported heuristic, cooldown            |
+| `src/server.rs`                                   |    20 | MappedStream, /admin/copilot/auth 200/409/404 paths, every route                            |
+| `src/test_support.rs`                             |     4 | test-only env-lock helpers                                                                  |
+| `src/tracing_capture.rs`                          |     3 | test-only tracing capture                                                                   |
+| `src/main.rs` (bin)                               |    14 | tracing-filter formatting + config bootstrap helpers                                        |
+| `tests/integration_router.rs`                     |    21 | end-to-end fallback + provider mirroring                                                    |
+| `tests/auth.rs`                                   |     7 | bearer / x-api-key / no-key                                                                 |
+| `tests/secrets_file.rs`                           |     5 | real `secrets:` file on disk, precedence, startup failure                                   |
+| `tests/server.rs`                                 |    57 | full axum stack, all routes                                                                 |
+| `tests/verify_deepseek_thinking.rs`               |     5 | cross-model fallback + Anthropic thinking strip/retry end-to-end                             |
+| **TOTAL**                                         | **995** | 886 lib + 14 bin + 95 integration                                                          |
 
 ## Coverage ceiling (architectural limits)
 
 The 4 categories below account for essentially all remaining
-uncovered regions (~476/15870) that cannot be closed without
+uncovered regions (476 of 15,870 at the 2026-07 baseline; the same
+categories still apply) that cannot be closed without
 modifying production code, breaking the test contract, or making
 tests more fragile.
 
@@ -312,11 +342,11 @@ runs as root), but the same script on the host failed with
 
 ```bash
 cargo install cargo-llvm-cov    # one-time
-cargo test --lib --tests        # 357 tests, all pass
-cargo llvm-cov --lib --tests    # coverage report
+cargo test --lib --bins --tests # 995 tests, all pass
+cargo llvm-cov --lib --bins --tests   # coverage report
 ```
 
-Baseline snapshot: `/tmp/cov-final.json` (15682 regions / 871 functions / 10098 lines).
+Historical baseline (2026-07): `/tmp/cov-final.json` (15682 regions / 871 functions / 10098 lines).
 
 ## Out of scope (explicitly not testing)
 

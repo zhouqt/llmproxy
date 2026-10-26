@@ -582,6 +582,30 @@ impl Config {
                 .map_err(|msg| ProxyError::Config(format!("provider '{name}': {msg}")))?;
         }
 
+        // `account_type` is interpolated into the token-host URL
+        // (`https://api.{account_type}.githubcopilot.com`). A typo here
+        // would send the GitHub token to an unintended subdomain, so pin
+        // it to the three hostnames GitHub actually operates (audit L4).
+        for p in &self.providers {
+            let ProviderConfig::GithubCopilot {
+                name,
+                account_type,
+                ..
+            } = p
+            else {
+                continue;
+            };
+            if !matches!(
+                account_type.as_str(),
+                "individual" | "business" | "enterprise"
+            ) {
+                return Err(ProxyError::Config(format!(
+                    "provider '{name}': account_type must be one of \
+                     individual|business|enterprise (got '{account_type}')"
+                )));
+            }
+        }
+
         let provider_names: std::collections::HashSet<&str> =
             self.providers.iter().map(|p| p.name()).collect();
 
@@ -872,6 +896,71 @@ models:
 "#;
         let err = Config::parse(raw).unwrap_err();
         assert!(format!("{err}").contains("not in providers"));
+    }
+
+    #[test]
+    fn config_rejects_unknown_copilot_account_type() {
+        // Audit L4: `account_type` is interpolated into the token host
+        // (`https://api.{account_type}.githubcopilot.com`); a typo must
+        // fail validation — naming the provider — instead of pointing
+        // the GitHub token at an unintended subdomain.
+        let raw = r#"
+providers:
+  - name: copilot
+    type: github_copilot
+    account_type: indivdual
+models:
+  - name: gpt-4
+    primary: copilot
+"#;
+        let err = Config::parse(raw).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("account_type must be one of"), "{msg}");
+        assert!(msg.contains("indivdual"), "{msg}");
+        assert!(msg.contains("'copilot'"), "{msg}");
+    }
+
+    #[test]
+    fn config_accepts_all_documented_copilot_account_types() {
+        for account_type in ["individual", "business", "enterprise"] {
+            let raw = format!(
+                r#"
+providers:
+  - name: copilot
+    type: github_copilot
+    account_type: {account_type}
+models:
+  - name: gpt-4
+    primary: copilot
+"#
+            );
+            let cfg = Config::parse(&raw).unwrap();
+            let ProviderConfig::GithubCopilot {
+                account_type: got, ..
+            } = cfg.find_provider("copilot").unwrap()
+            else {
+                panic!("expected a github_copilot provider");
+            };
+            assert_eq!(got, account_type);
+        }
+
+        // Absent field → the documented default (`individual`) is
+        // unaffected by the whitelist.
+        let raw = r#"
+providers:
+  - name: copilot
+    type: github_copilot
+models:
+  - name: gpt-4
+    primary: copilot
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        let ProviderConfig::GithubCopilot { account_type, .. } =
+            cfg.find_provider("copilot").unwrap()
+        else {
+            panic!("expected a github_copilot provider");
+        };
+        assert_eq!(account_type, "individual");
     }
 
     #[test]

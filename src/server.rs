@@ -1964,6 +1964,7 @@ mod tests {
                 http: reqwest::Client::new(),
                 copilot: Some(provider),
                 usage: UsageStats::new(8),
+                auth_limiter: crate::auth::AuthRateLimiter::new(),
             };
             crate::server::build_router(state)
         }
@@ -2238,6 +2239,7 @@ mod tests {
                 http: reqwest::Client::new(),
                 copilot: Some(provider),
                 usage: UsageStats::new(8),
+                auth_limiter: crate::auth::AuthRateLimiter::new(),
             });
 
             let resp = app
