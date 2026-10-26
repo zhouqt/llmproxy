@@ -195,6 +195,30 @@ value: the proxy rejects an empty key at startup rather than treating it
 as "auth disabled" (a misspelled variable must not silently open the
 endpoint).
 
+## Container hardening
+
+The compose service runs with a read-only root filesystem, every Linux
+capability dropped, and `no-new-privileges` set (security audit L5):
+
+```yaml
+read_only: true
+cap_drop: [ALL]
+security_opt: [no-new-privileges]
+tmpfs:
+  - /run:rw,noexec,nosuid,nodev,size=4m
+  - /tmp:rw,noexec,nosuid,nodev,size=4m
+```
+
+The writable surfaces are exactly the ones the design already needs:
+`/run` (the unsealed plaintext, tmpfs — never on disk), `/tmp` (the
+entrypoint's scratch file `/tmp/seal.ctx`, also tmpfs — with a read-only
+rootfs the unseal would have nowhere to load the policy session
+otherwise), and the `llmproxy-data` volume (Copilot token store). An
+exploited proxy process therefore cannot modify the image, persist a
+payload, or escalate; TPM access comes from `keep-groups` (the `tss`
+group on `/dev/tpmrm0`), not from any capability, so `cap_drop ALL`
+does not affect the unseal path.
+
 ## Normal operation
 
 ```bash

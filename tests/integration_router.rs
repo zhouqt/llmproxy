@@ -1131,6 +1131,7 @@ fn build_axum_app(
         http: reqwest::Client::new(),
         copilot: None,
         usage,
+        auth_limiter: llmproxy::auth::AuthRateLimiter::new(),
     };
     llmproxy::server::build_router(state)
 }
