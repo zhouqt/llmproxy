@@ -137,6 +137,7 @@ fn build_state(
         http: direct_http,
         copilot,
         usage: llmproxy::usage::UsageStats::new(usage_capacity),
+        auth_limiter: llmproxy::auth::AuthRateLimiter::new(),
     };
     Ok((state, bg_handles))
 }
