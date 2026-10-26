@@ -56,11 +56,17 @@ pub async fn require_auth(
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
+    // Hash both sides before comparing (audit L3): the raw loop used to
+    // return early on a length mismatch, which leaks the expected API
+    // key's length through timing. SHA-256 digests are always 32 bytes,
+    // so the comparison below has no length-dependent branch at all, and
+    // SHA-256 collision resistance makes the extra step invisible to
+    // correct-token traffic. `ring` is already a direct dependency (it
+    // encrypts the Copilot token store), so this adds no crate.
+    let da = ring::digest::digest(&ring::digest::SHA256, a);
+    let db = ring::digest::digest(&ring::digest::SHA256, b);
     let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
+    for (x, y) in da.as_ref().iter().zip(db.as_ref().iter()) {
         diff |= x ^ y;
     }
     diff == 0
@@ -77,5 +83,22 @@ mod tests {
         assert!(!constant_time_eq(b"hello", b"hell"));
         assert!(!constant_time_eq(b"hello", b"helloo"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn constant_time_eq_has_no_length_shortcut() {
+        // Audit L3: unequal lengths must still yield `false`, but through
+        // the same 32-byte digest comparison as every other input — the
+        // historical early `return false` on a length mismatch is gone.
+        assert!(!constant_time_eq(b"", b"a"));
+        assert!(!constant_time_eq(b"a", b""));
+        assert!(!constant_time_eq(&[0u8; 64], &[0u8; 65]));
+
+        // Long inputs: equal compares equal, a single flipped byte does not.
+        let long = [7u8; 4096];
+        assert!(constant_time_eq(&long, &long));
+        let mut flipped = long;
+        flipped[4095] ^= 1;
+        assert!(!constant_time_eq(&long, &flipped));
     }
 }
