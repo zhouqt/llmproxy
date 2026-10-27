@@ -188,6 +188,21 @@ mod env_guard_tests {
     /// Private to this module, so no other test can race on it.
     const KEY: &str = "LLMPROXY_TEST_ENV_GUARD";
 
+    /// Two more private keys, one per test that asserts *after* the guard
+    /// is dropped.
+    ///
+    /// The assertion after `drop(env)` runs with the lock released, so it
+    /// must not look at a variable another test might be mutating at that
+    /// moment. The tests below all used the same key, so a sibling test that
+    /// had just set it made the post-drop assertion read that value instead
+    /// of the original one — a flake that only showed up when the suite ran
+    /// the tests in a different order (it failed one PR run with
+    /// `left: Some("set-before-panic")`, `right: None`).
+    /// One key per test removes the overlap entirely: no test writes a
+    /// variable that another test asserts on.
+    const KEY_SECOND: &str = "LLMPROXY_TEST_ENV_GUARD_SECOND";
+    const KEY_PANIC: &str = "LLMPROXY_TEST_ENV_GUARD_PANIC";
+
     #[test]
     fn env_guard_restores_the_previous_value_on_drop() {
         let mut env = env_lock();
@@ -202,19 +217,19 @@ mod env_guard_tests {
     #[test]
     fn env_guard_does_not_overwrite_its_snapshot_on_second_mutation() {
         let mut env = env_lock();
-        let original = std::env::var_os(KEY);
-        env.set_var(KEY, "first");
-        env.set_var(KEY, "second");
+        let original = std::env::var_os(KEY_SECOND);
+        env.set_var(KEY_SECOND, "first");
+        env.set_var(KEY_SECOND, "second");
         drop(env);
 
-        assert_eq!(std::env::var_os(KEY), original);
+        assert_eq!(std::env::var_os(KEY_SECOND), original);
     }
 
     #[test]
     fn env_guard_restores_the_previous_value_when_the_test_panics() {
         let mut env = env_lock();
-        let original = std::env::var_os(KEY);
-        env.set_var(KEY, "set-before-panic");
+        let original = std::env::var_os(KEY_PANIC);
+        env.set_var(KEY_PANIC, "set-before-panic");
 
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let _env = env;
@@ -224,7 +239,7 @@ mod env_guard_tests {
 
         // The guard is dropped while unwinding, so the variable is restored
         // even though this test never reached a cleanup statement.
-        assert_eq!(std::env::var_os(KEY), original);
+        assert_eq!(std::env::var_os(KEY_PANIC), original);
 
         // This panic happened with the guard alive, so ENV_LOCK is now
         // poisoned for the rest of the process. That is intentional: it makes

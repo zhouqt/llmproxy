@@ -5,9 +5,12 @@ edition = "2021"
 
 [dependencies]
 axum = { version = "0.8", features = ["macros", "json"] }
-tokio = { version = "1", features = ["full"] }
+# tokio features are narrowed to what the code actually uses
+# (macros/net/rt/rt-multi-thread/signal/sync/time). "full" additionally
+# pulled in fs/process/parking_lot -- the parking_lot crate family is
+# three packages that were compiled but never called.
+tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tower = "0.5"
-tower-http = { version = "0.7", features = ["trace"] }
 
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks", "gzip"] }
 
@@ -28,7 +31,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 uuid = { version = "1", features = ["v4", "serde"] }
 async-trait = "0.1"
 futures-util = "0.3"
-tokio-stream = { version = "0.1", features = ["sync"] }
 bytes = "1"
 memchr = "2"
 
@@ -55,7 +57,9 @@ base64 = "0.23"
 libc = "0.2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["full", "test-util"] }
+# Same narrowed feature set as the main dependency, plus "test-util" for
+# tokio::time::advance. The tests never touch fs/process either.
+tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time", "test-util"] }
 wiremock = "0.6"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
