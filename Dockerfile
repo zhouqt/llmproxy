@@ -29,8 +29,16 @@
 # build inputs are identical to CI's (measured: for the same tag, the two
 # registries serve byte-identical manifests and the same digest).
 #
-# The FROM lines must be **literal**: Dependabot reads the FROM line to update
-# the digest. Written as ARG(${VAR}) it cannot see it, and tag drift goes unnoticed.
+# The FROM lines must be **literal**. tools/check-base-digests.py parses
+# them to spot a tag that drifted; written as ARG(${VAR}) it cannot parse
+# them, and then nobody knows which image is actually pinned.
+#
+# NOTE: a moved tag does **not** change this sha256 by itself. A pinned
+# digest moves for exactly one reason: the pinned image has a CVE that a
+# fresh build of the same tag has already fixed -- see the base-image-cve
+# job in .github/workflows/refresh-pins.yml.
+# To move it by hand:
+#   tools/check-base-digests.py --resolve && tools/check-base-digests.py --set <image>@<digest>
 #
 #   rust:1-alpine  → sha256:b1d5dd5a22a09404d3e798c0cf051b689077360374eb505fa5bb93c479693d87
 #   alpine:3       → sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
