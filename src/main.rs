@@ -153,9 +153,12 @@ fn init_tracing() {
 
 /// Build the EnvFilter used for tracing. Falls back to the project's default
 /// level when no `RUST_LOG` is configured.
+///
+/// The default used to include `tower_http=info`, but tower-http is no
+/// longer a dependency (nothing in the tree used its TraceLayer), so that
+/// directive could never match anything.
 fn build_tracing_filter() -> EnvFilter {
-    EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("llmproxy=info,tower_http=info"))
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("llmproxy=info"))
 }
 
 fn parse_args(args: &[String]) -> Args {

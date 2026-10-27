@@ -21,7 +21,7 @@ cargo llvm-cov --lib --bins --tests   # coverage (project target is >97% regions
 - Build output is pinned to `/tmp/llmproxy-target` by `.cargo/config.toml` — the repo tree stays source-only. Tests and binaries live there, not under `target/`.
 - Runtime requires `--config <path>`. Config files use `${ENV_VAR}` expansion; `config.example.yaml` is the field reference. Secrets live in `config.yaml` (gitignored) / env vars, never commit them.
 - A git pre-commit hook runs `scripts/scan-secrets.sh` (API-key leak audit). Install once with `scripts/install-hooks.sh`.
-- Log level via `RUST_LOG` (default `llmproxy=info,tower_http=info`).
+- Log level via `RUST_LOG` (default `llmproxy=info`).
 
 ## Architecture
 
