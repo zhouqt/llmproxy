@@ -2,6 +2,10 @@
 name = "llmproxy"
 version = "0.2.0"
 edition = "2021"
+# This proxy is not published to crates.io. Saying so explicitly also
+# tells cargo-deny the crate is private, so the license check does not
+# demand a license expression for it.
+publish = false
 
 [dependencies]
 axum = { version = "0.8", features = ["macros", "json"] }
