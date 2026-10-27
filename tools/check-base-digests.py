@@ -1,27 +1,31 @@
 #!/usr/bin/env python3
-"""Check that the base images pinned in the Dockerfile still match the tag.
+"""Manage the base images pinned in the Dockerfile.
 
-Why this exists
----------------
+The policy
+----------
 The Dockerfile pins its base images by digest:
 
     FROM docker.io/library/rust:1-alpine@sha256:...
 
-A digest pin is only useful if someone notices when the tag moves. The
-tag is what a human (or Dependabot) reads; the digest is what the build
-actually resolves. If they drift apart, the build silently keeps using
-an old image -- often one with a known CVE -- and nothing in CI says so.
+A tag moves every time upstream rebuilds the image, and `rust:1-alpine`
+is rebuilt constantly. A pin that follows the tag would move constantly
+too, and a pull request per rebuild is a pull request nobody reads.
 
-So this script does the comparison, in the one place that can reach
-Docker Hub: the CI runner.
+So the pin does **not** follow the tag. It moves for exactly one reason:
+the pinned image has a vulnerability that a newer build has fixed. The
+CVE scan in `.github/workflows/refresh-pins.yml` is what decides; this
+script is the hand that moves the pin once that decision is made.
 
-    tools/check-base-digests.py                     # check docker.io
-    tools/check-base-digests.py --registry public.ecr.aws
+    tools/check-base-digests.py                      # report drift
+    tools/check-base-digests.py --list               # what is pinned
+    tools/check-base-digests.py --resolve            # what the tags point at now
+    tools/check-base-digests.py --set IMAGE@DIGEST   # move a pin, deliberately
 
 Exit status
 -----------
-0   every pinned digest still matches its tag
-1   a digest has drifted (the tag moved) -- update the Dockerfile
+0   done
+1   a digest has drifted (the tag moved). On its own this is not an
+    error: a moved tag is only worth acting on when it carries a fix.
 2   the registry could not be reached (network problem, not a drift)
 
 The two failure modes are deliberately different exit codes: "your pin
@@ -200,6 +204,74 @@ def pinned_images(dockerfile: str) -> list[tuple[str, str]]:
     return unique
 
 
+def rewrite_pins(dockerfile: str, stale: list[tuple[str, str, str]]) -> int:
+    """Point the pins at the digests the tags currently resolve to.
+
+    Only the digest is replaced: the image name, the tag and everything
+    around it stay exactly as they were, so the diff of a refresh PR is
+    one line per base image.
+
+    The digest string is replaced wherever it appears, not just on the
+    FROM line. The Dockerfile's header lists the same digests in a
+    comment, and a comment that disagrees with the FROM line is a lie
+    that survives until somebody reads it.
+    """
+    with open(dockerfile, encoding="utf-8") as fh:
+        text = fh.read()
+    changed = 0
+    for image, old, new in stale:
+        if old in text:
+            text = text.replace(old, new)
+            changed += 1
+        else:
+            print(
+                f"warn: the pinned digest for {image} does not appear in "
+                f"{dockerfile}; it was not updated",
+                file=sys.stderr,
+            )
+    if changed:
+        with open(dockerfile, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    return changed
+
+
+def apply_sets(dockerfile: str, pins: list[tuple[str, str]], specs: list[str]) -> int:
+    """Move the given pins to the given digests.
+
+    This is the deliberate half of the job: unlike `--update`, which
+    follows the tag, this moves a specific image to a specific digest --
+    the one a CVE scan has cleared.
+    """
+    by_image = {image: digest for image, digest in pins}
+    stale: list[tuple[str, str, str]] = []
+    for spec in specs:
+        image, _, digest = spec.partition("@")
+        if not digest.startswith("sha256:") or len(digest) != len("sha256:") + 64:
+            print(f"error: not a digest: {spec}", file=sys.stderr)
+            return 2
+        if image not in by_image:
+            print(
+                f"error: {image} is not pinned in {dockerfile}; "
+                "use the exact image name from --list",
+                file=sys.stderr,
+            )
+            return 2
+        old = by_image[image]
+        if old == digest:
+            print(f"ok:   {image} is already pinned to {digest[:19]}...")
+            continue
+        stale.append((image, old, digest))
+
+    if not stale:
+        print("nothing to move")
+        return 0
+    changed = rewrite_pins(dockerfile, stale)
+    for image, old, new in stale:
+        print(f"moved {image}: {old[:19]}... -> {new[:19]}...")
+    print(f"updated {changed} pin(s) in {dockerfile}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -211,6 +283,32 @@ def main() -> int:
         "--dockerfile",
         default="Dockerfile",
         help="file to read the pinned images from",
+    )
+    ap.add_argument(
+        "--list",
+        action="store_true",
+        help="print the pinned images as 'image@digest', one per line, and exit",
+    )
+    ap.add_argument(
+        "--resolve",
+        action="store_true",
+        help=(
+            "print what each pinned tag resolves to right now as "
+            "'image@digest', one per line, and exit. This is the candidate "
+            "an upgrade would move to -- whether it is worth moving is a "
+            "question about CVEs, not about the tag having moved."
+        ),
+    )
+    ap.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        metavar="IMAGE@DIGEST",
+        help=(
+            "pin IMAGE to DIGEST in the Dockerfile (repeatable). This is "
+            "the deliberate move: it is what an upgrade does once a CVE "
+            "says the pin has to move."
+        ),
     )
     args = ap.parse_args()
 
@@ -225,6 +323,34 @@ def main() -> int:
     if not pins:
         print(f"error: no digest-pinned FROM line in {args.dockerfile}", file=sys.stderr)
         return 2
+
+    if args.set:
+        return apply_sets(args.dockerfile, pins, args.set)
+
+    if args.list:
+        # The Dockerfile is the single source of truth for which images are
+        # pinned; a workflow that needs those references reads them from
+        # here instead of repeating the digests.
+        for image, digest in pins:
+            print(f"{image}@{digest}")
+        return 0
+
+    if args.resolve:
+        failed = False
+        for image, _digest in pins:
+            _reg, repo_and_tag = split_image(image)
+            repo, tag = split_repo_tag(repo_and_tag)
+            try:
+                current = manifest_digest(args.registry, repo, tag)
+            except (urllib.error.URLError, OSError, ValueError) as exc:
+                print(f"warn: cannot reach {args.registry} for {repo}:{tag}: {exc}", file=sys.stderr)
+                failed = True
+                continue
+            print(f"{image}@{current}")
+        if failed:
+            print("error: could not resolve every pinned tag", file=sys.stderr)
+            return 2
+        return 0
 
     stale = []
     unreachable = []
@@ -250,6 +376,13 @@ def main() -> int:
             stale.append((image, digest, current))
 
     if stale:
+        # A moved tag is a fact, not a defect. The pin does not follow
+        # the tag; it follows a CVE. Say so and let the CVE scan decide.
+        print(
+            "note: the tag moved. The pin stays until a CVE says it has "
+            f"to move -- see the base-image-cve job in refresh-pins.yml.",
+            file=sys.stderr,
+        )
         return 1
     if unreachable and len(unreachable) == len(pins):
         print(
@@ -261,4 +394,12 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- the exit code is the message
+        # Anything unexpected is "could not check", not "nothing to do".
+        # The caller distinguishes the two by the exit code.
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        sys.exit(2)

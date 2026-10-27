@@ -19,8 +19,13 @@
 # 不是镜像站,所以构建输入与 CI 完全一致(实测:两个 registry 上同一 tag 的
 # manifest 字节相同,digest 相同)。
 #
-# Dockerfile 里必须写**字面量**的 FROM:Dependabot 靠解析 FROM 行来更新 digest,
-# 写成 ARG(${VAR})它认不出来,tag 漂移就没人管了。
+# Dockerfile 里必须写**字面量**的 FROM:tag 漂移要靠 tools/check-base-digests.py 认出来,
+# 写成 ARG(${VAR})它解析不了,钉的到底是哪个镜像就没人知道了。
+#
+# 注意:tag 移动**不会**自动改这里的 sha256。钉死的 digest 只在"这个镜像有 CVE、
+# 而上游新构建的同一个 tag 已经修好了"的时候才动 —— 见
+# .github/workflows/refresh-pins.yml 的 base-image-cve。
+# 手动要动时: tools/check-base-digests.py --resolve && tools/check-base-digests.py --set <image>@<digest>
 #
 #   rust:1-alpine  → sha256:b1d5dd5a22a09404d3e798c0cf051b689077360374eb505fa5bb93c479693d87
 #   alpine:3       → sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a

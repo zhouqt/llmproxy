@@ -1,0 +1,362 @@
+name: refresh-pins
+
+# Monthly check for the two things Dependabot cannot see.
+#
+# Dependabot covers what is in a manifest: the Rust dependencies
+# (Cargo.lock) and the workflow actions (`uses:` pins). It does not
+# cover the *audit tools*, because their versions are arguments in a
+# workflow file, not entries in a manifest:
+#
+#   cargo install --locked --version 0.20.2 cargo-deny
+#
+# Those versions are pinned on purpose -- these tools run with full
+# permissions, so bumping one is a decision -- but a pin that never
+# moves is a pin that goes stale, and a stale cargo-deny may not know
+# about a new class of advisory.
+#
+# So this workflow does the mechanical half: once a month, ask crates.io
+# what the current versions are, and if something moved, open a pull
+# request. It never merges. The version bump is still a decision
+# somebody makes on purpose -- the PR just means nobody has to remember
+# to look.
+#
+# The second job is the base image, and it works the other way round: the
+# digest pin moves only when there is a CVE to move it for. A rebuilt
+# tag is not a reason -- rust:1-alpine is rebuilt constantly, and a PR
+# for every rebuild is a PR nobody reads. The trigger is a
+# vulnerability in the image we actually build, and the fix is a
+# candidate that does not have it.
+#
+# Note: scheduled workflows only run from the default branch, so this
+# does nothing until it is merged to main.
+
+on:
+  schedule:
+    # Monthly, 1st of the month 04:23 UTC.
+    - cron: "23 4 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: refresh-pins
+  cancel-in-progress: false
+
+env:
+  # The branch the pull request targets. Not GITHUB_REF_NAME: on a
+  # manual run that would be whichever branch the workflow was started
+  # from, and a pin refresh belongs on the default branch.
+  DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+
+jobs:
+  tool-versions:
+    name: Pinned audit tool versions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # Rewrites the pins in place if crates.io has a newer version.
+      # Exit 0 = checked, up to date (or updated); exit 2 = could not
+      # reach crates.io, which is a failure of the check itself and must
+      # not be mistaken for "nothing to do".
+      - name: Check crates.io for newer tool versions
+        id: check
+        run: |
+          set -eu
+          rc=0
+          tools/check-tool-versions.py --update || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::could not check crates.io (exit $rc)"
+            exit "$rc"
+          fi
+          if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git diff --stat
+          fi
+
+      - name: Open a pull request
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          BRANCH="chore/refresh-tool-versions-$(date -u +%Y-%m)"
+          if gh pr list --head "$BRANCH" --state open --json number | grep -q number; then
+            echo "::notice::a pull request for $BRANCH is already open; nothing to do"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add -A
+          git commit -F - <<'MSG'
+          chore(deps): update the pinned audit tool versions
+
+          Found by .github/workflows/refresh-pins.yml: crates.io has newer
+          versions of the tools this repository pins by hand.
+
+          A version bump is a decision, not a chore: these tools run with
+          full permissions. Check the changelog before merging, and expect
+          deny.toml's schema or the cargo-vet ledger format to have moved.
+          MSG
+          git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)" \
+            push origin "HEAD:refs/heads/$BRANCH"
+          gh pr create \
+            --base "$DEFAULT_BRANCH" \
+            --head "$BRANCH" \
+            --title "chore(deps): update the pinned audit tool versions" \
+            --body "Monthly pin refresh (automated).
+
+          crates.io has newer versions of the tools pinned in \`ci.yml\` /
+          \`Dockerfile\`. This PR only changes the version numbers.
+
+          Before merging, read the changelog: \`cargo-deny\`'s config
+          schema and \`cargo-vet\`'s ledger format have both changed
+          between minor versions, and a tool that cannot read its own
+          config is a silently useless check."
+
+  base-image-cve:
+    name: Base image CVEs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # RustSec advisories (the weekly cargo-audit cron) cover the Rust
+      # crates. They say nothing about the Alpine apk packages or the
+      # Rust toolchain inside the base image -- those are a different
+      # database, and a different scanner.
+      #
+      # The scan runs against the pinned *digest*, not the tag: the digest
+      # is the exact image the build pulls, so the result is the CVE set
+      # of what we actually build, not of whatever the tag points at
+      # today.
+      #
+      # The pinned images come from the Dockerfile itself, not from a copy
+      # pasted here: two copies of a digest is one copy too many.
+      - name: Read the pinned images
+        id: pins
+        run: |
+          set -eu
+          while IFS= read -r ref; do
+            case "$ref" in
+              *"/rust:"*)   echo "rust=$ref"   >> "$GITHUB_OUTPUT" ;;
+              *"/alpine:"*) echo "alpine=$ref" >> "$GITHUB_OUTPUT" ;;
+            esac
+          done < <(tools/check-base-digests.py --list)
+
+      # `ignore-unfixed: true` keeps the report about vulnerabilities
+      # that a package update would actually fix -- a CVE with no patch
+      # is not something moving the pin can help with.
+      #
+      # The steps are allowed to fail: the finding is the signal, and
+      # the steps below are the alarm. A scheduled run that goes red and
+      # cannot be actioned is noise.
+      - name: Scan the pinned Rust base image
+        id: scan-pinned-rust
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.pins.outputs.rust }}
+          scan-type: image
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: 1
+        # The Java index DB is ~990 MB compressed and is only useful for
+        # images that contain JARs. Alpine has none. Without this, every
+        # monthly run downloads a gigabyte it never looks at.
+        env:
+          TRIVY_SKIP_JAVA_DB_UPDATE: "true"
+
+      - name: Scan the pinned Alpine base image
+        id: scan-pinned-alpine
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.pins.outputs.alpine }}
+          scan-type: image
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: 1
+        # The Java index DB is ~990 MB compressed and is only useful for
+        # images that contain JARs. Alpine has none. Without this, every
+        # monthly run downloads a gigabyte it never looks at.
+        env:
+          TRIVY_SKIP_JAVA_DB_UPDATE: "true"
+
+      # No CVE, no PR. This is the whole point: a rebuilt tag is not a
+      # reason to move the pin, so the pin stays where it is.
+      - name: Nothing to do when the pinned images are clean
+        if: steps.scan-pinned-rust.outcome == 'success' && steps.scan-pinned-alpine.outcome == 'success'
+        run: |
+          echo "::notice::the pinned base images have no HIGH/CRITICAL vulnerabilities with a fix available; the pin stays"
+
+      # There is a CVE. Now the question is whether upstream has rebuilt
+      # the tag into something that fixes it -- and only then is the pin
+      # worth moving.
+      - name: Resolve the candidate images
+        id: candidates
+        if: steps.scan-pinned-rust.outcome == 'failure' || steps.scan-pinned-alpine.outcome == 'failure'
+        run: |
+          set -eu
+          while IFS= read -r ref; do
+            case "$ref" in
+              *"/rust:"*)   echo "rust=$ref"   >> "$GITHUB_OUTPUT" ;;
+              *"/alpine:"*) echo "alpine=$ref" >> "$GITHUB_OUTPUT" ;;
+            esac
+          done < <(tools/check-base-digests.py --resolve)
+
+      - name: Scan the candidate Rust base image
+        id: scan-candidate-rust
+        if: steps.candidates.outputs.rust != ''
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.candidates.outputs.rust }}
+          scan-type: image
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: 1
+        # The Java index DB is ~990 MB compressed and is only useful for
+        # images that contain JARs. Alpine has none. Without this, every
+        # monthly run downloads a gigabyte it never looks at.
+        env:
+          TRIVY_SKIP_JAVA_DB_UPDATE: "true"
+
+      - name: Scan the candidate Alpine base image
+        id: scan-candidate-alpine
+        if: steps.candidates.outputs.alpine != ''
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.candidates.outputs.alpine }}
+          scan-type: image
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: 1
+        # The Java index DB is ~990 MB compressed and is only useful for
+        # images that contain JARs. Alpine has none. Without this, every
+        # monthly run downloads a gigabyte it never looks at.
+        env:
+          TRIVY_SKIP_JAVA_DB_UPDATE: "true"
+
+      # Move the pin for the images whose candidate is clean, and only for
+      # those. An image whose candidate still has the CVE keeps its pin:
+      # there is nothing better to move to.
+      - name: Move the pins the CVEs call for
+        id: apply
+        if: steps.candidates.outputs.rust != '' || steps.candidates.outputs.alpine != ''
+        run: |
+          set -eu
+          set_args=()
+          if [ "${{ steps.scan-candidate-rust.outcome }}" = "success" ] && [ -n "${{ steps.candidates.outputs.rust }}" ]; then
+            set_args+=(--set "${{ steps.candidates.outputs.rust }}")
+          fi
+          if [ "${{ steps.scan-candidate-alpine.outcome }}" = "success" ] && [ -n "${{ steps.candidates.outputs.alpine }}" ]; then
+            set_args+=(--set "${{ steps.candidates.outputs.alpine }}")
+          fi
+          if [ "${#set_args[@]}" -eq 0 ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no candidate image is clean; the pins stay where they are"
+            exit 0
+          fi
+          tools/check-base-digests.py "${set_args[@]}"
+          if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git diff --stat
+          fi
+
+      - name: Open a pull request
+        if: steps.apply.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          BRANCH="chore/fix-base-image-cve-$(date -u +%Y-%m)"
+          if gh pr list --head "$BRANCH" --state open --json number | grep -q number; then
+            echo "::notice::a pull request for $BRANCH is already open; nothing to do"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add -A
+          git commit -F - <<'MSG'
+          fix(deps): move the base image pin to a build without the CVE
+
+          The image this repository pins by digest has a HIGH or CRITICAL
+          vulnerability with a fix available, and upstream has rebuilt the
+          tag without it. The pin moves to that build.
+
+          The pin does not move because the tag moved -- it moves because
+          the pinned image is vulnerable.
+          MSG
+          git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)" \
+            push origin "HEAD:refs/heads/$BRANCH"
+          gh pr create \
+            --base "$DEFAULT_BRANCH" \
+            --head "$BRANCH" \
+            --title "fix(deps): move the base image pin to a build without the CVE" \
+            --body "Monthly CVE scan (automated).
+
+          The base image this repository pins by digest has a HIGH or
+          CRITICAL vulnerability with a fix available, and the current
+          build of the same tag does not. This PR moves the pin.
+
+          The pin is *not* moved by a rebuilt tag on its own: a tag that
+          moves without a CVE behind it leaves the pin alone.
+
+          The scan report is in the log of this workflow run:
+          ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      # The CVE is real and upstream has not fixed it yet. Nothing to
+      # move to, so this is a report, not a pull request.
+      - name: Report a CVE that upstream has not fixed
+        if: steps.apply.outputs.changed != 'true' && (steps.scan-pinned-rust.outcome == 'failure' || steps.scan-pinned-alpine.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          TITLE="Base image CVE: the pinned digest is vulnerable and upstream has not fixed it"
+          BODY=$(cat <<'MSG'
+          Trivy found HIGH or CRITICAL vulnerabilities (with a fix
+          available) in the base images this repository pins by digest, and
+          the current build of the same tag still has them.
+
+          The full report is in the log of this workflow run:
+          ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          Moving the pin would not help -- the tag upstream has the same
+          problem. What is left:
+
+          1. Move to a different base image version (a different tag
+             that is rebuilt more often, or a different distribution).
+          2. Or accept the finding and write down why: what the
+             vulnerability is, whether the vulnerable code is reachable
+             in this image, and when it will be revisited.
+          MSG
+          )
+          if gh issue list --search "$TITLE in:title" --state open --json number | grep -q number; then
+            echo "::notice::an issue for this finding is already open"
+            exit 0
+          fi
+          gh issue create --title "$TITLE" --body "$BODY"
