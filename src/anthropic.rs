@@ -525,7 +525,7 @@ mod schema_tests {
             }
             (Value::Array(a), Value::Array(e)) => {
                 assert_eq!(a.len(), e.len(), "array length mismatch");
-                for (i, (av, ev)) in a.iter().zip(e.iter()).enumerate() {
+                for (av, ev) in a.iter().zip(e.iter()) {
                     assert_subset(av, ev);
                 }
             }
