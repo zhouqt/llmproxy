@@ -2,6 +2,10 @@
 name = "llmproxy"
 version = "0.2.0"
 edition = "2021"
+# This proxy is not published to crates.io. Saying so explicitly also
+# tells cargo-deny the crate is private, so the license check does not
+# demand a license expression for it.
+publish = false
 
 [dependencies]
 axum = { version = "0.8", features = ["macros", "json"] }
@@ -79,3 +83,11 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Where cargo-vet's store (the exemption ledger, the audit file and the
+# imported-audits lock) lives. cargo-vet's default is a top-level
+# directory of its own; this project keeps the store under `.cargo/`,
+# next to cargo's own config, so the repository root stays about the
+# project itself.
+[package.metadata.vet]
+store = { path = ".cargo/vet" }
