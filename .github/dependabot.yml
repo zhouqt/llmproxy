@@ -38,3 +38,25 @@ updates:
     groups:
       action-dependencies:
         patterns: ["*"]
+  # NOTE: there is deliberately NO `docker` ecosystem here.
+  #
+  # The base images in the Dockerfile are pinned by digest, and the
+  # obvious way to keep them current is to let Dependabot move the pin
+  # whenever the tag is rebuilt. That is wrong for this repository: a
+  # rebuilt tag is not a reason to move the pin. `rust:1-alpine` is
+  # rebuilt constantly, so that policy produces a pull request per
+  # rebuild -- noise that trains everyone to ignore the channel that
+  # would have carried a real security update.
+  #
+  # The pin moves for one reason instead: the pinned image has a CVE
+  # that a newer build has fixed. The `base-image-cve` job in
+  # `.github/workflows/refresh-pins.yml` scans the pinned digest, finds
+  # the CVE, checks whether the current build of the tag has fixed it,
+  # and opens the pull request. A rebuild without a CVE behind it leaves
+  # the pin alone.
+  #
+  # To follow a tag by hand (a one-off, for instance), move the pin
+  # deliberately:
+  #   tools/check-base-digests.py --resolve
+  #   tools/check-base-digests.py --set <image>@<digest>
+
