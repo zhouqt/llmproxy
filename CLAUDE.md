@@ -19,6 +19,16 @@ cargo llvm-cov --lib --bins --tests   # coverage (project target is >97% regions
 ```
 
 - Build output is pinned to `/tmp/llmproxy-target` by `.cargo/config.toml` — the repo tree stays source-only. Tests and binaries live there, not under `target/`.
+- **No Rust toolchain on the host? Use the container:** `tools/rust-build.sh` runs cargo inside the *same* `rust:1-alpine` digest the Dockerfile pins, with the repository mounted **read-only** and the registry cache / target dir on the host. It exists because the build host has ~19 GB of disk and runs out of room for a debug build plus a scanner database; the deploy host has 61 GB and already has the source tree.
+
+  ```bash
+  tools/rust-build.sh fetch --locked
+  tools/rust-build.sh build --release --locked
+  tools/rust-build.sh test --lib --bins --tests
+  tools/rust-build.sh -- <command>      # anything else
+  ```
+
+  Override `RUST_IMAGE`, `CARGO_HOME_DIR` (`/var/tmp/llmproxy-cargo`), `CARGO_TARGET_DIR` (`/var/tmp/llmproxy-target`) as needed; `HTTPS_PROXY` is passed through when set.
 - Runtime requires `--config <path>`. Config files use `${ENV_VAR}` expansion; `config.example.yaml` is the field reference. Secrets live in `config.yaml` (gitignored) / env vars, never commit them.
 - A git pre-commit hook runs `scripts/scan-secrets.sh` (API-key leak audit). Install once with `scripts/install-hooks.sh`.
 - Log level via `RUST_LOG` (default `llmproxy=info`).
