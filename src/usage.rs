@@ -2409,9 +2409,9 @@ mod tests {
             failed_providers: vec![],
         total_tokens: 0,
         };
-        stats.record(mk(0));;
-        stats.record(mk(10));;
-        stats.record(mk(20));;
+        stats.record(mk(0));
+        stats.record(mk(10));
+        stats.record(mk(20));
 
         // since=10 inclusive (>=), until=20 exclusive (<) per plan
         // L604-605 → only the record at exactly 10 falls in [10, 20).
@@ -2719,9 +2719,9 @@ mod tests {
             failed_providers: vec![],
         total_tokens: 0,
         };
-        stats.record(mk(1));;
-        stats.record(mk(2));;
-        stats.record(mk(3));;
+        stats.record(mk(1));
+        stats.record(mk(2));
+        stats.record(mk(3));
         let snap = stats.snapshot(None, None, None);
         assert_eq!(snap.len(), 2);
         // Oldest (secs=1) evicted.

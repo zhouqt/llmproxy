@@ -19,9 +19,19 @@ cargo llvm-cov --lib --bins --tests   # coverage (project target is >97% regions
 ```
 
 - Build output is pinned to `/tmp/llmproxy-target` by `.cargo/config.toml` — the repo tree stays source-only. Tests and binaries live there, not under `target/`.
+- **No Rust toolchain on the host? Use the container:** `tools/rust-build.sh` runs cargo inside the *same* `rust:1-alpine` digest the Dockerfile pins, with the repository mounted **read-only** and the registry cache / target dir on the host. It exists because the build host has ~19 GB of disk and runs out of room for a debug build plus a scanner database; the deploy host has 61 GB and already has the source tree.
+
+  ```bash
+  tools/rust-build.sh fetch --locked
+  tools/rust-build.sh build --release --locked
+  tools/rust-build.sh test --lib --bins --tests
+  tools/rust-build.sh -- <command>      # anything else
+  ```
+
+  Override `RUST_IMAGE`, `CARGO_HOME_DIR` (`/var/tmp/llmproxy-cargo`), `CARGO_TARGET_DIR` (`/var/tmp/llmproxy-target`) as needed; `HTTPS_PROXY` is passed through when set.
 - Runtime requires `--config <path>`. Config files use `${ENV_VAR}` expansion; `config.example.yaml` is the field reference. Secrets live in `config.yaml` (gitignored) / env vars, never commit them.
 - A git pre-commit hook runs `scripts/scan-secrets.sh` (API-key leak audit). Install once with `scripts/install-hooks.sh`.
-- Log level via `RUST_LOG` (default `llmproxy=info,tower_http=info`).
+- Log level via `RUST_LOG` (default `llmproxy=info`).
 
 ## Architecture
 
@@ -79,6 +89,13 @@ The response carries `x-llmproxy-failed-providers` (e.g. `copilot:429,deepseek:5
 - **Copilot specifics**: 402 → cooldownable; `/models` cache drives `can_serve_model`-style routing and endpoint choice; token refresh runs as a background task.
 - **Client identity simulation**: non-Copilot outbound requests present the Claude Code client identity — `User-Agent: claude-cli/2.1.224 (external, claude-vscode, agent-sdk/0.3.224)` (default, from the top-level `user_agent` config; the exact string the real client reports when driven as an external agent) plus, on the `anthropic` provider, `anthropic-version: 2023-06-01` and `x-app: cli` (both verified by pointing a mock server at the real CLI). This is what lets upstream gateways classify the proxy as Claude Code rather than an unknown client (the bare `claude-code/<ver>` CLI format is not recognized; the real client sends no `anthropic-client-platform` header). Copilot deliberately keeps `GitHubCopilotChat/<version>` (it overrides the header per-request and GitHub gates by client version).
 - **`/admin/status` contract**: `ProviderHealth` is deliberately binary (`available`/`cooling_down`) and reflects in-memory cooldown state only — it never probes upstreams. Consumed by a Claude Code statusline hook; keep shape backwards-compatible.
+- **Supply-chain invariants** (see `plans/harden-cargo-deps.md` for the experiments behind them). Three facts that are easy to get wrong, so they are written down:
+  - `cargo build --offline` is **not** a sandbox. `build.rs` still runs, still reaches the network, still reads every environment variable. The only real egress block in this repo is the container's `--network=none`.
+  - `cargo build --locked` only asserts the manifest agrees with `Cargo.lock`. A **downgrade** is a perfectly consistent lock file, so `--locked` does not catch it — `tools/lock-drift.py` (CI job `lock-drift`) does.
+  - The `Dockerfile` compiles in four stages on purpose: `tools` (network, installs `cargo-auditable`/`cargo-cyclonedx`), `fetch` (network, `cargo fetch --locked` only, runs no build script), `builder` (`RUN --network=none cargo auditable build --release --offline --locked`), `runtime` (alpine + the binary + the CycloneDX SBOM). `tools/sandbox-canary/` is a probe crate whose `build.rs` fails the build if the compile environment can reach the network or holds credential-shaped env vars. Keep it wired into the image build **and** the CI job that proves it fails with the network reachable and passes without it.
+  - The base images are pinned by digest on `docker.io`. The build host cannot reach `docker.io` directly, so it goes through a proxy (`tools/build-image.sh`) — the same registry CI uses, not a mirror. Keep the `FROM` lines **literal**: `tools/check-base-digests.py` parses them and cannot follow a build ARG.
+  - **The base image pin does not follow the tag.** A rebuilt tag is not a reason to move a digest pin — `rust:1-alpine` is rebuilt constantly, and a PR per rebuild is noise. The pin moves for exactly one reason: the pinned image has a HIGH/CRITICAL CVE with a fix that the current build of the same tag does not have. The `base-image-cve` job in `.github/workflows/refresh-pins.yml` (monthly, Trivy) decides and opens the PR; there is deliberately no `docker` ecosystem in `dependabot.yml`. To move a pin by hand: `tools/check-base-digests.py --resolve` then `--set <image>@<digest>`.
+  - `docs/SUPPLY_CHAIN.md` is the reference for what is enforced vs. what only reports, and for how the pinned inputs (crates, base images, RustSec advisories, CI tool versions) are kept current. Read it before changing anything in `deny.toml`, `supply-chain/`, or the CI audit job.
 
 ## Config quick reference
 

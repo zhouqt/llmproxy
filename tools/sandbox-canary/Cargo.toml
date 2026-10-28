@@ -1,0 +1,25 @@
+# Sandbox canary — 编译期隔离自检
+#
+# 这个 crate 的 build.rs 主动探测"编译环境是否被隔离":
+#   1. 能不能连到外网?
+#   2. 环境里有没有本不该出现的凭据变量?
+#
+# 只要探测到破口,构建立刻失败 —— 目的是让"隔离失效"变成一个**构建立刻可见的红**,
+# 而不是等出事之后才发现。
+#
+# 它是独立 workspace(下面的 `[workspace]` 表),不进主 workspace,
+# 因此 `cargo build` / `cargo test` / `cargo llvm-cov` 都不会碰它。
+#
+# 用法:
+#   隔离环境(期望通过): cargo build --manifest-path tools/sandbox-canary/Cargo.toml
+#   有网环境(期望失败):   同上 —— 除非显式设置 SANDBOX_CANARY_RELAXED=1
+[package]
+name = "sandbox-canary"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# 独立 workspace:避免被仓库根的 workspace 吸收。
+[workspace]
+
+[dependencies]
