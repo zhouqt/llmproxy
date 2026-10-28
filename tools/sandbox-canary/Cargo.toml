@@ -1,0 +1,25 @@
+# Sandbox canary -- a compile-time isolation self-check
+#
+# This crate's build.rs actively probes whether the build environment is isolated:
+# 1. Can it reach the network?
+# 2. Does the environment hold credential variables that must not be there?
+#
+# As soon as a breach is detected the build fails -- the goal is to make "isolation is broken"
+# a **build failure that is visible right away**, instead of something you only find out about later.
+#
+# It is a separate workspace (the `[workspace]` table below), not part of the main
+# workspace, so `cargo build` / `cargo test` / `cargo llvm-cov` never touch it.
+#
+# Usage:
+#   Isolated environment (expected to pass): cargo build --manifest-path tools/sandbox-canary/Cargo.toml
+#   Networked environment (expected to fail): the same, unless SANDBOX_CANARY_RELAXED=1 is set explicitly
+[package]
+name = "sandbox-canary"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Separate workspace: keep the repository root's workspace from absorbing it.
+[workspace]
+
+[dependencies]
