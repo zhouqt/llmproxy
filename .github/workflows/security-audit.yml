@@ -34,6 +34,11 @@ jobs:
       # `# vX` comment naming the tag it was resolved from. To upgrade an
       # action, resolve the new tag's SHA and replace both.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The audit action only needs to read the tree. Leaving the
+          # GITHUB_TOKEN in .git/config would put a live credential where
+          # any later step could pick it up.
+          persist-credentials: false
 
       # `rustsec/audit-check` v2 wraps `cargo-audit` against the same RustSec
       # advisory DB the local audit uses. It is a node24 action and needs no
