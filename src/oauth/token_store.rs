@@ -6,7 +6,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::error::{ProxyError, Result};
-use crate::oauth::token_crypto::{open, parse_key, seal, TokenEnvelope};
+use crate::oauth::token_crypto::{open, parse_key, seal, seal_migrated, TokenEnvelope};
 
 /// Persisted GitHub OAuth + Copilot API tokens.
 ///
@@ -93,41 +93,49 @@ impl TokenStore {
     /// operator did not configure one and the store is (or should be)
     /// plaintext.
     ///
-    /// Three shapes are recognized, in this order:
+    /// The rule is **"the key decides the format"**:
     ///
-    /// 1. **Plaintext** — the body parses as [`StoredTokens`]. It is
-    ///    returned as-is, *regardless of `key`*. This is the migration
-    ///    path: an existing plaintext store keeps working, and the next
-    ///    `save` rewrites it encrypted.
-    /// 2. **Envelope** — the body parses as a [`TokenEnvelope`] carrying
-    ///    our magic string. Decrypting it requires `key`:
-    ///    * `None` → warn and return `Ok(None)`. A device-flow re-auth
-    ///      beats bricking the process; the operator can fix the key
-    ///      and the next load succeeds.
-    ///    * `Some` → decrypt. A failure (wrong key, tampered file) also
-    ///      warns and returns `Ok(None)` — we deliberately do **not**
-    ///      delete the file, so the next successful authentication can
-    ///      overwrite it. This mirrors the existing 401/403
-    ///      clears-the-store behavior.
-    /// 3. **Neither** → the historical corrupt-file handling: the
-    ///    original parse error propagates and callers treat it as "no
-    ///    tokens".
+    /// * **With a key** — only *our* envelope is accepted. A legacy
+    ///   plaintext store is *migrated* (re-written as an envelope, so
+    ///   the host disk stops holding plaintext) but **not trusted**:
+    ///   its contents were never authenticated, so anybody who could
+    ///   write that file could have planted their own token. The
+    ///   migration therefore yields no tokens; the operator has to
+    ///   re-authenticate, and that write produces a normal envelope.
+    /// * **Without a key** — only plaintext is accepted. An envelope
+    ///   cannot be read (there is no key) and is reported as "no
+    ///   tokens" with a warning.
+    /// * Neither shape parses → the historical corrupt-file handling:
+    ///   the original parse error propagates and callers treat it as
+    ///   "no tokens".
     pub fn load(&self, key: Option<&SecretString>) -> Result<Option<StoredTokens>> {
         if !self.path.exists() {
             return Ok(None);
         }
         let raw = std::fs::read_to_string(&self.path)?;
 
-        // (1) Legacy plaintext store.
-        if let Ok(tokens) = serde_json::from_str::<StoredTokens>(&raw) {
-            return Ok(Some(tokens));
-        }
-
-        // (2) Encrypted store.
+        // (1) Encrypted store.
         if let Ok(envelope) = serde_json::from_str::<TokenEnvelope>(&raw) {
             if envelope.is_ours() {
                 return self.load_encrypted(&envelope, key);
             }
+        }
+
+        // (2) Legacy plaintext store.
+        if let Ok(tokens) = serde_json::from_str::<StoredTokens>(&raw) {
+            if key.is_none() {
+                return Ok(Some(tokens));
+            }
+            // A key is configured: the plaintext must not be used, but
+            // it must also not stay on the disk in the clear.
+            self.migrate_plaintext(&raw, key);
+            tracing::warn!(
+                path = %self.path.display(),
+                "token store is plaintext but provider.token_store_key is configured; \
+                 refusing to use it (it was never authenticated) and migrating it to an \
+                 encrypted store -- re-authenticate via /admin/copilot/auth"
+            );
+            return Ok(None);
         }
 
         // (3) Neither — keep the historical corrupt-file behavior and
@@ -135,6 +143,31 @@ impl TokenStore {
         Err(ProxyError::Json(
             serde_json::from_str::<StoredTokens>(&raw).unwrap_err(),
         ))
+    }
+
+    /// Re-write a legacy plaintext store as a `migrated` envelope.
+    ///
+    /// Best-effort: a failure here must not take the proxy down (the
+    /// operator can still re-authenticate and the next `save` replaces
+    /// the file anyway), so the error is logged and swallowed.
+    fn migrate_plaintext(&self, raw: &str, key: Option<&SecretString>) {
+        let Some(key) = key else {
+            return;
+        };
+        let outcome = (|| -> Result<()> {
+            let key_bytes = parse_key(key.expose_secret()).map_err(ProxyError::Config)?;
+            let envelope = seal_migrated(key_bytes.as_bytes(), raw.as_bytes())?;
+            let serialized = serde_json::to_string_pretty(&envelope)?;
+            write_atomic(&self.path, serialized.as_bytes())
+        })();
+        if let Err(e) = outcome {
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %e,
+                "failed to migrate the plaintext token store to an encrypted one; \
+                 the plaintext file is still on disk"
+            );
+        }
     }
 
     /// Decrypt an envelope. Never fails hard: a missing or wrong key
@@ -153,8 +186,19 @@ impl TokenStore {
             );
             return Ok(None);
         };
+        if envelope.migrated {
+            // This envelope wraps a legacy plaintext store, which was
+            // never authenticated. Encrypting it got the plaintext off
+            // the disk, but the bytes themselves are not trustworthy.
+            tracing::warn!(
+                path = %self.path.display(),
+                "token store was migrated from an unauthenticated plaintext store; \
+                 treating it as empty (re-authenticate via /admin/copilot/auth)"
+            );
+            return Ok(None);
+        }
         let key_bytes = parse_key(key.expose_secret()).map_err(ProxyError::Config)?;
-        match open(&key_bytes, envelope) {
+        match open(key_bytes.as_bytes(), envelope) {
             Ok(plain) => Ok(Some(serde_json::from_slice(&plain)?)),
             Err(e) => {
                 tracing::warn!(
@@ -175,18 +219,41 @@ impl TokenStore {
     /// written as plaintext JSON exactly as before. The file permissions
     /// and atomicity are unchanged either way — `write_atomic` still
     /// creates the file 0600 and renames it into place.
+    ///
+    /// A plaintext write over an **encrypted** store is refused: that
+    /// would silently undo the encryption the moment the operator's
+    /// `token_store_key` goes missing (an unset `${VAR}` in the config
+    /// expands to nothing). Failing loudly here is the whole point —
+    /// the ciphertext on disk must never be downgraded by accident.
     pub fn save(&self, tokens: &StoredTokens, key: Option<&SecretString>) -> Result<()> {
+        if key.is_none() && self.is_encrypted_on_disk() {
+            return Err(ProxyError::Config(format!(
+                "refusing to overwrite the encrypted token store at {} with plaintext; \
+                 configure provider.token_store_key for this provider",
+                self.path.display()
+            )));
+        }
         let raw = match key {
             None => serde_json::to_string_pretty(tokens)?,
             Some(key) => {
                 let key_bytes = parse_key(key.expose_secret()).map_err(ProxyError::Config)?;
                 let plaintext = serde_json::to_vec(tokens)?;
-                let envelope = seal(&key_bytes, &plaintext)?;
+                let envelope = seal(key_bytes.as_bytes(), &plaintext)?;
                 serde_json::to_string_pretty(&envelope)?
             }
         };
         write_atomic(&self.path, raw.as_bytes())?;
         Ok(())
+    }
+
+    /// True when the store on disk is one of our encrypted envelopes.
+    fn is_encrypted_on_disk(&self) -> bool {
+        let Ok(raw) = std::fs::read_to_string(&self.path) else {
+            return false;
+        };
+        serde_json::from_str::<TokenEnvelope>(&raw)
+            .map(|envelope| envelope.is_ours())
+            .unwrap_or(false)
     }
 
     pub fn clear(&self) -> Result<()> {
@@ -506,21 +573,76 @@ mod tests {
         }
 
         #[test]
-        fn plaintext_store_still_loads_when_a_key_is_configured() {
-            // The migration path: an existing plaintext store keeps
-            // working after the operator adds token_store_key, and the
-            // next save rewrites it encrypted.
+        fn plaintext_store_is_migrated_but_not_trusted_when_a_key_is_configured() {
+            // A plaintext store carries no authentication: anybody who
+            // could write that file could have planted their own token.
+            // So a configured key means the plaintext is *not* used --
+            // but it is re-written as an envelope so the host disk stops
+            // holding the cleartext.
             let (_dir, store) = fresh_store();
             let tokens = sentinel_tokens();
             store.save(&tokens, None).unwrap();
+            let plaintext_bytes = std::fs::read(store.path()).unwrap();
 
             let key = secret_string(KEY_A);
-            let loaded = store
-                .load(Some(&key))
-                .unwrap()
-                .expect("plaintext store loads");
-            assert_eq!(loaded.github_access_token, tokens.github_access_token);
-            assert_eq!(loaded.copilot_token, tokens.copilot_token);
+            let loaded = store.load(Some(&key)).unwrap();
+            assert!(loaded.is_none(), "a plaintext store must not be trusted");
+
+            // The file is now an envelope ...
+            let raw = std::fs::read_to_string(store.path()).unwrap();
+            assert!(
+                raw.contains(crate::oauth::token_crypto::ENVELOPE_MAGIC),
+                "{raw}"
+            );
+            assert!(
+                !raw.contains("gh-plaintext-sentinel"),
+                "the cleartext must be gone from the disk: {raw}"
+            );
+            assert_ne!(
+                std::fs::read(store.path()).unwrap(),
+                plaintext_bytes,
+                "the store must have been rewritten"
+            );
+
+            // ... and the migrated envelope stays untrusted: reloading
+            // does not resurrect the migrated tokens either.
+            assert!(store.load(Some(&key)).unwrap().is_none());
+        }
+
+        #[test]
+        fn a_plaintext_write_over_an_encrypted_store_is_refused() {
+            // The operator's token_store_key went missing (an unset
+            // ${VAR} expands to nothing). The next token refresh must
+            // not quietly downgrade the encrypted store to plaintext.
+            let (_dir, store) = fresh_store();
+            let key = secret_string(KEY_A);
+            store.save(&sentinel_tokens(), Some(&key)).unwrap();
+            let before = std::fs::read(store.path()).unwrap();
+
+            let err = store.save(&sentinel_tokens(), None).unwrap_err();
+
+            assert!(
+                err.to_string().contains("refusing to overwrite the encrypted token store"),
+                "{err}"
+            );
+            assert_eq!(
+                std::fs::read(store.path()).unwrap(),
+                before,
+                "the encrypted store must be byte-identical after the refusal"
+            );
+        }
+
+        #[test]
+        fn a_plaintext_write_is_allowed_when_there_is_no_encrypted_store() {
+            // The legacy path: no key, no envelope on disk -> plaintext
+            // is fine.
+            let (_dir, store) = fresh_store();
+            store.save(&sentinel_tokens(), None).unwrap();
+
+            store.save(&sentinel_tokens(), None).unwrap();
+
+            let raw = std::fs::read_to_string(store.path()).unwrap();
+            assert!(!raw.contains(crate::oauth::token_crypto::ENVELOPE_MAGIC), "{raw}");
         }
 
         #[test]

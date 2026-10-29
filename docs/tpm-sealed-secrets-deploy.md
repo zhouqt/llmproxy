@@ -27,6 +27,7 @@ deploy/secrets/seal/llmproxy.NNNN.* ┐
 | `deploy/entrypoint.sh` | Unseals (or copies) the secrets, then `exec`s the proxy |
 | `deploy/seal.sh` | Host-side: seals a plaintext `.env` into the chunked blob, then verifies the round trip |
 | `deploy/secrets/seal/llmproxy.NNNN.{pub,priv}` | The sealed chunks — **ciphertext only**, gitignored |
+| `deploy/secrets/seal/llmproxy.env.sha256` | The digest of the sealed plaintext; the entrypoint verifies the unsealed payload against it |
 | `deploy/secrets/llmproxy.env` | Fallback plaintext — **empty in normal operation**, gitignored |
 | `deploy/secrets/llmproxy.env.example` | Template for the fallback file (tracked) |
 
@@ -43,6 +44,19 @@ entrypoint unseals the pieces in index order and concatenates them; the
 resulting byte stream is identical to the input file. The host still
 holds ciphertext only — chunking changes the file count, not the
 security property.
+
+### Why the seal directory carries a digest
+
+`deploy/seal.sh` records the sha256 of the plaintext it sealed as
+`llmproxy.env.sha256` next to the chunks. A successful unseal only
+proves that the TPM released the blobs — it says nothing about whether
+the blob *set* is complete, in order, or unmodified. The entrypoint
+therefore compares the digest of the unsealed payload with the recorded
+one and refuses to start on a mismatch.
+
+A seal directory produced before this check existed has no digest file.
+The entrypoint then only warns (it does not refuse to start), so an old
+deployment keeps working; re-running `deploy/seal.sh` adds the digest.
 
 ## Host prerequisites (once)
 
@@ -307,6 +321,49 @@ whole mechanism exists to provide does not hold. Use it to keep the
 service up while you diagnose a TPM problem, not as a permanent
 configuration.
 
+The fallback copy is only safe while `/run` is a tmpfs — otherwise it
+also lands in the container's writable layer. The entrypoint therefore
+refuses to start in fallback mode when `/run` is not a tmpfs, exactly as
+it does in TPM mode. If you knowingly accept the plaintext on disk (a
+temporary diagnosis, not a configuration), opt out explicitly:
+
+```yaml
+environment:
+  - ALLOW_PLAINTEXT_FALLBACK=1
+```
+
+## `LLMPROXY_MOUNTS` is a test knob — never set it in production
+
+The entrypoint reads the mount table it checks for the `/run` tmpfs from
+`$LLMPROXY_MOUNTS`, which defaults to `/proc/mounts`:
+
+```sh
+MOUNTS=${LLMPROXY_MOUNTS:-/proc/mounts}
+```
+
+**Production must not set this variable.** It exists for exactly one
+purpose: letting the tmpfs check's behaviour be *exercised* on a host
+where `/run` may or may not be a tmpfs — i.e. so the refusal path can
+be rehearsed without a container.
+
+It is not a configuration knob, and setting it in a deployment is a way
+to turn the check (T12) off. Pointing it at a mount table that does not
+contain a `/run` tmpfs makes the entrypoint believe `/run` is not a
+tmpfs; pointing it at a *forged* table that does contain one makes the
+entrypoint believe the opposite — and the unsealed plaintext then lands
+on the host disk, which is the one thing this whole mechanism exists to
+prevent. Either way the check has stopped meaning what it says.
+
+If you need to rehearse the refusal path, do it on the host with an
+explicit, temporary value, and never in the compose file:
+
+```bash
+LLMPROXY_MOUNTS=/path/to/a/fake-mounts sh deploy/entrypoint.sh true
+```
+
+A deployment that sets `LLMPROXY_MOUNTS` should be treated as a
+misconfiguration.
+
 ## Verification
 
 Run through this after the first deploy and after any seal change.
@@ -318,7 +375,7 @@ Run through this after the first deploy and after any seal change.
 | `podman inspect <c>` → `Mounts` | seal dir + empty placeholder, no `.env` |
 | `podman exec <c> ls -l /run/secrets/` | `llmproxy.env`, `0400` |
 | `podman exec <c> env \| grep -i key` | empty (nothing came via the environment) |
-| `podman logs <c>` | no key material; at most `from=file` source markers |
+| `podman logs <c>` | no key material; at most `from=file` source markers, plus `OK: the unsealed payload matches the sealed digest` |
 | `podman exec <c> mount \| grep ' /run '` | **`tmpfs on /run`** — see below |
 | `podman diff <c>` | no `/run/secrets/llmproxy.env` |
 | `grep -rl 'sk-' ~/.local/share/containers/storage/overlay/` | empty |

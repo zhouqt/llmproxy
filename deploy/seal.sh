@@ -10,9 +10,11 @@
 # the resulting byte stream is identical to the input file.
 #
 # The host keeps ciphertext only: llmproxy.NNNN.pub + llmproxy.NNNN.priv
-# per chunk. The plaintext is piped, never copied -- it is never written
-# to a temporary file, never put on a command line, and never enters the
-# shell history.
+# per chunk, plus the sha256 of the sealed plaintext
+# (llmproxy.env.sha256) that the entrypoint verifies the unsealed
+# payload against. The plaintext is piped, never copied -- it is never
+# written to a temporary file, never put on a command line, and never
+# enters the shell history.
 #
 # Usage:
 #   deploy/seal.sh <plaintext.env> [seal-dir]
@@ -138,6 +140,17 @@ if [ "$SRC_SUM" != "$OUT_SUM" ]; then
     echo "       unsealed sha256 $OUT_SUM" >&2
     exit 1
 fi
+
+# Record the digest of the sealed plaintext next to the chunks, so the
+# entrypoint can verify what it unseals (deploy/entrypoint.sh). The
+# unseal itself proves only that the TPM released the blob, not that
+# the blob set is complete and unmodified.
+#
+# The file is written with the plain "<hash>  <name>" layout that
+# sha256sum -c understands, but the entrypoint only reads the hash
+# field, so the name is a label rather than a path.
+printf '%s  llmproxy.env\n' "$SRC_SUM" > "$OUT/llmproxy.env.sha256"
+chmod 600 "$OUT/llmproxy.env.sha256"
 
 # The variable count is printed, the values are not: enough to tell
 # "the seal has all ten keys" from "the seal has half of them".
