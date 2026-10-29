@@ -53,6 +53,20 @@ pub enum ProxyError {
     #[error("upstream error: status={status}, body={body}")]
     Upstream { status: u16, body: String },
 
+    /// Explicitly marks an error whose message is upstream text.
+    ///
+    /// `Other` carries both purely client-side errors (e.g. "copilot bootstrap
+    /// already in progress") and errors that carry an upstream hint (a Copilot
+    /// token refresh failure, a GitHub device-flow response body); collapsing
+    /// the two would cost usability. So every error that really does carry
+    /// upstream text uses this variant, which `without_upstream_details()` /
+    /// `client_message(false)` genericise; a client-side `Other` stays readable.
+    ///
+    /// Unlike `Upstream` it takes no part in the cooldown decision and carries
+    /// no status meaning: it says what the upstream *said*, not what it answered.
+    #[error("{message}")]
+    UpstreamText { message: String },
+
     #[error("authentication failed")]
     Unauthorized,
 
@@ -92,6 +106,12 @@ pub enum ProxyError {
     #[error(transparent)]
     Yaml(#[from] serde_saphyr::Error),
 
+    /// Any other error: the catch-all.
+    ///
+    /// Note: **do not** put an error that carries upstream text in here -- an
+    /// error that says what the upstream said uses `UpstreamText`, so it is
+    /// genericised when `expose_upstream_details=false`. What is left in `Other`
+    /// is purely client-side / proxy-side text (local file-path errors, ...).
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -108,6 +128,9 @@ impl ProxyError {
             ProxyError::Upstream { status, .. } => {
                 StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
             }
+            // 500 like `Other` / `Internal`: the error says what the upstream
+            // said, not what status it answered with.
+            ProxyError::UpstreamText { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             ProxyError::Schema(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -118,6 +141,7 @@ impl ProxyError {
             ProxyError::Upstream { status, .. } => {
                 matches!(*status, 401 | 402 | 404 | 408 | 429) || *status >= 500
             }
+            // `UpstreamText` carries no status and takes no part in cooldown.
             _ => false,
         }
     }
@@ -131,6 +155,87 @@ impl ProxyError {
                 Some(format_attempts_header(attempts))
             }
             _ => None,
+        }
+    }
+
+    /// The generic body a client sees when the deployment does not
+    /// expose upstream details.
+    ///
+    /// Shaped like an Anthropic error object so the client parses it
+    /// with the same code path it uses for every other error.
+    pub const GENERIC_UPSTREAM_BODY: &'static str =
+        r#"{"type":"error","error":{"type":"upstream_error","message":"upstream request failed"}}"#;
+
+    /// The generic message used in an in-stream `event: error` when the
+    /// deployment does not expose upstream details.
+    pub const GENERIC_UPSTREAM_MESSAGE: &'static str = "upstream request failed";
+
+    /// Strip the upstream body from this error.
+    ///
+    /// Used when `server.expose_upstream_details` is `false`: the
+    /// client gets the status code and a generic message, but not the
+    /// upstream's own error text (which can carry account, quota and
+    /// backend details). The logs and the `/admin/usage` rows keep the
+    /// full detail — they are read by the operator, not by the client.
+    ///
+    /// `AllProvidersFailed` collapses into the plain upstream error, so
+    /// the `x-llmproxy-failed-providers` header (which names the
+    /// failing backends) disappears with it.
+    ///
+    /// `UpstreamText` is the marker for "this really does carry upstream text"
+    /// (see its definition); `Http` (whose Display holds the upstream URL) and
+    /// `Internal` (which may hold upstream response parsing details) are
+    /// genericised too. A client-side `Other` (e.g. "copilot bootstrap already
+    /// in progress") stays as it is: it is about the client/proxy, not the upstream.
+    pub fn without_upstream_details(self) -> Self {
+        match self {
+            ProxyError::Upstream { status, .. } => ProxyError::Upstream {
+                status,
+                body: Self::GENERIC_UPSTREAM_BODY.to_string(),
+            },
+            ProxyError::AllProvidersFailed { last, .. } => {
+                // Keep the status the client would have seen today (the
+                // last upstream error's status), drop everything else.
+                let status = last.status_code().as_u16();
+                ProxyError::Upstream {
+                    status,
+                    body: Self::GENERIC_UPSTREAM_BODY.to_string(),
+                }
+            }
+            // Carries upstream text: replace it with the generic wording.
+            ProxyError::UpstreamText { .. } => ProxyError::UpstreamText {
+                message: Self::GENERIC_UPSTREAM_MESSAGE.to_string(),
+            },
+            // A reqwest error's Display holds the upstream URL.
+            ProxyError::Http(_) => ProxyError::UpstreamText {
+                message: Self::GENERIC_UPSTREAM_MESSAGE.to_string(),
+            },
+            // An internal error may hold upstream response parsing details.
+            ProxyError::Internal(_) => ProxyError::UpstreamText {
+                message: Self::GENERIC_UPSTREAM_MESSAGE.to_string(),
+            },
+            other => other,
+        }
+    }
+
+    /// The message a client may see for this error.
+    ///
+    /// With upstream details exposed this is the error's own `Display`
+    /// (which embeds the upstream body for upstream errors); without
+    /// them it is the generic wording.
+    pub fn client_message(&self, expose_upstream_details: bool) -> String {
+        if expose_upstream_details {
+            return self.to_string();
+        }
+        match self {
+            // Only the variants that carry upstream text (or the upstream URL) are
+            // replaced; errors about the request shape are backend-agnostic and readable.
+            ProxyError::Upstream { .. }
+            | ProxyError::AllProvidersFailed { .. }
+            | ProxyError::UpstreamText { .. }
+            | ProxyError::Http(_)
+            | ProxyError::Internal(_) => Self::GENERIC_UPSTREAM_MESSAGE.to_string(),
+            other => other.to_string(),
         }
     }
 }
@@ -413,6 +518,135 @@ mod tests {
             resp.headers()["x-llmproxy-failed-providers"],
             "primary:500,backup:502"
         );
+    }
+
+    #[tokio::test]
+    async fn without_upstream_details_replaces_the_upstream_body() {
+        let err = ProxyError::Upstream {
+            status: 429,
+            body: "{\"quota\": \"exhausted for account foo\"}".into(),
+        }
+        .without_upstream_details();
+
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(!body.contains("exhausted for account"), "{body}");
+        assert!(body.contains("upstream request failed"), "{body}");
+    }
+
+    #[test]
+    fn without_upstream_details_drops_the_failed_providers_header() {
+        let err = ProxyError::AllProvidersFailed {
+            model: "m".into(),
+            attempts: vec![RouteStep::Failed {
+                provider: "primary".into(),
+                status: 500,
+                body: "primary down".into(),
+            }],
+            last: Box::new(ProxyError::Upstream {
+                status: 500,
+                body: "primary down".into(),
+            }),
+        }
+        .without_upstream_details();
+
+        let resp = err.into_response();
+        assert!(
+            resp.headers().get("x-llmproxy-failed-providers").is_none(),
+            "the topology header must not survive the sanitization"
+        );
+    }
+
+    #[test]
+    fn client_message_hides_only_the_upstream_variants() {
+        let upstream = ProxyError::Upstream {
+            status: 500,
+            body: "upstream said no".into(),
+        };
+        assert_eq!(
+            upstream.client_message(true),
+            upstream.to_string(),
+            "with details exposed the message is the error's own Display"
+        );
+        assert_eq!(
+            upstream.client_message(false),
+            ProxyError::GENERIC_UPSTREAM_MESSAGE
+        );
+
+        // A client-side error says nothing about the backend, so it
+        // stays informative.
+        let bad = ProxyError::BadRequest("model 'x' is not configured".into());
+        assert_eq!(bad.client_message(false), bad.to_string());
+    }
+
+    /// A2: an error carrying upstream text (`UpstreamText`) becomes the generic
+    /// wording when the switch is off; `Http` (Display holds the upstream URL)
+    /// and `Internal` are genericised as well; a client-side `Other` stays readable.
+    #[test]
+    fn client_message_hides_upstream_carrying_variants() {
+        let text = ProxyError::UpstreamText {
+            message: "copilot /models returned 503: quota exhausted".into(),
+        };
+        assert_eq!(
+            text.client_message(false),
+            ProxyError::GENERIC_UPSTREAM_MESSAGE,
+            "upstream text must be replaced by the generic wording"
+        );
+        assert!(
+            text.client_message(true).contains("quota exhausted"),
+            "verbatim when the switch is on"
+        );
+
+        let internal = ProxyError::Internal("failed to parse provider response: x".into());
+        assert_eq!(
+            internal.client_message(false),
+            ProxyError::GENERIC_UPSTREAM_MESSAGE
+        );
+
+        // A client-side Other holds no upstream information and stays readable.
+        let client_side = ProxyError::Other(anyhow::anyhow!("copilot bootstrap already in progress"));
+        assert!(client_side
+            .client_message(false)
+            .contains("bootstrap already in progress"));
+    }
+
+    /// A2: `without_upstream_details()` genericises the variants that carry
+    /// upstream text while keeping the status semantics.
+    #[tokio::test]
+    async fn without_upstream_details_sanitizes_upstream_carrying_variants() {
+        let text = ProxyError::UpstreamText {
+            message: "copilot /models returned 503: quota exhausted".into(),
+        }
+        .without_upstream_details();
+        assert_eq!(text.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!text.to_string().contains("quota exhausted"), "{text}");
+
+        // A failed send's Display holds the upstream URL.
+        let http_err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/models")
+            .timeout(std::time::Duration::from_millis(50))
+            .send()
+            .await
+            .expect_err("connecting to a closed port must fail");
+        assert!(
+            http_err.to_string().contains("127.0.0.1"),
+            "precondition: a reqwest error's Display holds a URL, got: {http_err}"
+        );
+        let sanitized = ProxyError::Http(http_err).without_upstream_details();
+        assert!(!sanitized.to_string().contains("127.0.0.1"), "{sanitized}");
+
+        // A client-side Other is unaffected.
+        let client_side =
+            ProxyError::Other(anyhow::anyhow!("copilot bootstrap already in progress"));
+        assert!(client_side
+            .without_upstream_details()
+            .to_string()
+            .contains("bootstrap already in progress"));
     }
 
     /// Non-`AllProvidersFailed` errors must not produce the failed-providers

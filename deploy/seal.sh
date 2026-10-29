@@ -10,14 +10,16 @@
 # the resulting byte stream is identical to the input file.
 #
 # The host keeps ciphertext only: llmproxy.NNNN.pub + llmproxy.NNNN.priv
-# per chunk. The plaintext is piped, never copied -- it is never written
-# to a temporary file, never put on a command line, and never enters the
-# shell history.
+# per chunk, plus the sha256 of the sealed plaintext
+# (llmproxy.env.sha256) that the entrypoint verifies the unsealed
+# payload against. The plaintext is piped, never copied -- it is never
+# written to a temporary file, never put on a command line, and never
+# enters the shell history.
 #
 # Usage:
 #   deploy/seal.sh <plaintext.env> [seal-dir]
 #
-# Defaults: seal-dir = deploy/secrets/seal
+# Defaults: seal-dir = <directory of this script>/secrets/seal
 #
 # See plans/feat-vault-secret-backend.md (A-Phase 1) for the design.
 set -eu
@@ -44,7 +46,14 @@ usage() {
 [ $# -ge 1 ] && [ $# -le 2 ] || usage
 
 SRC=$1
-OUT=${2:-deploy/secrets/seal}
+# The default seal directory is next to this script, not next to the
+# caller: "deploy/secrets/seal" is correct only when the script is run
+# from the repository root. Run from anywhere else (a cron job, a
+# recovery shell) the relative default would write the ciphertext into
+# an unrelated directory -- and the entrypoint would then find no seal
+# where it looks for one.
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+OUT=${2:-$SELF_DIR/secrets/seal}
 
 if [ ! -f "$SRC" ]; then
     echo "ERROR: $SRC is not a file" >&2
@@ -138,6 +147,17 @@ if [ "$SRC_SUM" != "$OUT_SUM" ]; then
     echo "       unsealed sha256 $OUT_SUM" >&2
     exit 1
 fi
+
+# Record the digest of the sealed plaintext next to the chunks, so the
+# entrypoint can verify what it unseals (deploy/entrypoint.sh). The
+# unseal itself proves only that the TPM released the blob, not that
+# the blob set is complete and unmodified.
+#
+# The file is written with the plain "<hash>  <name>" layout that
+# sha256sum -c understands, but the entrypoint only reads the hash
+# field, so the name is a label rather than a path.
+printf '%s  llmproxy.env\n' "$SRC_SUM" > "$OUT/llmproxy.env.sha256"
+chmod 600 "$OUT/llmproxy.env.sha256"
 
 # The variable count is printed, the values are not: enough to tell
 # "the seal has all ten keys" from "the seal has half of them".

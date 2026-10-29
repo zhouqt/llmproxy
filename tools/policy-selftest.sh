@@ -21,9 +21,9 @@
 #     tools/policy-selftest.sh
 #
 # Requires cargo-deny and cargo-vet on PATH (the versions CI pins:
-# cargo-deny 0.20.2, cargo-vet 0.10.3). The lock-drift case additionally
-# needs python3; without it that case is reported as SKIP -- CI treats a
-# SKIP as a failure, because there the interpreter is always present.
+# cargo-deny 0.20.2, cargo-vet 0.10.3), plus python3 and git. A missing
+# tool is an error: the script exits 2 instead of skipping the case that
+# needed it, because a self-test that quietly checks less proves less.
 #
 # POSIX sh on purpose: the build host has no bash and no python, and a
 # check that only runs on one machine is a check that quietly stops
@@ -51,7 +51,7 @@ skip(){ printf 'SKIP: %s\n' "$1"; SKIP=$((SKIP + 1)); }
 scratch_copy() {
     dest=$1
     mkdir -p "$dest"
-    for item in Cargo.toml Cargo.lock deny.toml src tests supply-chain tools; do
+    for item in Cargo.toml Cargo.lock deny.toml Dockerfile src tests supply-chain tools; do
         if [ -e "$REPO_ROOT/$item" ]; then
             cp -R "$REPO_ROOT/$item" "$dest/"
         fi
@@ -87,6 +87,12 @@ need cargo-vet
 need cargo
 need awk
 need sed
+# python3 is not optional here. Without it the lock-drift and pin cases
+# cannot run, and a self-test that quietly checks less is exactly the
+# "gate that never went red" this script exists to prevent. The CI step
+# also greps for SKIP; this is the belt to that suspenders.
+need python3
+need git
 
 # ---------------------------------------------------------------------------
 # Control: the green path. If the unmodified repository does NOT pass, the
@@ -186,36 +192,69 @@ fi
 # exercises the whole path -- a real lock file, a real base ref -- on a
 # copy of the repository, so the CI step that calls it is covered too.
 # ---------------------------------------------------------------------------
-if ! command -v python3 >/dev/null 2>&1; then
-    skip "lock-drift end-to-end case (python3 is not available on this host)"
+case_dir=$SCRATCH/drift
+scratch_copy "$case_dir"
+(
+    cd "$case_dir" &&
+    git init -q . &&
+    git add -A &&
+    git -c user.email=selftest@example.invalid -c user.name=selftest commit -qm base
+) >/dev/null 2>&1
+# Move one crate to an older version. The checksum is left alone on
+# purpose: this case tests the *version* comparison, not cargo's
+# checksum enforcement (which has its own experiment).
+sed '0,/^version = "1\.[0-9]*\.[0-9]*"$/!b' "$case_dir/Cargo.lock" >/dev/null 2>&1
+awk '
+    /^name = "anyhow"$/ { inpkg = 1 }
+    inpkg && /^version = "/ && !done {
+        print "version = \"1.0.80\""; done = 1; next
+    }
+    { print }
+' "$case_dir/Cargo.lock" > "$case_dir/Cargo.lock.new" && mv "$case_dir/Cargo.lock.new" "$case_dir/Cargo.lock"
+run_in "$case_dir" python3 "$REPO_ROOT/tools/lock-drift.py" HEAD Cargo.lock
+rc=$(last_rc)
+if [ "$rc" -eq 1 ] && last_out | grep -qi 'DOWNGRADE'; then
+    ok "lock-drift rejects a dependency moved to an older version"
 else
-    case_dir=$SCRATCH/drift
-    scratch_copy "$case_dir"
-    (
-        cd "$case_dir" &&
-        git init -q . &&
-        git add -A &&
-        git -c user.email=selftest@example.invalid -c user.name=selftest commit -qm base
-    ) >/dev/null 2>&1
-    # Move one crate to an older version. The checksum is left alone on
-    # purpose: this case tests the *version* comparison, not cargo's
-    # checksum enforcement (which has its own experiment).
-    sed '0,/^version = "1\.[0-9]*\.[0-9]*"$/!b' "$case_dir/Cargo.lock" >/dev/null 2>&1
-    awk '
-        /^name = "anyhow"$/ { inpkg = 1 }
-        inpkg && /^version = "/ && !done {
-            print "version = \"1.0.80\""; done = 1; next
-        }
-        { print }
-    ' "$case_dir/Cargo.lock" > "$case_dir/Cargo.lock.new" && mv "$case_dir/Cargo.lock.new" "$case_dir/Cargo.lock"
-    run_in "$case_dir" python3 "$REPO_ROOT/tools/lock-drift.py" HEAD Cargo.lock
-    rc=$(last_rc)
-    if [ "$rc" -eq 1 ] && last_out | grep -qi 'DOWNGRADE'; then
-        ok "lock-drift rejects a dependency moved to an older version"
-    else
-        bad "lock-drift did NOT reject the downgraded lock file (exit $rc)"
-        printf -- '---- lock-drift output ----\n%s\n---------------------------\n' "$(last_out)"
-    fi
+    bad "lock-drift did NOT reject the downgraded lock file (exit $rc)"
+    printf -- '---- lock-drift output ----\n%s\n---------------------------\n' "$(last_out)"
+fi
+
+# ---------------------------------------------------------------------------
+# Red case 5: the base-image pin check.
+#
+# A pin that is not a valid sha256 digest is not a pin, and a FROM line
+# without any digest is not pinned at all. In both cases the check must
+# refuse the Dockerfile (exit 2) instead of skipping the line and
+# reporting "nothing to do" -- that would turn a broken pin into a
+# green check.
+#
+# Both cases are offline: the check fails before it reaches a registry.
+# ---------------------------------------------------------------------------
+case_dir=$SCRATCH/pin-malformed
+scratch_copy "$case_dir"
+sed 's|@sha256:[0-9a-f]\{64\}|@sha256:NOT-A-DIGEST|g' "$case_dir/Dockerfile" > "$case_dir/Dockerfile.new" \
+    && mv "$case_dir/Dockerfile.new" "$case_dir/Dockerfile"
+run_in "$case_dir" python3 "$REPO_ROOT/tools/check-base-digests.py" --dockerfile Dockerfile
+rc=$(last_rc)
+if [ "$rc" -eq 2 ]; then
+    ok "check-base-digests refuses a malformed base image digest"
+else
+    bad "check-base-digests did NOT refuse the malformed digest (exit $rc)"
+    printf -- '---- check-base-digests output ----\n%s\n-------------------------------\n' "$(last_out)"
+fi
+
+case_dir=$SCRATCH/pin-missing
+scratch_copy "$case_dir"
+sed 's|@sha256:[0-9a-f]\{64\}||g' "$case_dir/Dockerfile" > "$case_dir/Dockerfile.new" \
+    && mv "$case_dir/Dockerfile.new" "$case_dir/Dockerfile"
+run_in "$case_dir" python3 "$REPO_ROOT/tools/check-base-digests.py" --dockerfile Dockerfile
+rc=$(last_rc)
+if [ "$rc" -eq 2 ]; then
+    ok "check-base-digests refuses a Dockerfile whose base image is not pinned"
+else
+    bad "check-base-digests did NOT refuse the unpinned base image (exit $rc)"
+    printf -- '---- check-base-digests output ----\n%s\n-------------------------------\n' "$(last_out)"
 fi
 
 printf '\n%d case(s) passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"

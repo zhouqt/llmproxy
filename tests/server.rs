@@ -57,6 +57,9 @@ enum CompleteBehavior {
     Stream,
     MalformedJson,
     Error(u16),
+    /// A `ProxyError::UpstreamText` failure — an error whose message is
+    /// upstream wording (e.g. "copilot /models returned 503: ...").
+    UpstreamText(&'static str),
     /// First `fail_count` calls return `Upstream{status, body}`,
     /// subsequent calls return a normal success JSON. C6 regression:
     /// lets a single test exercise "primary retried N times before
@@ -120,6 +123,9 @@ impl Provider for TestProvider {
             CompleteBehavior::Error(status) => Err(ProxyError::Upstream {
                 status: *status,
                 body: "upstream failed".to_string(),
+            }),
+            CompleteBehavior::UpstreamText(message) => Err(ProxyError::UpstreamText {
+                message: (*message).to_string(),
             }),
             CompleteBehavior::FailThenSucceed {
                 status,
@@ -221,6 +227,18 @@ fn build_app_with_usage_and_cooldown(
     backup: Option<SharedProvider>,
     usage: UsageStats,
 ) -> (axum::Router, CooldownCache) {
+    build_app_full(api_key, primary, backup, usage, true)
+}
+
+/// Like [`build_app_with_usage_and_cooldown`] but with the
+/// `server.expose_upstream_details` switch under the test's control.
+fn build_app_full(
+    api_key: Option<&str>,
+    primary: SharedProvider,
+    backup: Option<SharedProvider>,
+    usage: UsageStats,
+    expose_upstream_details: bool,
+) -> (axum::Router, CooldownCache) {
     let mut providers = HashMap::new();
     providers.insert("primary".to_string(), primary);
     let mut provider_configs = vec![ProviderConfig::OpenaiCompat {
@@ -254,6 +272,7 @@ fn build_app_with_usage_and_cooldown(
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
             api_key: api_key.map(secret_string),
+            expose_upstream_details,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -281,6 +300,7 @@ fn build_app_with_usage_and_cooldown(
 
         usage,
         auth_limiter: llmproxy::auth::AuthRateLimiter::new(),
+        expose_upstream_details,
     });
     (app, cooldown)
 }
@@ -962,6 +982,445 @@ async fn all_providers_failed_includes_header_and_last_body() {
 }
 
 #[tokio::test]
+async fn upstream_details_are_hidden_when_the_operator_turns_them_off() {
+    // `server.expose_upstream_details: false` (audit R0): the client
+    // must not learn the backend topology, nor read the upstream's own
+    // error text. The status code stays -- the client still has to be
+    // able to tell a 429 from a 500.
+    let app = build_app_full(
+        None,
+        provider(
+            "primary",
+            CompleteBehavior::Error(500),
+            StreamBehavior::Bytes("unused"),
+        ),
+        Some(provider(
+            "backup",
+            CompleteBehavior::Error(500),
+            StreamBehavior::Bytes("unused"),
+        )),
+        UsageStats::new(0),
+        false,
+    )
+    .0;
+
+    let response = app
+        .oneshot(test_request(
+            Method::POST,
+            "/v1/messages",
+            Some(messages_request(false)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        response.headers().get("x-llmproxy-failed-providers").is_none(),
+        "the failure topology must not be disclosed"
+    );
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body_str = std::str::from_utf8(&body_bytes).unwrap();
+    assert!(
+        !body_str.contains("upstream failed"),
+        "the upstream body must not reach the client, got: {body_str}"
+    );
+    assert!(
+        body_str.contains("upstream request failed"),
+        "expected the generic wording, got: {body_str}"
+    );
+}
+
+#[tokio::test]
+async fn upstream_details_are_exposed_by_default() {
+    // The switch defaults to `true`: today's behaviour must not change
+    // for an operator who never touches the config.
+    let app = build_app_full(
+        None,
+        provider(
+            "primary",
+            CompleteBehavior::Error(500),
+            StreamBehavior::Bytes("unused"),
+        ),
+        Some(provider(
+            "backup",
+            CompleteBehavior::Error(500),
+            StreamBehavior::Bytes("unused"),
+        )),
+        UsageStats::new(0),
+        true,
+    )
+    .0;
+
+    let response = app
+        .oneshot(test_request(
+            Method::POST,
+            "/v1/messages",
+            Some(messages_request(false)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.headers()["x-llmproxy-failed-providers"],
+        "primary:500,backup:500"
+    );
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body_str = std::str::from_utf8(&body_bytes).unwrap();
+    assert!(
+        body_str.contains("upstream failed"),
+        "expected last upstream body in response, got: {body_str}"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_error_does_not_leak_the_upstream_body_when_details_are_hidden() {
+    // The in-stream `event: error` carries the upstream's own words in
+    // its message. With the details hidden, it must be generic.
+    let app = build_app_full(
+        None,
+        provider(
+            "primary",
+            CompleteBehavior::Json,
+            StreamBehavior::ItemErrorHtml,
+        ),
+        None,
+        UsageStats::new(0),
+        false,
+    )
+    .0;
+
+    let response = app
+        .oneshot(test_request(
+            Method::POST,
+            "/v1/messages",
+            Some(messages_request(true)),
+        ))
+        .await
+        .unwrap();
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body_str = std::str::from_utf8(&body_bytes).unwrap();
+    assert!(body_str.contains("event: error"), "{body_str}");
+    assert!(
+        !body_str.contains("Bad Gateway"),
+        "the upstream body must not reach the client, got: {body_str}"
+    );
+    assert!(
+        body_str.contains("upstream request failed"),
+        "expected the generic wording, got: {body_str}"
+    );
+}
+
+/// A1: when the upstream sends `{"error":{...}}` inside a **200 SSE stream**,
+/// the OpenAI-compat adapter synthesises an `event: error` frame. That frame
+/// is `Ok(bytes)`, so `server.rs`'s `format_stream_error()` never sees it --
+/// `server.expose_upstream_details` must therefore be enforced by the adapter.
+///
+/// This drives a real `OpenAiCompatProvider` (not a stand-in) against
+/// wiremock and pins the bytes the client sees in both switch states.
+fn build_app_with_sse_error_provider(
+    api_base: String,
+    expose_upstream_details: bool,
+) -> axum::Router {
+    use llmproxy::secrets::secret_string;
+
+    let provider_config = ProviderConfig::OpenaiCompat {
+        name: "primary".to_string(),
+        api_key: secret_string("unused"),
+        api_base,
+        model_rewrite: HashMap::new(),
+        use_proxy: false,
+        provider_ignore: Vec::new(),
+        provider_allow: Vec::new(),
+        reasoning_echo: false,
+    };
+    let provider =
+        llmproxy::providers::build(&provider_config, reqwest::Client::new(), expose_upstream_details)
+            .unwrap();
+
+    let mut providers = HashMap::new();
+    providers.insert("primary".to_string(), provider);
+
+    let config = Arc::new(Config {
+        server: ServerConfig {
+            listen: "127.0.0.1:0".to_string(),
+            api_key: None,
+            expose_upstream_details,
+        },
+        proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
+        providers: vec![provider_config],
+        models: vec![ModelConfig {
+            name: "claude-test".to_string(),
+            primary: "primary".to_string(),
+            fallback_chain: vec![],
+            cooldown_seconds: 60,
+            max_retries_per_provider: 1,
+            max_retries_total: 2,
+        }],
+        ..Config::default()
+    });
+    let cooldown = CooldownCache::new();
+    let router = Arc::new(Router::new(config.clone(), providers, cooldown.clone()));
+    llmproxy::server::build_router(AppState {
+        config,
+        router,
+        cooldown,
+        http: reqwest::Client::new(),
+        copilot: None,
+        usage: UsageStats::new(0),
+        auth_limiter: llmproxy::auth::AuthRateLimiter::new(),
+        expose_upstream_details,
+    })
+}
+
+#[tokio::test]
+async fn sse_error_envelope_respects_expose_upstream_details() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // The upstream sent an error envelope inside a 200 SSE stream.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    "data: {\"error\":{\"message\":\"upstream leaked detail\",\"type\":\"invalid_request_error\"}}\n\n",
+                    "text/event-stream",
+                ),
+        )
+        .mount(&server)
+        .await;
+
+    // Switch off: the client sees no upstream text.
+    let app = build_app_with_sse_error_provider(server.uri(), false);
+    let response = app
+        .oneshot(test_request(
+            Method::POST,
+            "/v1/messages",
+            Some(messages_request(true)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body_str = std::str::from_utf8(&body_bytes).unwrap();
+    assert!(body_str.contains("event: error"), "{body_str}");
+    assert!(
+        !body_str.contains("upstream leaked detail"),
+        "upstream text must not reach the client, got: {body_str}"
+    );
+    assert!(
+        body_str.contains("upstream request failed"),
+        "should have become the generic wording, got: {body_str}"
+    );
+
+    // Switch on (the default): the client sees the upstream text, as today.
+    let app = build_app_with_sse_error_provider(server.uri(), true);
+    let response = app
+        .oneshot(test_request(
+            Method::POST,
+            "/v1/messages",
+            Some(messages_request(true)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body_str = std::str::from_utf8(&body_bytes).unwrap();
+    assert!(body_str.contains("event: error"), "{body_str}");
+    assert!(
+        body_str.contains("upstream leaked detail"),
+        "the default must keep the upstream text verbatim, got: {body_str}"
+    );
+}
+
+/// A2: with `expose_upstream_details=false`, an error carrying upstream text
+/// (`UpstreamText`) must not hand the text to the client; `true` keeps it verbatim.
+#[tokio::test]
+async fn upstream_text_errors_respect_expose_upstream_details() {
+    const UPSTREAM_HINT: &str = "copilot /models returned 503: quota exhausted for account foo";
+
+    // Switch off: the client only sees the generic wording.
+    let app = build_app_full(
+        None,
+        provider(
+            "primary",
+            CompleteBehavior::UpstreamText(UPSTREAM_HINT),
+            StreamBehavior::Json,
+        ),
+        None,
+        UsageStats::new(0),
+        false,
+    )
+    .0;
+    let response = app
+        .oneshot(test_request(
+            Method::POST,
+            "/v1/messages",
+            Some(messages_request(false)),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(response).await;
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        !message.contains("quota exhausted"),
+        "the upstream hint must not reach the client, got: {message}"
+    );
+    assert_eq!(message, "upstream request failed");
+
+    // Switch on: kept verbatim.
+    let app = build_app_full(
+        None,
+        provider(
+            "primary",
+            CompleteBehavior::UpstreamText(UPSTREAM_HINT),
+            StreamBehavior::Json,
+        ),
+        None,
+        UsageStats::new(0),
+        true,
+    )
+    .0;
+    let response = app
+        .oneshot(test_request(
+            Method::POST,
+            "/v1/messages",
+            Some(messages_request(false)),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(response).await;
+    assert_eq!(body["error"]["message"], UPSTREAM_HINT);
+}
+
+/// A2: the upstream URL must not leak through the error message either.
+#[tokio::test]
+async fn upstream_text_errors_do_not_leak_the_upstream_url_when_details_are_hidden() {
+    const UPSTREAM_URL: &str =
+        "copilot token fetch failed: https://api.githubcopilot.com/models returned 503";
+
+    let app = build_app_full(
+        None,
+        provider(
+            "primary",
+            CompleteBehavior::UpstreamText(UPSTREAM_URL),
+            StreamBehavior::Json,
+        ),
+        None,
+        UsageStats::new(0),
+        false,
+    )
+    .0;
+    let response = app
+        .oneshot(test_request(
+            Method::POST,
+            "/v1/messages",
+            Some(messages_request(false)),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(response).await;
+    assert!(
+        !body.to_string().contains("githubcopilot.com"),
+        "the upstream URL must not reach the client, got: {body}"
+    );
+}
+
+/// A9: when a provider name is not header-safe, the streaming fallback path
+/// must still answer 200, just **without** `x-llmproxy-failed-providers`.
+///
+/// `Config::validate` rejects such a name, so this test builds a provider
+/// map with an illegal character directly, bypassing validation -- the point
+/// is to cover the failure branch of `failed_providers.join(",").parse()`.
+#[tokio::test]
+async fn streaming_fallback_with_an_illegal_provider_name_still_returns_200() {
+    use llmproxy::secrets::secret_string;
+
+    let illegal_name = "bad\nname";
+    let mut providers = HashMap::new();
+    providers.insert(
+        illegal_name.to_string(),
+        provider(
+            illegal_name,
+            CompleteBehavior::Error(500),
+            StreamBehavior::Bytes("event: message_stop\ndata: {}\n\n"),
+        ),
+    );
+    providers.insert(
+        "backup".to_string(),
+        provider(
+            "backup",
+            CompleteBehavior::Json,
+            StreamBehavior::Bytes("event: message_stop\ndata: {}\n\n"),
+        ),
+    );
+
+    let config = Arc::new(Config {
+        server: ServerConfig {
+            listen: "127.0.0.1:0".to_string(),
+            api_key: None,
+            expose_upstream_details: true,
+        },
+        proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
+        providers: vec![ProviderConfig::OpenaiCompat {
+            name: "backup".to_string(),
+            api_key: secret_string("unused"),
+            api_base: "http://unused".to_string(),
+            model_rewrite: HashMap::new(),
+            use_proxy: false,
+            provider_ignore: Vec::new(),
+            provider_allow: Vec::new(),
+            reasoning_echo: false,
+        }],
+        models: vec![ModelConfig {
+            name: "claude-test".to_string(),
+            primary: illegal_name.to_string(),
+            fallback_chain: vec!["backup".to_string()],
+            cooldown_seconds: 60,
+            max_retries_per_provider: 1,
+            max_retries_total: 2,
+        }],
+        ..Config::default()
+    });
+    let cooldown = CooldownCache::new();
+    let router = Arc::new(Router::new(config.clone(), providers, cooldown.clone()));
+    let app = llmproxy::server::build_router(AppState {
+        config,
+        router,
+        cooldown,
+        http: reqwest::Client::new(),
+        copilot: None,
+        usage: UsageStats::new(0),
+        auth_limiter: llmproxy::auth::AuthRateLimiter::new(),
+        expose_upstream_details: true,
+    });
+
+    let response = app
+        .oneshot(test_request(
+            Method::POST,
+            "/v1/messages",
+            Some(messages_request(true)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers().get("x-llmproxy-failed-providers").is_none(),
+        "a non-header-safe provider name must not appear in a response header"
+    );
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body_str = std::str::from_utf8(&body_bytes).unwrap();
+    assert!(body_str.contains("message_stop"), "{body_str}");
+}
+
+#[tokio::test]
 async fn stream_chain_exhaustion_includes_failed_providers_header() {
     // Streaming-path counterpart of
     // `all_providers_failed_includes_header_and_last_body`: both
@@ -1101,6 +1560,7 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
             api_key: Some(secret_string("test-key")),
+            expose_upstream_details: true,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -1170,7 +1630,9 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
         copilot: None,
     
         usage: llmproxy::usage::UsageStats::new(0),
-        auth_limiter: llmproxy::auth::AuthRateLimiter::new(),});
+        auth_limiter: llmproxy::auth::AuthRateLimiter::new(),
+        expose_upstream_details: true,
+    });
 
     // Auth gate applies: /v1/models requires authentication.
     let unauth = app
@@ -1253,6 +1715,7 @@ async fn list_models_collision_winner_follows_chain_order_deterministically() {
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
             api_key: Some(secret_string("test-key")),
+            expose_upstream_details: true,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -1300,7 +1763,9 @@ async fn list_models_collision_winner_follows_chain_order_deterministically() {
         copilot: None,
     
         usage: llmproxy::usage::UsageStats::new(0),
-        auth_limiter: llmproxy::auth::AuthRateLimiter::new(),});
+        auth_limiter: llmproxy::auth::AuthRateLimiter::new(),
+        expose_upstream_details: true,
+    });
 
     let mut req = test_request(Method::GET, "/v1/models", None);
     req.headers_mut()
@@ -1358,6 +1823,7 @@ async fn admin_models_lists_every_provider_without_dedup() {
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
             api_key: Some(secret_string("test-key")),
+            expose_upstream_details: true,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -1420,7 +1886,9 @@ async fn admin_models_lists_every_provider_without_dedup() {
         copilot: None,
     
         usage: llmproxy::usage::UsageStats::new(0),
-        auth_limiter: llmproxy::auth::AuthRateLimiter::new(),});
+        auth_limiter: llmproxy::auth::AuthRateLimiter::new(),
+        expose_upstream_details: true,
+    });
 
     // Auth gate applies to /admin/* too.
     let unauth = app
@@ -1494,6 +1962,7 @@ async fn admin_models_reports_fetch_failed_for_provider_without_catalog() {
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
             api_key: Some(secret_string("test-key")),
+            expose_upstream_details: true,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -1529,7 +1998,9 @@ async fn admin_models_reports_fetch_failed_for_provider_without_catalog() {
         copilot: None,
     
         usage: llmproxy::usage::UsageStats::new(0),
-        auth_limiter: llmproxy::auth::AuthRateLimiter::new(),});
+        auth_limiter: llmproxy::auth::AuthRateLimiter::new(),
+        expose_upstream_details: true,
+    });
 
     let mut req = test_request(Method::GET, "/admin/models", None);
     req.headers_mut()
@@ -2484,6 +2955,7 @@ async fn admin_usage_excludes_serving_provider_from_failed_providers_on_retry() 
         server: ServerConfig {
             listen: "127.0.0.1:0".into(),
             api_key: Some(secret_string("secret")),
+            expose_upstream_details: true,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -2519,6 +2991,7 @@ async fn admin_usage_excludes_serving_provider_from_failed_providers_on_retry() 
         copilot: None,
         usage: usage_for_state,
         auth_limiter: llmproxy::auth::AuthRateLimiter::new(),
+        expose_upstream_details: true,
     });
     let mut msg_req = test_request(
         Method::POST,
@@ -2592,6 +3065,7 @@ async fn admin_usage_keeps_fallback_failures_when_serving_provider_is_different(
         server: ServerConfig {
             listen: "127.0.0.1:0".into(),
             api_key: Some(secret_string("secret")),
+            expose_upstream_details: true,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -2639,6 +3113,7 @@ async fn admin_usage_keeps_fallback_failures_when_serving_provider_is_different(
         copilot: None,
         usage: usage_for_state,
         auth_limiter: llmproxy::auth::AuthRateLimiter::new(),
+        expose_upstream_details: true,
     });
     let mut msg_req = test_request(
         Method::POST,

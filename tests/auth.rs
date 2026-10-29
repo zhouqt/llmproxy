@@ -21,6 +21,7 @@ fn dummy_state(api_key: Option<String>) -> AppState {
         server: ServerConfig {
             listen: "127.0.0.1:0".into(),
             api_key: api_key.map(secret_string),
+            expose_upstream_details: true,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -50,6 +51,7 @@ fn dummy_state(api_key: Option<String>) -> AppState {
         copilot: None,
         usage: UsageStats::new(8),
         auth_limiter: llmproxy::auth::AuthRateLimiter::new(),
+        expose_upstream_details: true,
     }
 }
 

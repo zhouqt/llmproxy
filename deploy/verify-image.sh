@@ -33,6 +33,11 @@
 
 set -eu
 
+die() {
+    printf 'verify-image: %s\n' "$1" >&2
+    exit 1
+}
+
 IMAGE_REF=${1:-ghcr.io/zhouqt/llmproxy:latest}
 LOCAL_TAG=${2:-localhost/llmproxy:latest}
 PODMAN=${PODMAN:-podman}
@@ -41,23 +46,37 @@ PODMAN=${PODMAN:-podman}
 # this repository's workflow path, so a signature minted by another
 # workflow -- or by a fork that somehow got id-token: write -- does not
 # verify against it.
+#
+# REPO goes into a REGEXP, so it has to be a plain name: a value like
+# ".*" would widen the identity to "any repository", which is exactly
+# the check this script exists to make. Anything outside the ordinary
+# GitHub owner/repository charset is refused, and the dots are escaped
+# so that "foo.bar" matches "foo.bar" and not "fooXbar".
 REPO=${REPO:-zhouqt/llmproxy}
-IDENTITY_RE="^https://github\.com/${REPO}/\.github/workflows/docker\.yaml@.*"
+case "$REPO" in
+    '') die "REPO must not be empty" ;;
+    *[!A-Za-z0-9._/-]*) die "REPO must contain only letters, digits, '.', '_', '-' and '/'" ;;
+esac
+REPO_RE=$(printf '%s' "$REPO" | sed 's/[.[\*^$()+?{|]/\\&/g')
+IDENTITY_RE="^https://github\.com/${REPO_RE}/\.github/workflows/docker\.yaml@.*"
 ISSUER="https://token.actions.githubusercontent.com"
 
 # cosign's official image, pinned by digest. The tag is written next to
 # it for humans; the digest is what is pulled.
+#
+# An override has to keep the digest pin: a floating tag here would let
+# the verifier itself be replaced between two runs of this script, which
+# is a bigger hole than the one the script closes.
 COSIGN_IMAGE=${COSIGN_IMAGE:-ghcr.io/sigstore/cosign/cosign@sha256:0f06154836d2de34f887a5c273506d52ca43edaa1d9e53e6510fa78a48f69c2d} # v3.1.4
+case "$COSIGN_IMAGE" in
+    *@sha256:*) ;;
+    *) die "COSIGN_IMAGE must be pinned by digest (an @sha256: suffix is required): $COSIGN_IMAGE" ;;
+esac
 
 # The manifest types the registry may answer with. Without the index
 # types it answers with the per-architecture manifest, whose digest is
 # NOT the digest CI signed.
 ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json"
-
-die() {
-    printf 'verify-image: %s\n' "$1" >&2
-    exit 1
-}
 
 command -v "$PODMAN" >/dev/null 2>&1 || die "podman is not installed (PODMAN=$PODMAN)"
 command -v curl >/dev/null 2>&1 || die "curl is not installed"
@@ -84,11 +103,19 @@ token=$(curl -sSf "https://ghcr.io/token?scope=repository:${repo_path}:pull&serv
 # The registry states the digest of what the tag points at in a header.
 # The body is hashed as well and the two must agree: if they do not,
 # something mangled the response and the honest answer is "cannot check".
+#
+# The pull token is passed to curl through a config file, not through
+# the command line: an argument is visible to every other process on the
+# host (`ps`, /proc/<pid>/cmdline) for as long as curl runs. The config
+# file lives in a private directory and is removed on exit.
 headers=$(mktemp)
 body=$(mktemp)
-trap 'rm -f "$headers" "$body"' EXIT
+curlcfg=$(mktemp)
+trap 'rm -f "$headers" "$body" "$curlcfg"' EXIT
+chmod 600 "$curlcfg"
+printf 'header = "Authorization: Bearer %s"\n' "$token" > "$curlcfg"
 curl -sSf -D "$headers" -o "$body" \
-    -H "Authorization: Bearer ${token}" \
+    --config "$curlcfg" \
     -H "Accept: ${ACCEPT}" \
     "https://ghcr.io/v2/${repo_path}/manifests/${tag}" \
     || die "could not fetch the manifest for ${repo_path}:${tag}"

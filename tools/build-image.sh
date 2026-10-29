@@ -12,13 +12,13 @@
 #   tools/build-image.sh                 # build llmproxy:local
 #   tools/build-image.sh --no-cache      # extra args go to podman build
 #
-# Override the proxy with HTTPS_PROXY if the default is not right:
-#   HTTPS_PROXY=http://host:port tools/build-image.sh
+# The proxy is NOT set by this script. If the host needs one, export
+# HTTPS_PROXY (and/or HTTP_PROXY) before calling it; `podman build`
+# passes the variables it finds in its environment through to the RUN
+# steps. The script deliberately holds no proxy value: a hardcoded
+# address is wrong on every host but one, and a value written here ends
+# up in git history and in `ps` output.
 set -eu
-
-: "${HTTPS_PROXY:=http://192.168.11.1:12345}"
-export HTTPS_PROXY
-export HTTP_PROXY="${HTTPS_PROXY}"
 
 TAG="${IMAGE_TAG:-llmproxy:local}"
 cd "$(dirname "$0")/.."

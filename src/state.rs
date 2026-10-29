@@ -26,4 +26,10 @@ pub struct AppState {
     /// `require_auth` middleware to answer 429 on brute-force bursts
     /// (audit L7). Shared by every `AppState` clone (`Arc` inside).
     pub auth_limiter: AuthRateLimiter,
+    /// Whether upstream details (the upstream error body, the failure
+    /// topology header) are exposed to clients — audit R0. `true`
+    /// keeps today's behaviour; `false` replaces the upstream text
+    /// with generic wording. The operator still sees the details in
+    /// the logs and in `/admin/usage`.
+    pub expose_upstream_details: bool,
 }

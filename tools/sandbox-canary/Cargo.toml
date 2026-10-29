@@ -12,7 +12,23 @@
 #
 # 用法:
 #   隔离环境(期望通过): cargo build --manifest-path tools/sandbox-canary/Cargo.toml
-#   有网环境(期望失败):   同上 —— 除非显式设置 SANDBOX_CANARY_RELAXED=1
+#   network reachable (expected to FAIL): same command -- there is no
+#   switch; a failure is a failure.
+#
+# Environment-variable rules (build.rs):
+#   violation: a variable whose name contains PROXY (HTTP_PROXY / HTTPS_PROXY /
+#           ALL_PROXY and their lower-case variants, and any other *PROXY*),
+#           because a proxy can re-route the compile-time egress.
+#   violation: credential-shaped variables (GITHUB_TOKEN / AWS_* / *_API_KEY /
+#           SSH_AUTH_SOCK, ...), see FORBIDDEN_ENV in build.rs.
+#   NOT a violation: `NO_PROXY` / `no_proxy`. It is the exclusion list of
+#           "hosts that must bypass the proxy": not an egress, not a
+#           credential. `run_in_container()` in tools/rust-build.sh injects
+#           `-e NO_PROXY=...` / `-e no_proxy=...` unconditionally (the test
+#           suite talks to mock servers on 127.0.0.1), so excluding it keeps
+#           the canary from reporting a false positive on every local run,
+#           and a check that is always red is a check people skip.
+#   Only variable names are inspected; values are never printed.
 [package]
 name = "sandbox-canary"
 version = "0.1.0"

@@ -63,6 +63,23 @@ async fn messages_handler(
     State(state): State<AppState>,
     AppJson(req): AppJson<MessagesRequest>,
 ) -> Result<Response> {
+    // The `expose_upstream_details` switch is applied here, at the one
+    // place every client-visible error passes through. The inner
+    // handler keeps the full detail in the logs and in the usage rows;
+    // only what leaves the process is stripped.
+    messages_inner(&state, req).await.map_err(|e| {
+        if state.expose_upstream_details {
+            e
+        } else {
+            e.without_upstream_details()
+        }
+    })
+}
+
+async fn messages_inner(
+    state: &AppState,
+    req: MessagesRequest,
+) -> Result<Response> {
     // StartedAt must be captured before find_model so even an
     // "unknown model" early-return can record a row (Review #11).
     // The model label is what we have, so use it directly with no
@@ -161,6 +178,7 @@ async fn messages_handler(
             attempts,
             start,
             state.usage.clone(),
+            state.expose_upstream_details,
         ));
     }
 
@@ -346,7 +364,7 @@ async fn messages_handler(
     // is also dead on the happy path (the function still iterates
     // the empty slice and returns None, but skipping it costs a
     // single branch on the hot path).
-    if !attempts.is_empty() {
+    if state.expose_upstream_details && !attempts.is_empty() {
         if let Some(s) = crate::router::format_attempts_header(&attempts, Some(&provider_label)) {
             if let Ok(v) = s.parse() {
                 headers.insert("x-llmproxy-failed-providers", v);
@@ -780,6 +798,7 @@ fn stream_response(
     attempts: Vec<crate::router::RouteStep>,
     start: StartedAt,
     stats: UsageStats,
+    expose_upstream_details: bool,
 ) -> Response {
     // C9: even when the router returns Ok with a non-Stream output
     // (a provider that ignores `stream` mode and hands back JSON),
@@ -858,11 +877,14 @@ fn stream_response(
     // Written BEFORE the MappedStream::new move below — the stream
     // wrapper takes ownership of `failed_providers` so we can't borrow
     // it after the move.
-    if !failed_providers.is_empty() {
-        resp_headers.insert(
-            "x-llmproxy-failed-providers",
-            failed_providers.join(",").parse().unwrap(),
-        );
+    if expose_upstream_details && !failed_providers.is_empty() {
+        // A provider name is validated to be header-safe at config
+        // load time, but a parse failure must never panic on the
+        // request path -- the same defensive `if let Ok` the error
+        // path uses.
+        if let Ok(v) = failed_providers.join(",").parse() {
+            resp_headers.insert("x-llmproxy-failed-providers", v);
+        }
     }
 
     let body = Body::from_stream(MappedStream::new(
@@ -872,6 +894,7 @@ fn stream_response(
         start,
         stats,
         failed_providers, // moved into the stream wrapper
+        expose_upstream_details,
     ));
 
     let mut resp = Response::new(body);
@@ -932,6 +955,10 @@ pub struct MappedStream {
     /// UsageRecord's `outcome` reflects Errored rather than Success.
     /// See plan sixth-round finding C3.
     errored: bool,
+    /// Whether the in-stream `event: error` may embed the upstream's
+    /// own words (audit R0). `false` replaces them with generic
+    /// wording; the log line still carries the full text.
+    expose_upstream_details: bool,
 }
 
 impl MappedStream {
@@ -942,6 +969,7 @@ impl MappedStream {
         start: StartedAt,
         stats: UsageStats,
         failed_providers: Vec<String>,
+        expose_upstream_details: bool,
     ) -> Self {
         Self {
             provider: provider.to_string(),
@@ -953,6 +981,7 @@ impl MappedStream {
             failed_providers,
             usage_scanner: Some(UsageScanner::new()),
             errored: false,
+            expose_upstream_details,
         }
     }
 
@@ -1101,7 +1130,7 @@ impl Stream for MappedStream {
                 self.errored = true;
                 self.finalize_and_record();
                 self.done = true;
-                Poll::Ready(Some(Ok(format_stream_error(&e))))
+                Poll::Ready(Some(Ok(format_stream_error(&e, self.expose_upstream_details))))
             }
             Poll::Ready(None) => {
                 self.done = true;
@@ -1114,7 +1143,7 @@ impl Stream for MappedStream {
 }
 
 /// Encode a [`ProxyError`] as an Anthropic SSE `event: error` chunk.
-fn format_stream_error(err: &ProxyError) -> Bytes {
+fn format_stream_error(err: &ProxyError, expose_upstream_details: bool) -> Bytes {
     // Code review finding #4: build the SSE error chunk in ONE pass.
     // The previous shape paid for `serde_json::json!` (Value Map +
     // nested Values) + `format!("data: {payload}")` (which calls
@@ -1127,15 +1156,17 @@ fn format_stream_error(err: &ProxyError) -> Bytes {
     buf.extend_from_slice(b"event: error\ndata: ");
     // The shape mirrors the upstream Anthropic `error` event: a JSON
     // object with `type` and an `error.{type,message}` payload. The
-    // message is the Display form of the ProxyError — must be
-    // JSON-escaped (quotes, backslashes, control chars) so we route
-    // through `serde_json::to_string` rather than hand-rolling
-    // escaping (which would re-introduce the same alloc cost).
+    // message is the Display form of the ProxyError -- unless the
+    // deployment hides upstream details, in which case it is the
+    // generic wording. Must be JSON-escaped (quotes, backslashes,
+    // control chars) so we route through `serde_json::to_string`
+    // rather than hand-rolling escaping (which would re-introduce the
+    // same alloc cost).
     let inner = serde_json::json!({
         "type": "error",
         "error": {
             "type": "upstream_error",
-            "message": err.to_string(),
+            "message": err.client_message(expose_upstream_details),
         }
     });
     let _ = write!(&mut buf, "{inner}");
@@ -1674,6 +1705,7 @@ mod tests {
             failed_providers: Vec::new(),
             usage_scanner: Some(UsageScanner::new()),
             errored: false,
+            expose_upstream_details: true,
         }
     }
 
@@ -1712,6 +1744,7 @@ mod tests {
             failed_providers: Vec::new(),
             usage_scanner: Some(UsageScanner::new()),
             errored: false,
+            expose_upstream_details: true,
         };
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
@@ -1733,6 +1766,7 @@ mod tests {
             failed_providers: Vec::new(),
             usage_scanner: Some(UsageScanner::new()),
             errored: false,
+            expose_upstream_details: true,
         };
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
@@ -1758,6 +1792,7 @@ mod tests {
             failed_providers: Vec::new(),
             usage_scanner: Some(UsageScanner::new()),
             errored: false,
+            expose_upstream_details: true,
         };
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
@@ -1804,6 +1839,7 @@ mod tests {
             failed_providers: Vec::new(),
             usage_scanner: Some(UsageScanner::new()),
             errored: false,
+            expose_upstream_details: true,
         };
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
@@ -1850,6 +1886,7 @@ mod tests {
             failed_providers: Vec::new(),
             usage_scanner: Some(UsageScanner::new()),
             errored: false,
+            expose_upstream_details: true,
         };
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
@@ -1875,7 +1912,7 @@ mod tests {
     fn format_stream_error_contains_event_and_message() {
         // Standalone unit test for the helper so future SSE-format
         // changes are caught here.
-        let bytes = format_stream_error(&ProxyError::Internal("disk full".into()));
+        let bytes = format_stream_error(&ProxyError::Internal("disk full".into()), true);
         let s = std::str::from_utf8(&bytes).unwrap();
         assert!(s.starts_with("event: error\n"));
         assert!(s.contains("disk full"));
@@ -1931,6 +1968,7 @@ mod tests {
                 server: ServerConfig {
                     listen: "127.0.0.1:0".to_string(),
                     api_key: None,
+                    expose_upstream_details: true,
                 },
                 proxy: Default::default(),
                 user_agent: crate::config::default_user_agent(),
@@ -1965,6 +2003,7 @@ mod tests {
                 copilot: Some(provider),
                 usage: UsageStats::new(8),
                 auth_limiter: crate::auth::AuthRateLimiter::new(),
+                expose_upstream_details: true,
             };
             crate::server::build_router(state)
         }
@@ -2206,6 +2245,7 @@ mod tests {
                 server: ServerConfig {
                     listen: "127.0.0.1:0".to_string(),
                     api_key: None,
+                    expose_upstream_details: true,
                 },
                 proxy: Default::default(),
                 user_agent: crate::config::default_user_agent(),
@@ -2240,6 +2280,7 @@ mod tests {
                 copilot: Some(provider),
                 usage: UsageStats::new(8),
                 auth_limiter: crate::auth::AuthRateLimiter::new(),
+                expose_upstream_details: true,
             });
 
             let resp = app
@@ -2282,6 +2323,7 @@ mod tests {
             server: ServerConfig {
                 listen: "127.0.0.1:0".to_string(),
                 api_key: None,
+                expose_upstream_details: true,
             },
             proxy: Default::default(),
             user_agent: crate::config::default_user_agent(),
@@ -2333,7 +2375,8 @@ mod tests {
             ),
             (
                 "compat".to_string(),
-                crate::providers::build(&config.providers[0], reqwest::Client::new()).unwrap(),
+                crate::providers::build(&config.providers[0], reqwest::Client::new(), true)
+                    .unwrap(),
             ),
         ]);
 
@@ -2369,6 +2412,7 @@ mod tests {
             server: ServerConfig {
                 listen: "127.0.0.1:0".to_string(),
                 api_key: None,
+                expose_upstream_details: true,
             },
             proxy: Default::default(),
             user_agent: crate::config::default_user_agent(),
@@ -2405,11 +2449,13 @@ mod tests {
         let providers: HashMap<String, crate::providers::SharedProvider> = HashMap::from([
             (
                 "copilot".to_string(),
-                crate::providers::build(&config.providers[1], reqwest::Client::new()).unwrap(),
+                crate::providers::build(&config.providers[1], reqwest::Client::new(), true)
+                    .unwrap(),
             ),
             (
                 "compat".to_string(),
-                crate::providers::build(&config.providers[0], reqwest::Client::new()).unwrap(),
+                crate::providers::build(&config.providers[0], reqwest::Client::new(), true)
+                    .unwrap(),
             ),
         ]);
 
@@ -2435,6 +2481,7 @@ mod tests {
             server: ServerConfig {
                 listen: "127.0.0.1:0".to_string(),
                 api_key: None,
+                expose_upstream_details: true,
             },
             proxy: Default::default(),
             user_agent: crate::config::default_user_agent(),
@@ -2471,7 +2518,8 @@ mod tests {
                 };
         let providers: HashMap<String, crate::providers::SharedProvider> = HashMap::from([(
             "copilot".to_string(),
-            crate::providers::build(&config.providers[0], reqwest::Client::new()).unwrap(),
+            crate::providers::build(&config.providers[0], reqwest::Client::new(), true)
+                    .unwrap(),
         )]);
 
         let priority = build_routing_priority(&config, &providers);
@@ -2623,6 +2671,7 @@ mod tests {
                 reasoning_echo: false,
             },
             reqwest::Client::new(),
+            true,
         )
         .unwrap();
 

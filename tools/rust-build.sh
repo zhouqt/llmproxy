@@ -25,7 +25,9 @@
 #
 # Environment:
 #   RUST_IMAGE       the image to run (default: the digest the Dockerfile
-#                    pins -- the same compiler CI uses)
+#                    pins -- the same compiler CI uses). An override
+#                    must keep the digest pin: a value without an
+#                    "@sha256:" suffix is refused.
 #   CARGO_HOME_DIR   where the registry cache lives on the host
 #                    (default: /var/tmp/llmproxy-cargo). Keeping it
 #                    across runs means the dependencies are downloaded
@@ -60,10 +62,26 @@ die() {
     exit 1
 }
 
+# An override has to keep the digest pin, the same rule the cosign image
+# (deploy/verify-image.sh) and the scanner (tools/scan-image.sh) follow:
+# a floating tag here would let the compiler itself be swapped between
+# two runs of this script, which is a bigger hole than the one the
+# script closes. The default above already carries a digest, so it is
+# not rejected by this check.
+case "$RUST_IMAGE" in
+    *@sha256:*) ;;
+    *) die "RUST_IMAGE must be pinned by digest (an @sha256: suffix is required): $RUST_IMAGE" ;;
+esac
+
 command -v "$PODMAN" >/dev/null 2>&1 || die "podman is not installed (PODMAN=$PODMAN)"
 
 [ $# -ge 1 ] || die "usage: rust-build.sh <cargo-subcommand> [args...] | -- <command>"
 
+# The registry cache holds downloaded crates and the target directory
+# holds the compiled output; both are private to the user running the
+# build. umask has to come before the mkdir, or the directories are
+# created group/world-readable and the 0700 applies to nothing.
+umask 077
 mkdir -p "$CARGO_HOME_DIR" "$CARGO_TARGET_DIR"
 
 # The cargo command runs through the rustup shim in the image, which
@@ -75,47 +93,49 @@ mkdir -p "$CARGO_HOME_DIR" "$CARGO_TARGET_DIR"
 # would otherwise become an empty string inside the container, and an
 # empty proxy is a proxy that cannot be reached.
 #
+# The value is passed by NAME (`-e HTTPS_PROXY`), never as
+# `-e HTTPS_PROXY=value`: the latter puts the proxy URL into podman's
+# argv, where every process on the host can read it from
+# /proc/<pid>/cmdline. With the bare name, podman copies the value from
+# its own environment.
+#
 # NO_PROXY covers the loopback. The test suite talks to mock servers on
 # 127.0.0.1, and reqwest honours the proxy variables for those requests
 # too -- the proxy answers them with an empty body, and every test that
 # expects JSON fails with "EOF while parsing a value". Excluding the
 # loopback is what makes the suite pass with a proxy in the environment.
-run_in_container() {
-    if [ -n "${HTTPS_PROXY:-}" ] && [ -n "${HTTP_PROXY:-}" ]; then
-        "$PODMAN" run --rm \
-            -v "$REPO_ROOT:/app:ro" \
-            -v "$CARGO_HOME_DIR:/cargo-home" \
-            -v "$CARGO_TARGET_DIR:/tmp/llmproxy-target" \
-            -e CARGO_HOME=/cargo-home \
-            -e CARGO_TARGET_DIR=/tmp/llmproxy-target \
-            -e HTTPS_PROXY="$HTTPS_PROXY" \
-            -e HTTP_PROXY="$HTTP_PROXY" \
-            -e NO_PROXY=localhost,127.0.0.1,::1 \
-            -e no_proxy=localhost,127.0.0.1,::1 \
-            -w /app \
-            "$RUST_IMAGE" "$@"
-    elif [ -n "${HTTPS_PROXY:-}" ]; then
-        "$PODMAN" run --rm \
-            -v "$REPO_ROOT:/app:ro" \
-            -v "$CARGO_HOME_DIR:/cargo-home" \
-            -v "$CARGO_TARGET_DIR:/tmp/llmproxy-target" \
-            -e CARGO_HOME=/cargo-home \
-            -e CARGO_TARGET_DIR=/tmp/llmproxy-target \
-            -e HTTPS_PROXY="$HTTPS_PROXY" \
-            -e NO_PROXY=localhost,127.0.0.1,::1 \
-            -e no_proxy=localhost,127.0.0.1,::1 \
-            -w /app \
-            "$RUST_IMAGE" "$@"
-    else
-        "$PODMAN" run --rm \
-            -v "$REPO_ROOT:/app:ro" \
-            -v "$CARGO_HOME_DIR:/cargo-home" \
-            -v "$CARGO_TARGET_DIR:/tmp/llmproxy-target" \
-            -e CARGO_HOME=/cargo-home \
-            -e CARGO_TARGET_DIR=/tmp/llmproxy-target \
-            -w /app \
-            "$RUST_IMAGE" "$@"
+#
+# The helper prints only the literal words `-e HTTPS_PROXY` (never a
+# value), so word-splitting its output below is safe.
+proxy_opts() {
+    if [ -n "${HTTPS_PROXY:-}" ]; then
+        printf -- '-e\nHTTPS_PROXY\n'
     fi
+    if [ -n "${HTTP_PROXY:-}" ]; then
+        printf -- '-e\nHTTP_PROXY\n'
+    fi
+}
+
+run_in_container() {
+    # The podman argv is built from the right: the command goes last,
+    # after the image name, and each fixed option is prepended in front
+    # of it. Prepending is what keeps every option BEFORE the image --
+    # podman stops parsing options at the image, and anything after it
+    # becomes the container's command.
+    set -- "$RUST_IMAGE" "$@"
+    set -- -w /app "$@"
+    set -- -e no_proxy=localhost,127.0.0.1,::1 "$@"
+    set -- -e NO_PROXY=localhost,127.0.0.1,::1 "$@"
+    set -- -e CARGO_TARGET_DIR=/tmp/llmproxy-target "$@"
+    set -- -e CARGO_HOME=/cargo-home "$@"
+    set -- -v "$CARGO_TARGET_DIR:/tmp/llmproxy-target" "$@"
+    set -- -v "$CARGO_HOME_DIR:/cargo-home" "$@"
+    set -- -v "$REPO_ROOT:/app:ro" "$@"
+    # shellcheck disable=SC2046 # proxy_opts emits fixed literal words
+    set -- $(proxy_opts) "$@"
+    set -- run --rm "$@"
+
+    "$PODMAN" "$@"
 }
 
 # `--` means "run this, not cargo".
