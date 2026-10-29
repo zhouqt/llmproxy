@@ -33,6 +33,18 @@ set -eu
 PODMAN=${PODMAN:-podman}
 SCANNER=${SCANNER:-ghcr.io/anchore/grype@sha256:af9f30d1de4ecfbbcd2b674371e8df787879e16832af8ab81551b0bf1ec0ad5b} # v0.111.0
 
+# The scanner is the tool that decides whether an image is acceptable,
+# so an override has to keep the digest pin: a floating tag would let
+# the scanner itself be swapped between two runs.
+case "$SCANNER" in
+    *@sha256:*) ;;
+    *)
+        printf 'scan-image: SCANNER must be pinned by digest (an @sha256: suffix is required): %s\n' \
+            "$SCANNER" >&2
+        exit 2
+        ;;
+esac
+
 usage() {
     sed -n '2,/^set -eu/p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
@@ -43,12 +55,30 @@ IMAGE_REF=$1
 shift
 
 FAIL_ON=""
+FAIL_ON_SET=false
 while [ $# -gt 0 ]; do
     case "$1" in
-        --fail-on) FAIL_ON=${2:-}; shift 2 ;;
+        --fail-on)
+            [ $# -ge 2 ] || {
+                printf 'scan-image: --fail-on needs a severity\n' >&2
+                exit 2
+            }
+            FAIL_ON=$2
+            FAIL_ON_SET=true
+            shift 2
+            ;;
         *) printf 'scan-image: unknown argument: %s\n' "$1" >&2; exit 2 ;;
     esac
 done
+
+# An empty severity is not "no threshold" -- it is a threshold nobody
+# wrote. "--fail-on ''" used to be silently ignored, so the scan ran
+# and reported findings while the caller believed it had asked for a
+# gate. Refuse it.
+if [ "$FAIL_ON_SET" = true ] && [ -z "$FAIL_ON" ]; then
+    printf 'scan-image: --fail-on needs a severity (e.g. HIGH,CRITICAL)\n' >&2
+    exit 2
+fi
 
 command -v "$PODMAN" >/dev/null 2>&1 || {
     printf 'scan-image: podman is not installed (PODMAN=%s)\n' "$PODMAN" >&2
@@ -70,14 +100,19 @@ set -- run --rm
 # The proxy is only passed through when it is set; an unset variable
 # would otherwise become an empty string in the container.
 #
+# The value is passed by NAME, not by name=value: `-e HTTPS_PROXY=...`
+# puts the proxy URL into podman's argv, where every other process on
+# the host can read it out of /proc/<pid>/cmdline. With the bare name,
+# podman copies the value out of its own environment.
+#
 # Every option has to come BEFORE the image name: podman stops parsing
 # options at the image, so an option after it is passed to the scanner
 # instead (which does not understand it).
 if [ -n "${HTTPS_PROXY:-}" ]; then
-    set -- "$@" -e HTTPS_PROXY="$HTTPS_PROXY"
+    set -- "$@" -e HTTPS_PROXY
 fi
 if [ -n "${HTTP_PROXY:-}" ]; then
-    set -- "$@" -e HTTP_PROXY="$HTTP_PROXY"
+    set -- "$@" -e HTTP_PROXY
 fi
 
 set -- "$@" \

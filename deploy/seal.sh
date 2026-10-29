@@ -19,7 +19,7 @@
 # Usage:
 #   deploy/seal.sh <plaintext.env> [seal-dir]
 #
-# Defaults: seal-dir = deploy/secrets/seal
+# Defaults: seal-dir = <directory of this script>/secrets/seal
 #
 # See plans/feat-vault-secret-backend.md (A-Phase 1) for the design.
 set -eu
@@ -46,7 +46,14 @@ usage() {
 [ $# -ge 1 ] && [ $# -le 2 ] || usage
 
 SRC=$1
-OUT=${2:-deploy/secrets/seal}
+# The default seal directory is next to this script, not next to the
+# caller: "deploy/secrets/seal" is correct only when the script is run
+# from the repository root. Run from anywhere else (a cron job, a
+# recovery shell) the relative default would write the ciphertext into
+# an unrelated directory -- and the entrypoint would then find no seal
+# where it looks for one.
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+OUT=${2:-$SELF_DIR/secrets/seal}
 
 if [ ! -f "$SRC" ]; then
     echo "ERROR: $SRC is not a file" >&2
