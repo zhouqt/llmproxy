@@ -147,16 +147,30 @@ jobs:
       #
       # The pinned images come from the Dockerfile itself, not from a copy
       # pasted here: two copies of a digest is one copy too many.
+      #
+      # The output is written to a file first and the exit code checked
+      # before anything is consumed. A process substitution
+      # (`done < <(cmd)`) does not propagate the exit status of `cmd`, so
+      # a failed run would silently feed a partial list into the scan
+      # steps -- and `set -eu` does not see it either.
       - name: Read the pinned images
         id: pins
         run: |
           set -eu
+          pins_file=$(mktemp)
+          rc=0
+          tools/check-base-digests.py --list > "$pins_file" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::could not read the pinned base images (exit $rc)"
+            cat "$pins_file"
+            exit 1
+          fi
           while IFS= read -r ref; do
             case "$ref" in
               *"/rust:"*)   echo "rust=$ref"   >> "$GITHUB_OUTPUT" ;;
               *"/alpine:"*) echo "alpine=$ref" >> "$GITHUB_OUTPUT" ;;
             esac
-          done < <(tools/check-base-digests.py --list)
+          done < "$pins_file"
 
       # `ignore-unfixed: true` keeps the report about vulnerabilities
       # that a package update would actually fix -- a CVE with no patch
@@ -209,17 +223,30 @@ jobs:
       # There is a CVE. Now the question is whether upstream has rebuilt
       # the tag into something that fixes it -- and only then is the pin
       # worth moving.
+      #
+      # As above: the output goes to a file and the exit code is checked
+      # before the output is consumed. `--resolve` exits 2 when it could
+      # not resolve every pinned tag, and a partial candidate list would
+      # otherwise be treated as a complete one.
       - name: Resolve the candidate images
         id: candidates
         if: steps.scan-pinned-rust.outcome == 'failure' || steps.scan-pinned-alpine.outcome == 'failure'
         run: |
           set -eu
+          cand_file=$(mktemp)
+          rc=0
+          tools/check-base-digests.py --resolve > "$cand_file" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::could not resolve the candidate base images (exit $rc); no pin is moved"
+            cat "$cand_file"
+            exit 1
+          fi
           while IFS= read -r ref; do
             case "$ref" in
               *"/rust:"*)   echo "rust=$ref"   >> "$GITHUB_OUTPUT" ;;
               *"/alpine:"*) echo "alpine=$ref" >> "$GITHUB_OUTPUT" ;;
             esac
-          done < <(tools/check-base-digests.py --resolve)
+          done < "$cand_file"
 
       - name: Scan the candidate Rust base image
         id: scan-candidate-rust

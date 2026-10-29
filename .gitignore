@@ -43,4 +43,4 @@ Thumbs.db
 coverage/
 *.lcov
 *.profraw
-*.profdata
+*.profdata__pycache__/
