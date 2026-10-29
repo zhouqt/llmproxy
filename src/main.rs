@@ -107,7 +107,7 @@ fn build_state(
         } else {
             direct_http.clone()
         };
-        let built = providers::build(p, client)
+        let built = providers::build(p, client, cfg.server.expose_upstream_details)
             .map_err(|e| llmproxy::error::ProxyError::Other(anyhow::anyhow!("building provider '{name}': {e}")))?;
         if let Some(h) = built.clone().spawn_background() {
             bg_handles.push(h);
@@ -125,6 +125,9 @@ fn build_state(
         cooldown.clone(),
     ));
 
+    // Read the flag before `cfg` is moved into the Arc below.
+    let expose_upstream_details = cfg.server.expose_upstream_details;
+
     let state = AppState {
         config: Arc::new(cfg),
         router,
@@ -138,6 +141,7 @@ fn build_state(
         copilot,
         usage: llmproxy::usage::UsageStats::new(usage_capacity),
         auth_limiter: llmproxy::auth::AuthRateLimiter::new(),
+        expose_upstream_details,
     };
     Ok((state, bg_handles))
 }
