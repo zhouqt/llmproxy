@@ -196,6 +196,7 @@ async fn mock_llm_provider_primary_succeeds_returns_anthropic_response() {
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
             api_key: None,
+            expose_upstream_details: true,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -262,6 +263,7 @@ async fn mock_llm_provider_falls_back_when_primary_returns_429() {
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
             api_key: None,
+            expose_upstream_details: true,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -354,6 +356,7 @@ async fn copilot_endpoint_rejection_400_triggers_fallback() {
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
             api_key: None,
+            expose_upstream_details: true,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -443,6 +446,7 @@ async fn mock_llm_provider_falls_back_when_primary_returns_402_quota() {
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
             api_key: None,
+            expose_upstream_details: true,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -531,6 +535,7 @@ async fn mock_llm_provider_falls_back_when_primary_returns_empty_body_402() {
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
             api_key: None,
+            expose_upstream_details: true,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -620,6 +625,7 @@ async fn mock_llm_provider_does_not_fall_back_on_403() {
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
             api_key: None,
+            expose_upstream_details: true,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -703,6 +709,7 @@ async fn mock_llm_provider_chain_exhausted_returns_last_upstream_error() {
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
             api_key: None,
+            expose_upstream_details: true,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -813,6 +820,7 @@ async fn mock_llm_provider_per_provider_retry_three_times_before_chain_advance()
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
             api_key: None,
+            expose_upstream_details: true,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -922,6 +930,7 @@ async fn http_end_to_end_anthropic_provider_strips_and_succeeds() {
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
             api_key: None,
+            expose_upstream_details: true,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -1033,6 +1042,7 @@ async fn http_end_to_end_anthropic_provider_strip_max_attempts_then_passthrough(
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
             api_key: None,
+            expose_upstream_details: true,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -1106,6 +1116,7 @@ fn build_axum_app(
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
             api_key: None,
+            expose_upstream_details: true,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -1132,6 +1143,7 @@ fn build_axum_app(
         copilot: None,
         usage,
         auth_limiter: llmproxy::auth::AuthRateLimiter::new(),
+        expose_upstream_details: true,
     };
     llmproxy::server::build_router(state)
 }
@@ -1567,6 +1579,7 @@ async fn mock_llm_provider_short_cooldown_for_non_429_upstream_error() {
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
             api_key: None,
+            expose_upstream_details: true,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -1672,6 +1685,7 @@ async fn mock_llm_provider_402_uses_configured_cooldown_seconds_and_skips_primar
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
             api_key: None,
+            expose_upstream_details: true,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -1790,6 +1804,7 @@ async fn mock_llm_provider_subsequent_request_skips_cooldown_provider_directly()
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
             api_key: None,
+            expose_upstream_details: true,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -1926,6 +1941,7 @@ async fn mock_llm_provider_skips_provider_with_unsupported_model_via_runtime_400
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
             api_key: None,
+            expose_upstream_details: true,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),

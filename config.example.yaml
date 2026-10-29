@@ -84,6 +84,26 @@ server:
   # `Authorization: Bearer ` — remove the field to disable auth.
   api_key: "${LLMPROXY_API_KEY}"
 
+  # Whether the client is told what the upstream said.
+  #
+  # true (the default) passes the upstream error body through, names the
+  # failing backends in the `x-llmproxy-failed-providers` header, and
+  # embeds the upstream text in an in-stream `event: error`. That is a
+  # debugging convenience — and a disclosure surface: anyone holding the
+  # shared bearer token learns the backend topology and the upstream
+  # account's quota/auth details.
+  #
+  # false replaces all of it with generic wording. The operator still
+  # sees the full detail in the logs and in `/admin/usage` — only the
+  # client stops seeing it. Set this when more than one client shares
+  # the token, or when the port is published beyond localhost.
+  #
+  # "All of it" includes the `event: error` frames the SSE adapters
+  # synthesise from an upstream error object, and the errors that only
+  # carry upstream text (transport errors, token-refresh messages).
+  # Purely client-side errors keep their own wording.
+  expose_upstream_details: true
+
 # ───────────────────────────────────────────────────────────────────────
 # proxy: outgoing proxy used by providers with `use_proxy: true`
 # ───────────────────────────────────────────────────────────────────────

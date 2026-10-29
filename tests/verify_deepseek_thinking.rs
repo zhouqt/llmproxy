@@ -130,6 +130,7 @@ fn build_router(
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
             api_key: None,
+            expose_upstream_details: true,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),

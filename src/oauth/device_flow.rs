@@ -70,9 +70,10 @@ async fn request_device_code_at(
     let status = resp.status();
     let body: Value = resp.json().await?;
     if !status.is_success() {
-        return Err(ProxyError::Other(anyhow::anyhow!(
-            "device code request failed: {status} {body}"
-        )));
+        // Upstream response body verbatim: mark it as UpstreamText.
+        return Err(ProxyError::UpstreamText {
+            message: format!("device code request failed: {status} {body}"),
+        });
     }
     serde_json::from_value(body).map_err(ProxyError::Json)
 }
@@ -109,19 +110,23 @@ async fn poll_access_token_at(
     let status = resp.status();
     let value: Value = resp.json().await?;
     if !status.is_success() {
-        return Err(ProxyError::Other(anyhow::anyhow!(
-            "access token request failed: {status} {value}"
-        )));
+        // Upstream response body verbatim: mark it as UpstreamText.
+        return Err(ProxyError::UpstreamText {
+            message: format!("access token request failed: {status} {value}"),
+        });
     }
     let body: AccessTokenResponse = serde_json::from_value(value)?;
     match body.error.as_deref() {
         Some("authorization_pending") => Ok(None),
         Some("slow_down") => Ok(None),
         Some("expired_token") => Err(ProxyError::Other(anyhow::anyhow!("device code expired"))),
-        Some(other) => Err(ProxyError::Other(anyhow::anyhow!(
-            "oauth error: {other}: {}",
-            body.error_description.unwrap_or_default()
-        ))),
+        // GitHub's error code and description are upstream text: mark them UpstreamText.
+        Some(other) => Err(ProxyError::UpstreamText {
+            message: format!(
+                "oauth error: {other}: {}",
+                body.error_description.unwrap_or_default()
+            ),
+        }),
         None => match body.access_token {
             Some(t) => Ok(Some(t)),
             None => Err(ProxyError::Other(anyhow::anyhow!(

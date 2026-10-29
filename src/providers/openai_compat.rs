@@ -57,6 +57,10 @@ pub struct OpenAiCompatProvider {
     /// 逐字透传）。默认 `false`（wire 字节与关闭前一致）。
     reasoning_echo: bool,
     http: reqwest::Client,
+    /// `server.expose_upstream_details` (default `true`).
+    /// Passed to the SSE adapter: when `false`, the `event: error` frames
+    /// it synthesises itself carry no upstream text.
+    expose_upstream_details: bool,
 }
 
 impl OpenAiCompatProvider {
@@ -104,7 +108,13 @@ impl OpenAiCompatProvider {
             is_openrouter,
             reasoning_echo,
             http,
+            expose_upstream_details: true,
         })
+    }
+
+    /// Sets `server.expose_upstream_details` (see `providers::build`).
+    pub fn set_expose_upstream_details(&mut self, expose: bool) {
+        self.expose_upstream_details = expose;
     }
 
     fn chat_url(&self) -> String {
@@ -191,6 +201,7 @@ impl OpenAiCompatProvider {
             is_openrouter: force_openrouter,
             reasoning_echo,
             http,
+            expose_upstream_details: true,
         })
     }
 
@@ -541,7 +552,8 @@ impl Provider for OpenAiCompatProvider {
             let status = resp.status();
             if status.is_success() {
                 let byte_stream = resp.bytes_stream();
-                let sse = OpenAiSseToAnthropic::new(byte_stream, &req.model);
+                let sse = OpenAiSseToAnthropic::new(byte_stream, &req.model)
+                    .with_expose_upstream_details(self.expose_upstream_details);
                 if format_downgraded {
                     tracing::info!(
                         provider = %self.name,
@@ -595,6 +607,13 @@ pub struct OpenAiSseToAnthropic<S> {
     pending: BytesMut,
     finished: bool,
     output_buffer: VecDeque<Bytes>,
+    /// The value of `server.expose_upstream_details` (default `true`).
+    ///
+    /// When the upstream sends `{"error":{...}}` inside a 200 SSE stream, this
+    /// adapter synthesises an `event: error` frame itself. That frame is
+    /// `Ok(bytes)`, so `server.rs`'s `format_stream_error()` never sees it --
+    /// hence the switch must be applied here. `false` replaces the message.
+    expose_upstream_details: bool,
 }
 
 impl<S> OpenAiSseToAnthropic<S>
@@ -611,7 +630,18 @@ where
             pending: BytesMut::new(),
             finished: false,
             output_buffer: VecDeque::new(),
+            expose_upstream_details: true,
         }
+    }
+
+    /// Sets `server.expose_upstream_details`.
+    ///
+    /// When `false`, the `event: error` frames this adapter synthesises no
+    /// longer carry upstream text; they use `ProxyError::GENERIC_UPSTREAM_MESSAGE`.
+    /// The default (`true`) leaves the wire bytes unchanged, character for character.
+    pub fn with_expose_upstream_details(mut self, expose: bool) -> Self {
+        self.expose_upstream_details = expose;
+        self
     }
 
     fn encode(ev: &StreamEvent) -> Bytes {
@@ -658,6 +688,13 @@ where
                     .and_then(|error| error.get("message"))
                     .and_then(Value::as_str)
                     .unwrap_or("upstream error");
+                // `expose_upstream_details=false` keeps upstream text from the client
+                // (this frame is Ok(bytes), invisible to the server-level handling).
+                let message = if self.expose_upstream_details {
+                    message.to_string()
+                } else {
+                    crate::error::ProxyError::GENERIC_UPSTREAM_MESSAGE.to_string()
+                };
                 let event = StreamEvent::Error {
                     error: serde_json::json!({
                         "type": "upstream_error",
@@ -1186,6 +1223,32 @@ mod tests {
         assert!(encoded.contains("event: error"));
         assert!(encoded.contains("model rejected request"));
         assert!(!encoded.contains("event: message_stop"));
+    }
+
+    #[tokio::test]
+    async fn adapter_hides_the_upstream_error_message_when_details_are_not_exposed() {
+        // `expose_upstream_details=false`: this frame is the adapter's own Ok(bytes),
+        // invisible to the server-level scrub, so the adapter must replace it itself.
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data: {\"error\":{\"message\":\"model rejected request\",\"type\":\"invalid_request_error\"}}\n\n",
+        ))];
+        let mut adapter = OpenAiSseToAnthropic::new(stream::iter(chunks), "model")
+            .with_expose_upstream_details(false);
+        let mut encoded = String::new();
+
+        while let Some(item) = adapter.next().await {
+            encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+        }
+
+        assert!(encoded.contains("event: error"), "{encoded}");
+        assert!(
+            !encoded.contains("model rejected request"),
+            "upstream text must not appear in an in-stream error frame: {encoded}"
+        );
+        assert!(
+            encoded.contains(crate::error::ProxyError::GENERIC_UPSTREAM_MESSAGE),
+            "should have become the generic wording: {encoded}"
+        );
     }
 
     #[tokio::test]
