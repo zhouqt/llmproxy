@@ -120,6 +120,29 @@ class Lock:
         return None
 
 
+def prerelease_key(pre: str) -> tuple:
+    """Order a prerelease suffix the way semver does.
+
+    A prerelease is a dot-separated list of identifiers. Numeric
+    identifiers compare numerically and always have *lower* precedence
+    than alphanumeric ones; alphanumeric identifiers compare
+    lexically (ASCII order); a larger set of identifiers wins when all
+    the preceding ones are equal.
+
+    So "rc.10" > "rc.9" -- comparing the suffix as a plain string would
+    say the opposite, and a downgrade from rc.10 to rc.9 would go
+    unnoticed.
+    """
+    parts = []
+    for ident in pre.split("."):
+        if ident.isdigit():
+            # (0, value, "") -- numeric identifiers rank below alphanumerics.
+            parts.append((0, int(ident), ""))
+        else:
+            parts.append((1, 0, ident))
+    return tuple(parts)
+
+
 def version_key(v: str):
     """Order versions the way semver does, approximately.
 
@@ -132,7 +155,7 @@ def version_key(v: str):
     nums = [int(p) if p.isdigit() else 0 for p in core.split(".")]
     nums = (nums + [0, 0, 0])[:3]
     # (0, pre) sorts before (1, "") -- i.e. prerelease before release.
-    return (tuple(nums), 0 if pre else 1, pre)
+    return (tuple(nums), 0 if pre else 1, prerelease_key(pre))
 
 
 def direct_downgrades(old: Lock, new: Lock) -> list[tuple[str, str, str]]:
@@ -265,6 +288,30 @@ def selftest() -> int:
             lock([("foo", "0.8.0", []), ("foo", "1.0.0", [])]),
             [],
         ),
+        (
+            "a prerelease moved to an older prerelease (rc.10 -> rc.9)",
+            lock([("foo", "1.0.0-rc.10", [])]),
+            lock([("foo", "1.0.0-rc.9", [])]),
+            [("foo", "1.0.0-rc.10", "1.0.0-rc.9")],
+        ),
+        (
+            "a prerelease moved to a newer prerelease (rc.9 -> rc.10)",
+            lock([("foo", "1.0.0-rc.9", [])]),
+            lock([("foo", "1.0.0-rc.10", [])]),
+            [],
+        ),
+        (
+            "a prerelease moved to its release (1.0.0-rc.1 -> 1.0.0)",
+            lock([("foo", "1.0.0-rc.1", [])]),
+            lock([("foo", "1.0.0", [])]),
+            [],
+        ),
+        (
+            "a release moved back to a prerelease (1.0.0 -> 1.0.0-rc.1)",
+            lock([("foo", "1.0.0", [])]),
+            lock([("foo", "1.0.0-rc.1", [])]),
+            [("foo", "1.0.0", "1.0.0-rc.1")],
+        ),
     ]
 
     failures = 0
@@ -299,8 +346,26 @@ def main() -> int:
         print(f"lock-drift: cannot read {lock_path}: {exc}", file=sys.stderr)
         return 2
 
+    # Resolve the base ref to a full object name first. A ref that
+    # starts with "-" would otherwise be parsed by git as an option;
+    # `--end-of-options` tells git that everything after it is a
+    # revision, and the resolved SHA never starts with "-".
+    resolved = subprocess.run(
+        ["git", "rev-parse", "--verify", "--end-of-options", f"{base_ref}^{{commit}}"],
+        capture_output=True,
+        text=True,
+    )
+    if resolved.returncode != 0:
+        print(
+            f"lock-drift: cannot resolve base ref {base_ref!r}: "
+            f"{resolved.stderr.strip()}",
+            file=sys.stderr,
+        )
+        return 2
+    base = resolved.stdout.strip()
+
     proc = subprocess.run(
-        ["git", "show", f"{base_ref}:Cargo.lock"],
+        ["git", "show", f"{base}:Cargo.lock"],
         capture_output=True,
         text=True,
     )
