@@ -60,8 +60,19 @@ jobs:
 
       # A moved tag is not a defect: the base image pin moves for a CVE,
       # not because upstream rebuilt the image (which it does constantly).
-      # So this check reports, it does not fail -- a red build over a
-      # rebuild nobody asked for trains people to ignore red builds.
+      # So this check reports a drift, it does not fail -- a red build
+      # over a rebuild nobody asked for trains people to ignore red
+      # builds.
+      #
+      # A pin that could NOT be checked is the opposite case: the script
+      # exits 2 and the pins are unverified, so the job fails. An
+      # unverified pin is not a verified pin.
+      #
+      # Exit 2 also wins when both happen at once -- one pin drifted and
+      # another could not be reached. The script decides the "could not
+      # check" case first, because exit 1 means "every pin was checked
+      # and one merely moved", and treating a partly-verified run as
+      # exit 1 would leave the unchecked pin green behind a moved tag.
       #
       # The thing that *does* fail on a vulnerable image is the monthly
       # CVE scan in refresh-pins.yml.
@@ -72,8 +83,16 @@ jobs:
           if [ "$rc" -eq 1 ]; then
             echo "::warning::a base image tag moved; the pin stays until a CVE requires it to move"
           elif [ "$rc" -eq 2 ]; then
-            echo "::warning::could not reach the registry; the pins were not verified"
+            echo "::error::the base image pins could not be verified (a registry was unreachable, or a pin is malformed)"
+            exit 1
           fi
+
+      # The exit-code logic itself, offline: no registry is contacted, so
+      # this proves the "could not check" case is never mistaken for
+      # "the tag moved". Without it, the ordering above would only ever
+      # be exercised by a real registry outage.
+      - name: Self-test the base image pin check
+        run: tools/check-base-digests.py --selftest
 
       # `cargo fetch` downloads and verifies checksums against Cargo.lock.
       # It compiles nothing, so no third-party build.rs runs here.
@@ -145,11 +164,17 @@ jobs:
       - name: cargo-deny
         run: cargo deny check
 
-      # cargo-vet is a ledger, not a barrier: every dependency needs an
-      # audit record or an exemption. The exemptions in audits.toml cover
-      # the current dependency set, so a NEW dependency has to be reviewed
-      # by a human before it can land.
-      - name: cargo-vet
+      # cargo-vet is a ledger, not a barrier. This job does NOT claim
+      # that any dependency has been manually audited: supply-chain/audits.toml
+      # is empty, and every current dependency is covered by a version-pinned
+      # exemption in supply-chain/config.toml.
+      #
+      # What it does assert is real, and it is what a new dependency
+      # hits: a dependency that is neither audited nor exempted (or one
+      # whose version moved off its pin) fails the build. So the step is
+      # named for what it is -- an exemption ledger -- rather than for a
+      # claim about manual auditing that nobody is making.
+      - name: cargo-vet (exemption ledger)
         run: cargo vet
 
       # The same SBOM that is baked into the image, published as a build
@@ -211,15 +236,33 @@ jobs:
       #   1. with the network reachable it MUST fail (it detected a breach)
       #   2. with --network none it MUST pass (isolation actually holds)
 
+      # The negative test has to fail *because of the canary*. A build
+      # that fails for any other reason (a typo in the canary crate, a
+      # missing lock file) also exits non-zero -- and then the positive
+      # test below would "prove" nothing about isolation. So the log is
+      # captured and the canary's OWN failure marker is required in it.
+      #
+      # The marker is the message from the panic in
+      # tools/sandbox-canary/build.rs ("隔离已被打破"), NOT the crate
+      # name: cargo prints "Compiling sandbox-canary" and the build.rs
+      # path for any failure of this crate, so grepping for the crate
+      # name would match a compile error in the canary itself and the
+      # step would pass while proving nothing.
       - name: Canary must FAIL when the network is reachable
         run: |
-          set -eu
+          set -o pipefail
+          log=$(mktemp)
           if docker run --rm \
               -v "$GITHUB_WORKSPACE:/w" -w /w/tools/sandbox-canary \
               -e CARGO_TARGET_DIR=/tmp/canary-net \
               "$RUST_IMAGE" \
-              cargo build --offline --locked; then
+              cargo build --offline --locked 2>&1 | tee "$log"; then
             echo "::error::sandbox-canary passed with the network reachable -- it does not detect a breach, so the positive test below would be meaningless"
+            exit 1
+          fi
+          if ! grep -q '隔离已被打破' "$log"; then
+            echo "::error::the canary build failed, but not because of the canary -- the isolation test proved nothing"
+            cat "$log"
             exit 1
           fi
           echo "ok: the canary correctly failed with the network reachable"
@@ -313,8 +356,15 @@ jobs:
 
   lock-drift:
     name: Dependency downgrade check
-    # PR-only: a push to a branch has no meaningful base to diff against.
-    if: github.event_name == 'pull_request'
+    # A pull request has a base branch to diff against; a push to main
+    # has the commit it replaced (`github.event.before`). Both are a
+    # meaningful "before", so the check runs in both cases: a downgrade
+    # that lands on main through a direct push is exactly the case
+    # that matters. A push that creates the branch has no "before"
+    # (it is all zeros) and is skipped -- there is nothing to compare.
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -337,6 +387,13 @@ jobs:
         run: tools/lock-drift.py --selftest
 
       - name: Reject dependency downgrades
-        if: ${{ !contains(github.event.pull_request.labels.*.name, 'supply-chain-ok') }}
+        if: >-
+          ${{ !contains(github.event.pull_request.labels.*.name, 'supply-chain-ok') }}
         run: |
-          tools/lock-drift.py "${{ github.event.pull_request.base.sha }}" Cargo.lock
+          set -eu
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            echo "::notice::no base commit to compare against; skipping the downgrade check"
+            exit 0
+          fi
+          tools/lock-drift.py "$base" Cargo.lock

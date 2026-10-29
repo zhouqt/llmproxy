@@ -115,5 +115,7 @@ CMD ["llmproxy", "--config", "/etc/llmproxy/config.yaml"]
 # 刷新基础镜像 digest 的方法:
 #   tools/check-base-digests.py            # 核对当前 digest 是否仍与 tag 一致
 #   tools/check-base-digests.py --registry public.ecr.aws   # 构建机上用(ECR 可达)
-# digest 漂移时,Dependabot(docker ecosystem)会开 PR 改这一行。
+# When the digest drifts, the base-image-cve job in refresh-pins.yml
+# (monthly, Trivy) opens the PR -- but only when the pinned image has a
+# HIGH/CRITICAL CVE that the current build of the same tag has fixed.
 # ---------------------------------------------------------------------------

@@ -18,8 +18,8 @@ turns into a green checkmark that means nothing.
 | `RUN --network=none` | Dockerfile | The compile step has no egress at the kernel level | Hide environment variables. Hence the credential half of the canary |
 | `cargo-auditable` | Dockerfile | The dependency list is embedded in the binary, so Trivy/Grype can see the Rust crates | Prove the build was clean |
 | `cargo-deny` | CI (`deny.toml`) | Advisory / license / source policy | Prevent a malicious crate from doing anything. It is a linter with a human behind it |
-| `cargo-vet` | CI (`supply-chain/`) | Every dependency is audited or explicitly exempted, per version | Be a barrier you can skip. It is a ledger: a new dependency is simply not in it, and the build fails |
-| `lock-drift.py` | CI (PR only) | Rejects a dependency that moved **backwards** | Catch a malicious bump forward — that is `cargo deny`'s job |
+| `cargo-vet` | CI (`supply-chain/`) | Every dependency is **explicitly exempted** (per version) or audited — the ledger is complete | Be a barrier you can skip. It is a ledger: a new dependency is simply not in it, and the build fails. It does **not** claim any dependency was manually audited: `supply-chain/audits.toml` is empty and every current dependency sits under a version-pinned exemption |
+| `lock-drift.py` | CI (pull requests **and** pushes to main) | Rejects a dependency that moved **backwards** | Catch a malicious bump forward — that is `cargo deny`'s job |
 | `cosign sign` (keyless) | `docker.yaml` | The published image has a signature tied to this repository's workflow | Sign the source. The image is the artifact, so the image is what gets signed |
 
 The split, stated once: **Dockerfile + `Cargo.lock` are the walls. CI is
@@ -50,8 +50,28 @@ either. CI runs it twice:
 1. with the network reachable it **must fail** (it detects a breach)
 2. with `--network none` it **must pass** (the isolation holds)
 
+The negative test asserts the canary's own failure marker in the build log
+(the panic message `隔离已被打破` from `tools/sandbox-canary/build.rs`),
+not merely a non-zero exit status: a build that fails for an unrelated
+reason (a typo in the canary crate) would otherwise make the positive
+test meaningless. The marker is deliberately *not* the crate name —
+cargo prints `Compiling sandbox-canary` and the `build.rs` path for any
+failure of that crate, so grepping for the name would match a compile
+error in the canary itself. There is no "relaxed" switch — a build
+environment that can reach the network simply does not pass.
+
 A canary that only ever passes proves nothing, which is why the negative
 test exists.
+
+### What counts as a credential-shaped environment variable
+
+The canary looks at variable **names only**; it never prints a value.
+
+| Variable | Verdict | Why |
+|---|---|---|
+| `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (and any other name containing `PROXY`) | **violation** | A proxy can redirect the compile step's egress to an uncontrolled exit — the same breach the canary exists to catch, in another direction. The rule is "name contains `PROXY`", not an enumeration, so a new proxy variable is caught without a code change. |
+| `NO_PROXY` / `no_proxy` | **allowed** | It is the *bypass list* ("do not use a proxy for these hosts"), not an exit and not a credential. `tools/rust-build.sh`'s `run_in_container()` injects `-e NO_PROXY=…` / `-e no_proxy=…` unconditionally, because the test suite talks to mock servers on `127.0.0.1` and reqwest would otherwise send those requests to the proxy. Without this exception the canary is guaranteed to fail locally — and a check that is always red is a check nobody runs. |
+| `GITHUB_TOKEN`, `AWS_*`, `*_API_KEY`, `SSH_AUTH_SOCK`, … | **violation** | Credential-shaped; `--network=none` blocks egress but does **not** hide the environment. |
 
 ## 3. Keeping the pinned inputs current
 

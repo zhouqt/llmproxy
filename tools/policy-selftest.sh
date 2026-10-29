@@ -51,7 +51,7 @@ skip(){ printf 'SKIP: %s\n' "$1"; SKIP=$((SKIP + 1)); }
 scratch_copy() {
     dest=$1
     mkdir -p "$dest"
-    for item in Cargo.toml Cargo.lock deny.toml src tests supply-chain tools; do
+    for item in Cargo.toml Cargo.lock deny.toml Dockerfile src tests supply-chain tools; do
         if [ -e "$REPO_ROOT/$item" ]; then
             cp -R "$REPO_ROOT/$item" "$dest/"
         fi
@@ -215,6 +215,47 @@ else
     else
         bad "lock-drift did NOT reject the downgraded lock file (exit $rc)"
         printf -- '---- lock-drift output ----\n%s\n---------------------------\n' "$(last_out)"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Red case 5: the base-image pin check.
+#
+# A pin that is not a valid sha256 digest is not a pin, and a FROM line
+# without any digest is not pinned at all. In both cases the check must
+# refuse the Dockerfile (exit 2) instead of skipping the line and
+# reporting "nothing to do" -- that would turn a broken pin into a
+# green check.
+#
+# Both cases are offline: the check fails before it reaches a registry.
+# ---------------------------------------------------------------------------
+if ! command -v python3 >/dev/null 2>&1; then
+    skip "base image pin cases (python3 is not available on this host)"
+else
+    case_dir=$SCRATCH/pin-malformed
+    scratch_copy "$case_dir"
+    sed 's|@sha256:[0-9a-f]\{64\}|@sha256:NOT-A-DIGEST|g' "$case_dir/Dockerfile" > "$case_dir/Dockerfile.new" \
+        && mv "$case_dir/Dockerfile.new" "$case_dir/Dockerfile"
+    run_in "$case_dir" python3 "$REPO_ROOT/tools/check-base-digests.py" --dockerfile Dockerfile
+    rc=$(last_rc)
+    if [ "$rc" -eq 2 ]; then
+        ok "check-base-digests refuses a malformed base image digest"
+    else
+        bad "check-base-digests did NOT refuse the malformed digest (exit $rc)"
+        printf -- '---- check-base-digests output ----\n%s\n-------------------------------\n' "$(last_out)"
+    fi
+
+    case_dir=$SCRATCH/pin-missing
+    scratch_copy "$case_dir"
+    sed 's|@sha256:[0-9a-f]\{64\}||g' "$case_dir/Dockerfile" > "$case_dir/Dockerfile.new" \
+        && mv "$case_dir/Dockerfile.new" "$case_dir/Dockerfile"
+    run_in "$case_dir" python3 "$REPO_ROOT/tools/check-base-digests.py" --dockerfile Dockerfile
+    rc=$(last_rc)
+    if [ "$rc" -eq 2 ]; then
+        ok "check-base-digests refuses a Dockerfile whose base image is not pinned"
+    else
+        bad "check-base-digests did NOT refuse the unpinned base image (exit $rc)"
+        printf -- '---- check-base-digests output ----\n%s\n-------------------------------\n' "$(last_out)"
     fi
 fi
 
