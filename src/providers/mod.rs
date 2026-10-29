@@ -110,9 +110,15 @@ pub(crate) fn is_openrouter_api_base(api_base: &str) -> bool {
 }
 
 /// Build a provider instance from a ProviderConfig.
+///
+/// `expose_upstream_details` is the value of `server.expose_upstream_details`:
+/// when `false`, the `event: error` frames the SSE adapters synthesise no
+/// longer carry upstream text (those frames are `Ok(bytes)`, so the server-level
+/// scrub never sees them).
 pub fn build(
     cfg: &ProviderConfig,
     http: reqwest::Client,
+    expose_upstream_details: bool,
 ) -> Result<SharedProvider> {
     match cfg {
         ProviderConfig::GithubCopilot {
@@ -123,7 +129,7 @@ pub fn build(
             model_rewrite,
             ..
         } => {
-            let inner = copilot::CopilotProvider::new(
+            let mut inner = copilot::CopilotProvider::new(
                 name.clone(),
                 vscode_version.clone(),
                 account_type.clone(),
@@ -131,6 +137,7 @@ pub fn build(
                 model_rewrite.clone(),
                 http,
             )?;
+            inner.set_expose_upstream_details(expose_upstream_details);
             Ok(Arc::new(inner))
         }
         ProviderConfig::Anthropic {
@@ -165,7 +172,7 @@ pub fn build(
             reasoning_echo,
             ..
         } => {
-            let inner = openai_compat::OpenAiCompatProvider::new(
+            let mut inner = openai_compat::OpenAiCompatProvider::new(
                 name.clone(),
                 api_base.clone(),
                 api_key.clone(),
@@ -175,6 +182,7 @@ pub fn build(
                 reasoning_echo.clone(),
                 http,
             )?;
+            inner.set_expose_upstream_details(expose_upstream_details);
             Ok(Arc::new(inner))
         }
         ProviderConfig::OpenaiResponses {
@@ -184,13 +192,14 @@ pub fn build(
             model_rewrite,
             ..
         } => {
-            let inner = openai_responses::OpenaiResponsesProvider::new(
+            let mut inner = openai_responses::OpenaiResponsesProvider::new(
                 name.clone(),
                 api_base.clone(),
                 api_key.clone(),
                 model_rewrite.clone(),
                 http,
             )?;
+            inner.set_expose_upstream_details(expose_upstream_details);
             Ok(Arc::new(inner))
         }
     }
@@ -216,6 +225,7 @@ mod tests {
             reasoning_echo: false,
             },
             reqwest::Client::new(),
+            true,
         )
         .unwrap();
         assert_eq!(compat.name(), "compat");
@@ -233,6 +243,7 @@ mod tests {
                 thinking_when_absent: crate::config::ThinkingWhenAbsent::Omit,
             },
             reqwest::Client::new(),
+            true,
         )
         .unwrap();
         assert_eq!(router.name(), "router");
@@ -250,6 +261,7 @@ mod tests {
                 use_proxy: false,
             },
             reqwest::Client::new(),
+            true,
         )
         .unwrap();
         assert_eq!(responses.name(), "responses");
@@ -274,6 +286,7 @@ mod tests {
                 use_proxy: false,
             },
             reqwest::Client::new(),
+            true,
         )
         .unwrap();
 

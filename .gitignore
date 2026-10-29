@@ -44,3 +44,4 @@ coverage/
 *.lcov
 *.profraw
 *.profdata
+__pycache__/
