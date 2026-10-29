@@ -142,5 +142,7 @@ CMD ["llmproxy", "--config", "/etc/llmproxy/config.yaml"]
 # Refreshing a base image digest:
 #   tools/check-base-digests.py            # check that the digest still matches the tag
 #   tools/check-base-digests.py --registry public.ecr.aws   # for hosts that can reach ECR
-# When the digest drifts, Dependabot (docker ecosystem) opens a PR to change this line.
+# When the digest drifts, the base-image-cve job in refresh-pins.yml
+# (monthly, Trivy) opens the PR -- but only when the pinned image has a
+# HIGH/CRITICAL CVE that the current build of the same tag has fixed.
 # ---------------------------------------------------------------------------

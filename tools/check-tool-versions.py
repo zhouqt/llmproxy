@@ -29,6 +29,12 @@ The pins live in two kinds of file:
 
 Both are rewritten in place by --update. The version stays exact
 (no caret, no range) -- that is the whole point of pinning it.
+
+The version that comes back from crates.io is validated before it is
+written anywhere: it has to look like `1.2.3`. A version string that
+does not is refused outright (exit 2, nothing written) -- the pin ends
+up in a `cargo install --version` argument that CI executes, so an
+unvalidated string from the network does not belong in it.
 """
 
 from __future__ import annotations
@@ -50,6 +56,16 @@ CRATES_IO_API = "https://crates.io/api/v1/crates/{crate}"
 # crates.io asks every client to identify itself.
 USER_AGENT = "llmproxy-supply-chain-check (version pin refresher)"
 
+# The only version shape this script is willing to write into a pin.
+# A version string that does not match is refused: writing it would
+# put an arbitrary token into a `cargo install --version` argument in a
+# file that CI then executes.
+SEMVER_RE = re.compile(r"\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?")
+
+
+class BadVersion(ValueError):
+    """crates.io returned a version string this script refuses to pin."""
+
 
 def pinned_versions(paths: list[str]) -> list[tuple[str, str, str, int]]:
     """Return [(path, crate, version, line_no)] for every pinned install."""
@@ -64,12 +80,23 @@ def pinned_versions(paths: list[str]) -> list[tuple[str, str, str, int]]:
 
 
 def latest_version(crate: str) -> str | None:
-    """Return the newest stable version of `crate` on crates.io."""
+    """Return the newest stable version of `crate` on crates.io.
+
+    Raises BadVersion when the answer is not a plain version string:
+    the caller must not write such a value into a pin.
+    """
     url = CRATES_IO_API.format(crate=crate)
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=30) as resp:
         data = json.load(resp)
-    return data.get("crate", {}).get("max_stable_version")
+    ver = data.get("crate", {}).get("max_stable_version")
+    if ver is None:
+        return None
+    if not SEMVER_RE.fullmatch(ver):
+        raise BadVersion(
+            f"expected a version like 1.2.3, got {ver!r}; refusing to pin it"
+        )
+    return ver
 
 
 def update_pins(paths: list[str], wanted: dict[tuple[str, str], str]) -> int:
@@ -127,13 +154,26 @@ def main() -> int:
     crates = sorted({crate for _, crate, _, _ in pins})
     latest: dict[str, str | None] = {}
     unreachable = False
+    invalid = False
     for crate in crates:
         try:
             latest[crate] = latest_version(crate)
+        except BadVersion as exc:
+            print(f"error: crates.io answered unusable for {crate}: {exc}", file=sys.stderr)
+            invalid = True
         except (urllib.error.URLError, OSError, ValueError) as exc:
             print(f"warn: cannot reach crates.io for {crate}: {exc}", file=sys.stderr)
             latest[crate] = None
             unreachable = True
+
+    if invalid:
+        # Nothing is written: a pin that could not be understood is
+        # worse than a pin that is one version behind.
+        print(
+            "error: at least one version could not be validated; no pin was written",
+            file=sys.stderr,
+        )
+        return 2
 
     outdated = []
     wanted: dict[tuple[str, str], str] = {}

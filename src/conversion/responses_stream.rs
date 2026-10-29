@@ -57,6 +57,10 @@ pub struct ResponsesStreamTranslator {
     /// arrived). When no delta was seen, the done event's `text` is emitted
     /// as a fallback text delta so the client does not see an empty block.
     deltas_seen: std::collections::HashSet<u32>,
+    /// The value of `server.expose_upstream_details` (default `true`).
+    /// When `false`, the upstream text in `response.failed` / `error` events
+    /// (message and code) is replaced with the generic wording.
+    expose_upstream_details: bool,
     /// Anthropic block index of the currently-open thinking block (driven
     /// by `response.reasoning_text.*` events). `None` when no thinking
     /// block is open. Thinking blocks are allocated independently of the
@@ -120,7 +124,13 @@ impl ResponsesStreamTranslator {
             closed_thinking_items: std::collections::HashSet::new(),
             text_block_index: None,
             finalized: false,
+            expose_upstream_details: true,
         }
+    }
+
+    /// Sets `server.expose_upstream_details` (see `providers::openai_responses`).
+    pub fn set_expose_upstream_details(&mut self, expose: bool) {
+        self.expose_upstream_details = expose;
     }
 
     fn ensure_started(&mut self, out: &mut Vec<StreamEvent>) {
@@ -447,6 +457,16 @@ impl ResponsesStreamTranslator {
                     .and_then(|v| v.get("code"))
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_owned());
+                // `expose_upstream_details=false`: the upstream message and code are both
+                // upstream text, so the pair becomes the generic wording.
+                let (msg, code) = if self.expose_upstream_details {
+                    (msg, code.clone())
+                } else {
+                    (
+                        crate::error::ProxyError::GENERIC_UPSTREAM_MESSAGE.to_string(),
+                        None,
+                    )
+                };
                 let mut error_body = serde_json::json!({
                     "type": "upstream_error",
                     "message": msg,
@@ -470,6 +490,16 @@ impl ResponsesStreamTranslator {
                     .cloned()
                     .or_else(|| extra.get("error").and_then(|v| v.get("message")).and_then(|v| v.as_str().map(|s| s.to_owned())))
                     .unwrap_or_else(|| "upstream error".to_string());
+                // `expose_upstream_details=false`: as above, message and code both
+                // become the generic wording.
+                let (msg, code) = if self.expose_upstream_details {
+                    (msg, code.clone())
+                } else {
+                    (
+                        crate::error::ProxyError::GENERIC_UPSTREAM_MESSAGE.to_string(),
+                        None,
+                    )
+                };
                 let mut error_body = serde_json::json!({
                     "type": "upstream_error",
                     "message": msg,
@@ -2216,6 +2246,58 @@ mod tests {
             "response.failed must emit Error event even without error details"
         );
         assert!(t.finalized, "translator must be finalized");
+    }
+
+    /// A1: with `server.expose_upstream_details=false`, an in-stream error frame
+    /// carries no upstream text (message and code both become generic wording).
+    #[test]
+    fn error_frames_hide_upstream_text_when_details_are_not_exposed() {
+        let mut t = ResponsesStreamTranslator::new("msg_a1", "gpt-4o");
+        t.set_expose_upstream_details(false);
+        let _ = t.push_event(&ResponsesStreamEvent::ResponseCreated {
+            response: Box::new(placeholder_response("in_progress")),
+        });
+
+        // response.failed branch
+        let mut failed_resp = placeholder_response("failed");
+        failed_resp.extra = json!({"error": {"code": "rate_limited", "message": "too fast"}});
+        let out = t.push_event(&ResponsesStreamEvent::ResponseFailed {
+            response: Box::new(failed_resp),
+        });
+        let error_ev = out
+            .iter()
+            .find(|e| matches!(e, StreamEvent::Error { .. }))
+            .unwrap();
+        let StreamEvent::Error { error } = error_ev else { unreachable!() };
+        assert_eq!(error["type"], "upstream_error");
+        assert_eq!(
+            error["message"],
+            crate::error::ProxyError::GENERIC_UPSTREAM_MESSAGE
+        );
+        assert!(
+            error.get("code").is_none(),
+            "the upstream code is upstream text too and must not appear: {error}"
+        );
+
+        // error branch
+        let mut t2 = ResponsesStreamTranslator::new("msg_a1b", "gpt-4o");
+        t2.set_expose_upstream_details(false);
+        let out = t2.push_event(&ResponsesStreamEvent::Error {
+            code: Some("server_error".into()),
+            message: Some("upstream is overloaded".into()),
+            param: None,
+            extra: json!({}),
+        });
+        let error_ev = out
+            .iter()
+            .find(|e| matches!(e, StreamEvent::Error { .. }))
+            .unwrap();
+        let StreamEvent::Error { error } = error_ev else { unreachable!() };
+        assert_eq!(
+            error["message"],
+            crate::error::ProxyError::GENERIC_UPSTREAM_MESSAGE
+        );
+        assert!(error.get("code").is_none(), "{error}");
     }
 
     /// T21: P2-2 — a text delta for an output_index that was never opened
