@@ -112,10 +112,42 @@ pub struct ServerConfig {
     #[serde(default)]
     #[serde(serialize_with = "serialize_redacted_secret_option")]
     pub api_key: Option<SecretString>,
+    /// Whether upstream details are exposed to clients.
+    ///
+    /// `true` (the default) keeps today's behaviour byte for byte: the
+    /// upstream error body is passed through to the client, the
+    /// `x-llmproxy-failed-providers` header names the backends that
+    /// failed, and an in-stream `event: error` embeds the upstream
+    /// text. That is a debugging convenience, and it is also a
+    /// disclosure surface: anyone holding the shared bearer token can
+    /// read the backend topology and the upstream accounts' quota and
+    /// auth details.
+    ///
+    /// `false` replaces all of that with generic wording. The operator
+    /// still gets the full detail in the logs and in `/admin/usage` —
+    /// only the *client* stops seeing it.
+    ///
+    /// "All of that" includes the error frames the SSE adapters
+    /// synthesise themselves (`OpenAiSseToAnthropic`'s error-envelope
+    /// branch, `ResponsesStreamTranslator`'s `response.failed` /
+    /// `error` frames) and the error variants that merely *carry*
+    /// upstream text without being `ProxyError::Upstream`
+    /// (`UpstreamText`, `Http`, `Internal`). Errors that are purely
+    /// client-side (`ProxyError::Other`) keep their own wording: they
+    /// describe the request, not the backend.
+    #[serde(default = "default_expose_upstream_details")]
+    pub expose_upstream_details: bool,
 }
 
 fn default_listen() -> String {
     "127.0.0.1:8080".to_string()
+}
+
+/// Upstream details are exposed unless the operator says otherwise:
+/// the switch exists to *reduce* what a client can see, so it must
+/// not silently change the current behaviour when it is absent.
+fn default_expose_upstream_details() -> bool {
+    true
 }
 
 impl Default for ServerConfig {
@@ -123,6 +155,7 @@ impl Default for ServerConfig {
         Self {
             listen: default_listen(),
             api_key: None,
+            expose_upstream_details: default_expose_upstream_details(),
         }
     }
 }
@@ -609,6 +642,26 @@ impl Config {
         let provider_names: std::collections::HashSet<&str> =
             self.providers.iter().map(|p| p.name()).collect();
 
+        // Provider names end up in HTTP response headers
+        // (`x-llmproxy-failed-providers`) and in log lines. A name with
+        // a control character or a non-ASCII byte is not a legal HTTP
+        // header value, so writing it used to panic on the request
+        // path. Pin the names to a conservative character set instead
+        // of sanitizing them at every write site.
+        for p in &self.providers {
+            let name = p.name();
+            let ok = !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+            if !ok {
+                return Err(ProxyError::Config(format!(
+                    "provider name '{name}' must be non-empty and contain only ASCII \
+                     letters, digits, '.', '_' or '-'"
+                )));
+            }
+        }
+
         for m in &self.models {
             if !provider_names.contains(m.primary.as_str()) {
                 return Err(ProxyError::Config(format!(
@@ -882,6 +935,55 @@ models:
         assert_eq!(cfg.providers.len(), 1);
         assert_eq!(cfg.models.len(), 1);
         assert_eq!(cfg.server.listen, "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn upstream_details_are_exposed_unless_the_config_says_otherwise() {
+        // Audit R0: the switch exists to *reduce* what a client can
+        // see, so its default must keep today's behaviour.
+        let raw = r#"
+providers:
+  - name: copilot
+    type: github_copilot
+models:
+  - name: gpt-4
+    primary: copilot
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        assert!(cfg.server.expose_upstream_details);
+
+        let raw = r#"
+server:
+  expose_upstream_details: false
+providers:
+  - name: copilot
+    type: github_copilot
+models:
+  - name: gpt-4
+    primary: copilot
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        assert!(!cfg.server.expose_upstream_details);
+    }
+
+    #[test]
+    fn config_rejects_a_provider_name_that_is_not_header_safe() {
+        // Audit R2: a provider name lands in the
+        // `x-llmproxy-failed-providers` header, so it must be a legal
+        // header value.
+        let raw = r#"
+providers:
+  - name: "bad name"
+    type: github_copilot
+models:
+  - name: gpt-4
+    primary: "bad name"
+"#;
+        let err = Config::parse(raw).unwrap_err();
+        assert!(
+            format!("{err}").contains("must be non-empty and contain only ASCII"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2191,6 +2293,7 @@ models:
             server: ServerConfig {
                 listen: "127.0.0.1:0".to_string(),
                 api_key: Some(secret_string("sk-server-secret-value")),
+                expose_upstream_details: true,
             },
             providers: vec![provider_with_secret()],
             ..Config::default()
@@ -2212,6 +2315,7 @@ models:
             server: ServerConfig {
                 listen: "127.0.0.1:0".to_string(),
                 api_key: Some(secret_string("sk-server-secret-value")),
+                expose_upstream_details: true,
             },
             providers: vec![provider_with_secret()],
             ..Config::default()
@@ -2249,6 +2353,7 @@ models:
             server: ServerConfig {
                 listen: "127.0.0.1:0".to_string(),
                 api_key: Some(secret_string("sk-server-secret-value")),
+                expose_upstream_details: true,
             },
             providers: vec![provider_with_secret()],
             models: vec![ModelConfig {

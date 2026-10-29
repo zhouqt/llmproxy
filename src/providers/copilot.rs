@@ -61,6 +61,10 @@ pub struct CopilotProvider {
     model_rewrite: HashMap<String, String>,
     http: reqwest::Client,
     state: Arc<CopilotState>,
+    /// `server.expose_upstream_details` (default `true`).
+    /// Passed to both SSE adapters: when `false`, the `event: error` frames
+    /// it synthesises itself carry no upstream text.
+    expose_upstream_details: bool,
     #[cfg(test)]
     api_base_override: Option<String>,
     #[cfg(test)]
@@ -349,11 +353,17 @@ impl CopilotProvider {
             model_rewrite,
             http,
             state,
+            expose_upstream_details: true,
             #[cfg(test)]
             api_base_override: None,
             #[cfg(test)]
             copilot_token_url: COPILOT_INTERNAL_TOKEN_URL.to_string(),
         }
+    }
+
+    /// Sets `server.expose_upstream_details` (see `providers::build`).
+    pub fn set_expose_upstream_details(&mut self, expose: bool) {
+        self.expose_upstream_details = expose;
     }
 
     fn base_url(&self) -> String {
@@ -590,7 +600,10 @@ impl CopilotProvider {
                     reason = %reason,
                     "copilot token refresh failed (transient); keeping stored credentials"
                 );
-                Err(ProxyError::Other(anyhow::anyhow!(reason)))
+                // `reason` is an upstream hint (already scrubbed by summarize_for_log);
+                // mark it as UpstreamText so it is genericised when
+                // expose_upstream_details=false.
+                Err(ProxyError::UpstreamText { message: reason })
             }
             // fetch_copilot_token never returns Auth, but Rust needs the
             // match to be exhaustive. Treat it as transient if it appears.
@@ -600,7 +613,7 @@ impl CopilotProvider {
                     reason = %msg,
                     "copilot token refresh failed (unexpected auth); keeping stored credentials"
                 );
-                Err(ProxyError::Other(anyhow::anyhow!(msg)))
+                Err(ProxyError::UpstreamText { message: msg })
             }
         }
     }
@@ -660,9 +673,10 @@ impl CopilotProvider {
     async fn complete_bootstrap(&self, dc: DeviceCodeResponse) -> Result<()> {
         let gh = crate::oauth::device_flow::poll_device_token(&self.http, &dc).await?;
         let new_tokens = self.fetch_copilot_token(&gh).await.map_err(|e| {
-            ProxyError::Other(anyhow::anyhow!(
-                "copilot token fetch after device flow failed: {e}"
-            ))
+            // Contains an upstream error (upstream text): mark it as UpstreamText.
+            ProxyError::UpstreamText {
+                message: format!("copilot token fetch after device flow failed: {e}"),
+            }
         })?;
         let copilot_token = new_tokens.copilot_token.clone();
         self.state
@@ -1196,7 +1210,8 @@ impl CopilotProvider {
         let sse = crate::providers::openai_responses::ResponsesSseToAnthropic::new(
             stream,
             &req.model,
-        );
+        )
+        .with_expose_upstream_details(self.expose_upstream_details);
         Ok(ProviderOutput::Stream(Box::new(sse)))
     }
 }
@@ -1374,7 +1389,8 @@ impl Provider for CopilotProvider {
             });
         }
         let stream = resp.bytes_stream();
-        let sse = OpenAiSseToAnthropic::new(stream, &req.model);
+        let sse = OpenAiSseToAnthropic::new(stream, &req.model)
+            .with_expose_upstream_details(self.expose_upstream_details);
         Ok(ProviderOutput::Stream(Box::new(sse)))
     }
 
@@ -1684,6 +1700,7 @@ mod tests {
             model_rewrite: HashMap::new(),
             http: reqwest::Client::new(),
             state,
+            expose_upstream_details: true,
             api_base_override: server.map(MockServer::uri),
             copilot_token_url: server
                 .map(|server| format!("{}/copilot_internal/v2/token", server.uri()))
@@ -2061,6 +2078,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             // 127.0.0.1:1 is in the reserved low-port range; nothing
             // listens there, so the TCP connect fails immediately.
             copilot_token_url: "http://127.0.0.1:1/copilot_internal/v2/token".to_string(),
+            expose_upstream_details: true,
         };
         let error = provider.fetch_copilot_token("github").await.unwrap_err();
         assert!(
@@ -2106,6 +2124,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             model_rewrite: HashMap::new(),
             http: reqwest::Client::new(),
             state,
+            expose_upstream_details: true,
             api_base_override: Some(server.uri()),
             copilot_token_url: format!("{}/copilot_internal/v2/token", server.uri()),
         };
@@ -3308,6 +3327,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             model_rewrite: HashMap::new(),
             http: reqwest::Client::new(),
             state,
+            expose_upstream_details: true,
             api_base_override: Some(server.uri()),
             copilot_token_url: format!("{}/copilot_internal/v2/token", server.uri()),
         });
@@ -3400,6 +3420,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             model_rewrite: HashMap::new(),
             http: reqwest::Client::new(),
             state,
+            expose_upstream_details: true,
             api_base_override: Some(server.uri()),
             copilot_token_url: format!("{}/copilot_internal/v2/token", server.uri()),
         });
@@ -3527,6 +3548,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             model_rewrite: HashMap::new(),
             http: reqwest::Client::new(),
             state,
+            expose_upstream_details: true,
             api_base_override: Some(server.uri()),
             copilot_token_url: format!("{}/copilot_internal/v2/token", server.uri()),
         };
@@ -3592,6 +3614,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             model_rewrite: HashMap::new(),
             http: reqwest::Client::new(),
             state,
+            expose_upstream_details: true,
             api_base_override: Some(server.uri()),
             copilot_token_url: format!("{}/copilot_internal/v2/token", server.uri()),
         };
@@ -3669,6 +3692,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             model_rewrite: HashMap::new(),
             http: reqwest::Client::new(),
             state,
+            expose_upstream_details: true,
             api_base_override: Some(server.uri()),
             copilot_token_url: format!("{}/copilot_internal/v2/token", server.uri()),
         };
@@ -3774,6 +3798,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             model_rewrite: HashMap::new(),
             http: reqwest::Client::new(),
             state,
+            expose_upstream_details: true,
             api_base_override: Some(server.uri()),
             copilot_token_url: format!("{}/copilot_internal/v2/token", server.uri()),
         });
@@ -3876,6 +3901,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             model_rewrite: HashMap::new(),
             http: reqwest::Client::new(),
             state,
+            expose_upstream_details: true,
             api_base_override: Some(server.uri()),
             copilot_token_url: format!("{}/copilot_internal/v2/token", server.uri()),
         });
@@ -3940,6 +3966,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             model_rewrite: HashMap::new(),
             http: reqwest::Client::new(),
             state,
+            expose_upstream_details: true,
             api_base_override: Some(server.uri()),
             copilot_token_url: format!("{}/copilot_internal/v2/token", server.uri()),
         };
@@ -4718,6 +4745,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             model_rewrite: HashMap::new(),
             http: reqwest::Client::new(),
             state,
+            expose_upstream_details: true,
             api_base_override: Some(server.uri()),
             copilot_token_url: format!("{}/copilot_internal/v2/token", server.uri()),
         });

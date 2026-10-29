@@ -35,6 +35,10 @@ pub struct OpenaiResponsesProvider {
     api_key: SecretString,
     model_rewrite: HashMap<String, String>,
     http: reqwest::Client,
+    /// `server.expose_upstream_details` (default `true`).
+    /// Passed to the SSE adapter: when `false`, the `event: error` frames
+    /// it synthesises itself carry no upstream text.
+    expose_upstream_details: bool,
 }
 
 impl OpenaiResponsesProvider {
@@ -52,7 +56,13 @@ impl OpenaiResponsesProvider {
             api_key,
             model_rewrite,
             http,
+            expose_upstream_details: true,
         })
+    }
+
+    /// Sets `server.expose_upstream_details` (see `providers::build`).
+    pub fn set_expose_upstream_details(&mut self, expose: bool) {
+        self.expose_upstream_details = expose;
     }
 
     fn responses_url(&self) -> String {
@@ -196,7 +206,8 @@ impl Provider for OpenaiResponsesProvider {
         }
 
         let byte_stream = resp.bytes_stream();
-        let sse = ResponsesSseToAnthropic::new(byte_stream, &req.model);
+        let sse = ResponsesSseToAnthropic::new(byte_stream, &req.model)
+            .with_expose_upstream_details(self.expose_upstream_details);
         Ok(ProviderOutput::Stream(Box::new(sse)))
     }
 }
@@ -209,6 +220,10 @@ pub struct ResponsesSseToAnthropic<S> {
     pending: BytesMut,
     finished: bool,
     output_buffer: VecDeque<Bytes>,
+    /// The value of `server.expose_upstream_details` (default `true`).
+    /// When `false`, the text in upstream `response.failed` / `error` events is
+    /// replaced with the generic wording.
+    expose_upstream_details: bool,
 }
 
 impl<S> ResponsesSseToAnthropic<S>
@@ -222,7 +237,22 @@ where
             pending: BytesMut::new(),
             finished: false,
             output_buffer: VecDeque::new(),
+            expose_upstream_details: true,
         }
+    }
+
+    /// Sets `server.expose_upstream_details`.
+    ///
+    /// When `false`, the `event: error` frames this adapter synthesises no
+    /// longer carry upstream text (the frame is `Ok(bytes)`, invisible to the
+    /// server-level handling); they use `ProxyError::GENERIC_UPSTREAM_MESSAGE`.
+    /// The default (`true`) leaves the wire bytes unchanged, character for character.
+    pub fn with_expose_upstream_details(mut self, expose: bool) -> Self {
+        self.expose_upstream_details = expose;
+        if let Some(t) = self.translator.as_mut() {
+            t.set_expose_upstream_details(expose);
+        }
+        self
     }
 
     fn encode(ev: &StreamEvent) -> Bytes {
@@ -1184,6 +1214,36 @@ mod tests {
     /// T10: P1-B regression — an upstream `error` SSE event must
     /// surface as `event: error` with `type_:"upstream_error"` and
     /// immediately terminate the stream (no hang, no message_stop).
+    #[tokio::test]
+    async fn adapter_hides_the_upstream_error_message_when_details_are_not_exposed() {
+        // `expose_upstream_details=false`: this adapter's own error frame carries no upstream text.
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"upstream is overloaded\"}\n\n",
+        ))];
+        let inner = stream::iter(chunks).chain(stream::pending());
+        let mut adapter =
+            ResponsesSseToAnthropic::new(inner, "m").with_expose_upstream_details(false);
+
+        let mut encoded = String::new();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(item) = adapter.next().await {
+                encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+            }
+        })
+        .await;
+        assert!(result.is_ok(), "the adapter must terminate after an error event");
+
+        assert!(encoded.contains("event: error"), "{encoded}");
+        assert!(
+            !encoded.contains("upstream is overloaded"),
+            "upstream text must not appear in an in-stream error frame: {encoded}"
+        );
+        assert!(
+            encoded.contains(crate::error::ProxyError::GENERIC_UPSTREAM_MESSAGE),
+            "should have become the generic wording: {encoded}"
+        );
+    }
+
     #[tokio::test]
     async fn midstream_error_event_surfaces_as_anthropic_error_and_terminates() {
         use std::time::Duration;
