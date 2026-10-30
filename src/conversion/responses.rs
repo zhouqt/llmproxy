@@ -32,6 +32,22 @@ use crate::responses::{
     ResponseInputItem, ResponseInputPart, ResponsesRequest, ResponsesResponse, ResponsesTool,
 };
 
+/// Smallest `max_output_tokens` the Responses API accepts.
+///
+/// The OpenAI OpenAPI schema declares `minimum: 16` for
+/// `max_output_tokens`; anything smaller is rejected with
+/// `Invalid 'max_output_tokens': integer below minimum value. Expected a value >= 16, but got N instead.`
+/// GitHub Copilot's `/responses` endpoint fronts the same backend and
+/// enforces the same floor.
+///
+/// Anthropic's `max_tokens` has no such floor (1 is legal there), so a
+/// client that probes a model with `max_tokens: 1` — Claude Desktop's
+/// model-availability check does exactly that — would otherwise produce
+/// a request the upstream can never accept. Clamping here keeps the
+/// request valid; the only cost is that the reply may be truncated at
+/// 16 tokens instead of the 1 the client asked for.
+pub const MIN_MAX_OUTPUT_TOKENS: u32 = 16;
+
 /// Truncate the `user` identifier to the 64-character limit enforced by
 /// Copilot's Responses API. The Anthropic `metadata.user_id` has no
 /// length constraint in the spec, so clients routinely send longer
@@ -165,7 +181,7 @@ pub fn anthropic_to_responses_request(
         model,
         input,
         instructions,
-        max_output_tokens: Some(req.max_tokens),
+        max_output_tokens: Some(req.max_tokens.max(MIN_MAX_OUTPUT_TOKENS)),
         temperature: req.temperature,
         top_p: req.top_p,
         stream: req.stream,
@@ -656,6 +672,28 @@ mod tests {
                 }
             }
             _ => panic!("expected message item"),
+        }
+    }
+
+    #[test]
+    fn request_clamps_max_output_tokens_to_the_responses_minimum() {
+        // Anthropic allows `max_tokens: 1`; the Responses API rejects
+        // anything below 16 with "integer below minimum value". A
+        // client probing a model (Claude Desktop's availability check)
+        // sends exactly that, so the conversion must raise it.
+        for (asked, expected) in [(1, 16), (15, 16), (16, 16), (256, 256)] {
+            let req: MessagesRequest = serde_json::from_value(json!({
+                "model": "gpt-5",
+                "max_tokens": asked,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap();
+            let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
+            assert_eq!(
+                out.max_output_tokens,
+                Some(expected),
+                "max_tokens {asked} must become max_output_tokens {expected}"
+            );
         }
     }
 
