@@ -2247,6 +2247,55 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
     }
 
     #[tokio::test]
+    async fn complete_responses_clamps_max_output_tokens_for_tiny_client_budgets() {
+        // Claude Desktop's model-availability probe sends `max_tokens: 1`.
+        // Anthropic accepts that; the Responses API does not (schema
+        // minimum 16) and Copilot fronts the same backend, so the probe
+        // came back as "Invalid 'max_output_tokens': integer below
+        // minimum value. Expected a value >= 16, but got 1 instead.".
+        // The conversion must raise the value before it goes on the wire.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("authorization", "Bearer copilot-token"))
+            .and(body_partial_json(json!({
+                "model": "claude-model",
+                "stream": false,
+                "max_output_tokens": 16
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_1",
+                "object": "response",
+                "created_at": 0,
+                "model": "claude-model",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "hello-from-responses"}]
+                }],
+                "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+        let mut probe = request(false);
+        probe.max_tokens = 1;
+
+        let output = provider.complete(&probe, &HashMap::new()).await.unwrap();
+
+        expect_variant!(output, ProviderOutput::Json(body) => {
+            assert_eq!(body["content"][0]["text"], "hello-from-responses");
+        });
+    }
+
+    #[tokio::test]
     async fn stream_routes_gpt5_to_responses_endpoint() {
         let server = MockServer::start().await;
         let sse = concat!(
