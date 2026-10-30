@@ -34,17 +34,24 @@ use crate::responses::{
 
 /// Smallest `max_output_tokens` the Responses API accepts.
 ///
-/// The OpenAI OpenAPI schema declares `minimum: 16` for
-/// `max_output_tokens`; anything smaller is rejected with
-/// `Invalid 'max_output_tokens': integer below minimum value. Expected a value >= 16, but got N instead.`
-/// GitHub Copilot's `/responses` endpoint fronts the same backend and
-/// enforces the same floor.
+/// OpenAI's OpenAPI schema pins the floor: `POST /responses` takes a
+/// `CreateResponse` body whose `max_output_tokens` is
+/// `anyOf: [{type: integer, minimum: 16}, {type: "null"}]`, and the beta
+/// `BetaCreateResponse` repeats it. Source (fetched 2026-10-30):
+/// <https://github.com/openai/openai-openapi/blob/master/openapi.yaml>,
+/// `components.schemas.CreateResponse.properties.max_output_tokens`.
+/// Chat Completions has no such floor — `CreateChatCompletionRequest`'s
+/// `max_completion_tokens` is a bare `integer | null` — which is why only
+/// this conversion clamps.
 ///
-/// Anthropic's `max_tokens` has no such floor (1 is legal there), so a
-/// client that probes a model with `max_tokens: 1` — Claude Desktop's
-/// model-availability check does exactly that — would otherwise produce
-/// a request the upstream can never accept. Clamping here keeps the
-/// request valid; the only cost is that the reply may be truncated at
+/// Anthropic's `max_tokens` has no floor either (1 is legal), so a client
+/// that probes a model with `max_tokens: 1` — Claude Desktop's
+/// model-availability check does exactly that — would otherwise produce a
+/// request the upstream can only answer with a 400 ("Invalid
+/// 'max_output_tokens': integer below minimum value. Expected a value >=
+/// 16, but got 1 instead."; observed from Copilot's `/responses`
+/// endpoint, which fronts the same backend and enforces the same floor).
+/// Clamping keeps the request valid; the reply may then be truncated at
 /// 16 tokens instead of the 1 the client asked for.
 pub const MIN_MAX_OUTPUT_TOKENS: u32 = 16;
 
