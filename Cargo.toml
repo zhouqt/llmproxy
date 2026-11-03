@@ -78,16 +78,16 @@ http-body-util = "0.1"
 # guarantees don't hold. `#[ctor::ctor(unsafe)]` is that marker.
 ctor = "1.0"
 
-[profile.release]
-opt-level = 3
-lto = "thin"
-codegen-units = 1
-strip = true
-
-# Where cargo-vet's store (the exemption ledger, the audit file and the
-# imported-audits lock) lives. cargo-vet's default is a top-level
+# Where cargo-vet keeps its store (the exemption ledger, the audit file
+# and the imported-audits lock). cargo-vet's default is a top-level
 # directory of its own; this project keeps the store under `.cargo/`,
 # next to cargo's own config, so the repository root stays about the
 # project itself.
 [package.metadata.vet]
 store = { path = ".cargo/vet" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

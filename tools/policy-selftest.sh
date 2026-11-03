@@ -58,8 +58,10 @@ scratch_copy() {
     done
     # .cargo/config.toml pins CARGO_TARGET_DIR to a shared path; inside a
     # scratch copy the tools must not share a target directory with the
-    # real tree.
-    rm -rf "$dest/.cargo"
+    # real tree. The rest of .cargo/ has to survive: cargo-vet's store
+    # lives in .cargo/vet, and without it `cargo vet` has no ledger to
+    # check against.
+    rm -f "$dest/.cargo/config.toml"
     return 0
 }
 
