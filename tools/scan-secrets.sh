@@ -66,7 +66,12 @@ PATTERNS=(
 # sk-fakeabc123def456ghi789jkl012: scanner's own documentation example
 #   in tools/hooks/pre-commit's commit message; intentionally a fake
 #   key that exercises the `FOUND` path without being a real secret.
-WHITELIST_REGEX='sk-llmproxy-1234|sk-fakeabc123def456ghi789jkl012'
+# sk-SUPERSECRET-SENTINEL: the test fixture in src/config.rs that proves
+#   a parse error next to an `api_key:` line does not echo the secret
+#   into the startup log. It is a fake key of the same shape as the
+#   ones above, and it lives in the tree on purpose -- whitelisting it
+#   keeps the pre-commit hook from blocking every commit.
+WHITELIST_REGEX='sk-llmproxy-1234|sk-fakeabc123def456ghi789jkl012|sk-SUPERSECRET-SENTINEL'
 
 matches=0
 
