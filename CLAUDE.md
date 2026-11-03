@@ -19,7 +19,7 @@ cargo llvm-cov --lib --bins --tests   # coverage (project target is >97% regions
 ```
 
 - Build output is pinned to `/tmp/llmproxy-target` by `.cargo/config.toml` — the repo tree stays source-only. Tests and binaries live there, not under `target/`.
-- **No Rust toolchain on the host? Use the container:** `tools/cargo-in-container.sh` runs cargo inside the *same* `rust:1-alpine` digest the Dockerfile pins, with the repository mounted **read-only** and the registry cache / target dir on the host. It exists because the build host has ~19 GB of disk and runs out of room for a debug build plus a scanner database; the deploy host has 61 GB and already has the source tree.
+- **No Rust toolchain on the host? Use the container:** `tools/cargo-in-container.sh` runs cargo inside the *same* `rust:1-alpine` digest the Dockerfile pins, with the repository mounted **read-only** and the registry cache / target dir on the host. It exists because compiling needs room: the toolchain, the registry cache and the build output are several gigabytes together, and a host without a Rust toolchain of its own has neither the toolchain nor the disk.
 
   ```bash
   tools/cargo-in-container.sh fetch --locked
@@ -32,6 +32,13 @@ cargo llvm-cov --lib --bins --tests   # coverage (project target is >97% regions
 - Runtime requires `--config <path>`. Config files use `${ENV_VAR}` expansion; `config.example.yaml` is the field reference. Secrets live in `config.yaml` (gitignored) / env vars, never commit them.
 - A git pre-commit hook runs `tools/scan-secrets.sh` (API-key leak audit). Install once with `tools/install-hooks.sh`.
 - Log level via `RUST_LOG` (default `llmproxy=info`).
+
+### Where the scripts live
+
+Two directories, one rule each — there is no third place for a script:
+
+- **`tools/`** — build-, check- and development-time helpers, run on a developer machine or in CI: `cargo-in-container.sh` (cargo inside the pinned toolchain container), `build-image.sh`, `scan-image.sh`, `check-base-digests.py`, `check-tool-versions.py`, `lock-drift.py`, `policy-selftest.sh`, `scan-secrets.sh`, `install-hooks.sh` + `hooks/pre-commit`, and the `sandbox-canary/` probe crate. See `tools/README.md`.
+- **`deploy/`** — runtime: `entrypoint.sh` (copied into the image), `seal.sh` and `verify-image.sh` (run by an operator), `secrets/` (the sealed blob and the fallback plaintext, gitignored). See `deploy/README.md`. `docker-compose.yaml` bind-mounts `./deploy/secrets/seal`, so this layout is part of the deployment contract.
 
 ## Architecture
 

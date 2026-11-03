@@ -55,7 +55,7 @@ CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/var/tmp/llmproxy-target}
 PODMAN=${PODMAN:-podman}
 
 die() {
-    printf 'rust-build: %s\n' "$1" >&2
+    printf 'cargo-in-container: %s\n' "$1" >&2
     exit 1
 }
 
