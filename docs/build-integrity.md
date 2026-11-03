@@ -217,8 +217,8 @@ What a run actually downloads, measured:
 
 ## 4. Why the build host uses a proxy
 
-Some build hosts cannot reach `docker.io`: the TLS connection is reset. It
-goes through a proxy instead:
+Some build hosts cannot reach `docker.io`: the TLS connection is
+reset. They go through a proxy instead:
 
 ```sh
 tools/build-image.sh          # sets HTTPS_PROXY and calls podman build

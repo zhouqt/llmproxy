@@ -133,7 +133,7 @@ COPY deploy/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod 0755 /usr/local/bin/entrypoint.sh
 
 EXPOSE 8080
-# The entrypoint unseals the TPM-sealed secrets into /run/secrets and
+# The entrypoint unseals the TPM-sealed secrets into /run/llmproxy and
 # then execs the command below -- see deploy/entrypoint.sh.
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["llmproxy", "--config", "/etc/llmproxy/config.yaml"]

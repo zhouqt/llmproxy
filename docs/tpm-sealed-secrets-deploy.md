@@ -3,7 +3,7 @@
 The container ships with an entrypoint that materialises the proxy's
 secrets **inside the container only**. The host disk holds a TPM-sealed
 blob (ciphertext); the entrypoint unseals it into a tmpfs at
-`/run/secrets/llmproxy.env`; llmproxy reads that file through its
+`/run/llmproxy/llmproxy.env`; llmproxy reads that file through its
 `secrets:` config block. No key ever reaches the container environment,
 `podman inspect`, or the host filesystem.
 
@@ -14,7 +14,7 @@ rather not pay it, see [Fallback mode](#fallback-mode).
 ```
 host                                    container (tmpfs)
 deploy/secrets/seal/llmproxy.NNNN.* ┐
-  (one .pub/.priv pair per chunk)   ┴─► tpm2_load + tpm2_unseal ─► /run/secrets/llmproxy.env
+  (one .pub/.priv pair per chunk)   ┴─► tpm2_load + tpm2_unseal ─► /run/llmproxy/llmproxy.env
                                         (parent 0x81000001)              │
                                                                          ▼
                                                     llmproxy --config /etc/llmproxy/config.yaml
@@ -196,7 +196,7 @@ block at the tmpfs file:
 secrets:
   provider: file
   file:
-    path: /run/secrets/llmproxy.env
+    path: /run/llmproxy/llmproxy.env
     required: true      # default: refuse to start without it
 ```
 
@@ -224,14 +224,37 @@ tmpfs:
 ```
 
 The writable surfaces are exactly the ones the design already needs:
-`/run` (the unsealed plaintext, tmpfs — never on disk), `/tmp` (the
-entrypoint's scratch file `/tmp/seal.ctx`, also tmpfs — with a read-only
-rootfs the unseal would have nowhere to load the policy session
-otherwise), and the `llmproxy-data` volume (Copilot token store). An
+`/run` (the unsealed plaintext, tmpfs — never on disk) and the
+`llmproxy-data` volume (Copilot token store). The entrypoint's scratch
+file `/run/llmproxy/seal.ctx` (the loaded TPM policy session, removed on
+exit) sits on the same `/run` tmpfs, so the read-only rootfs gives it
+somewhere to load the session. An
 exploited proxy process therefore cannot modify the image, persist a
 payload, or escalate; TPM access comes from `keep-groups` (the `tss`
 group on `/dev/tpmrm0`), not from any capability, so `cap_drop ALL`
 does not affect the unseal path.
+
+### Why `/run/llmproxy/` and not `/run/secrets/`
+
+podman mounts its own per-container directories at `/run/secrets` and
+`/run/.containerenv`. With `read_only: true` podman forces those
+mounts **read-only** (libpod/container_internal_common.go: `if
+c.IsReadOnly() { ... "ro" ... }`), so they shadow the writable `/run`
+tmpfs the compose file declares. Writing the unsealed payload to
+`/run/secrets/llmproxy.env` then fails with `EROFS` even though `/run`
+itself is writable — and a tmpfs check that only looks at `/run`'s
+filesystem type would pass, because `/run` really is a tmpfs. Nothing
+under `/run/llmproxy/` is reserved by podman, so it stays writable. The
+compose file sets `LLMPROXY_KEYS=/run/llmproxy/llmproxy.env` and
+`config.yaml`'s `secrets.file.path` must name the same path.
+
+The entrypoint's checks are about the **target directory**, not about
+`/run`: it looks up the mount that actually contains that directory
+(the deepest one whose path is a prefix of it) and requires that mount
+to be a tmpfs and not read-only. A tmpfs somewhere other than `/run`
+is just as good, so an operator who moves the payload elsewhere does not
+have to keep `/run` in the picture; and a misconfiguration fails loudly
+— with the reason named — instead of with `EROFS`.
 
 ## Normal operation
 
@@ -321,11 +344,12 @@ whole mechanism exists to provide does not hold. Use it to keep the
 service up while you diagnose a TPM problem, not as a permanent
 configuration.
 
-The fallback copy is only safe while `/run` is a tmpfs — otherwise it
-also lands in the container's writable layer. The entrypoint therefore
-refuses to start in fallback mode when `/run` is not a tmpfs, exactly as
-it does in TPM mode. If you knowingly accept the plaintext on disk (a
-temporary diagnosis, not a configuration), opt out explicitly:
+The fallback copy is only safe while the target directory is on a
+tmpfs — otherwise it also lands in the container's writable layer. The
+entrypoint therefore refuses to start in fallback mode when the target
+is not on a tmpfs, exactly as it does in TPM mode. If you knowingly
+accept the plaintext on disk (a temporary diagnosis, not a
+configuration), opt out explicitly:
 
 ```yaml
 environment:
@@ -334,8 +358,8 @@ environment:
 
 ## `LLMPROXY_MOUNTS` is a test knob — never set it in production
 
-The entrypoint reads the mount table it checks for the `/run` tmpfs from
-`$LLMPROXY_MOUNTS`, which defaults to `/proc/mounts`:
+The entrypoint reads the mount table it checks the target directory
+against from `$LLMPROXY_MOUNTS`, which defaults to `/proc/mounts`:
 
 ```sh
 MOUNTS=${LLMPROXY_MOUNTS:-/proc/mounts}
@@ -343,13 +367,13 @@ MOUNTS=${LLMPROXY_MOUNTS:-/proc/mounts}
 
 **Production must not set this variable.** It exists for exactly one
 purpose: letting the tmpfs check's behaviour be *exercised* on a host
-where `/run` may or may not be a tmpfs — i.e. so the refusal path can
-be rehearsed without a container.
+where the target directory may or may not be on a tmpfs — i.e. so the
+refusal path can be rehearsed without a container.
 
 It is not a configuration knob, and setting it in a deployment is a way
 to turn the check (T12) off. Pointing it at a mount table that does not
-contain a `/run` tmpfs makes the entrypoint believe `/run` is not a
-tmpfs; pointing it at a *forged* table that does contain one makes the
+put the target on a tmpfs makes the entrypoint believe the target is
+not a tmpfs; pointing it at a *forged* table that does makes the
 entrypoint believe the opposite — and the unsealed plaintext then lands
 on the host disk, which is the one thing this whole mechanism exists to
 prevent. Either way the check has stopped meaning what it says.
@@ -373,21 +397,26 @@ Run through this after the first deploy and after any seal change.
 | `podman inspect <c> \| grep -i 'sk-'` | empty |
 | `podman inspect <c>` → `Config.Env` | `RUST_LOG=...` only |
 | `podman inspect <c>` → `Mounts` | seal dir + empty placeholder, no `.env` |
-| `podman exec <c> ls -l /run/secrets/` | `llmproxy.env`, `0400` |
+| `podman exec <c> ls -l /run/llmproxy/` | `llmproxy.env`, `0400` |
 | `podman exec <c> env \| grep -i key` | empty (nothing came via the environment) |
 | `podman logs <c>` | no key material; at most `from=file` source markers, plus `OK: the unsealed payload matches the sealed digest` |
 | `podman exec <c> mount \| grep ' /run '` | **`tmpfs on /run`** — see below |
-| `podman diff <c>` | no `/run/secrets/llmproxy.env` |
+| `podman diff <c>` | no `/run/llmproxy/llmproxy.env` |
 | `grep -rl 'sk-' ~/.local/share/containers/storage/overlay/` | empty |
 | `podman-compose restart llmproxy` (twice in a row) | both starts succeed |
 | `tpm2_getcap handles-persistent` (host) | `0x81000001` present |
 | `ls deploy/secrets/seal/llmproxy.*.pub \| wc -l` (host) | the chunk count (a 1.7 kB `.env` → 14) |
 
-The `tmpfs` row is not optional. **rootless podman does not give `/run` a
-tmpfs of its own**; without the compose `tmpfs:` entry the unsealed file
-is a regular file in the container's overlay *diff* layer, i.e. on the
-host disk at `~/.local/share/containers/storage/overlay/<id>/diff/run/`.
-The entrypoint refuses to unseal when `/run` is not a tmpfs.
+The `tmpfs` row is not optional, even though podman gives the container
+a tmpfs at `/run` anyway (measured on podman 5.4.2, rootless): the
+compose entry is what pins that tmpfs's options — `noexec`, `nosuid`,
+`nodev` and a 4 MB ceiling — instead of leaving them to a runtime
+default a version bump could change. The guarantee itself does not rest
+on that line: the entrypoint refuses to unseal when the target
+directory is not on a tmpfs, so a runtime that does not provide one
+fails loudly instead of writing the plaintext into the container's
+writable layer (i.e. onto the host disk, at
+`~/.local/share/containers/storage/overlay/<id>/diff/run/`).
 
 ## Troubleshooting
 
@@ -397,7 +426,9 @@ The entrypoint refuses to unseal when `/run` is not a tmpfs.
 | `tpm2_load` fails, handle invalid | Persistent `0x81000001` gone (vTPM state lost) | Re-seal, then recreate the container |
 | `tpm2_unseal` fails, policy check | PCR 0/7 changed (firmware or Secure Boot update) | Confirm with `tpm2_pcrread sha256:0,7`, re-seal |
 | Third consecutive start fails, `0x902` | Transient slots leaked | The entrypoint flushes on exit; if it recurs, check for other `tpm2_*` users on the host |
-| `ERROR: /run is not a tmpfs` | `tmpfs:` missing from the compose service | Restore it; do not "fix" this by disabling the check |
+| `ERROR: /run/llmproxy is not on a tmpfs` | `tmpfs:` missing from the compose service | Restore it; do not "fix" this by disabling the check |
+| `ERROR: /run/llmproxy is on a read-only mount` | The payload path sits under a mount podman reserves (`/run/secrets`, `/run/.containerenv`) | Move the payload to a directory of your own (`/run/llmproxy`) and point `LLMPROXY_KEYS` and `secrets.file.path` at it |
+| `ERROR: tpm2_load failed for ...` | The private half is unreadable, or the scratch file's directory is not writable | Check the seal directory's permissions and that `LLMPROXY_SCRATCH` points at a writable directory |
 | Container restart-loops every second, log shows only `name: ...` | The compose file sets `entrypoint:` (podman-compose 1.3 then drops the image CMD, leaving the entrypoint nothing to exec) | Remove the `entrypoint:` override; keep `command:` |
 | `ERROR: ... is empty or contains no NAME=VALUE lines` | Unseal or copy produced nothing | Check the seal with the round-trip command above, then re-seal |
 | Container restarts with empty API keys | `secrets.file.required: false` | Set it back to `true` |

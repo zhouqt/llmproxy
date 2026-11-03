@@ -6,7 +6,7 @@
 //! in-memory string; these drive `Config::load` with a real file on
 //! disk, which is how the container deployment actually reaches the
 //! proxy: the entrypoint unseals the TPM sealed object into
-//! `/run/secrets/llmproxy.env` and the proxy reads that path.
+//! `/run/llmproxy/llmproxy.env` and the proxy reads that path.
 //!
 //! Every test uses its own environment-variable name — the process
 //! environment is global and the test harness runs tests in parallel.

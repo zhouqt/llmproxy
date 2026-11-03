@@ -2212,7 +2212,7 @@ models:
     fn secrets_block_round_trips_through_serde() {
         let raw = secret_config(
             "LLMPROXY_SECRET_ROUNDTRIP",
-            "secrets:\n  provider: file\n  file:\n    path: /run/secrets/llmproxy.env\n    required: false\n",
+            "secrets:\n  provider: file\n  file:\n    path: /run/llmproxy/llmproxy.env\n    required: false\n",
         );
         let cfg = Config::parse(&raw).unwrap();
         let s = serde_saphyr::to_string(&cfg).unwrap();
@@ -2221,7 +2221,7 @@ models:
         assert_eq!(reparsed.secrets.provider, SecretsProvider::File);
         assert_eq!(
             reparsed.secrets.file_path(),
-            Some("/run/secrets/llmproxy.env")
+            Some("/run/llmproxy/llmproxy.env")
         );
         assert!(!reparsed.secrets.file.required);
     }

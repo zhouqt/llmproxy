@@ -46,15 +46,20 @@
 #   - a line without `=` is skipped with a warning.
 #
 # Typical use: the container entrypoint unseals a TPM-sealed blob into
-# the container's tmpfs at /run/secrets/llmproxy.env and the proxy reads
+# the container's tmpfs at /run/llmproxy/llmproxy.env and the proxy reads
 # it from there — so the plaintext key never sits in the container's
 # process environment (`podman inspect` would show it there) and never
 # lands in an image layer. See plans/feat-vault-secret-backend.md.
 #
+# Use a directory of your own under /run: podman reserves /run/secrets
+# (and /run/.containerenv) for its own per-container mounts, and with a
+# read-only rootfs it mounts them read-only, which would make the write
+# fail with EROFS.
+#
 # secrets:
 #   provider: file
 #   file:
-#     path: /run/secrets/llmproxy.env
+#     path: /run/llmproxy/llmproxy.env
 #     required: true
 
 # ───────────────────────────────────────────────────────────────────────
