@@ -17,20 +17,32 @@ services:
       # - ./deploy/secrets/llmproxy.env:/secrets/llmproxy.env:ro
       - llmproxy-data:/root/.local/share/llmproxy
 
-    # The unsealed secrets MUST land on a tmpfs. rootless podman does
-    # NOT give /run a tmpfs of its own, so without this line the
-    # entrypoint's /run/secrets/llmproxy.env is a regular file in the
-    # container's overlay diff layer -- i.e. plaintext on the host disk,
-    # readable by any local user through
-    # ~/.local/share/containers/storage/overlay/<id>/diff/run/secrets/.
+    # The unsealed secrets MUST land on a tmpfs. podman gives the
+    # container a tmpfs at /run by default (measured on podman 5.4.2,
+    # rootless), but this entry is what pins its options -- noexec,
+    # nosuid, nodev and a 4 MB ceiling -- instead of leaving them to a
+    # runtime default that a version bump could change. The entrypoint
+    # checks the target directory's mount before writing, so the
+    # guarantee does not rest on this line alone.
+    #
+    # The payload lives under /run/llmproxy/ and NOT under /run/secrets/:
+    # podman mounts its own per-container directories at /run/secrets and
+    # /run/.containerenv, and with `read_only: true` below podman forces
+    # those mounts read-only. They then shadow the rw /run tmpfs, and
+    # writing the unsealed payload to /run/secrets fails with EROFS even
+    # though /run itself is writable.
     tmpfs:
       - /run:rw,noexec,nosuid,nodev,size=4m
-      # With `read_only` below the rootfs has no writable layer at all,
-      # and the entrypoint's TPM unseal needs one scratch file
-      # (/tmp/seal.ctx, the loaded policy session, rm'd on exit). Give
-      # it a tmpfs instead of making the rootfs writable: same
-      # no-plaintext-on-disk guarantee as /run, and /tmp is not a place
-      # anything here needs to execute from.
+      # The entrypoint's TPM unseal needs one scratch file (the loaded
+      # policy session). It sits next to the payload, in /run/llmproxy/,
+      # so the /run tmpfs above covers it: the same no-plaintext-on-disk
+      # guarantee as the payload itself.
+      #
+      # /tmp is here for the process, not for the secrets: with
+      # `read_only` below the rootfs has no writable layer at all, and a
+      # program that wants a scratch directory (/tmp is the usual
+      # answer) would fail without this. Nothing the proxy writes there
+      # is secret, and the mount is noexec/nosuid/nodev.
       - /tmp:rw,noexec,nosuid,nodev,size=4m
 
     # Hardening (security audit L5): the proxy is a self-contained Rust
@@ -65,7 +77,7 @@ services:
 
     # NOTE: no `env_file: .env` -- that would put every API key into
     # `podman inspect`'s Config.Env. Secrets reach the proxy through
-    # /run/secrets/llmproxy.env (see config.yaml `secrets:` block).
+    # /run/llmproxy/llmproxy.env (see config.yaml `secrets:` block).
     #
     # `${RUST_LOG}` below is interpolated from the host environment (or
     # a .env file, for interpolation only); it is NOT injected as
@@ -78,6 +90,10 @@ services:
       # "llmproxy=debug" (or "llmproxy=trace") to debug routing/cache
       # internals. See README "Logging".
       - RUST_LOG=${RUST_LOG:-info}
+      # Where the entrypoint writes the unsealed payload. Must match the
+      # `secrets.file.path` in config.yaml. Kept off podman's reserved
+      # /run/secrets -- see the tmpfs comment above.
+      - LLMPROXY_KEYS=/run/llmproxy/llmproxy.env
 
     # The image already declares ENTRYPOINT entrypoint.sh; do not repeat
     # it here. podman-compose 1.3 drops the image CMD whenever the
