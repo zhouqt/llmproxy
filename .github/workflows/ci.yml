@@ -16,8 +16,12 @@ name: ci
 #   lock-drift          -- no dependency was moved backwards
 
 on:
+  # A push to a branch no longer runs the suite: the pull request for
+  # that branch runs it (on every update), and a push to main runs it
+  # once more against the merged result. Running it on every branch
+  # push as well only duplicated the same commits in a second place.
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
