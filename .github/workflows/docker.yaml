@@ -1,14 +1,16 @@
 name: docker
 
 on:
-  push:
-    branches:
-      - "**"
-    tags:
-      - "v*.*.*"
+  # The image is built for a pull request (as a check, not pushed) and
+  # on demand (workflow_dispatch, which pushes). Nothing else builds
+  # it: a push to a branch used to publish an image for every commit,
+  # and the ones that carried nothing but a commit SHA were garbage
+  # nobody ever pulled.
   pull_request:
     branches:
       - main
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
@@ -46,12 +48,22 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Every tag produced here is a *named* tag: the branch, the
+          # pull request, the release version, or `latest`. The
+          # `type=sha` tag that used to be in this list produced an
+          # image whose only name was a commit SHA -- nothing points at
+          # it, nothing pulls it, and every push added another one. It
+          # is gone.
+          # One tag per release: the full version. The second semver
+          # pattern that used to sit here (`{{major}}.{{minor}}`) made
+          # every release publish two tags -- 0.3.0 and 0.3 -- and
+          # the shorter one was the only thing anybody ever pulled,
+          # because nobody pins to a moving minor version. One release,
+          # one tag.
           tags: |
             type=ref,event=branch
             type=ref,event=pr
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,format=short
             type=raw,value=latest,enable={{is_default_branch}}
           labels: |
             org.opencontainers.image.title=llmproxy
