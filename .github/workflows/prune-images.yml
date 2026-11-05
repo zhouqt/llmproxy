@@ -63,7 +63,10 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  # The package name, without the owner. The packages API path is
+  # /users/<owner>/packages/container/<package_name>, and the package
+  # name is the repository name alone -- not "owner/name".
+  IMAGE_NAME: ${{ github.event.repository.name }}
 
 jobs:
   prune:
