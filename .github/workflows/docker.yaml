@@ -1,14 +1,22 @@
 name: docker
 
 on:
-  push:
-    branches:
-      - "**"
-    tags:
-      - "v*.*.*"
+  # The image is built on a pull request (as a check, not pushed) and on
+  # demand (workflow_dispatch, which pushes). A plain push to a branch
+  # does NOT build anything: every push used to publish a set of
+  # images, and the ones that carried nothing but a commit SHA were
+  # garbage nobody ever pulled. See the tag list below -- no sha-only
+  # tag is produced any more, so a build that is not asked for does not
+  # happen at all.
   pull_request:
     branches:
       - main
+    types: [opened, synchronize, reopened]
+  # A release tag is a deliberate act, so it still builds and pushes.
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
@@ -46,12 +54,17 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Every tag produced here is a *named* tag: the branch, the
+          # pull request, the release version, or `latest`. The
+          # `type=sha` tag that used to be in this list produced an
+          # image whose only name was a commit SHA -- nothing points at
+          # it, nothing pulls it, and every push added another one. It
+          # is gone.
           tags: |
             type=ref,event=branch
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,format=short
             type=raw,value=latest,enable={{is_default_branch}}
           labels: |
             org.opencontainers.image.title=llmproxy
