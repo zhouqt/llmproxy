@@ -1,0 +1,195 @@
+name: prune-images
+
+# Deletes the container images that carry nothing but a commit SHA.
+#
+# The `docker` workflow used to tag every image with `type=sha`, so a
+# push produced an image whose only name was a commit SHA -- a name
+# nothing points at and nobody can roll back to. Every push added
+# another one, and the registry filled up with versions that cannot be
+# identified and cannot be deleted by hand once there are hundreds.
+#
+# The rule is simple and total:
+#
+#   every tag of the version matches the "insignificant" pattern
+#       -> DELETE the version
+#   at least one tag does not match it
+#       -> KEEP the version
+#
+# "every tag", not "any tag". A version is a whole manifest and its
+# tags are a set: the main-branch build, for instance, carries
+# `main`, `latest` and `sha-20498b2` at once. It has a SHA tag, but
+# it also has two names somebody could pull or roll back to, so it is
+# kept. Only a version whose tags are ALL SHA tags -- `sha-1a2b3c4`
+# and nothing else -- is deleted.
+#
+# That "every tag" also matters for how the deletion works: the
+# packages API deletes a *version*, and with it every tag pointing at
+# that version. Deleting on "has a SHA tag" would therefore wipe
+# `main` and `latest` along with the SHA tag of the same manifest.
+# The condition has to be "no tag of this version is worth keeping",
+# never "this version has a tag I do not like".
+#
+# The default pattern is `^(sha-|sha256-)`: a commit-SHA tag, and the
+# digest alias the registry creates next to it. So a version tagged
+# only `sha-1a2b3c4` is deleted, while a version that also carries a
+# branch name, a release version or `latest` is kept -- that name is
+# what somebody could actually pull or roll back to.
+#
+# The pattern is an input, so the boundary is explicit and reviewable
+# rather than buried in the script.
+#
+# It is manual on purpose: pruning is a housekeeping act, not a
+# reaction to a commit. Run it from the Actions tab (or with
+# `gh workflow run prune-images.yml`) when the registry needs it.
+#
+# The `dry_run` input defaults to true, so an accidental run reports
+# what it would delete and changes nothing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only report what would be deleted"
+        type: boolean
+        default: true
+      drop_tags:
+        description: "Regex of the tags that make a version insignificant"
+        type: string
+        default: "^(sha-|sha256-)"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Classify the package versions
+        id: classify
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          DROP_TAGS: ${{ inputs.drop_tags }}
+        run: |
+          set -eu
+
+          # The owner may be a user or an organization; the package
+          # lives under whichever it is, and the endpoint differs.
+          endpoint=""
+          for kind in users orgs; do
+            if gh api "/$kind/$OWNER/packages/container/$IMAGE_NAME/versions?per_page=1" >/dev/null 2>&1; then
+              endpoint="/$kind/$OWNER/packages/container/$IMAGE_NAME/versions"
+              break
+            fi
+          done
+          if [ -z "$endpoint" ]; then
+            echo "::error::no container package found for $OWNER/$IMAGE_NAME"
+            exit 1
+          fi
+          echo "endpoint: $endpoint"
+
+          versions=$(gh api "$endpoint?per_page=100" --paginate \
+            --jq '.[] | {id: .id, tags: .metadata.container.tags}')
+
+          # Belt and braces: a version that carries one of these is
+          # never deleted, whatever the pattern says. The pattern is
+          # configurable, and a misconfigured pattern must not be able
+          # to wipe `latest` or `main`.
+          PROTECTED="latest main"
+
+          keep_ids=""
+          delete_ids=""
+          kept=0
+          deleted=0
+
+          while IFS= read -r version; do
+            [ -n "$version" ] || continue
+            id=$(printf '%s' "$version" | jq -r '.id')
+            tags=$(printf '%s' "$version" | jq -r '(.tags // []) | join(",")')
+
+            # A version with no tags at all has no name either -- that
+            # counts as insignificant.
+            significant=""
+            protected=0
+            for tag in $(printf '%s' "$tags" | tr ',' ' '); do
+              [ -n "$tag" ] || continue
+              for p in $PROTECTED; do
+                if [ "$tag" = "$p" ]; then protected=1; fi
+              done
+              if ! printf '%s' "$tag" | grep -Eq "$DROP_TAGS"; then
+                significant="$tag"
+                break
+              fi
+            done
+
+            if [ "$protected" -eq 1 ]; then
+              significant="${significant:-protected}"
+            fi
+
+            if [ -n "$significant" ]; then
+              keep_ids="$keep_ids $id"
+              kept=$((kept + 1))
+              echo "keep   $id  tags=[$tags]  (significant tag: $significant)"
+            else
+              delete_ids="$delete_ids $id"
+              deleted=$((deleted + 1))
+              echo "delete $id  tags=[$tags]"
+            fi
+          done <<EOF
+          $versions
+          EOF
+
+          echo "kept=$kept deleted=$deleted" >> "$GITHUB_OUTPUT"
+          echo "delete_ids=$delete_ids" >> "$GITHUB_OUTPUT"
+
+      - name: Delete the insignificant versions
+        if: ${{ inputs.dry_run == false }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          DELETE_IDS: ${{ steps.classify.outputs.delete_ids }}
+        run: |
+          set -eu
+
+          endpoint=""
+          for kind in users orgs; do
+            if gh api "/$kind/$OWNER/packages/container/$IMAGE_NAME/versions?per_page=1" >/dev/null 2>&1; then
+              endpoint="/$kind/$OWNER/packages/container/$IMAGE_NAME/versions"
+              break
+            fi
+          done
+
+          count=0
+          for id in $DELETE_IDS; do
+            echo "deleting version $id"
+            gh api --method DELETE "$endpoint/$id"
+            count=$((count + 1))
+          done
+          echo "::notice::deleted $count version(s)"
+
+      - name: Summary
+        env:
+          KEPT: ${{ steps.classify.outputs.kept }}
+          DELETED: ${{ steps.classify.outputs.deleted }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          {
+            echo "### Pruned container images"
+            echo ""
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "Dry run -- nothing was deleted."
+            fi
+            echo ""
+            echo "- versions kept: $KEPT"
+            echo "- versions deleted: $DELETED"
+          } >> "$GITHUB_STEP_SUMMARY"
