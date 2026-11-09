@@ -30,8 +30,16 @@ pub enum ProviderOutput {
 #[async_trait]
 pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
-    async fn complete(&self, req: &MessagesRequest, model_rewrite: &std::collections::HashMap<String, String>) -> Result<ProviderOutput>;
-    async fn stream(&self, req: &MessagesRequest, model_rewrite: &std::collections::HashMap<String, String>) -> Result<ProviderOutput>;
+    async fn complete(
+        &self,
+        req: &MessagesRequest,
+        model_rewrite: &std::collections::HashMap<String, String>,
+    ) -> Result<ProviderOutput>;
+    async fn stream(
+        &self,
+        req: &MessagesRequest,
+        model_rewrite: &std::collections::HashMap<String, String>,
+    ) -> Result<ProviderOutput>;
     /// Whether this provider can serve `model` without the proxy sending an
     /// unmapped name upstream. Providers with an empty rewrite table accept
     /// any model name verbatim (they expose a model catalog of their own);
@@ -222,7 +230,7 @@ mod tests {
                 use_proxy: false,
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
-            reasoning_echo: false,
+                reasoning_echo: false,
             },
             reqwest::Client::new(),
             true,

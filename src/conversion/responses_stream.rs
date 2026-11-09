@@ -149,7 +149,9 @@ impl ResponsesStreamTranslator {
                 usage: Usage::default(),
                 extra: std::collections::HashMap::new(),
             };
-            out.push(StreamEvent::MessageStart { message: placeholder });
+            out.push(StreamEvent::MessageStart {
+                message: placeholder,
+            });
         }
     }
 
@@ -216,7 +218,9 @@ impl ResponsesStreamTranslator {
                 // and own the Thinking block themselves.
                 if matches!(
                     item,
-                    OutputItem::Unknown | OutputItem::WebSearchCall { .. } | OutputItem::Reasoning { .. }
+                    OutputItem::Unknown
+                        | OutputItem::WebSearchCall { .. }
+                        | OutputItem::Reasoning { .. }
                 ) {
                     return out;
                 }
@@ -239,7 +243,9 @@ impl ResponsesStreamTranslator {
                     content_block: block,
                 });
             }
-            ResponsesStreamEvent::ResponseContentPartAdded { output_index, part, .. } => {
+            ResponsesStreamEvent::ResponseContentPartAdded {
+                output_index, part, ..
+            } => {
                 // A single Responses item may have multiple content parts.
                 // For now, fold them into the same block — the first part
                 // opens the block on `output_item.added`. Extra parts emit
@@ -260,10 +266,14 @@ impl ResponsesStreamTranslator {
                 self.deltas_seen.insert(block_idx);
                 out.push(StreamEvent::ContentBlockDelta {
                     index: block_idx,
-                    delta: BlockDelta::TextDelta { text: delta.clone() },
+                    delta: BlockDelta::TextDelta {
+                        text: delta.clone(),
+                    },
                 });
             }
-            ResponsesStreamEvent::ResponseOutputTextDone { output_index, text, .. } => {
+            ResponsesStreamEvent::ResponseOutputTextDone {
+                output_index, text, ..
+            } => {
                 let Some(&block_idx) = self.block_map.get(output_index) else {
                     tracing::warn!(?output_index, "text.done for unseen block; ignoring");
                     return out;
@@ -311,7 +321,9 @@ impl ResponsesStreamTranslator {
                 };
                 out.push(StreamEvent::ContentBlockDelta {
                     index: idx,
-                    delta: BlockDelta::ThinkingDelta { thinking: delta.clone() },
+                    delta: BlockDelta::ThinkingDelta {
+                        thinking: delta.clone(),
+                    },
                 });
             }
             ResponsesStreamEvent::ResponseReasoningTextDone { item_id, .. } => {
@@ -345,13 +357,13 @@ impl ResponsesStreamTranslator {
                 self.deltas_seen.insert(block_idx);
                 out.push(StreamEvent::ContentBlockDelta {
                     index: block_idx,
-                    delta: BlockDelta::TextDelta { text: delta.clone() },
+                    delta: BlockDelta::TextDelta {
+                        text: delta.clone(),
+                    },
                 });
             }
             ResponsesStreamEvent::ResponseRefusalDone {
-                output_index,
-                text,
-                ..
+                output_index, text, ..
             } => {
                 // Close the refusal/text block. If no delta was seen (rare:
                 // upstream sends the full refusal only on .done), emit the
@@ -390,7 +402,12 @@ impl ResponsesStreamTranslator {
                     .copied()
                     .unwrap_or(*output_index);
                 let Some(&block_idx) = self.block_map.get(&fc_index) else {
-                    tracing::warn!(?output_index, ?item_id, ?fc_index, "fc args delta for unseen block; ignoring");
+                    tracing::warn!(
+                        ?output_index,
+                        ?item_id,
+                        ?fc_index,
+                        "fc args delta for unseen block; ignoring"
+                    );
                     return out;
                 };
                 out.push(StreamEvent::ContentBlockDelta {
@@ -411,7 +428,11 @@ impl ResponsesStreamTranslator {
                     .copied()
                     .unwrap_or(*output_index);
                 let Some(&block_idx) = self.block_map.get(&fc_index) else {
-                    tracing::warn!(?fc_index, ?item_id, "fc_args.done for unseen block; ignoring");
+                    tracing::warn!(
+                        ?fc_index,
+                        ?item_id,
+                        "fc_args.done for unseen block; ignoring"
+                    );
                     return out;
                 };
                 if self.closed_blocks.insert(block_idx) {
@@ -488,7 +509,12 @@ impl ResponsesStreamTranslator {
                 let msg = message
                     .as_ref()
                     .cloned()
-                    .or_else(|| extra.get("error").and_then(|v| v.get("message")).and_then(|v| v.as_str().map(|s| s.to_owned())))
+                    .or_else(|| {
+                        extra
+                            .get("error")
+                            .and_then(|v| v.get("message"))
+                            .and_then(|v| v.as_str().map(|s| s.to_owned()))
+                    })
                     .unwrap_or_else(|| "upstream error".to_string());
                 // `expose_upstream_details=false`: as above, message and code both
                 // become the generic wording.
@@ -564,7 +590,11 @@ impl ResponsesStreamTranslator {
             stop_reason
         };
         let raw = self.final_usage.take().unwrap_or_default();
-        let cached = raw.input_tokens_details.as_ref().map(|d| d.cached_tokens).unwrap_or(0);
+        let cached = raw
+            .input_tokens_details
+            .as_ref()
+            .map(|d| d.cached_tokens)
+            .unwrap_or(0);
         let reasoning = raw
             .output_tokens_details
             .as_ref()
@@ -619,17 +649,19 @@ fn output_item_to_block(item: &OutputItem) -> ResponseBlock {
         // Caller (`ResponseOutputItemAdded` arm) early-returns on
         // `OutputItem::Unknown`, `WebSearchCall`, and `Reasoning`, so this
         // variant is unreachable here.
-        OutputItem::Unknown => unreachable!("OutputItem::Unknown is filtered before output_item_to_block"),
+        OutputItem::Unknown => {
+            unreachable!("OutputItem::Unknown is filtered before output_item_to_block")
+        }
         // Caller early-returns on WebSearchCall (same as Unknown) — this
         // arm is a compile-time safety net.
-        OutputItem::WebSearchCall { .. } => unreachable!(
-            "OutputItem::WebSearchCall is filtered before output_item_to_block"
-        ),
+        OutputItem::WebSearchCall { .. } => {
+            unreachable!("OutputItem::WebSearchCall is filtered before output_item_to_block")
+        }
         // Caller early-returns on Reasoning — reasoning_* delta/done
         // events own the Thinking block themselves.
-        OutputItem::Reasoning { .. } => unreachable!(
-            "OutputItem::Reasoning is filtered before output_item_to_block"
-        ),
+        OutputItem::Reasoning { .. } => {
+            unreachable!("OutputItem::Reasoning is filtered before output_item_to_block")
+        }
     }
 }
 
@@ -637,8 +669,7 @@ fn output_item_to_block(item: &OutputItem) -> ResponseBlock {
 mod tests {
     use super::*;
     use crate::responses::{
-        IncompleteDetails, InputTokensDetails, OutputContentPart, ResponsesResponse,
-        ResponsesUsage,
+        IncompleteDetails, InputTokensDetails, OutputContentPart, ResponsesResponse, ResponsesUsage,
     };
     use serde_json::json;
 
@@ -695,7 +726,10 @@ mod tests {
             },
         });
         match &start[0] {
-            StreamEvent::ContentBlockStart { content_block: ResponseBlock::Text { text, .. }, .. } => {
+            StreamEvent::ContentBlockStart {
+                content_block: ResponseBlock::Text { text, .. },
+                ..
+            } => {
                 assert!(text.is_empty(), "start block must be empty, got {text:?}");
             }
             _ => panic!("expected empty Text ContentBlockStart"),
@@ -711,9 +745,10 @@ mod tests {
         let accumulated: String = std::iter::once(&start[0])
             .chain(d1.iter())
             .filter_map(|e| match e {
-                StreamEvent::ContentBlockDelta { delta: BlockDelta::TextDelta { text }, .. } => {
-                    Some(text.clone())
-                }
+                StreamEvent::ContentBlockDelta {
+                    delta: BlockDelta::TextDelta { text },
+                    ..
+                } => Some(text.clone()),
                 _ => None,
             })
             .collect();
@@ -783,7 +818,10 @@ mod tests {
             output_index: 0,
             item,
         });
-        assert!(matches!(evs[0], StreamEvent::ContentBlockStart { index: 0, .. }));
+        assert!(matches!(
+            evs[0],
+            StreamEvent::ContentBlockStart { index: 0, .. }
+        ));
 
         // Push a delta.
         let evs = t.push_event(&ResponsesStreamEvent::ResponseOutputTextDelta {
@@ -816,7 +854,13 @@ mod tests {
             output_index: 0,
             item,
         });
-        assert!(matches!(evs[0], StreamEvent::ContentBlockStart { index: 0, content_block: ResponseBlock::ToolUse { .. } }));
+        assert!(matches!(
+            evs[0],
+            StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: ResponseBlock::ToolUse { .. }
+            }
+        ));
 
         let evs = t.push_event(&ResponsesStreamEvent::ResponseFunctionCallArgumentsDelta {
             item_id: "fc_1".into(),
@@ -1069,7 +1113,13 @@ mod tests {
         let evs = t.push_event(&reasoning_delta("rsn_1", "let me think", 1));
         assert_eq!(evs.len(), 2, "expected start + delta, got {evs:?}");
         assert!(
-            matches!(&evs[0], StreamEvent::ContentBlockStart { index: 0, content_block: ResponseBlock::Thinking { .. } }),
+            matches!(
+                &evs[0],
+                StreamEvent::ContentBlockStart {
+                    index: 0,
+                    content_block: ResponseBlock::Thinking { .. }
+                }
+            ),
             "first event must open a Thinking block, got {:?}",
             evs[0]
         );
@@ -1131,7 +1181,13 @@ mod tests {
         // Second reasoning item starts a fresh block (index 1).
         let evs = t.push_event(&reasoning_delta("rsn_2", "second", 3));
         assert!(
-            evs.iter().any(|e| matches!(e, StreamEvent::ContentBlockStart { index: 1, content_block: ResponseBlock::Thinking { .. } })),
+            evs.iter().any(|e| matches!(
+                e,
+                StreamEvent::ContentBlockStart {
+                    index: 1,
+                    content_block: ResponseBlock::Thinking { .. }
+                }
+            )),
             "second reasoning item must open block 1, got {evs:?}"
         );
     }
@@ -1161,7 +1217,13 @@ mod tests {
             },
         });
         assert!(
-            evs.iter().any(|e| matches!(e, StreamEvent::ContentBlockStart { index: 1, content_block: ResponseBlock::Text { .. } })),
+            evs.iter().any(|e| matches!(
+                e,
+                StreamEvent::ContentBlockStart {
+                    index: 1,
+                    content_block: ResponseBlock::Text { .. }
+                }
+            )),
             "message item must open text block 1 after thinking, got {evs:?}"
         );
     }
@@ -1185,11 +1247,18 @@ mod tests {
         });
         let evs = t.push_event(&reasoning_delta("rsn_1", "think", 1));
         assert!(
-            evs.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { index: 0 })),
+            evs.iter()
+                .any(|e| matches!(e, StreamEvent::ContentBlockStop { index: 0 })),
             "open text block must be closed before the thinking block, got {evs:?}"
         );
         assert!(
-            evs.iter().any(|e| matches!(e, StreamEvent::ContentBlockStart { index: 1, content_block: ResponseBlock::Thinking { .. } })),
+            evs.iter().any(|e| matches!(
+                e,
+                StreamEvent::ContentBlockStart {
+                    index: 1,
+                    content_block: ResponseBlock::Thinking { .. }
+                }
+            )),
             "thinking block must open at index 1, got {evs:?}"
         );
     }
@@ -1215,7 +1284,10 @@ mod tests {
             text: "sum".into(),
             sequence_number: 2,
         });
-        assert!(evs2.is_empty(), "summary done must be ignored, got {evs2:?}");
+        assert!(
+            evs2.is_empty(),
+            "summary done must be ignored, got {evs2:?}"
+        );
     }
 
     /// P2-9: a completed response carrying only reasoning (no text/tool
@@ -1255,7 +1327,13 @@ mod tests {
         // No ContentBlockStart for a text block, and the thinking block was
         // closed by the done event (no stray stop in finalize).
         assert!(
-            !tail.iter().any(|e| matches!(e, StreamEvent::ContentBlockStart { content_block: ResponseBlock::Text { .. }, .. })),
+            !tail.iter().any(|e| matches!(
+                e,
+                StreamEvent::ContentBlockStart {
+                    content_block: ResponseBlock::Text { .. },
+                    ..
+                }
+            )),
             "reasoning-only response must not open a text block, got {tail:?}"
         );
     }
@@ -1274,7 +1352,8 @@ mod tests {
         });
         let tail = t.finalize();
         assert!(
-            tail.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { index: 0 })),
+            tail.iter()
+                .any(|e| matches!(e, StreamEvent::ContentBlockStop { index: 0 })),
             "finalize must close the open thinking block, got {tail:?}"
         );
     }
@@ -1302,13 +1381,21 @@ mod tests {
             "response.failed must emit Error event"
         );
         assert!(
-            !tail.iter().any(|e| matches!(e, StreamEvent::MessageDelta { .. })),
+            !tail
+                .iter()
+                .any(|e| matches!(e, StreamEvent::MessageDelta { .. })),
             "response.failed must not emit MessageDelta"
         );
-        assert!(t.finalized, "translator must be finalized after response.failed");
+        assert!(
+            t.finalized,
+            "translator must be finalized after response.failed"
+        );
         // finalize() should emit nothing.
         let final_events = t.finalize();
-        assert!(final_events.is_empty(), "finalize after response.failed must be empty");
+        assert!(
+            final_events.is_empty(),
+            "finalize after response.failed must be empty"
+        );
     }
 
     #[test]
@@ -1357,7 +1444,10 @@ mod tests {
             },
         });
         // First block is at index 0.
-        assert!(matches!(evs[0], StreamEvent::ContentBlockStart { index: 0, .. }));
+        assert!(matches!(
+            evs[0],
+            StreamEvent::ContentBlockStart { index: 0, .. }
+        ));
 
         let evs = t.push_event(&ResponsesStreamEvent::ResponseOutputItemAdded {
             output_index: 1,
@@ -1370,7 +1460,10 @@ mod tests {
             },
         });
         // Second block is at index 1, not 0.
-        assert!(matches!(evs[0], StreamEvent::ContentBlockStart { index: 1, .. }));
+        assert!(matches!(
+            evs[0],
+            StreamEvent::ContentBlockStart { index: 1, .. }
+        ));
 
         // A delta on output_index=1 must land on block 1.
         let evs = t.push_event(&ResponsesStreamEvent::ResponseFunctionCallArgumentsDelta {
@@ -1449,7 +1542,10 @@ mod tests {
             .collect();
         assert_eq!(stops, vec![0]);
         // And the tail must include message_delta + message_stop.
-        assert!(matches!(final_events.last(), Some(StreamEvent::MessageStop)));
+        assert!(matches!(
+            final_events.last(),
+            Some(StreamEvent::MessageStop)
+        ));
     }
 
     #[test]
@@ -1519,7 +1615,10 @@ mod tests {
         assert_eq!(evs.len(), 2);
         assert!(matches!(
             evs[0],
-            StreamEvent::ContentBlockDelta { index: 0, delta: BlockDelta::TextDelta { .. } }
+            StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: BlockDelta::TextDelta { .. }
+            }
         ));
         assert!(matches!(evs[1], StreamEvent::ContentBlockStop { index: 0 }));
     }
@@ -1619,12 +1718,13 @@ mod tests {
         });
         assert_eq!(evs.len(), 1);
         match &evs[0] {
-            StreamEvent::ContentBlockStart { index: 0, content_block } => {
-                match content_block {
-                    ResponseBlock::Text { text, .. } => assert!(text.is_empty()),
-                    _ => panic!("expected empty Text block"),
-                }
-            }
+            StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block,
+            } => match content_block {
+                ResponseBlock::Text { text, .. } => assert!(text.is_empty()),
+                _ => panic!("expected empty Text block"),
+            },
             _ => panic!("expected ContentBlockStart"),
         }
     }
@@ -1769,7 +1869,10 @@ mod tests {
         });
         assert_eq!(evs.len(), 1);
         match &evs[0] {
-            StreamEvent::ContentBlockDelta { index: 0, delta: BlockDelta::InputJsonDelta { .. } } => {}
+            StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: BlockDelta::InputJsonDelta { .. },
+            } => {}
             other => panic!("expected delta on block 0, got {other:?}"),
         }
         // Done also arrives with mismatched output_index=1.
@@ -1863,7 +1966,10 @@ mod tests {
         // stop_reason defaults to "end_turn" for completed status
         assert_eq!(message_delta.0.stop_reason.as_deref(), Some("end_turn"));
         // usage should be Some with default values when upstream usage is None
-        let usage = message_delta.1.as_ref().expect("usage should be Some, not None");
+        let usage = message_delta
+            .1
+            .as_ref()
+            .expect("usage should be Some, not None");
         assert_eq!(usage.input_tokens, 0);
         assert_eq!(usage.output_tokens, 0);
     }
@@ -1902,7 +2008,10 @@ mod tests {
         // Must emit a fallback text delta before the stop.
         assert_eq!(evs.len(), 2);
         match &evs[0] {
-            StreamEvent::ContentBlockDelta { index: 0, delta: BlockDelta::TextDelta { text } } => {
+            StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: BlockDelta::TextDelta { text },
+            } => {
                 assert_eq!(text, "Hello from done");
             }
             other => panic!("expected fallback text delta on block 0, got {other:?}"),
@@ -1916,8 +2025,12 @@ mod tests {
             response: Box::new(placeholder_response("completed")),
         });
         let tail = t.finalize();
-        assert!(!tail.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { .. })));
-        assert!(!tail.iter().any(|e| matches!(e, StreamEvent::ContentBlockDelta { .. })));
+        assert!(!tail
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ContentBlockStop { .. })));
+        assert!(!tail
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ContentBlockDelta { .. })));
     }
 
     /// T8: P1-5 — a `text.done` event for an output_index that was never
@@ -1946,7 +2059,9 @@ mod tests {
             response: Box::new(placeholder_response("completed")),
         });
         let tail = t.finalize();
-        assert!(!tail.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { .. })));
+        assert!(!tail
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ContentBlockStop { .. })));
     }
 
     /// T9: P1-5 — a `function_call_arguments.done` with an item_id that
@@ -1973,7 +2088,9 @@ mod tests {
             response: Box::new(placeholder_response("completed")),
         });
         let tail = t.finalize();
-        assert!(!tail.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { .. })));
+        assert!(!tail
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ContentBlockStop { .. })));
     }
 
     /// T15: P1-G — calling finalize() after an Error event has already
@@ -2014,10 +2131,7 @@ mod tests {
             response: Box::new(placeholder_response("completed")),
         });
         let first = t.finalize();
-        assert!(
-            !first.is_empty(),
-            "first finalize must emit events"
-        );
+        assert!(!first.is_empty(), "first finalize must emit events");
         let second = t.finalize();
         assert!(
             second.is_empty(),
@@ -2081,12 +2195,14 @@ mod tests {
         });
         // Must NOT contain a delta; only the stop is allowed.
         assert!(
-            !evs.iter().any(|e| matches!(e, StreamEvent::ContentBlockDelta { .. })),
+            !evs.iter()
+                .any(|e| matches!(e, StreamEvent::ContentBlockDelta { .. })),
             "part 1 done must not emit a fallback delta when deltas_seen is set"
         );
         // Should emit ContentBlockStop (first close of the block).
         assert!(
-            evs.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { index: 0 })),
+            evs.iter()
+                .any(|e| matches!(e, StreamEvent::ContentBlockStop { index: 0 })),
             "part 1 done should close block 0"
         );
 
@@ -2108,7 +2224,9 @@ mod tests {
         });
         let tail = t.finalize();
         assert!(
-            !tail.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { .. })),
+            !tail
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ContentBlockStop { .. })),
             "finalize must not emit extra content_block_stop"
         );
     }
@@ -2172,12 +2290,19 @@ mod tests {
             // The translator should set finalized = true, clear
             // final_stop_reason so finalize emits nothing, and emit
             // a StreamEvent::Error.
-            assert!(t.finalized, "translator must be finalized after error event");
-            assert!(t.final_stop_reason.is_none(), "final_stop_reason must be cleared");
+            assert!(
+                t.finalized,
+                "translator must be finalized after error event"
+            );
+            assert!(
+                t.final_stop_reason.is_none(),
+                "final_stop_reason must be cleared"
+            );
             // finalize() should emit nothing.
             let tail = t.finalize();
             assert!(
-                tail.iter().all(|e| !matches!(e, StreamEvent::MessageDelta { .. })),
+                tail.iter()
+                    .all(|e| !matches!(e, StreamEvent::MessageDelta { .. })),
                 "finalize must not emit message_delta after error"
             );
             // The output must contain a StreamEvent::Error.
@@ -2212,17 +2337,29 @@ mod tests {
         );
         // Must NOT emit end_turn semantics — no message_delta.
         assert!(
-            !out.iter().any(|e| matches!(e, StreamEvent::MessageDelta { .. })),
+            !out.iter()
+                .any(|e| matches!(e, StreamEvent::MessageDelta { .. })),
             "response.failed must not emit message_delta"
         );
         // Finalized flag must be set.
-        assert!(t.finalized, "translator must be finalized after response.failed");
+        assert!(
+            t.finalized,
+            "translator must be finalized after response.failed"
+        );
         // final_stop_reason must be cleared.
-        assert!(t.final_stop_reason.is_none(), "final_stop_reason must be cleared after response.failed");
+        assert!(
+            t.final_stop_reason.is_none(),
+            "final_stop_reason must be cleared after response.failed"
+        );
 
         // Verify the error payload.
-        let error_ev = out.iter().find(|e| matches!(e, StreamEvent::Error { .. })).unwrap();
-        let StreamEvent::Error { error } = error_ev else { unreachable!() };
+        let error_ev = out
+            .iter()
+            .find(|e| matches!(e, StreamEvent::Error { .. }))
+            .unwrap();
+        let StreamEvent::Error { error } = error_ev else {
+            unreachable!()
+        };
         assert_eq!(error["type"], "upstream_error");
         assert_eq!(error["message"], "too fast");
         assert_eq!(error["code"], "rate_limited");
@@ -2268,7 +2405,9 @@ mod tests {
             .iter()
             .find(|e| matches!(e, StreamEvent::Error { .. }))
             .unwrap();
-        let StreamEvent::Error { error } = error_ev else { unreachable!() };
+        let StreamEvent::Error { error } = error_ev else {
+            unreachable!()
+        };
         assert_eq!(error["type"], "upstream_error");
         assert_eq!(
             error["message"],
@@ -2292,7 +2431,9 @@ mod tests {
             .iter()
             .find(|e| matches!(e, StreamEvent::Error { .. }))
             .unwrap();
-        let StreamEvent::Error { error } = error_ev else { unreachable!() };
+        let StreamEvent::Error { error } = error_ev else {
+            unreachable!()
+        };
         assert_eq!(
             error["message"],
             crate::error::ProxyError::GENERIC_UPSTREAM_MESSAGE
@@ -2316,7 +2457,8 @@ mod tests {
             delta: "orphan".into(),
         });
         assert!(
-            !out.iter().any(|e| matches!(e, StreamEvent::ContentBlockDelta { .. })),
+            !out.iter()
+                .any(|e| matches!(e, StreamEvent::ContentBlockDelta { .. })),
             "must not emit a content_block_delta for unseen output_index; got {out:?}"
         );
     }
@@ -2334,7 +2476,8 @@ mod tests {
             delta: "{}".into(),
         });
         assert!(
-            !out.iter().any(|e| matches!(e, StreamEvent::ContentBlockDelta { .. })),
+            !out.iter()
+                .any(|e| matches!(e, StreamEvent::ContentBlockDelta { .. })),
             "must not emit a content_block_delta for unknown item_id; got {out:?}"
         );
     }
@@ -2427,7 +2570,9 @@ mod tests {
         });
         let tail = t.finalize();
         assert!(
-            !tail.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { .. })),
+            !tail
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ContentBlockStop { .. })),
             "finalize must not re-close the refusal block"
         );
         // refusal stop_reason comes from the incomplete_details path.
@@ -2462,7 +2607,9 @@ mod tests {
             output_tokens: 50,
             total_tokens: 60,
             input_tokens_details: None,
-            output_tokens_details: Some(OutputTokensDetails { reasoning_tokens: 21 }),
+            output_tokens_details: Some(OutputTokensDetails {
+                reasoning_tokens: 21,
+            }),
             service_tier: None,
         });
         let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
@@ -2527,7 +2674,9 @@ mod tests {
             output_tokens: 50,
             total_tokens: 60,
             input_tokens_details: None,
-            output_tokens_details: Some(OutputTokensDetails { reasoning_tokens: 0 }),
+            output_tokens_details: Some(OutputTokensDetails {
+                reasoning_tokens: 0,
+            }),
             service_tier: None,
         });
         let _ = t.push_event(&ResponsesStreamEvent::ResponseCompleted {
@@ -2547,4 +2696,3 @@ mod tests {
         );
     }
 }
-

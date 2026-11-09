@@ -20,11 +20,7 @@ pub const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 /// every failure past this count gets 429 until the window closes.
 pub const AUTH_FAILURE_LIMIT: u32 = 30;
 
-pub async fn require_auth(
-    State(state): State<AppState>,
-    req: Request,
-    next: Next,
-) -> Response {
+pub async fn require_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let Some(expected) = state
         .config
         .server
@@ -44,9 +40,7 @@ pub async fn require_auth(
         .or_else(|| {
             // Anthropic SDK uses x-api-key for the provider-side auth; allow
             // it as a fallback so existing clients work unchanged.
-            req.headers()
-                .get("x-api-key")
-                .and_then(|v| v.to_str().ok())
+            req.headers().get("x-api-key").and_then(|v| v.to_str().ok())
         });
 
     match header_value {
@@ -131,10 +125,7 @@ impl AuthRateLimiter {
     pub fn register_failure(&self, now: Instant) -> bool {
         // A poisoned mutex must not take auth down with it: recover the
         // (possibly torn) state and keep counting.
-        let mut f = self
-            .inner
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut f = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         match f.window_start {
             Some(start) if now.duration_since(start) < AUTH_FAILURE_WINDOW => {
                 f.count += 1;
@@ -166,10 +157,7 @@ impl AuthRateLimiter {
     /// (the caller only asks this after `register_failure` returned
     /// `true`, so in practice a window is always open here).
     pub fn retry_after_secs(&self, now: Instant) -> u64 {
-        let f = self
-            .inner
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let f = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         f.window_start
             .map(|start| {
                 AUTH_FAILURE_WINDOW

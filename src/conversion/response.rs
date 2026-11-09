@@ -20,9 +20,10 @@ pub fn openai_to_anthropic_response(
     model: &str,
     message_id: &str,
 ) -> Result<MessagesResponse> {
-    let choice = resp.choices.first().ok_or_else(|| {
-        ProxyError::BadRequest("upstream returned no choices".into())
-    })?;
+    let choice = resp
+        .choices
+        .first()
+        .ok_or_else(|| ProxyError::BadRequest("upstream returned no choices".into()))?;
 
     let mut content: Vec<ResponseBlock> = Vec::new();
 
@@ -62,8 +63,8 @@ pub fn openai_to_anthropic_response(
 
     if let Some(tool_calls) = &choice.message.tool_calls {
         for tc in tool_calls {
-            let input: Value = serde_json::from_str(&tc.function.arguments)
-                .unwrap_or_else(|_| json!({}));
+            let input: Value =
+                serde_json::from_str(&tc.function.arguments).unwrap_or_else(|_| json!({}));
             content.push(ResponseBlock::ToolUse {
                 id: tc.id.clone(),
                 name: tc.function.name.clone(),
@@ -213,11 +214,20 @@ mod tests {
     #[test]
     fn maps_stop_reasons() {
         assert_eq!(map_stop_reason("stop").unwrap(), Some("end_turn".into()));
-        assert_eq!(map_stop_reason("length").unwrap(), Some("max_tokens".into()));
-        assert_eq!(map_stop_reason("tool_calls").unwrap(), Some("tool_use".into()));
+        assert_eq!(
+            map_stop_reason("length").unwrap(),
+            Some("max_tokens".into())
+        );
+        assert_eq!(
+            map_stop_reason("tool_calls").unwrap(),
+            Some("tool_use".into())
+        );
         // PR-7: content_filter → refusal (was "end_turn"). See the
         // `map_stop_reason` doc comment and litellm PR #23899.
-        assert_eq!(map_stop_reason("content_filter").unwrap(), Some("refusal".into()));
+        assert_eq!(
+            map_stop_reason("content_filter").unwrap(),
+            Some("refusal".into())
+        );
     }
 
     #[test]
@@ -237,10 +247,7 @@ mod tests {
         // for spec values the converter has never seen. Asserting on a
         // truly-unknown value here keeps the unknown→None behavior
         // separately covered.
-        assert_eq!(
-            map_stop_reason("totally_unknown_reason").unwrap(),
-            None
-        );
+        assert_eq!(map_stop_reason("totally_unknown_reason").unwrap(), None);
     }
 
     /// PR-7 response side: upstream OpenAI `service_tier` (e.g. `scale`)
@@ -289,7 +296,9 @@ mod tests {
 
         let out = openai_to_anthropic_response(&resp, "model", "msg_1").unwrap();
         assert_eq!(out.content.len(), 2);
-        assert!(matches!(out.content[0], ResponseBlock::Thinking { ref thinking, .. } if thinking == "because"));
+        assert!(
+            matches!(out.content[0], ResponseBlock::Thinking { ref thinking, .. } if thinking == "because")
+        );
         assert!(matches!(out.content[1], ResponseBlock::Text { ref text, .. } if text == "final"));
         assert_eq!(out.usage.input_tokens, 0);
         assert_eq!(out.usage.output_tokens, 0);
@@ -563,9 +572,10 @@ mod tests {
         }))
         .unwrap();
         let out = openai_to_anthropic_response(&with_reasoning, "gpt-4o", "msg_t").unwrap();
-        let details = out.usage.output_tokens_details.expect(
-            "reasoning_tokens>0 must surface output_tokens_details",
-        );
+        let details = out
+            .usage
+            .output_tokens_details
+            .expect("reasoning_tokens>0 must surface output_tokens_details");
         assert_eq!(details["thinking_tokens"], 12);
         // The OpenAI-side key must NOT leak into the Anthropic write payload.
         assert!(
@@ -672,7 +682,9 @@ mod tests {
         let resp: ChatResponse = serde_json::from_value(raw).unwrap();
         let out = openai_to_anthropic_response(&resp, "gpt-4o", "msg_rf").unwrap();
         assert_eq!(out.content.len(), 1);
-        assert!(matches!(&out.content[0], ResponseBlock::Text { text, .. } if text == "blocked by policy"));
+        assert!(
+            matches!(&out.content[0], ResponseBlock::Text { text, .. } if text == "blocked by policy")
+        );
         // And stop_reason is refusal because finish_reason=content_filter.
         assert_eq!(out.stop_reason.as_deref(), Some("refusal"));
     }

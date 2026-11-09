@@ -621,9 +621,7 @@ impl Config {
         // it to the three hostnames GitHub actually operates (audit L4).
         for p in &self.providers {
             let ProviderConfig::GithubCopilot {
-                name,
-                account_type,
-                ..
+                name, account_type, ..
             } = p
             else {
                 continue;
@@ -749,8 +747,7 @@ fn extract_secrets_config(raw: &str) -> Result<SecretsConfig> {
     // `serde_json::Value` (serde-saphyr has no generic YAML value) also
     // means a file with non-string mapping keys lands here; the main
     // parse still rejects it loudly.
-    let Ok(value) =
-        serde_saphyr::from_str_with_options::<serde_json::Value>(raw, yaml_options())
+    let Ok(value) = serde_saphyr::from_str_with_options::<serde_json::Value>(raw, yaml_options())
     else {
         return Ok(SecretsConfig::default());
     };
@@ -1131,14 +1128,16 @@ models:
         let expanded = expand_env_vars("前缀-$LLMPROXY_UNBRACED_VAR-后缀");
 
         assert_eq!(expanded, "前缀-值-后缀");
-        assert_eq!(expand_env_vars("literal-$9-${UNCLOSED"), "literal-$9-${UNCLOSED");
+        assert_eq!(
+            expand_env_vars("literal-$9-${UNCLOSED"),
+            "literal-$9-${UNCLOSED"
+        );
     }
 
     #[test]
     fn env_expansion_bash_default_unset_var_uses_default() {
         std::env::remove_var("LLMPROXY_DEFINITELY_NOT_SET");
-        let expanded =
-            expand_env_vars("key=${LLMPROXY_DEFINITELY_NOT_SET:-fallback}-end");
+        let expanded = expand_env_vars("key=${LLMPROXY_DEFINITELY_NOT_SET:-fallback}-end");
         assert_eq!(expanded, "key=fallback-end");
     }
 
@@ -1161,16 +1160,14 @@ models:
     #[test]
     fn env_expansion_bash_default_strips_double_quotes() {
         std::env::remove_var("LLMPROXY_BASH_DEFAULT_QUOTED");
-        let expanded =
-            expand_env_vars("k=${LLMPROXY_BASH_DEFAULT_QUOTED:-\"hello world\"}-e");
+        let expanded = expand_env_vars("k=${LLMPROXY_BASH_DEFAULT_QUOTED:-\"hello world\"}-e");
         assert_eq!(expanded, "k=hello world-e");
     }
 
     #[test]
     fn env_expansion_bash_default_strips_single_quotes() {
         std::env::remove_var("LLMPROXY_BASH_DEFAULT_SQUOTED");
-        let expanded =
-            expand_env_vars("k=${LLMPROXY_BASH_DEFAULT_SQUOTED:-'hello world'}-e");
+        let expanded = expand_env_vars("k=${LLMPROXY_BASH_DEFAULT_SQUOTED:-'hello world'}-e");
         assert_eq!(expanded, "k=hello world-e");
     }
 
@@ -1481,7 +1478,7 @@ models:
                     use_proxy: false,
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
-                reasoning_echo: false,
+                    reasoning_echo: false,
                 },
                 "openai_compat",
             ),
@@ -1699,9 +1696,7 @@ models:
         assert_eq!(p.name(), "openai_direct");
         assert!(p.use_proxy());
         match p {
-            ProviderConfig::OpenaiResponses {
-                model_rewrite, ..
-            } => {
+            ProviderConfig::OpenaiResponses { model_rewrite, .. } => {
                 assert_eq!(model_rewrite.len(), 2);
                 assert_eq!(model_rewrite.get("claude-sonnet-4.6").unwrap(), "gpt-5");
                 assert_eq!(model_rewrite.get("claude-opus-4.6").unwrap(), "gpt-5");
@@ -1876,7 +1871,8 @@ models:
         let cfg = Config::parse(raw).unwrap();
         match &cfg.providers[0] {
             ProviderConfig::Anthropic {
-                thinking_when_absent, ..
+                thinking_when_absent,
+                ..
             } => assert_eq!(*thinking_when_absent, ThinkingWhenAbsent::Disabled),
             other => panic!("expected an anthropic provider, got {other:?}"),
         }
@@ -1898,7 +1894,8 @@ models:
         let cfg = Config::parse(raw).unwrap();
         match &cfg.providers[0] {
             ProviderConfig::Anthropic {
-                thinking_when_absent, ..
+                thinking_when_absent,
+                ..
             } => assert_eq!(*thinking_when_absent, ThinkingWhenAbsent::Disabled),
             other => panic!("expected an anthropic provider, got {other:?}"),
         }
@@ -1920,7 +1917,8 @@ models:
         let cfg = Config::parse(raw).unwrap();
         match &cfg.providers[0] {
             ProviderConfig::Anthropic {
-                thinking_when_absent, ..
+                thinking_when_absent,
+                ..
             } => assert_eq!(*thinking_when_absent, ThinkingWhenAbsent::Omit),
             other => panic!("expected an anthropic provider, got {other:?}"),
         }
@@ -1942,7 +1940,8 @@ models:
         let cfg = Config::parse(raw).unwrap();
         match &cfg.providers[0] {
             ProviderConfig::Anthropic {
-                thinking_when_absent, ..
+                thinking_when_absent,
+                ..
             } => assert_eq!(*thinking_when_absent, ThinkingWhenAbsent::EffortLow),
             other => panic!("expected an anthropic provider, got {other:?}"),
         }
@@ -1994,7 +1993,8 @@ models:
         let reparsed = Config::parse(&s).unwrap();
         match &reparsed.providers[0] {
             ProviderConfig::Anthropic {
-                thinking_when_absent, ..
+                thinking_when_absent,
+                ..
             } => assert_eq!(*thinking_when_absent, ThinkingWhenAbsent::Disabled),
             other => panic!("expected an anthropic provider, got {other:?}"),
         }
@@ -2023,7 +2023,8 @@ models:
         let reparsed = Config::parse(&s).unwrap();
         match &reparsed.providers[0] {
             ProviderConfig::Anthropic {
-                thinking_when_absent, ..
+                thinking_when_absent,
+                ..
             } => assert_eq!(*thinking_when_absent, ThinkingWhenAbsent::EffortLow),
             other => panic!("expected an anthropic provider, got {other:?}"),
         }
@@ -2369,11 +2370,7 @@ models:
         let dumped = serde_saphyr::to_string(&cfg).unwrap();
         let reparsed = Config::parse(&dumped).unwrap();
         assert_eq!(
-            reparsed
-                .server
-                .api_key
-                .as_ref()
-                .map(|k| k.expose_secret()),
+            reparsed.server.api_key.as_ref().map(|k| k.expose_secret()),
             Some("[REDACTED]")
         );
     }

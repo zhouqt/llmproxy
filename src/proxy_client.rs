@@ -18,9 +18,8 @@ pub fn build_client(cfg: &ProxyConfig, user_agent: &str) -> Result<Client> {
     let mut builder = common_builder(cfg, user_agent);
 
     if let Some(url) = &cfg.url {
-        let proxy = reqwest::Proxy::all(url).map_err(|e| {
-            ProxyError::Config(format!("invalid proxy url '{url}': {e}"))
-        })?;
+        let proxy = reqwest::Proxy::all(url)
+            .map_err(|e| ProxyError::Config(format!("invalid proxy url '{url}': {e}")))?;
         builder = builder.proxy(proxy);
     }
 
@@ -34,7 +33,9 @@ pub fn build_client(cfg: &ProxyConfig, user_agent: &str) -> Result<Client> {
 /// false` so the chain can share a single direct-egress pool across all
 /// of them rather than spawning one reqwest::Client per provider.
 pub fn build_direct_client(cfg: &ProxyConfig, user_agent: &str) -> Result<Client> {
-    common_builder(cfg, user_agent).build().map_err(ProxyError::Http)
+    common_builder(cfg, user_agent)
+        .build()
+        .map_err(ProxyError::Http)
 }
 
 fn common_builder(cfg: &ProxyConfig, user_agent: &str) -> reqwest::ClientBuilder {
@@ -71,11 +72,7 @@ mod tests {
 
     impl Match for HeaderVerbatim {
         fn matches(&self, request: &Request) -> bool {
-            request
-                .headers
-                .get(self.0)
-                .and_then(|v| v.to_str().ok())
-                == Some(self.1)
+            request.headers.get(self.0).and_then(|v| v.to_str().ok()) == Some(self.1)
         }
     }
 

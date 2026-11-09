@@ -208,7 +208,10 @@ mod env_guard_tests {
         let mut env = env_lock();
         let original = std::env::var_os(KEY);
         env.set_var(KEY, "set-by-guard");
-        assert_eq!(std::env::var_os(KEY).as_deref(), Some(OsStr::new("set-by-guard")));
+        assert_eq!(
+            std::env::var_os(KEY).as_deref(),
+            Some(OsStr::new("set-by-guard"))
+        );
         drop(env);
 
         assert_eq!(std::env::var_os(KEY), original);

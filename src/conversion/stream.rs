@@ -78,7 +78,9 @@ impl StreamTranslator {
                 usage: Usage::default(),
                 extra: std::collections::HashMap::new(),
             };
-            out.push(StreamEvent::MessageStart { message: placeholder });
+            out.push(StreamEvent::MessageStart {
+                message: placeholder,
+            });
         }
 
         if let Some(usage) = &chunk.usage {
@@ -210,13 +212,18 @@ impl StreamTranslator {
             self.block_has_text[idx as usize] = true;
             out.push(StreamEvent::ContentBlockStart {
                 index: idx,
-                content_block: ResponseBlock::Text { text: String::new(), citations: None },
+                content_block: ResponseBlock::Text {
+                    text: String::new(),
+                    citations: None,
+                },
             });
         }
 
         out.push(StreamEvent::ContentBlockDelta {
             index: idx,
-            delta: BlockDelta::TextDelta { text: text.to_string() },
+            delta: BlockDelta::TextDelta {
+                text: text.to_string(),
+            },
         });
         out
     }
@@ -242,7 +249,9 @@ impl StreamTranslator {
         }
         out.push(StreamEvent::ContentBlockDelta {
             index: idx,
-            delta: BlockDelta::ThinkingDelta { thinking: text.to_string() },
+            delta: BlockDelta::ThinkingDelta {
+                thinking: text.to_string(),
+            },
         });
         out
     }
@@ -291,9 +300,9 @@ impl StreamTranslator {
 
             let id_len = id.chars().count();
             let id_anthropic_compatible = (1..=64).contains(&id_len)
-                && id.chars().all(|c| {
-                    c.is_ascii_alphanumeric() || c == '_' || c == '-'
-                });
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
             let name_len = name.chars().count();
             tracing::debug!(
                 target: "tool_call_debug",
@@ -366,8 +375,7 @@ impl StreamTranslator {
         let mut open = std::mem::take(&mut self.open_blocks);
         open.sort_unstable();
         open.dedup();
-        open
-            .into_iter()
+        open.into_iter()
             .map(|index| StreamEvent::ContentBlockStop { index })
             .collect()
     }
@@ -461,7 +469,10 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, StreamEvent::ContentBlockStart { .. }))
             .count();
-        assert_eq!(start_count, 1, "finalized translators must not reopen text blocks");
+        assert_eq!(
+            start_count, 1,
+            "finalized translators must not reopen text blocks"
+        );
         assert!(late.is_empty());
     }
 
@@ -503,7 +514,10 @@ mod tests {
                 )
             })
             .count();
-        assert_eq!(start_count, 1, "finalized translators must not reopen thinking blocks");
+        assert_eq!(
+            start_count, 1,
+            "finalized translators must not reopen thinking blocks"
+        );
         assert!(late.is_empty());
     }
 
@@ -521,7 +535,8 @@ mod tests {
                 }]},
                 "finish_reason": null
             }]
-        })).unwrap();
+        }))
+        .unwrap();
 
         let c2: ChatChunk = serde_json::from_value(serde_json::json!({
             "id": "c", "object": "chat.completion.chunk", "created": 0, "model": "m",
@@ -533,7 +548,8 @@ mod tests {
                 }]},
                 "finish_reason": null
             }]
-        })).unwrap();
+        }))
+        .unwrap();
 
         let mut events = t.push_chunk(&c1);
         events.extend(t.push_chunk(&c2));
@@ -541,10 +557,22 @@ mod tests {
         events.extend(t.finalize());
 
         let has_tool_start = events.iter().any(|e| {
-            matches!(e, StreamEvent::ContentBlockStart { content_block: ResponseBlock::ToolUse { .. }, .. })
+            matches!(
+                e,
+                StreamEvent::ContentBlockStart {
+                    content_block: ResponseBlock::ToolUse { .. },
+                    ..
+                }
+            )
         });
         let has_json_delta = events.iter().any(|e| {
-            matches!(e, StreamEvent::ContentBlockDelta { delta: BlockDelta::InputJsonDelta { .. }, .. })
+            matches!(
+                e,
+                StreamEvent::ContentBlockDelta {
+                    delta: BlockDelta::InputJsonDelta { .. },
+                    ..
+                }
+            )
         });
         assert!(has_tool_start);
         assert!(has_json_delta);
@@ -576,11 +604,17 @@ mod tests {
 
         assert!(events.iter().any(|e| matches!(
             e,
-            StreamEvent::ContentBlockStart { content_block: ResponseBlock::Thinking { .. }, .. }
+            StreamEvent::ContentBlockStart {
+                content_block: ResponseBlock::Thinking { .. },
+                ..
+            }
         )));
         assert!(events.iter().any(|e| matches!(
             e,
-            StreamEvent::ContentBlockDelta { delta: BlockDelta::ThinkingDelta { .. }, .. }
+            StreamEvent::ContentBlockDelta {
+                delta: BlockDelta::ThinkingDelta { .. },
+                ..
+            }
         )));
     }
 
@@ -759,7 +793,10 @@ mod tests {
                 (index, args)
             })
             .collect();
-        assert_eq!(tool_args, vec![(1, "{\"x\":1}".into()), (2, "{\"y\":2}".into())]);
+        assert_eq!(
+            tool_args,
+            vec![(1, "{\"x\":1}".into()), (2, "{\"y\":2}".into())]
+        );
     }
 
     #[test]
@@ -834,14 +871,22 @@ mod tests {
         for index in [0, 1] {
             let starts = block_sequence
                 .iter()
-                .filter(|event| event.starts_with("start:") && event.ends_with(&format!(":{index}")))
+                .filter(|event| {
+                    event.starts_with("start:") && event.ends_with(&format!(":{index}"))
+                })
                 .count();
             let stops = block_sequence
                 .iter()
                 .filter(|event| event == &&format!("stop:{index}"))
                 .count();
-            assert_eq!(starts, 1, "index {index} should start once: {block_sequence:?}");
-            assert_eq!(stops, 1, "index {index} should stop once: {block_sequence:?}");
+            assert_eq!(
+                starts, 1,
+                "index {index} should start once: {block_sequence:?}"
+            );
+            assert_eq!(
+                stops, 1,
+                "index {index} should stop once: {block_sequence:?}"
+            );
         }
     }
 
@@ -938,14 +983,22 @@ mod tests {
         for index in [0, 1, 2] {
             let starts = block_sequence
                 .iter()
-                .filter(|event| event.starts_with("start:") && event.ends_with(&format!(":{index}")))
+                .filter(|event| {
+                    event.starts_with("start:") && event.ends_with(&format!(":{index}"))
+                })
                 .count();
             let stops = block_sequence
                 .iter()
                 .filter(|event| event == &&format!("stop:{index}"))
                 .count();
-            assert_eq!(starts, 1, "index {index} should start once: {block_sequence:?}");
-            assert_eq!(stops, 1, "index {index} should stop once: {block_sequence:?}");
+            assert_eq!(
+                starts, 1,
+                "index {index} should start once: {block_sequence:?}"
+            );
+            assert_eq!(
+                stops, 1,
+                "index {index} should stop once: {block_sequence:?}"
+            );
         }
     }
 
@@ -1052,8 +1105,14 @@ mod tests {
         let mut t = StreamTranslator::new("msg_1", "m");
         let events = t.finalize();
 
-        assert!(matches!(events.first(), Some(StreamEvent::MessageStart { .. })));
-        assert!(matches!(events.get(1), Some(StreamEvent::MessageDelta { .. })));
+        assert!(matches!(
+            events.first(),
+            Some(StreamEvent::MessageStart { .. })
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(StreamEvent::MessageDelta { .. })
+        ));
         assert!(matches!(events.last(), Some(StreamEvent::MessageStop)));
     }
 
@@ -1134,7 +1193,10 @@ mod tests {
                 None
             }
         });
-        assert_eq!(delta.and_then(|d| d.stop_reason.as_deref()), Some("max_tokens"));
+        assert_eq!(
+            delta.and_then(|d| d.stop_reason.as_deref()),
+            Some("max_tokens")
+        );
         let usage = events.iter().rev().find_map(|e| {
             if let StreamEvent::MessageDelta { usage, .. } = e {
                 usage.clone()
@@ -1142,7 +1204,10 @@ mod tests {
                 None
             }
         });
-        assert_eq!(usage.as_ref().and_then(|u| u.cache_read_input_tokens), Some(2));
+        assert_eq!(
+            usage.as_ref().and_then(|u| u.cache_read_input_tokens),
+            Some(2)
+        );
     }
 
     /// Bug repro for Chat Completions streaming path — mirrors
@@ -1219,7 +1284,9 @@ mod tests {
         let empty_events = t.push_chunk(&empty);
         let role_events = t.push_chunk(&just_role);
 
-        assert!(empty_events.iter().all(|e| matches!(e, StreamEvent::MessageStart { .. })));
+        assert!(empty_events
+            .iter()
+            .all(|e| matches!(e, StreamEvent::MessageStart { .. })));
         assert!(role_events.is_empty());
     }
 
@@ -1233,18 +1300,24 @@ mod tests {
                 "delta": {"content": "hello"},
                 "finish_reason": null
             }]
-        })).unwrap();
+        }))
+        .unwrap();
         let metadata: ChatChunk = serde_json::from_value(serde_json::json!({
             "choices": [],
             "x-opencode-type": "inference-cost"
-        })).unwrap();
+        }))
+        .unwrap();
 
         let events = t.push_chunk(&content);
         let second = t.push_chunk(&metadata);
 
         // First push emits MessageStart + ContentBlockStart + ContentBlockDelta
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::MessageStart { .. })));
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::ContentBlockDelta { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::MessageStart { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ContentBlockDelta { .. })));
         // Second push (metadata with empty choices) emits nothing
         assert!(second.is_empty());
     }

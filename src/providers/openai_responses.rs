@@ -310,7 +310,10 @@ where
                     }
                 }
                 Err(e) => {
-                    tracing::debug!("skipping malformed Responses SSE line: {} ({e})", crate::util::summarize_for_log(payload, "<empty payload>"));
+                    tracing::debug!(
+                        "skipping malformed Responses SSE line: {} ({e})",
+                        crate::util::summarize_for_log(payload, "<empty payload>")
+                    );
                 }
             }
         }
@@ -446,7 +449,10 @@ mod tests {
             "runtime-model".to_string(),
         );
 
-        let output = provider.complete(&request(false), &runtime_rewrite).await.unwrap();
+        let output = provider
+            .complete(&request(false), &runtime_rewrite)
+            .await
+            .unwrap();
 
         assert_eq!(provider.name(), "test");
         expect_variant!(output, ProviderOutput::Json(body) => {
@@ -639,8 +645,14 @@ mod tests {
 
         let merged = p.merged_rewrite(&runtime);
         // runtime wins on key collision; configured-only entries survive.
-        assert_eq!(merged.get("claude-a").map(String::as_str), Some("runtime-model"));
-        assert_eq!(merged.get("claude-b").map(String::as_str), Some("runtime-b"));
+        assert_eq!(
+            merged.get("claude-a").map(String::as_str),
+            Some("runtime-model")
+        );
+        assert_eq!(
+            merged.get("claude-b").map(String::as_str),
+            Some("runtime-b")
+        );
         assert_eq!(
             merged.get("claude-c").map(String::as_str),
             Some("configured-only-model")
@@ -746,7 +758,10 @@ mod tests {
         )
         .unwrap();
 
-        let _ = provider.complete(&request(false), &HashMap::new()).await.unwrap();
+        let _ = provider
+            .complete(&request(false), &HashMap::new())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -835,7 +850,10 @@ mod tests {
         )
         .unwrap();
 
-        let output = provider.stream(&request(true), &HashMap::new()).await.unwrap();
+        let output = provider
+            .stream(&request(true), &HashMap::new())
+            .await
+            .unwrap();
         expect_variant!(output, ProviderOutput::Stream(mut stream) => {
             let mut encoded = String::new();
             while let Some(item) = stream.next().await {
@@ -878,7 +896,10 @@ mod tests {
         .unwrap();
 
         let _ = provider
-            .complete(&cache_request_with("ephemeral", Some("u-42")), &HashMap::new())
+            .complete(
+                &cache_request_with("ephemeral", Some("u-42")),
+                &HashMap::new(),
+            )
             .await
             .unwrap();
     }
@@ -910,7 +931,10 @@ mod tests {
         .unwrap();
 
         let _ = provider
-            .complete(&cache_request_with("ephemeral_1h", Some("u-9")), &HashMap::new())
+            .complete(
+                &cache_request_with("ephemeral_1h", Some("u-9")),
+                &HashMap::new(),
+            )
             .await
             .unwrap();
     }
@@ -1003,7 +1027,9 @@ mod tests {
         // Order: message_start must come before content_block_delta,
         // which must come before message_stop.
         let pos_start = encoded.find("event: message_start").expect("message_start");
-        let pos_delta = encoded.find("event: content_block_delta").expect("content_block_delta");
+        let pos_delta = encoded
+            .find("event: content_block_delta")
+            .expect("content_block_delta");
         let pos_stop = encoded.find("event: message_stop").expect("message_stop");
         assert!(pos_start < pos_delta);
         assert!(pos_delta < pos_stop);
@@ -1052,7 +1078,10 @@ mod tests {
             encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
         }
         let stop_count = encoded.matches("event: message_stop").count();
-        assert_eq!(stop_count, 1, "exactly one message_stop expected, got {stop_count}: {encoded}");
+        assert_eq!(
+            stop_count, 1,
+            "exactly one message_stop expected, got {stop_count}: {encoded}"
+        );
     }
 
     #[tokio::test]
@@ -1083,8 +1112,14 @@ mod tests {
         // The first item should be the message_start chunk; the
         // second should be the propagated error.
         assert!(items.len() >= 2, "expected >=2 items, got {}", items.len());
-        assert!(items[0].is_ok(), "first chunk should be the message_start bytes");
-        assert!(items[1].is_err(), "second item should be the propagated Http error, got Ok");
+        assert!(
+            items[0].is_ok(),
+            "first chunk should be the message_start bytes"
+        );
+        assert!(
+            items[1].is_err(),
+            "second item should be the propagated Http error, got Ok"
+        );
         match &items[1] {
             Err(crate::error::ProxyError::Http(_)) => {}
             other => panic!("expected ProxyError::Http, got {other:?}"),
@@ -1231,7 +1266,10 @@ mod tests {
             }
         })
         .await;
-        assert!(result.is_ok(), "the adapter must terminate after an error event");
+        assert!(
+            result.is_ok(),
+            "the adapter must terminate after an error event"
+        );
 
         assert!(encoded.contains("event: error"), "{encoded}");
         assert!(
@@ -1509,4 +1547,3 @@ mod tests {
         assert!(provider.list_models().await.is_none());
     }
 }
-

@@ -152,10 +152,7 @@ pub async fn device_flow_blocking(http: &reqwest::Client) -> Result<String> {
 /// banner (caller is expected to print it). Used by `start_bootstrap`'s
 /// spawned task so the banner isn't duplicated when the device code
 /// was returned by an admin endpoint — see fix-R2.
-pub async fn poll_device_token(
-    http: &reqwest::Client,
-    dc: &DeviceCodeResponse,
-) -> Result<String> {
+pub async fn poll_device_token(http: &reqwest::Client, dc: &DeviceCodeResponse) -> Result<String> {
     poll_loop(http, github_base_url(), dc).await
 }
 
@@ -255,9 +252,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/login/device/code"))
-            .respond_with(
-                ResponseTemplate::new(403).set_body_json(json!({"message": "forbidden"})),
-            )
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({"message": "forbidden"})))
             .mount(&server)
             .await;
 
@@ -393,9 +388,7 @@ mod tests {
         // the first request_device_code call live only here, so this run
         // covers that code path under the same env override.
         let _stop = spawn_auto_advance();
-        let token = device_flow_blocking(&reqwest::Client::new())
-            .await
-            .unwrap();
+        let token = device_flow_blocking(&reqwest::Client::new()).await.unwrap();
         assert_eq!(token, "public-token");
     }
 

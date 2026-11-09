@@ -23,7 +23,9 @@ use crate::extractor::{AppJson, AppQuery};
 use crate::providers::ProviderOutput;
 use crate::state::AppState;
 use crate::tokenize::estimate_request_tokens;
-use crate::usage::{Outcome, StreamUsage, UsageRecord, UsageScanner, UsageStats, DEFAULT_LIMIT, MAX_LIMIT};
+use crate::usage::{
+    Outcome, StreamUsage, UsageRecord, UsageScanner, UsageStats, DEFAULT_LIMIT, MAX_LIMIT,
+};
 
 pub fn build_router(state: AppState) -> AxumRouter {
     let api = AxumRouter::new()
@@ -76,10 +78,7 @@ async fn messages_handler(
     })
 }
 
-async fn messages_inner(
-    state: &AppState,
-    req: MessagesRequest,
-) -> Result<Response> {
+async fn messages_inner(state: &AppState, req: MessagesRequest) -> Result<Response> {
     // StartedAt must be captured before find_model so even an
     // "unknown model" early-return can record a row (Review #11).
     // The model label is what we have, so use it directly with no
@@ -414,7 +413,10 @@ impl StartedAt {
 }
 
 fn parse_failed_providers(attempts: &[crate::router::RouteStep]) -> Vec<String> {
-    attempts.iter().map(crate::router::RouteStep::render).collect()
+    attempts
+        .iter()
+        .map(crate::router::RouteStep::render)
+        .collect()
 }
 
 /// Like [`parse_failed_providers`] but drops any attempt against the
@@ -486,11 +488,11 @@ fn extract_failed_providers(e: &ProxyError) -> Vec<String> {
 /// stays `Cow::Borrowed` (also no allocation).
 fn extract_provider_label(e: &ProxyError) -> String {
     match e {
-        ProxyError::AllProvidersFailed { attempts, .. } => crate::router::last_failed_provider(
-            attempts,
-        )
-        .expect("AllProvidersFailed.attempts must contain at least one Failed step")
-        .to_string(),
+        ProxyError::AllProvidersFailed { attempts, .. } => {
+            crate::router::last_failed_provider(attempts)
+                .expect("AllProvidersFailed.attempts must contain at least one Failed step")
+                .to_string()
+        }
         ProxyError::AllProvidersCoolingDown { .. } | ProxyError::RouterBadRequest { .. } => {
             "<router>".to_string()
         }
@@ -811,8 +813,7 @@ fn stream_response(
     // succeeded on it). Drop any attempt against the same provider
     // before writing the row / building the response header. Local
     // skips remain -- the row keeps full-history (third-party policy).
-    let failed_providers =
-        filter_failed_providers_for(&attempts, provider_name);
+    let failed_providers = filter_failed_providers_for(&attempts, provider_name);
     let ProviderOutput::Stream(stream) = output else {
         // Phase 2 §3: contract-violation branch (router returned
         // `ProviderOutput::Json` for a `stream:true` request). The
@@ -862,12 +863,7 @@ fn stream_response(
     // Helper is no-op when `attempts` is empty (commit 6
     // Option-absent convention) — no `failed_providers=` empty-string
     // noise on the happy path.
-    log_streaming_fallback(
-        model,
-        provider_name,
-        start.elapsed_ms(),
-        &attempts,
-    );
+    log_streaming_fallback(model, provider_name, start.elapsed_ms(), &attempts);
 
     let mut resp_headers = HeaderMap::new();
     // Upstream-only view for the response header — see the
@@ -1101,10 +1097,8 @@ impl Stream for MappedStream {
                 // ~200 chars (plan §Phase 1 §4: unstripped multi-KB
                 // bodies must never reach the log).
                 let status = e.status_code().as_u16();
-                let detail = crate::util::summarize_for_log(
-                    &e.to_string(),
-                    "<empty error message>",
-                );
+                let detail =
+                    crate::util::summarize_for_log(&e.to_string(), "<empty error message>");
                 tracing::error!(
                     provider = %self.provider,
                     model = %self.model,
@@ -1130,7 +1124,10 @@ impl Stream for MappedStream {
                 self.errored = true;
                 self.finalize_and_record();
                 self.done = true;
-                Poll::Ready(Some(Ok(format_stream_error(&e, self.expose_upstream_details))))
+                Poll::Ready(Some(Ok(format_stream_error(
+                    &e,
+                    self.expose_upstream_details,
+                ))))
             }
             Poll::Ready(None) => {
                 self.done = true;
@@ -1239,7 +1236,10 @@ pub(crate) fn build_routing_priority(
                 continue;
             }
             let rewrite = provider.merged_rewrite(&empty);
-            let upstream_id = rewrite.get(&m.name).cloned().unwrap_or_else(|| m.name.clone());
+            let upstream_id = rewrite
+                .get(&m.name)
+                .cloned()
+                .unwrap_or_else(|| m.name.clone());
             let key = (upstream_id, provider_name.to_string());
             let rank = (pos as u64, seq);
             seq += 1;
@@ -1276,7 +1276,10 @@ fn entry_rank(
     let fallback_json = serde_json::to_string(entry).unwrap_or_default();
     match provider {
         Some("llmproxy") => (2, 0, 0, String::new(), String::new()),
-        Some(p) => match priority.get(&(entry["id"].as_str().unwrap_or_default().to_string(), p.to_string())) {
+        Some(p) => match priority.get(&(
+            entry["id"].as_str().unwrap_or_default().to_string(),
+            p.to_string(),
+        )) {
             Some(&(pos, seq)) => (0, pos, seq, String::new(), String::new()),
             None => (1, 0, 0, p.to_string(), fallback_json),
         },
@@ -1328,9 +1331,11 @@ fn dedup_models_by_routing_priority(
             }
         }
     }
-    entries.extend(order.into_iter().filter_map(move |id| {
-        best.remove_entry(&id).map(|(_, (_, entry))| entry)
-    }));
+    entries.extend(
+        order
+            .into_iter()
+            .filter_map(move |id| best.remove_entry(&id).map(|(_, (_, entry))| entry)),
+    );
 }
 
 async fn list_models_handler(State(state): State<AppState>) -> impl IntoResponse {
@@ -1444,16 +1449,14 @@ async fn all_models_handler(State(state): State<AppState>) -> impl IntoResponse 
             let mut static_pairs: Vec<(&String, &String)> = rewrite.iter().collect();
             static_pairs.sort();
             for (_, upstream) in static_pairs {
-                merged
-                    .entry(upstream.clone())
-                    .or_insert_with(|| {
-                        serde_json::json!({
-                            "id": upstream,
-                            "object": "model",
-                            "created": 0,
-                            "display_name": upstream,
-                        })
-                    });
+                merged.entry(upstream.clone()).or_insert_with(|| {
+                    serde_json::json!({
+                        "id": upstream,
+                        "object": "model",
+                        "created": 0,
+                        "display_name": upstream,
+                    })
+                });
             }
         }
 
@@ -1466,8 +1469,7 @@ async fn all_models_handler(State(state): State<AppState>) -> impl IntoResponse 
         let discovered_ok = discovered.is_some();
         if let Some(models) = discovered {
             for entry in models {
-                let Some(id) = entry.get("id").and_then(|v| v.as_str()).map(str::to_string)
-                else {
+                let Some(id) = entry.get("id").and_then(|v| v.as_str()).map(str::to_string) else {
                     continue;
                 };
                 merged.insert(id, entry);
@@ -1713,10 +1715,15 @@ mod tests {
     /// Keeping the message in one helper means each test call site is free
     /// of its own missed panic-string line.
     fn expect_poll_none(poll: std::task::Poll<Option<std::result::Result<Bytes, std::io::Error>>>) {
-        assert!(matches!(poll, std::task::Poll::Ready(None)), "expected Ready(None)");
+        assert!(
+            matches!(poll, std::task::Poll::Ready(None)),
+            "expected Ready(None)"
+        );
     }
 
-    fn expect_poll_pending(poll: std::task::Poll<Option<std::result::Result<Bytes, std::io::Error>>>) {
+    fn expect_poll_pending(
+        poll: std::task::Poll<Option<std::result::Result<Bytes, std::io::Error>>>,
+    ) {
         assert!(matches!(poll, std::task::Poll::Pending), "expected Pending");
     }
 
@@ -1798,10 +1805,7 @@ mod tests {
         let mut cx = std::task::Context::from_waker(waker);
 
         // First poll: the synthetic error chunk.
-        let b1 = assert_poll_ready_some_ok(
-            Pin::new(&mut s).poll_next(&mut cx),
-            "error event",
-        );
+        let b1 = assert_poll_ready_some_ok(Pin::new(&mut s).poll_next(&mut cx), "error event");
         let s1 = std::str::from_utf8(&b1).unwrap();
         assert!(
             s1.contains("event: error"),
@@ -1844,10 +1848,7 @@ mod tests {
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
 
-        let b1 = assert_poll_ready_some_ok(
-            Pin::new(&mut s).poll_next(&mut cx),
-            "first poll",
-        );
+        let b1 = assert_poll_ready_some_ok(Pin::new(&mut s).poll_next(&mut cx), "first poll");
         assert!(
             std::str::from_utf8(&b1).unwrap().contains("event: error"),
             "in-band error chunk must reach the client"
@@ -1891,16 +1892,10 @@ mod tests {
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
 
-        let b1 = assert_poll_ready_some_ok(
-            Pin::new(&mut s).poll_next(&mut cx),
-            "first poll",
-        );
+        let b1 = assert_poll_ready_some_ok(Pin::new(&mut s).poll_next(&mut cx), "first poll");
         assert_eq!(&b1[..], b"event: foo\n\n");
 
-        let b2 = assert_poll_ready_some_ok(
-            Pin::new(&mut s).poll_next(&mut cx),
-            "second poll",
-        );
+        let b2 = assert_poll_ready_some_ok(Pin::new(&mut s).poll_next(&mut cx), "second poll");
         assert_eq!(&b2[..], b"event: bar\n\n");
 
         let p3 = Pin::new(&mut s).poll_next(&mut cx);
@@ -1947,8 +1942,8 @@ mod tests {
     mod admin_copilot {
         use crate::config::{Config, ModelConfig, ProviderConfig, ServerConfig};
         use crate::cooldown::CooldownCache;
-        use crate::providers::Provider;
         use crate::providers::copilot::CopilotProvider;
+        use crate::providers::Provider;
         use crate::router::Router;
         use crate::state::AppState;
         use crate::test_support::{env_lock, EnvGuard};
@@ -1988,8 +1983,8 @@ mod tests {
                     max_retries_per_provider: 1,
                     max_retries_total: 1,
                 }],
-                    ..Config::default()
-                };
+                ..Config::default()
+            };
             let cfg = Arc::new(cfg);
             let cooldown = CooldownCache::new();
             let mut providers = HashMap::new();
@@ -2173,7 +2168,12 @@ mod tests {
 
             // Inspect the 409 body: structured conflict envelope with
             // an "already in progress" message.
-            let bytes = conflict_resp.into_body().collect().await.unwrap().to_bytes();
+            let bytes = conflict_resp
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes();
             let body: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(body["type"], "error");
             assert_eq!(body["error"]["type"], "conflict");
@@ -2265,8 +2265,8 @@ mod tests {
                     max_retries_per_provider: 1,
                     max_retries_total: 1,
                 }],
-                    ..Config::default()
-                };
+                ..Config::default()
+            };
             let cfg = Arc::new(cfg);
             let cooldown = CooldownCache::new();
             let mut providers = HashMap::new();
@@ -2358,20 +2358,22 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 1,
             }],
-                ..Config::default()
-            };
+            ..Config::default()
+        };
         let providers: HashMap<String, crate::providers::SharedProvider> = HashMap::from([
             (
                 "copilot".to_string(),
-                Arc::new(crate::providers::copilot::CopilotProvider::new(
-                    "copilot".to_string(),
-                    "1.95.0".to_string(),
-                    "individual".to_string(),
-                    None,
-                    config.providers[1].model_rewrite().clone(),
-                    reqwest::Client::new(),
-                )
-                .unwrap()) as Arc<dyn Provider>,
+                Arc::new(
+                    crate::providers::copilot::CopilotProvider::new(
+                        "copilot".to_string(),
+                        "1.95.0".to_string(),
+                        "individual".to_string(),
+                        None,
+                        config.providers[1].model_rewrite().clone(),
+                        reqwest::Client::new(),
+                    )
+                    .unwrap(),
+                ) as Arc<dyn Provider>,
             ),
             (
                 "compat".to_string(),
@@ -2444,8 +2446,8 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 1,
             }],
-                ..Config::default()
-            };
+            ..Config::default()
+        };
         let providers: HashMap<String, crate::providers::SharedProvider> = HashMap::from([
             (
                 "copilot".to_string(),
@@ -2514,12 +2516,11 @@ mod tests {
                     max_retries_total: 1,
                 },
             ],
-                    ..Config::default()
-                };
+            ..Config::default()
+        };
         let providers: HashMap<String, crate::providers::SharedProvider> = HashMap::from([(
             "copilot".to_string(),
-            crate::providers::build(&config.providers[0], reqwest::Client::new(), true)
-                    .unwrap(),
+            crate::providers::build(&config.providers[0], reqwest::Client::new(), true).unwrap(),
         )]);
 
         let priority = build_routing_priority(&config, &providers);
@@ -2539,10 +2540,7 @@ mod tests {
         id: &str,
         provider: &str,
     ) -> EntryRank {
-        entry_rank(
-            &json!({"id": id, "owned_by": provider}),
-            priority,
-        )
+        entry_rank(&json!({"id": id, "owned_by": provider}), priority)
     }
 
     #[test]

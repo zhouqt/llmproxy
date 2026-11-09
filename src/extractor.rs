@@ -17,8 +17,8 @@
 
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{FromRequest, FromRequestParts, Query, Request};
-use axum::http::request::Parts;
 use axum::http::header;
+use axum::http::request::Parts;
 use axum::Json;
 use serde::de::DeserializeOwned;
 
@@ -71,10 +71,7 @@ where
 {
     type Rejection = ProxyError;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         match Query::<T>::from_request_parts(parts, state).await {
             Ok(Query(value)) => Ok(AppQuery(value)),
             Err(rejection) => Err(map_query_rejection(rejection)),
@@ -125,10 +122,7 @@ mod tests {
             "application/json; charset=utf-8".parse().unwrap(),
         );
         assert!(is_json_content_type(&h));
-        h.insert(
-            header::CONTENT_TYPE,
-            "APPLICATION/JSON".parse().unwrap(),
-        );
+        h.insert(header::CONTENT_TYPE, "APPLICATION/JSON".parse().unwrap());
         assert!(is_json_content_type(&h));
     }
 
@@ -164,10 +158,7 @@ mod tests {
         struct Q {
             n: u32,
         }
-        let req = Request::builder()
-            .uri("/?n=42")
-            .body(())
-            .unwrap();
+        let req = Request::builder().uri("/?n=42").body(()).unwrap();
         let (mut parts, _body) = req.into_parts();
         let got = AppQuery::<Q>::from_request_parts(&mut parts, &())
             .await
@@ -181,8 +172,7 @@ mod tests {
         use axum::http::Request;
         use serde::Deserialize;
 
-        #[derive(Deserialize)]
-        #[derive(Debug)]
+        #[derive(Deserialize, Debug)]
         #[allow(dead_code)]
         struct Q {
             n: u32,
@@ -190,10 +180,7 @@ mod tests {
         // `n=abc` cannot parse into u32 → must surface as
         // ProxyError::BadRequest, not axum's default text/plain
         // rejection.
-        let req = Request::builder()
-            .uri("/?n=abc")
-            .body(())
-            .unwrap();
+        let req = Request::builder().uri("/?n=abc").body(()).unwrap();
         let (mut parts, _body) = req.into_parts();
         let err = AppQuery::<Q>::from_request_parts(&mut parts, &())
             .await

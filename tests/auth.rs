@@ -66,10 +66,7 @@ fn build_test_app(api_key: Option<String>) -> Router {
 fn build_test_app_with_state(state: AppState) -> Router {
     Router::new()
         .route("/protected", get(echo_handler))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_auth,
-        ))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state)
 }
 
@@ -93,7 +90,12 @@ fn good_request() -> Request<Body> {
 async fn no_api_key_configured_passes_through() {
     let app = build_test_app(None);
     let resp = app
-        .oneshot(Request::builder().uri("/protected").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -135,7 +137,12 @@ async fn wrong_bearer_rejected() {
 async fn missing_auth_header_rejected() {
     let app = build_test_app(Some("secret-key".into()));
     let resp = app
-        .oneshot(Request::builder().uri("/protected").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);

@@ -753,7 +753,10 @@ mod schema_tests {
     #[test]
     fn stream_event_block_delta_signature_carries_signature() {
         let raw = json!({"type": "signature_delta", "signature": "sig-stream-1"});
-        let v = serde_json::to_value(&BlockDelta::SignatureDelta { signature: "sig-stream-1".into() }).unwrap();
+        let v = serde_json::to_value(&BlockDelta::SignatureDelta {
+            signature: "sig-stream-1".into(),
+        })
+        .unwrap();
         assert_subset(&v, &raw);
     }
 
@@ -766,7 +769,10 @@ mod schema_tests {
         });
         let citation = json!({"type": "char_location", "cited_text": "x", "document_index": 0,
                               "document_title": "t", "end_char_index": 10, "start_char_index": 0});
-        let v = serde_json::to_value(&BlockDelta::CitationsDelta { citation: citation.clone() }).unwrap();
+        let v = serde_json::to_value(&BlockDelta::CitationsDelta {
+            citation: citation.clone(),
+        })
+        .unwrap();
         assert_subset(&v, &raw);
     }
 
@@ -797,7 +803,10 @@ mod schema_tests {
             output_tokens: 2,
             cache_creation_input_tokens: Some(3),
             cache_read_input_tokens: Some(4),
-            cache_creation: Some(CacheCreation { ephemeral_1h_input_tokens: Some(1), ephemeral_5m_input_tokens: Some(2) }),
+            cache_creation: Some(CacheCreation {
+                ephemeral_1h_input_tokens: Some(1),
+                ephemeral_5m_input_tokens: Some(2),
+            }),
             server_tool_use: None,
             output_tokens_details: None,
             service_tier: None,

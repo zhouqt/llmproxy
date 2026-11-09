@@ -9,15 +9,15 @@ pub mod error;
 pub mod extractor;
 pub mod oauth;
 pub mod openai;
-pub mod proxy_client;
 pub mod providers;
+pub mod proxy_client;
 pub mod responses;
 pub mod router;
 pub mod secrets;
-#[cfg(test)]
-pub mod test_support;
 pub mod server;
 pub mod state;
+#[cfg(test)]
+pub mod test_support;
 pub mod tokenize;
 pub mod tracing_capture;
 pub mod usage;

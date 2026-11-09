@@ -312,7 +312,10 @@ mod tests_extra {
         assert!(xdg_root.join("llmproxy").exists());
         assert_eq!(
             store.path(),
-            xdg_root.join("llmproxy").join("github_token.json").as_path()
+            xdg_root
+                .join("llmproxy")
+                .join("github_token.json")
+                .as_path()
         );
     }
 
@@ -486,7 +489,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(store.path()).unwrap().permissions().mode();
+            let mode = std::fs::metadata(store.path())
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600, "expected 0600, got {:o}", mode);
         }
     }
@@ -622,7 +628,8 @@ mod tests {
             let err = store.save(&sentinel_tokens(), None).unwrap_err();
 
             assert!(
-                err.to_string().contains("refusing to overwrite the encrypted token store"),
+                err.to_string()
+                    .contains("refusing to overwrite the encrypted token store"),
                 "{err}"
             );
             assert_eq!(
@@ -642,7 +649,10 @@ mod tests {
             store.save(&sentinel_tokens(), None).unwrap();
 
             let raw = std::fs::read_to_string(store.path()).unwrap();
-            assert!(!raw.contains(crate::oauth::token_crypto::ENVELOPE_MAGIC), "{raw}");
+            assert!(
+                !raw.contains(crate::oauth::token_crypto::ENVELOPE_MAGIC),
+                "{raw}"
+            );
         }
 
         #[test]
@@ -748,7 +758,10 @@ mod tests {
                     .map(|name| name.starts_with(".github_token.json."))
                     .unwrap_or(false)
             });
-        assert!(first_tmp.is_none(), "no tmp file should remain after rename");
+        assert!(
+            first_tmp.is_none(),
+            "no tmp file should remain after rename"
+        );
 
         // Concurrent writers should not collide on tmp paths.
         let mut handles = Vec::new();
@@ -781,7 +794,10 @@ mod tests {
             let entry = entry.unwrap();
             let name = entry.file_name();
             let name = name.to_str().unwrap();
-            assert!(!name.contains(".tmp"), "no tmp file should remain after failed rename");
+            assert!(
+                !name.contains(".tmp"),
+                "no tmp file should remain after failed rename"
+            );
         }
         assert!(matches!(err, ProxyError::Io(_)));
     }

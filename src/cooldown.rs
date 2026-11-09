@@ -108,7 +108,8 @@ mod tests {
     async fn mark_and_expire() {
         let c = CooldownCache::new();
         assert!(!c.is_cooling_down("p").await);
-        c.mark_cooldown("p", Duration::from_millis(50), 429, "rate limit").await;
+        c.mark_cooldown("p", Duration::from_millis(50), 429, "rate limit")
+            .await;
         assert!(c.is_cooling_down("p").await);
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert!(!c.is_cooling_down("p").await);
@@ -125,7 +126,8 @@ mod tests {
     #[tokio::test]
     async fn cleanup_removes_expired() {
         let c = CooldownCache::new();
-        c.mark_cooldown("a", Duration::from_millis(10), 500, "").await;
+        c.mark_cooldown("a", Duration::from_millis(10), 500, "")
+            .await;
         c.mark_cooldown("b", Duration::from_secs(60), 429, "").await;
         tokio::time::sleep(Duration::from_millis(30)).await;
         c.cleanup().await;
@@ -208,7 +210,6 @@ mod tests {
             assert!(!new_cache.is_cooling_down("anything").await);
         });
     }
-
 
     #[tokio::test]
     async fn mark_cooldown_does_not_cache_reason_body() {

@@ -182,16 +182,15 @@ async fn mock_llm_provider_primary_succeeds_returns_anthropic_response() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_ok("hello back", "claude-test")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(anthropic_ok("hello back", "claude-test")),
+        )
         .expect(1)
         .mount(&server)
         .await;
 
     let mut providers = HashMap::new();
-    providers.insert(
-        "primary".to_string(),
-        wiremock_provider("primary", &server),
-    );
+    providers.insert("primary".to_string(), wiremock_provider("primary", &server));
     let cfg = Config {
         server: ServerConfig {
             listen: "127.0.0.1:0".to_string(),
@@ -207,9 +206,9 @@ async fn mock_llm_provider_primary_succeeds_returns_anthropic_response() {
             api_base: server.uri(),
             model_rewrite: HashMap::new(),
             use_proxy: false,
-        provider_ignore: Vec::new(),
-        provider_allow: Vec::new(),
-        reasoning_echo: false,
+            provider_ignore: Vec::new(),
+            provider_allow: Vec::new(),
+            reasoning_echo: false,
         }],
         models: vec![ModelConfig {
             name: "claude-test".into(),
@@ -219,17 +218,23 @@ async fn mock_llm_provider_primary_succeeds_returns_anthropic_response() {
             max_retries_per_provider: 1,
             max_retries_total: 1,
         }],
-            ..Config::default()
-        };
+        ..Config::default()
+    };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
-    let (out, attempts, _served) = router.complete(model_cfg, &make_req("claude-test")).await.unwrap();
+    let (out, attempts, _served) = router
+        .complete(model_cfg, &make_req("claude-test"))
+        .await
+        .unwrap();
     let ProviderOutput::Json(body) = out else {
         panic!("expected JSON output");
     };
     assert_eq!(body["content"][0]["text"], "hello back");
-    assert!(attempts.is_empty(), "primary succeeded; no fallback expected");
+    assert!(
+        attempts.is_empty(),
+        "primary succeeded; no fallback expected"
+    );
 }
 
 #[tokio::test]
@@ -247,7 +252,9 @@ async fn mock_llm_provider_falls_back_when_primary_returns_429() {
     let backup = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_ok("from backup", "claude-test")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(anthropic_ok("from backup", "claude-test")),
+        )
         .expect(1)
         .mount(&backup)
         .await;
@@ -275,9 +282,9 @@ async fn mock_llm_provider_falls_back_when_primary_returns_429() {
                 api_base: primary.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
-            provider_ignore: Vec::new(),
-            provider_allow: Vec::new(),
-            reasoning_echo: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -285,9 +292,9 @@ async fn mock_llm_provider_falls_back_when_primary_returns_429() {
                 api_base: backup.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
-            provider_ignore: Vec::new(),
-            provider_allow: Vec::new(),
-            reasoning_echo: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
             },
         ],
         models: vec![ModelConfig {
@@ -298,19 +305,26 @@ async fn mock_llm_provider_falls_back_when_primary_returns_429() {
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-            ..Config::default()
-        };
+        ..Config::default()
+    };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
-    let (out, attempts, _served) = router.complete(model_cfg, &make_req("claude-test")).await.unwrap();
+    let (out, attempts, _served) = router
+        .complete(model_cfg, &make_req("claude-test"))
+        .await
+        .unwrap();
     let ProviderOutput::Json(body) = out else {
         panic!("expected JSON output");
     };
     assert_eq!(body["content"][0]["text"], "from backup");
     assert_eq!(attempts.len(), 1, "exactly one attempt (primary's 429)");
     match &attempts[0] {
-        RouteStep::Failed { provider, status, body } => {
+        RouteStep::Failed {
+            provider,
+            status,
+            body,
+        } => {
             assert_eq!(provider, "primary");
             assert_eq!(*status, 429);
             assert_eq!(body, "rate limited");
@@ -340,7 +354,9 @@ async fn copilot_endpoint_rejection_400_triggers_fallback() {
     let backup = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_ok("from backup", "claude-test")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(anthropic_ok("from backup", "claude-test")),
+        )
         .expect(1)
         .mount(&backup)
         .await;
@@ -391,19 +407,24 @@ async fn copilot_endpoint_rejection_400_triggers_fallback() {
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-            ..Config::default()
-        };
+        ..Config::default()
+    };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
-    let (out, attempts, _served) = router.complete(model_cfg, &make_req("claude-test")).await.unwrap();
+    let (out, attempts, _served) = router
+        .complete(model_cfg, &make_req("claude-test"))
+        .await
+        .unwrap();
     let ProviderOutput::Json(body) = out else {
         panic!("expected JSON output");
     };
     assert_eq!(body["content"][0]["text"], "from backup");
     assert_eq!(attempts.len(), 1, "exactly one attempt (primary's 400)");
     match &attempts[0] {
-        RouteStep::Failed { provider, status, .. } => {
+        RouteStep::Failed {
+            provider, status, ..
+        } => {
             assert_eq!(provider, "primary");
             assert_eq!(*status, 400);
         }
@@ -421,8 +442,7 @@ async fn mock_llm_provider_falls_back_when_primary_returns_402_quota() {
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
         .respond_with(
-            ResponseTemplate::new(402)
-                .set_body_string("You have exceeded your monthly quota"),
+            ResponseTemplate::new(402).set_body_string("You have exceeded your monthly quota"),
         )
         .expect(1)
         .mount(&primary)
@@ -430,16 +450,18 @@ async fn mock_llm_provider_falls_back_when_primary_returns_402_quota() {
     let backup = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_ok(
-            "from backup",
-            "claude-test",
-        )))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(anthropic_ok("from backup", "claude-test")),
+        )
         .expect(1)
         .mount(&backup)
         .await;
 
     let mut providers = HashMap::new();
-    providers.insert("primary".to_string(), wiremock_provider("primary", &primary));
+    providers.insert(
+        "primary".to_string(),
+        wiremock_provider("primary", &primary),
+    );
     providers.insert("backup".to_string(), wiremock_provider("backup", &backup));
 
     let cfg = Config {
@@ -458,9 +480,9 @@ async fn mock_llm_provider_falls_back_when_primary_returns_402_quota() {
                 api_base: primary.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
-            provider_ignore: Vec::new(),
-            provider_allow: Vec::new(),
-            reasoning_echo: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -468,9 +490,9 @@ async fn mock_llm_provider_falls_back_when_primary_returns_402_quota() {
                 api_base: backup.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
-            provider_ignore: Vec::new(),
-            provider_allow: Vec::new(),
-            reasoning_echo: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
             },
         ],
         models: vec![ModelConfig {
@@ -481,8 +503,8 @@ async fn mock_llm_provider_falls_back_when_primary_returns_402_quota() {
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-            ..Config::default()
-        };
+        ..Config::default()
+    };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
@@ -496,7 +518,11 @@ async fn mock_llm_provider_falls_back_when_primary_returns_402_quota() {
     assert_eq!(body["content"][0]["text"], "from backup");
     assert_eq!(attempts.len(), 1);
     match &attempts[0] {
-        RouteStep::Failed { provider, status, body } => {
+        RouteStep::Failed {
+            provider,
+            status,
+            body,
+        } => {
             assert_eq!(provider, "primary");
             assert_eq!(*status, 402);
             assert_eq!(body, "You have exceeded your monthly quota");
@@ -519,16 +545,18 @@ async fn mock_llm_provider_falls_back_when_primary_returns_empty_body_402() {
     let backup = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_ok(
-            "from backup",
-            "claude-test",
-        )))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(anthropic_ok("from backup", "claude-test")),
+        )
         .expect(1)
         .mount(&backup)
         .await;
 
     let mut providers = HashMap::new();
-    providers.insert("primary".to_string(), wiremock_provider("primary", &primary));
+    providers.insert(
+        "primary".to_string(),
+        wiremock_provider("primary", &primary),
+    );
     providers.insert("backup".to_string(), wiremock_provider("backup", &backup));
 
     let cfg = Config {
@@ -547,9 +575,9 @@ async fn mock_llm_provider_falls_back_when_primary_returns_empty_body_402() {
                 api_base: primary.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
-            provider_ignore: Vec::new(),
-            provider_allow: Vec::new(),
-            reasoning_echo: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -557,9 +585,9 @@ async fn mock_llm_provider_falls_back_when_primary_returns_empty_body_402() {
                 api_base: backup.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
-            provider_ignore: Vec::new(),
-            provider_allow: Vec::new(),
-            reasoning_echo: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
             },
         ],
         models: vec![ModelConfig {
@@ -570,8 +598,8 @@ async fn mock_llm_provider_falls_back_when_primary_returns_empty_body_402() {
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-            ..Config::default()
-        };
+        ..Config::default()
+    };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
@@ -609,16 +637,19 @@ async fn mock_llm_provider_does_not_fall_back_on_403() {
     let backup = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_ok(
-            "must not be called",
-            "claude-test",
-        )))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(anthropic_ok("must not be called", "claude-test")),
+        )
         .expect(0)
         .mount(&backup)
         .await;
 
     let mut providers = HashMap::new();
-    providers.insert("primary".to_string(), wiremock_provider("primary", &primary));
+    providers.insert(
+        "primary".to_string(),
+        wiremock_provider("primary", &primary),
+    );
     providers.insert("backup".to_string(), wiremock_provider("backup", &backup));
 
     let cfg = Config {
@@ -637,9 +668,9 @@ async fn mock_llm_provider_does_not_fall_back_on_403() {
                 api_base: primary.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
-            provider_ignore: Vec::new(),
-            provider_allow: Vec::new(),
-            reasoning_echo: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -647,9 +678,9 @@ async fn mock_llm_provider_does_not_fall_back_on_403() {
                 api_base: backup.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
-            provider_ignore: Vec::new(),
-            provider_allow: Vec::new(),
-            reasoning_echo: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
             },
         ],
         models: vec![ModelConfig {
@@ -660,8 +691,8 @@ async fn mock_llm_provider_does_not_fall_back_on_403() {
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-            ..Config::default()
-        };
+        ..Config::default()
+    };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
@@ -702,7 +733,10 @@ async fn mock_llm_provider_chain_exhausted_returns_last_upstream_error() {
         .await;
 
     let mut providers = HashMap::new();
-    providers.insert("primary".to_string(), wiremock_provider("primary", &primary));
+    providers.insert(
+        "primary".to_string(),
+        wiremock_provider("primary", &primary),
+    );
     providers.insert("backup".to_string(), wiremock_provider("backup", &backup));
 
     let cfg = Config {
@@ -721,9 +755,9 @@ async fn mock_llm_provider_chain_exhausted_returns_last_upstream_error() {
                 api_base: primary.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
-            provider_ignore: Vec::new(),
-            provider_allow: Vec::new(),
-            reasoning_echo: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -731,9 +765,9 @@ async fn mock_llm_provider_chain_exhausted_returns_last_upstream_error() {
                 api_base: backup.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
-            provider_ignore: Vec::new(),
-            provider_allow: Vec::new(),
-            reasoning_echo: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
             },
         ],
         models: vec![ModelConfig {
@@ -744,8 +778,8 @@ async fn mock_llm_provider_chain_exhausted_returns_last_upstream_error() {
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-            ..Config::default()
-        };
+        ..Config::default()
+    };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
@@ -760,8 +794,16 @@ async fn mock_llm_provider_chain_exhausted_returns_last_upstream_error() {
             assert_eq!(attempts.len(), 2);
             match (&attempts[0], &attempts[1]) {
                 (
-                    RouteStep::Failed { provider: p0, body: b0, .. },
-                    RouteStep::Failed { provider: p1, body: b1, .. },
+                    RouteStep::Failed {
+                        provider: p0,
+                        body: b0,
+                        ..
+                    },
+                    RouteStep::Failed {
+                        provider: p1,
+                        body: b1,
+                        ..
+                    },
                 ) => {
                     assert_eq!(p0, "primary");
                     assert_eq!(b0, "primary-error");
@@ -802,7 +844,8 @@ async fn mock_llm_provider_per_provider_retry_three_times_before_chain_advance()
             if n < 2 {
                 ResponseTemplate::new(429).set_body_string("please retry")
             } else {
-                ResponseTemplate::new(200).set_body_json(anthropic_ok("third time lucky", "claude-test"))
+                ResponseTemplate::new(200)
+                    .set_body_json(anthropic_ok("third time lucky", "claude-test"))
             }
         })
         .expect(3)
@@ -810,11 +853,11 @@ async fn mock_llm_provider_per_provider_retry_three_times_before_chain_advance()
         .await;
 
     let mut providers = HashMap::new();
-    providers.insert("primary".to_string(), wiremock_provider("primary", &primary));
     providers.insert(
-        "backup".to_string(),
-        wiremock_provider("backup", &primary),
+        "primary".to_string(),
+        wiremock_provider("primary", &primary),
     );
+    providers.insert("backup".to_string(), wiremock_provider("backup", &primary));
 
     let cfg = Config {
         server: ServerConfig {
@@ -832,9 +875,9 @@ async fn mock_llm_provider_per_provider_retry_three_times_before_chain_advance()
                 api_base: primary.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
-            provider_ignore: Vec::new(),
-            provider_allow: Vec::new(),
-            reasoning_echo: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -842,9 +885,9 @@ async fn mock_llm_provider_per_provider_retry_three_times_before_chain_advance()
                 api_base: primary.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
-            provider_ignore: Vec::new(),
-            provider_allow: Vec::new(),
-            reasoning_echo: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
             },
         ],
         models: vec![ModelConfig {
@@ -855,12 +898,15 @@ async fn mock_llm_provider_per_provider_retry_three_times_before_chain_advance()
             max_retries_per_provider: 3,
             max_retries_total: 5,
         }],
-            ..Config::default()
-        };
+        ..Config::default()
+    };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
-    let (out, attempts, _served) = router.complete(model_cfg, &make_req("claude-test")).await.unwrap();
+    let (out, attempts, _served) = router
+        .complete(model_cfg, &make_req("claude-test"))
+        .await
+        .unwrap();
     let ProviderOutput::Json(body) = out else {
         panic!("expected JSON output");
     };
@@ -887,8 +933,7 @@ async fn http_end_to_end_anthropic_provider_strips_and_succeeds() {
     // 2 requests and the retried body carries no thinking /
     // redacted_thinking block.
     let server = MockServer::start().await;
-    let captured: Arc<std::sync::Mutex<Option<Value>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    let captured: Arc<std::sync::Mutex<Option<Value>>> = Arc::new(std::sync::Mutex::new(None));
     let captured_for_responder = captured.clone();
     let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let counter_clone = counter.clone();
@@ -953,8 +998,8 @@ async fn http_end_to_end_anthropic_provider_strips_and_succeeds() {
             max_retries_per_provider: 1,
             max_retries_total: 1,
         }],
-            ..Config::default()
-        };
+        ..Config::default()
+    };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
@@ -978,7 +1023,11 @@ async fn http_end_to_end_anthropic_provider_strips_and_succeeds() {
     // assistant message (index 1) keeps its text block. These pinned
     // assertions make a "strip everything / strip nothing" false green
     // impossible.
-    let sent = captured.lock().unwrap().clone().expect("second body captured");
+    let sent = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("second body captured");
     assert_eq!(sent["messages"].as_array().unwrap().len(), 3);
     let assistant = &sent["messages"][1];
     assert_eq!(assistant["role"], "assistant");
@@ -1065,8 +1114,8 @@ async fn http_end_to_end_anthropic_provider_strip_max_attempts_then_passthrough(
             max_retries_per_provider: 1,
             max_retries_total: 1,
         }],
-            ..Config::default()
-        };
+        ..Config::default()
+    };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
@@ -1166,7 +1215,9 @@ fn post(uri: &str, body: Value) -> Request<Body> {
         .unwrap()
 }
 
-async fn collect_bytes(resp: axum::response::Response) -> (StatusCode, Vec<(String, String)>, Bytes) {
+async fn collect_bytes(
+    resp: axum::response::Response,
+) -> (StatusCode, Vec<(String, String)>, Bytes) {
     let status = resp.status();
     let mut headers = Vec::new();
     for (k, v) in resp.headers() {
@@ -1188,24 +1239,27 @@ async fn http_end_to_end_primary_succeeds_returns_requested_model_name() {
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
         .and(body_partial_json(json!({"stream": false})))
-        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_ok(
-            "ack",
-            "different-upstream-name",
-        )))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(anthropic_ok("ack", "different-upstream-name")),
+        )
         .mount(&upstream)
         .await;
 
     let mut providers = HashMap::new();
-    providers.insert("primary".to_string(), wiremock_provider("primary", &upstream));
+    providers.insert(
+        "primary".to_string(),
+        wiremock_provider("primary", &upstream),
+    );
     let configs = vec![ProviderConfig::OpenaiCompat {
         name: "primary".to_string(),
         api_key: secret_string("k"),
         api_base: upstream.uri(),
         model_rewrite: HashMap::new(),
         use_proxy: false,
-    provider_ignore: Vec::new(),
-    provider_allow: Vec::new(),
-    reasoning_echo: false,
+        provider_ignore: Vec::new(),
+        provider_allow: Vec::new(),
+        reasoning_echo: false,
     }];
     let app = build_axum_app(providers, configs, vec!["primary".to_string()]);
 
@@ -1268,7 +1322,10 @@ async fn http_end_to_end_hosted_web_search_tool_passes_through_extractor() {
     .unwrap();
 
     let mut providers = HashMap::new();
-    providers.insert("primary".to_string(), Arc::new(real_provider) as SharedProvider);
+    providers.insert(
+        "primary".to_string(),
+        Arc::new(real_provider) as SharedProvider,
+    );
 
     let configs = vec![ProviderConfig::OpenaiCompat {
         name: "primary".to_string(),
@@ -1276,9 +1333,9 @@ async fn http_end_to_end_hosted_web_search_tool_passes_through_extractor() {
         api_base: upstream.uri(),
         model_rewrite: HashMap::new(),
         use_proxy: false,
-    provider_ignore: Vec::new(),
-    provider_allow: Vec::new(),
-    reasoning_echo: false,
+        provider_ignore: Vec::new(),
+        provider_allow: Vec::new(),
+        reasoning_echo: false,
     }];
     let app = build_axum_app(providers, configs, vec!["primary".to_string()]);
 
@@ -1316,12 +1373,17 @@ async fn http_end_to_end_429_falls_back_to_backup_with_failed_providers_header()
     let backup = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_ok("via backup", "claude-test")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(anthropic_ok("via backup", "claude-test")),
+        )
         .mount(&backup)
         .await;
 
     let mut providers = HashMap::new();
-    providers.insert("primary".to_string(), wiremock_provider("primary", &primary));
+    providers.insert(
+        "primary".to_string(),
+        wiremock_provider("primary", &primary),
+    );
     providers.insert("backup".to_string(), wiremock_provider("backup", &backup));
     let configs = vec![
         ProviderConfig::OpenaiCompat {
@@ -1330,9 +1392,9 @@ async fn http_end_to_end_429_falls_back_to_backup_with_failed_providers_header()
             api_base: primary.uri(),
             model_rewrite: HashMap::new(),
             use_proxy: false,
-        provider_ignore: Vec::new(),
-        provider_allow: Vec::new(),
-        reasoning_echo: false,
+            provider_ignore: Vec::new(),
+            provider_allow: Vec::new(),
+            reasoning_echo: false,
         },
         ProviderConfig::OpenaiCompat {
             name: "backup".to_string(),
@@ -1340,9 +1402,9 @@ async fn http_end_to_end_429_falls_back_to_backup_with_failed_providers_header()
             api_base: backup.uri(),
             model_rewrite: HashMap::new(),
             use_proxy: false,
-        provider_ignore: Vec::new(),
-        provider_allow: Vec::new(),
-        reasoning_echo: false,
+            provider_ignore: Vec::new(),
+            provider_allow: Vec::new(),
+            reasoning_echo: false,
         },
     ];
     let app = build_axum_app(providers, configs, vec!["primary".into(), "backup".into()]);
@@ -1383,7 +1445,10 @@ async fn http_end_to_end_chain_exhausted_returns_status_and_failed_providers_hea
         .await;
 
     let mut providers = HashMap::new();
-    providers.insert("primary".to_string(), wiremock_provider("primary", &primary));
+    providers.insert(
+        "primary".to_string(),
+        wiremock_provider("primary", &primary),
+    );
     providers.insert("backup".to_string(), wiremock_provider("backup", &backup));
     let configs = vec![
         ProviderConfig::OpenaiCompat {
@@ -1392,9 +1457,9 @@ async fn http_end_to_end_chain_exhausted_returns_status_and_failed_providers_hea
             api_base: primary.uri(),
             model_rewrite: HashMap::new(),
             use_proxy: false,
-        provider_ignore: Vec::new(),
-        provider_allow: Vec::new(),
-        reasoning_echo: false,
+            provider_ignore: Vec::new(),
+            provider_allow: Vec::new(),
+            reasoning_echo: false,
         },
         ProviderConfig::OpenaiCompat {
             name: "backup".to_string(),
@@ -1402,9 +1467,9 @@ async fn http_end_to_end_chain_exhausted_returns_status_and_failed_providers_hea
             api_base: backup.uri(),
             model_rewrite: HashMap::new(),
             use_proxy: false,
-        provider_ignore: Vec::new(),
-        provider_allow: Vec::new(),
-        reasoning_echo: false,
+            provider_ignore: Vec::new(),
+            provider_allow: Vec::new(),
+            reasoning_echo: false,
         },
     ];
     let app = build_axum_app(providers, configs, vec!["primary".into(), "backup".into()]);
@@ -1448,12 +1513,10 @@ async fn http_end_to_end_unknown_model_returns_anthropic_envelope_400() {
     let body: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(body["type"], "error");
     assert_eq!(body["error"]["type"], "Bad Request");
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("unknown model")
-    );
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("unknown model"));
 }
 
 #[tokio::test]
@@ -1503,7 +1566,11 @@ enum DeferredBehavior {
     Ok(Value),
     /// Return ProxyError::Upstream with the given status/body until the
     /// call count reaches `fail_count`, then return Ok(body).
-    FailThenOk { fail_count: u32, ok: Value, status: u16 },
+    FailThenOk {
+        fail_count: u32,
+        ok: Value,
+        status: u16,
+    },
 }
 
 #[async_trait]
@@ -1551,9 +1618,10 @@ async fn mock_llm_provider_short_cooldown_for_non_429_upstream_error() {
     // the *short* default TTL, not the model's configured cooldown_seconds.
     // Verifying this prevents accidentally giving flaky 5xx upstreams the
     // same grace period as rate-limited (429) ones.
-    let behavior = Arc::new(std::sync::Mutex::new(DeferredBehavior::Ok(
-        anthropic_ok("secondary body", "claude-test"),
-    )));
+    let behavior = Arc::new(std::sync::Mutex::new(DeferredBehavior::Ok(anthropic_ok(
+        "secondary body",
+        "claude-test",
+    ))));
     let primary_behavior = Arc::new(std::sync::Mutex::new(DeferredBehavior::FailThenOk {
         fail_count: u32::MAX,
         ok: serde_json::json!({}),
@@ -1591,9 +1659,9 @@ async fn mock_llm_provider_short_cooldown_for_non_429_upstream_error() {
                 api_base: "http://x".into(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
-            provider_ignore: Vec::new(),
-            provider_allow: Vec::new(),
-            reasoning_echo: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -1601,9 +1669,9 @@ async fn mock_llm_provider_short_cooldown_for_non_429_upstream_error() {
                 api_base: "http://x".into(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
-            provider_ignore: Vec::new(),
-            provider_allow: Vec::new(),
-            reasoning_echo: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
             },
         ],
         models: vec![ModelConfig {
@@ -1614,12 +1682,15 @@ async fn mock_llm_provider_short_cooldown_for_non_429_upstream_error() {
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-            ..Config::default()
-        };
+        ..Config::default()
+    };
     let router = Router::new(Arc::new(cfg), providers.clone(), CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
-    let (out, attempts, _served) = router.complete(model_cfg, &make_req("claude-test")).await.unwrap();
+    let (out, attempts, _served) = router
+        .complete(model_cfg, &make_req("claude-test"))
+        .await
+        .unwrap();
     let ProviderOutput::Json(body) = out else {
         panic!("expected JSON output");
     };
@@ -1661,8 +1732,7 @@ async fn mock_llm_provider_402_uses_configured_cooldown_seconds_and_skips_primar
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
         .respond_with(
-            ResponseTemplate::new(402)
-                .set_body_string("You have exceeded your monthly quota"),
+            ResponseTemplate::new(402).set_body_string("You have exceeded your monthly quota"),
         )
         .expect(1)
         .mount(&primary)
@@ -1670,16 +1740,18 @@ async fn mock_llm_provider_402_uses_configured_cooldown_seconds_and_skips_primar
     let backup = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_ok(
-            "backup served",
-            "claude-test",
-        )))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(anthropic_ok("backup served", "claude-test")),
+        )
         .expect(2)
         .mount(&backup)
         .await;
 
     let mut providers = HashMap::new();
-    providers.insert("primary".to_string(), wiremock_provider("primary", &primary));
+    providers.insert(
+        "primary".to_string(),
+        wiremock_provider("primary", &primary),
+    );
     providers.insert("backup".to_string(), wiremock_provider("backup", &backup));
     let cfg = Config {
         server: ServerConfig {
@@ -1697,9 +1769,9 @@ async fn mock_llm_provider_402_uses_configured_cooldown_seconds_and_skips_primar
                 api_base: primary.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
-            provider_ignore: Vec::new(),
-            provider_allow: Vec::new(),
-            reasoning_echo: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -1707,9 +1779,9 @@ async fn mock_llm_provider_402_uses_configured_cooldown_seconds_and_skips_primar
                 api_base: backup.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
-            provider_ignore: Vec::new(),
-            provider_allow: Vec::new(),
-            reasoning_echo: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
             },
         ],
         models: vec![ModelConfig {
@@ -1720,8 +1792,8 @@ async fn mock_llm_provider_402_uses_configured_cooldown_seconds_and_skips_primar
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-            ..Config::default()
-        };
+        ..Config::default()
+    };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
@@ -1798,7 +1870,10 @@ async fn mock_llm_provider_subsequent_request_skips_cooldown_provider_directly()
         .await;
 
     let mut providers = HashMap::new();
-    providers.insert("primary".to_string(), wiremock_provider("primary", &primary));
+    providers.insert(
+        "primary".to_string(),
+        wiremock_provider("primary", &primary),
+    );
     providers.insert("backup".to_string(), wiremock_provider("backup", &backup));
     let cfg = Config {
         server: ServerConfig {
@@ -1816,9 +1891,9 @@ async fn mock_llm_provider_subsequent_request_skips_cooldown_provider_directly()
                 api_base: primary.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
-            provider_ignore: Vec::new(),
-            provider_allow: Vec::new(),
-            reasoning_echo: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -1826,9 +1901,9 @@ async fn mock_llm_provider_subsequent_request_skips_cooldown_provider_directly()
                 api_base: backup.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
-            provider_ignore: Vec::new(),
-            provider_allow: Vec::new(),
-            reasoning_echo: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
             },
         ],
         models: vec![ModelConfig {
@@ -1839,8 +1914,8 @@ async fn mock_llm_provider_subsequent_request_skips_cooldown_provider_directly()
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-            ..Config::default()
-        };
+        ..Config::default()
+    };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
@@ -1924,7 +1999,9 @@ async fn mock_llm_provider_skips_provider_with_unsupported_model_via_runtime_400
     let backup_server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_ok("backup ok", "claude-test")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(anthropic_ok("backup ok", "claude-test")),
+        )
         .mount(&backup_server)
         .await;
 
@@ -1953,9 +2030,9 @@ async fn mock_llm_provider_skips_provider_with_unsupported_model_via_runtime_400
                 api_base: primary_server.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
-            provider_ignore: Vec::new(),
-            provider_allow: Vec::new(),
-            reasoning_echo: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -1963,9 +2040,9 @@ async fn mock_llm_provider_skips_provider_with_unsupported_model_via_runtime_400
                 api_base: backup_server.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
-            provider_ignore: Vec::new(),
-            provider_allow: Vec::new(),
-            reasoning_echo: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
             },
         ],
         models: vec![ModelConfig {
@@ -1976,19 +2053,26 @@ async fn mock_llm_provider_skips_provider_with_unsupported_model_via_runtime_400
             max_retries_per_provider: 1,
             max_retries_total: 2,
         }],
-            ..Config::default()
-        };
+        ..Config::default()
+    };
     let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
 
     let model_cfg = router.find_model("claude-test").unwrap();
-    let (out, attempts, _served) = router.complete(model_cfg, &make_req("claude-test")).await.unwrap();
+    let (out, attempts, _served) = router
+        .complete(model_cfg, &make_req("claude-test"))
+        .await
+        .unwrap();
     let ProviderOutput::Json(body) = out else {
         panic!("expected JSON output");
     };
     assert_eq!(body["content"][0]["text"], "backup ok");
     assert_eq!(attempts.len(), 1);
     match &attempts[0] {
-        RouteStep::Failed { provider, status, body } => {
+        RouteStep::Failed {
+            provider,
+            status,
+            body,
+        } => {
             assert_eq!(provider, "primary");
             assert_eq!(*status, 400);
             assert!(body.contains("model_not_supported"));
@@ -2014,8 +2098,7 @@ async fn output_config_propagation_through_router() {
     // body so we can assert the response_format shape on the wire.
     use llmproxy::providers::openai_compat::OpenAiCompatProvider;
 
-    let captured_body: Arc<std::sync::Mutex<Option<Value>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    let captured_body: Arc<std::sync::Mutex<Option<Value>>> = Arc::new(std::sync::Mutex::new(None));
     let captured_for_responder = captured_body.clone();
 
     let server = MockServer::start().await;
@@ -2024,8 +2107,8 @@ async fn output_config_propagation_through_router() {
         .respond_with(move |req: &wiremock::Request| {
             // Parse the request body so we can inspect it after the
             // proxy call returns. The captured body is asserted below.
-            let parsed: Value = serde_json::from_slice(&req.body)
-                .unwrap_or_else(|_| json!({"_unparseable": true}));
+            let parsed: Value =
+                serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({"_unparseable": true}));
             *captured_for_responder.lock().unwrap() = Some(parsed);
             // OpenAI Chat Completions response shape (the real provider
             // converts this into an Anthropic envelope before returning
@@ -2078,9 +2161,9 @@ async fn output_config_propagation_through_router() {
         api_base,
         model_rewrite: HashMap::new(),
         use_proxy: false,
-    provider_ignore: Vec::new(),
-    provider_allow: Vec::new(),
-    reasoning_echo: false,
+        provider_ignore: Vec::new(),
+        provider_allow: Vec::new(),
+        reasoning_echo: false,
     }];
     let app = build_axum_app(providers, configs, vec!["primary".to_string()]);
 

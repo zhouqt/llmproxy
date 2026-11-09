@@ -7,7 +7,7 @@ use tracing_subscriber::EnvFilter;
 
 #[allow(unused_imports)]
 use llmproxy::{
-    anthropic, auth, config, conversion, cooldown, error, oauth, openai, proxy_client, providers,
+    anthropic, auth, config, conversion, cooldown, error, oauth, openai, providers, proxy_client,
     router, server, state,
 };
 
@@ -107,8 +107,12 @@ fn build_state(
         } else {
             direct_http.clone()
         };
-        let built = providers::build(p, client, cfg.server.expose_upstream_details)
-            .map_err(|e| llmproxy::error::ProxyError::Other(anyhow::anyhow!("building provider '{name}': {e}")))?;
+        let built =
+            providers::build(p, client, cfg.server.expose_upstream_details).map_err(|e| {
+                llmproxy::error::ProxyError::Other(anyhow::anyhow!(
+                    "building provider '{name}': {e}"
+                ))
+            })?;
         if let Some(h) = built.clone().spawn_background() {
             bg_handles.push(h);
         }
@@ -221,9 +225,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llmproxy::config::{
-        Config, ModelConfig, ProviderConfig, ServerConfig,
-    };
+    use llmproxy::config::{Config, ModelConfig, ProviderConfig, ServerConfig};
     use llmproxy::expect_variant;
     use secrecy::ExposeSecret;
 
@@ -231,7 +233,10 @@ mod tests {
     /// terminated by the expected signal. Consolidates the per-test panic
     /// message into one line.
     fn assert_subprocess_exit_ok(status: std::process::ExitStatus, expected_signal: Option<i32>) {
-        assert!(status.code().is_some() || status.signal() == expected_signal, "subprocess exit mismatch");
+        assert!(
+            status.code().is_some() || status.signal() == expected_signal,
+            "subprocess exit mismatch"
+        );
     }
 
     fn strings(values: &[&str]) -> Vec<String> {
@@ -293,7 +298,8 @@ models:
     async fn build_state_wires_providers_router_and_cooldown() {
         let cfg = fixture_config();
         let (state, bg_handles) =
-            build_state(cfg.clone(), reqwest::Client::new(), reqwest::Client::new()).expect("build_state succeeds");
+            build_state(cfg.clone(), reqwest::Client::new(), reqwest::Client::new())
+                .expect("build_state succeeds");
 
         // Router can find the model and primary provider.
         let model = state
@@ -363,9 +369,13 @@ models:
 "#;
         let cfg = Config::parse(yaml).unwrap();
         let (state, bg_handles) =
-            build_state(cfg.clone(), reqwest::Client::new(), reqwest::Client::new()).expect("build_state succeeds");
+            build_state(cfg.clone(), reqwest::Client::new(), reqwest::Client::new())
+                .expect("build_state succeeds");
 
-        assert!(!bg_handles.is_empty(), "copilot should spawn a refresh task");
+        assert!(
+            !bg_handles.is_empty(),
+            "copilot should spawn a refresh task"
+        );
         for handle in &bg_handles {
             handle.abort();
         }
@@ -428,7 +438,10 @@ models:
         let out = run_subprocess(&["--help"]);
         assert_eq!(out.status.code(), Some(0));
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("Usage"), "subprocess --help stderr must contain Usage");
+        assert!(
+            stderr.contains("Usage"),
+            "subprocess --help stderr must contain Usage"
+        );
     }
 
     #[test]
@@ -626,10 +639,7 @@ models:
             ModelConfig { primary, .. } => assert_eq!(primary, "compat"),
         }
         assert_eq!(
-            cfg.server
-                .api_key
-                .as_ref()
-                .map(|k| k.expose_secret()),
+            cfg.server.api_key.as_ref().map(|k| k.expose_secret()),
             Some("test-key")
         );
         let _ = ServerConfig::default();

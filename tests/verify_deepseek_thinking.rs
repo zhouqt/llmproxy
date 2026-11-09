@@ -144,8 +144,8 @@ fn build_router(
             max_retries_per_provider: 1,
             max_retries_total: model_chain.len() as u32,
         }],
-            ..Config::default()
-        };
+        ..Config::default()
+    };
     Router::new(Arc::new(cfg), providers, CooldownCache::new())
 }
 
@@ -180,8 +180,7 @@ async fn cross_model_fallback_self_healing() {
 
     // -- Wiremock: fallback (DeepSeek) returns 400 thinking → 200 --------
     let deepseek_srv = MockServer::start().await;
-    let captured: Arc<std::sync::Mutex<Option<Value>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    let captured: Arc<std::sync::Mutex<Option<Value>>> = Arc::new(std::sync::Mutex::new(None));
     let captured_for_responder = captured.clone();
     let ds_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let ds_counter_clone = ds_counter.clone();
@@ -192,9 +191,8 @@ async fn cross_model_fallback_self_healing() {
             if n == 0 {
                 ResponseTemplate::new(400).set_body_json(thinking_400_body())
             } else {
-                *captured_for_responder.lock().unwrap() = Some(
-                    serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
-                );
+                *captured_for_responder.lock().unwrap() =
+                    Some(serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({})));
                 ResponseTemplate::new(200)
                     .set_body_json(anthropic_ok("deepseek answer after strip", "claude-test"))
             }
@@ -237,7 +235,9 @@ async fn cross_model_fallback_self_healing() {
     // -- Assert fallback happened (1 RouteStep::Failed for primary's 429) -----
     assert_eq!(attempts.len(), 1, "exactly one attempt (primary's 429)");
     match &attempts[0] {
-        RouteStep::Failed { provider, status, .. } => {
+        RouteStep::Failed {
+            provider, status, ..
+        } => {
             assert_eq!(provider, "claude");
             assert_eq!(*status, 429);
         }
@@ -252,7 +252,11 @@ async fn cross_model_fallback_self_healing() {
     );
 
     // -- Assert the retried body is properly stripped ---------------------
-    let sent = captured.lock().unwrap().clone().expect("second body captured");
+    let sent = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("second body captured");
 
     // Top-level thinking key must be ABSENT (not null).
     assert!(
@@ -282,7 +286,11 @@ async fn cross_model_fallback_self_healing() {
             for b in blocks {
                 let t = b["type"].as_str();
                 assert_ne!(t, Some("thinking"), "thinking block must be stripped");
-                assert_ne!(t, Some("redacted_thinking"), "redacted_thinking block must be stripped");
+                assert_ne!(
+                    t,
+                    Some("redacted_thinking"),
+                    "redacted_thinking block must be stripped"
+                );
             }
         }
     }
@@ -360,8 +368,7 @@ async fn strip_exhausted_no_deeper_fallback() {
     match &err {
         ProxyError::Upstream { status, body } => {
             assert_eq!(*status, 400);
-            let parsed: Value =
-                serde_json::from_str(body).unwrap_or_else(|_| json!({}));
+            let parsed: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
             assert_eq!(
                 parsed["error"]["message"],
                 "The `content[].thinking` in the thinking mode must be passed back to the API."
@@ -422,8 +429,7 @@ async fn pure_thinking_history_message_removed_after_strip() {
     // the structural consequence (message removal + consecutive roles).
 
     let server = MockServer::start().await;
-    let captured: Arc<std::sync::Mutex<Option<Value>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    let captured: Arc<std::sync::Mutex<Option<Value>>> = Arc::new(std::sync::Mutex::new(None));
     let captured_for_responder = captured.clone();
     let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let counter_clone = counter.clone();
@@ -435,9 +441,8 @@ async fn pure_thinking_history_message_removed_after_strip() {
             if n == 0 {
                 ResponseTemplate::new(400).set_body_json(thinking_400_body())
             } else {
-                *captured_for_responder.lock().unwrap() = Some(
-                    serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
-                );
+                *captured_for_responder.lock().unwrap() =
+                    Some(serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({})));
                 // Return 200 so the test passes and we can inspect the
                 // captured body. In production, a real upstream would
                 // reject consecutive same-role messages with a new 400.
@@ -473,7 +478,11 @@ async fn pure_thinking_history_message_removed_after_strip() {
     );
 
     // -- Inspect the retried body for structural consequences ------------
-    let sent = captured.lock().unwrap().clone().expect("second body captured");
+    let sent = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("second body captured");
 
     // Top-level thinking is removed.
     assert!(sent.as_object().unwrap().get("thinking").is_none());
@@ -530,8 +539,7 @@ async fn top_level_thinking_param_completely_absent_in_retry() {
     // but we replicate it here with a fresh fixture for completeness.
 
     let server = MockServer::start().await;
-    let captured: Arc<std::sync::Mutex<Option<Value>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    let captured: Arc<std::sync::Mutex<Option<Value>>> = Arc::new(std::sync::Mutex::new(None));
     let captured_for_responder = captured.clone();
     let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let counter_clone = counter.clone();
@@ -543,11 +551,9 @@ async fn top_level_thinking_param_completely_absent_in_retry() {
             if n == 0 {
                 ResponseTemplate::new(400).set_body_json(thinking_400_body())
             } else {
-                *captured_for_responder.lock().unwrap() = Some(
-                    serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
-                );
-                ResponseTemplate::new(200)
-                    .set_body_json(anthropic_ok("ok", "claude-test"))
+                *captured_for_responder.lock().unwrap() =
+                    Some(serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({})));
+                ResponseTemplate::new(200).set_body_json(anthropic_ok("ok", "claude-test"))
             }
         })
         .expect(2)
@@ -580,7 +586,11 @@ async fn top_level_thinking_param_completely_absent_in_retry() {
 
     let (_out, _attempts, _served) = router.complete(model_cfg, &req).await.unwrap();
 
-    let sent = captured.lock().unwrap().clone().expect("second body captured");
+    let sent = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("second body captured");
 
     // The key assertion: `thinking` must be completely absent from the
     // top-level object. It must NOT be present as `null`.
@@ -626,9 +636,7 @@ async fn stream_thinking_400_with_thinking_history_returns_friendly_error() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
-        .respond_with(
-            ResponseTemplate::new(400).set_body_json(thinking_400_body())
-        )
+        .respond_with(ResponseTemplate::new(400).set_body_json(thinking_400_body()))
         .expect(1) // exactly one call — no retry
         .mount(&server)
         .await;
