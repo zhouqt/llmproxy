@@ -28,15 +28,11 @@ pub fn gpt5_family(model: &str) -> bool {
 /// `[A-Za-z0-9_-]` word — `task-1234…` must never match `sk-`.
 fn secret_span(input: &str, i: usize) -> Option<usize> {
     type Rule = (&'static str, fn(char) -> bool, usize);
-    const SK_AFTER: fn(char) -> bool =
-        |c| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    const SK_AFTER: fn(char) -> bool = |c| c.is_ascii_alphanumeric() || c == '_' || c == '-';
     const GH_AFTER: fn(char) -> bool = |c| c.is_ascii_alphanumeric();
-    const PAT_AFTER: fn(char) -> bool =
-        |c| c.is_ascii_alphanumeric() || c == '_';
-    const AKIA_AFTER: fn(char) -> bool =
-        |c| c.is_ascii_digit() || c.is_ascii_uppercase();
-    const XOX_AFTER: fn(char) -> bool =
-        |c| c.is_ascii_alphanumeric() || c == '-';
+    const PAT_AFTER: fn(char) -> bool = |c| c.is_ascii_alphanumeric() || c == '_';
+    const AKIA_AFTER: fn(char) -> bool = |c| c.is_ascii_digit() || c.is_ascii_uppercase();
+    const XOX_AFTER: fn(char) -> bool = |c| c.is_ascii_alphanumeric() || c == '-';
     const BEARER_AFTER: fn(char) -> bool =
         |c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '+' | '/' | '=' | '-');
 
@@ -112,10 +108,7 @@ pub fn redact_secrets(input: &str) -> String {
             }
         }
         // Advance one UTF-8 character, copying it verbatim.
-        let ch_len = input[i..]
-            .chars()
-            .next()
-            .map_or(1, char::len_utf8);
+        let ch_len = input[i..].chars().next().map_or(1, char::len_utf8);
         out.push_str(&input[i..i + ch_len]);
         i += ch_len;
     }
@@ -162,7 +155,13 @@ pub fn summarize_for_log(input: &str, empty_placeholder: &str) -> String {
         s.replace_range(start..start + end_rel + 3, " ");
     }
     // Strip URLs (http/https/ftp), image refs, and CSS url(...) calls.
-    let url_chars = |c: char| c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-' | '_' | '?' | '&' | '=' | '%' | '#' | '+' | '~');
+    let url_chars = |c: char| {
+        c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                ':' | '/' | '.' | '-' | '_' | '?' | '&' | '=' | '%' | '#' | '+' | '~'
+            )
+    };
     let strip_token = |s: &mut String, token: &str| {
         let mut idx = 0;
         while let Some(rel) = s[idx..].find(token) {
@@ -274,8 +273,14 @@ mod tests {
 
         // Empty input returns placeholder.
         assert_eq!(summarize_for_log("", "<empty payload>"), "<empty payload>");
-        assert_eq!(summarize_for_log("   \n  \t ", "<empty payload>"), "<empty payload>");
-        assert_eq!(summarize_for_log("<html></html>", "<empty payload>"), "<empty payload>");
+        assert_eq!(
+            summarize_for_log("   \n  \t ", "<empty payload>"),
+            "<empty payload>"
+        );
+        assert_eq!(
+            summarize_for_log("<html></html>", "<empty payload>"),
+            "<empty payload>"
+        );
 
         // Multibyte characters are preserved.
         let mb = "模型限流 请稍后重试";
@@ -382,8 +387,14 @@ mod tests {
         assert!(out.len() <= 210, "still capped: {out}");
         assert!(out.contains("<redacted>"), "marker present: {out}");
         assert!(!out.contains("ghp_"), "no PAT head survives: {out}");
-        assert!(!out.contains("a1B2c3D4"), "no token fragment survives: {out}");
-        assert!(out.contains("retry later"), "trailing text preserved: {out}");
+        assert!(
+            !out.contains("a1B2c3D4"),
+            "no token fragment survives: {out}"
+        );
+        assert!(
+            out.contains("retry later"),
+            "trailing text preserved: {out}"
+        );
     }
 }
 

@@ -105,7 +105,9 @@ pub enum ResponseInputItem {
     /// Reference to a previously-produced item (reasoning, message,
     /// function_call, etc.) by id. Spec `ItemReferenceParam.id` (v0.11
     /// correction — earlier plan draft used `reference`; spec is `id`).
-    ItemReference { id: String },
+    ItemReference {
+        id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,8 +120,13 @@ pub enum ResponseInputContent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseInputPart {
-    InputText { text: String },
-    InputImage { image_url: String, detail: Option<String> },
+    InputText {
+        text: String,
+    },
+    InputImage {
+        image_url: String,
+        detail: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,7 +259,7 @@ pub struct OutputTokensDetails {
 pub enum OutputItem {
     Message {
         id: String,
-        role: String, // "assistant"
+        role: String,   // "assistant"
         status: String, // "completed" | "incomplete"
         content: Vec<OutputContentPart>,
     },
@@ -341,35 +348,19 @@ pub enum OutputContentPart {
 #[serde(tag = "type")]
 pub enum ResponsesStreamEvent {
     #[serde(rename = "response.created")]
-    ResponseCreated {
-        response: Box<ResponsesResponse>,
-    },
+    ResponseCreated { response: Box<ResponsesResponse> },
     #[serde(rename = "response.in_progress")]
-    ResponseInProgress {
-        response: Box<ResponsesResponse>,
-    },
+    ResponseInProgress { response: Box<ResponsesResponse> },
     #[serde(rename = "response.completed")]
-    ResponseCompleted {
-        response: Box<ResponsesResponse>,
-    },
+    ResponseCompleted { response: Box<ResponsesResponse> },
     #[serde(rename = "response.failed")]
-    ResponseFailed {
-        response: Box<ResponsesResponse>,
-    },
+    ResponseFailed { response: Box<ResponsesResponse> },
     #[serde(rename = "response.incomplete")]
-    ResponseIncomplete {
-        response: Box<ResponsesResponse>,
-    },
+    ResponseIncomplete { response: Box<ResponsesResponse> },
     #[serde(rename = "response.output_item.added")]
-    ResponseOutputItemAdded {
-        output_index: u32,
-        item: OutputItem,
-    },
+    ResponseOutputItemAdded { output_index: u32, item: OutputItem },
     #[serde(rename = "response.output_item.done")]
-    ResponseOutputItemDone {
-        output_index: u32,
-        item: OutputItem,
-    },
+    ResponseOutputItemDone { output_index: u32, item: OutputItem },
     #[serde(rename = "response.content_part.added")]
     ResponseContentPartAdded {
         item_id: String,
@@ -490,22 +481,13 @@ pub enum ResponsesStreamEvent {
     /// SSE event indicating a web search call is in progress (hosted
     /// tool provider has started the search).
     #[serde(rename = "response.web_search_call.in_progress")]
-    ResponseWebSearchCallInProgress {
-        output_index: u32,
-        item_id: String,
-    },
+    ResponseWebSearchCallInProgress { output_index: u32, item_id: String },
     /// SSE event indicating the web search provider is actively searching.
     #[serde(rename = "response.web_search_call.searching")]
-    ResponseWebSearchCallSearching {
-        output_index: u32,
-        item_id: String,
-    },
+    ResponseWebSearchCallSearching { output_index: u32, item_id: String },
     /// SSE event indicating the web search has completed.
     #[serde(rename = "response.web_search_call.completed")]
-    ResponseWebSearchCallCompleted {
-        output_index: u32,
-        item_id: String,
-    },
+    ResponseWebSearchCallCompleted { output_index: u32, item_id: String },
     /// Upstream SSE error event. OpenAI send these inline during a
     /// stream when something goes wrong mid-response (e.g. model
     /// overload, internal error).
@@ -779,7 +761,11 @@ mod tests {
         };
         let v = serde_json::to_value(&cfg).unwrap();
         let obj = v.as_object().unwrap();
-        assert!(!obj.contains_key("type"), "type field must not appear; got {}", v);
+        assert!(
+            !obj.contains_key("type"),
+            "type field must not appear; got {}",
+            v
+        );
         assert_eq!(obj["effort"], "medium");
         assert!(!obj.contains_key("summary"));
     }
@@ -955,7 +941,10 @@ mod tests {
         let raw = json!({"type": "web_search", "search_context_size": "high"});
         let tool: ResponsesTool = serde_json::from_value(raw).unwrap();
         match &tool {
-            ResponsesTool::WebSearch { search_context_size, .. } => {
+            ResponsesTool::WebSearch {
+                search_context_size,
+                ..
+            } => {
                 assert_eq!(search_context_size.as_deref(), Some("high"));
             }
             other => panic!("expected WebSearch, got {other:?}"),

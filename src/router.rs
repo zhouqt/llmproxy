@@ -253,7 +253,9 @@ pub fn derive_fail_reason(steps: &[RouteStep]) -> Option<FailReason> {
         (true, true) => unreachable!("early-exit above returns Mixed when both flags are set"),
         // Non-empty steps + no `Failed` implies at least one
         // `LocalSkip`, which implies `Cooldown` or `ModelUnmapped`.
-        (false, false) => unreachable!("derive_fail_reason: non-empty steps with no Failed implies at least one LocalSkip"),
+        (false, false) => unreachable!(
+            "derive_fail_reason: non-empty steps with no Failed implies at least one LocalSkip"
+        ),
     }
 }
 
@@ -324,7 +326,9 @@ pub fn format_attempts_header(steps: &[RouteStep], served_by: Option<&str>) -> O
         // narrows to the `Failed` arm, which has `status` and
         // `provider`.
         let (provider, status) = match step {
-            RouteStep::Failed { provider, status, .. } => (provider.as_str(), *status),
+            RouteStep::Failed {
+                provider, status, ..
+            } => (provider.as_str(), *status),
             RouteStep::LocalSkip { .. } => unreachable!("filtered above"),
         };
         let _ = write!(out, "{provider}:{status}");
@@ -372,8 +376,16 @@ pub struct ProviderStatus {
 }
 
 impl Router {
-    pub fn new(cfg: Arc<Config>, providers: HashMap<String, SharedProvider>, cooldown: CooldownCache) -> Self {
-        Self { cfg, providers, cooldown }
+    pub fn new(
+        cfg: Arc<Config>,
+        providers: HashMap<String, SharedProvider>,
+        cooldown: CooldownCache,
+    ) -> Self {
+        Self {
+            cfg,
+            providers,
+            cooldown,
+        }
     }
 
     pub fn config(&self) -> &Config {
@@ -445,12 +457,20 @@ impl Router {
                 // Track the soonest-expiring one as fallback.
                 let active = self.cooldown.active().await;
                 if let Some((_, _, remaining)) = active.iter().find(|(n, _, _)| n == name) {
-                    if best.as_ref().map(|(_, _, d)| *remaining < *d).unwrap_or(true) {
+                    if best
+                        .as_ref()
+                        .map(|(_, _, d)| *remaining < *d)
+                        .unwrap_or(true)
+                    {
                         best = Some((name.to_string(), p.clone(), *remaining));
                     }
                 }
             } else {
-                tracing::warn!("model '{}' references unknown provider '{}'", model.name, name);
+                tracing::warn!(
+                    "model '{}' references unknown provider '{}'",
+                    model.name,
+                    name
+                );
             }
         }
 
@@ -570,9 +590,7 @@ impl Router {
                             } else {
                                 Duration::from_secs(5)
                             };
-                            self.cooldown
-                                .mark_cooldown(name, ttl, *status, &body)
-                                .await;
+                            self.cooldown.mark_cooldown(name, ttl, *status, &body).await;
                             last_error = Some(e);
                         } else {
                             return Err(e);
@@ -616,10 +634,7 @@ impl Router {
             // `max_total` only counts real upstream calls (RouteStep::Failed).
             // Local skips (cooldown / model_rewrite miss) have no upstream
             // cost and shouldn't trip the budget — plan §Phase 1.
-            let failed_count = attempts
-                .iter()
-                .filter(|s| s.is_upstream_failure())
-                .count();
+            let failed_count = attempts.iter().filter(|s| s.is_upstream_failure()).count();
             if failed_count >= max_total {
                 break;
             }
@@ -740,11 +755,8 @@ impl Router {
                         attempts.push(RouteStep::Failed {
                             provider: name.clone(),
                             status: *status,
-                            body: crate::util::truncate_for_log(
-                                body,
-                                FAILED_BODY_LOG_CAP_BYTES,
-                            )
-                            .to_string(),
+                            body: crate::util::truncate_for_log(body, FAILED_BODY_LOG_CAP_BYTES)
+                                .to_string(),
                         });
                         let ttl = if matches!(*status, 402 | 429) {
                             Duration::from_secs(model.cooldown_seconds)
@@ -765,11 +777,8 @@ impl Router {
                         attempts.push(RouteStep::Failed {
                             provider: name.clone(),
                             status: *status,
-                            body: crate::util::truncate_for_log(
-                                body,
-                                FAILED_BODY_LOG_CAP_BYTES,
-                            )
-                            .to_string(),
+                            body: crate::util::truncate_for_log(body, FAILED_BODY_LOG_CAP_BYTES)
+                                .to_string(),
                         });
                         self.cooldown
                             .mark_cooldown(name, Duration::from_secs(60), *status, &body)
@@ -813,11 +822,11 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use crate::config::{ModelConfig, ProviderConfig};
     use crate::providers::Provider;
     use crate::secrets::secret_string;
     use async_trait::async_trait;
+    use bytes::Bytes;
     use futures_util::stream;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -883,7 +892,6 @@ mod tests {
             &self.name
         }
 
-
         async fn complete(
             &self,
             _req: &MessagesRequest,
@@ -933,9 +941,9 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
-                reasoning_echo: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -943,9 +951,9 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
-                reasoning_echo: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
                 },
             ],
             models: vec![ModelConfig {
@@ -956,8 +964,8 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-                ..Config::default()
-            };
+            ..Config::default()
+        };
 
         Router::new(Arc::new(cfg), providers, CooldownCache::new())
     }
@@ -980,7 +988,9 @@ mod tests {
         assert!(matches!(out, ProviderOutput::Json(_)));
         assert_eq!(attempts.len(), 1);
         match &attempts[0] {
-            RouteStep::Failed { provider, status, .. } => {
+            RouteStep::Failed {
+                provider, status, ..
+            } => {
                 assert_eq!(provider, "primary");
                 assert_eq!(*status, 429);
             }
@@ -1021,9 +1031,9 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
-                reasoning_echo: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -1031,9 +1041,9 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
-                reasoning_echo: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
                 },
             ],
             models: vec![ModelConfig {
@@ -1044,8 +1054,8 @@ mod tests {
                 max_retries_per_provider: 3,
                 max_retries_total: 3,
             }],
-                ..Config::default()
-            };
+            ..Config::default()
+        };
         let router = Router::new(Arc::new(cfg), providers.clone(), CooldownCache::new());
         let model = router.find_model("m").unwrap();
 
@@ -1057,7 +1067,9 @@ mod tests {
         assert_eq!(attempts.len(), 2);
         for a in &attempts {
             match a {
-                RouteStep::Failed { provider, status, .. } => {
+                RouteStep::Failed {
+                    provider, status, ..
+                } => {
                     assert_eq!(provider, "primary");
                     assert_eq!(*status, 429);
                 }
@@ -1213,7 +1225,9 @@ mod tests {
         let router = build_test_router();
         let statuses = router.provider_status().await;
         assert_eq!(statuses.len(), 2);
-        assert!(statuses.iter().all(|s| s.status == ProviderHealth::Available));
+        assert!(statuses
+            .iter()
+            .all(|s| s.status == ProviderHealth::Available));
         assert!(statuses.iter().all(|s| s.last_error_status.is_none()));
     }
 
@@ -1283,16 +1297,17 @@ mod tests {
         let router = build_test_router();
         let model = router.find_model("m").unwrap();
 
-        let (provider, output, attempts) = router
-            .stream(model, &dummy_request())
-            .await
-            .unwrap();
+        let (provider, output, attempts) = router.stream(model, &dummy_request()).await.unwrap();
 
         assert_eq!(provider.name(), "backup");
         assert!(matches!(output, ProviderOutput::Stream(_)));
         assert_eq!(attempts.len(), 1);
         match &attempts[0] {
-            RouteStep::Failed { provider, status, body } => {
+            RouteStep::Failed {
+                provider,
+                status,
+                body,
+            } => {
                 assert_eq!(provider, "primary");
                 assert_eq!(*status, 429);
                 assert_eq!(body, "rate limited");
@@ -1339,9 +1354,9 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
-                reasoning_echo: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -1349,9 +1364,9 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
-                reasoning_echo: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
                 },
             ],
             models: vec![ModelConfig {
@@ -1362,21 +1377,22 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-                ..Config::default()
-            };
+            ..Config::default()
+        };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
 
-        let (provider, output, attempts) = router
-            .stream(model, &dummy_request())
-            .await
-            .unwrap();
+        let (provider, output, attempts) = router.stream(model, &dummy_request()).await.unwrap();
 
         assert_eq!(provider.name(), "backup");
         assert!(matches!(output, ProviderOutput::Stream(_)));
         assert_eq!(attempts.len(), 1);
         match &attempts[0] {
-            RouteStep::Failed { provider, status, body } => {
+            RouteStep::Failed {
+                provider,
+                status,
+                body,
+            } => {
                 assert_eq!(provider, "primary");
                 assert_eq!(*status, 402);
                 assert_eq!(body, "rate limited");
@@ -1428,9 +1444,9 @@ mod tests {
                 api_base: "http://x".into(),
                 model_rewrite: Default::default(),
                 use_proxy: false,
-            provider_ignore: Vec::new(),
-            provider_allow: Vec::new(),
-            reasoning_echo: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
             }],
             models: vec![ModelConfig {
                 name: "m".into(),
@@ -1440,8 +1456,8 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 1,
             }],
-                ..Config::default()
-            };
+            ..Config::default()
+        };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
 
@@ -1498,8 +1514,12 @@ mod tests {
             .err()
             .expect("stream should fail");
 
-        assert!(matches!(complete, ProxyError::BadRequest(ref message) if message == "invalid request"));
-        assert!(matches!(stream, ProxyError::BadRequest(ref message) if message == "invalid stream request"));
+        assert!(
+            matches!(complete, ProxyError::BadRequest(ref message) if message == "invalid request")
+        );
+        assert!(
+            matches!(stream, ProxyError::BadRequest(ref message) if message == "invalid stream request")
+        );
         assert!(!router.cooldown().is_cooling_down("primary").await);
     }
 
@@ -1532,7 +1552,10 @@ mod tests {
         // not AllProvidersFailed. The router distinguishes the two cases:
         // "no attempt happened" stays as AllProvidersCoolingDown,
         // "at least one attempt failed" becomes AllProvidersFailed.
-        assert!(matches!(complete, ProxyError::AllProvidersCoolingDown { .. }));
+        assert!(matches!(
+            complete,
+            ProxyError::AllProvidersCoolingDown { .. }
+        ));
         assert!(matches!(stream, ProxyError::AllProvidersCoolingDown { .. }));
     }
 
@@ -1570,7 +1593,9 @@ mod tests {
         // provider is silently skipped without recording an attempt.
         assert_eq!(attempts.len(), 1);
         match &attempts[0] {
-            RouteStep::Failed { provider, status, .. } => {
+            RouteStep::Failed {
+                provider, status, ..
+            } => {
                 assert_eq!(provider, "primary");
                 assert_eq!(*status, 429);
             }
@@ -1592,7 +1617,9 @@ mod tests {
         assert!(matches!(output, ProviderOutput::Stream(_)));
         assert_eq!(attempts.len(), 1);
         match &attempts[0] {
-            RouteStep::Failed { provider, status, .. } => {
+            RouteStep::Failed {
+                provider, status, ..
+            } => {
                 assert_eq!(provider, "primary");
                 assert_eq!(*status, 429);
             }
@@ -1633,9 +1660,9 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
-                reasoning_echo: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -1643,9 +1670,9 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
-                reasoning_echo: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
                 },
             ],
             models: vec![ModelConfig {
@@ -1656,8 +1683,8 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 5,
             }],
-                ..Config::default()
-            };
+            ..Config::default()
+        };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
 
@@ -1706,9 +1733,9 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
-                reasoning_echo: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -1716,9 +1743,9 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
-                reasoning_echo: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
                 },
             ],
             models: vec![ModelConfig {
@@ -1729,8 +1756,8 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 5,
             }],
-                ..Config::default()
-            };
+            ..Config::default()
+        };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
 
@@ -1807,9 +1834,9 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
-                reasoning_echo: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -1817,9 +1844,9 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
-                reasoning_echo: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
                 },
             ],
             models: vec![ModelConfig {
@@ -1830,8 +1857,8 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-                ..Config::default()
-            };
+            ..Config::default()
+        };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
 
@@ -1841,7 +1868,11 @@ mod tests {
             .err()
             .expect("request should fail");
         match err {
-            ProxyError::AllProvidersFailed { model, attempts, last } => {
+            ProxyError::AllProvidersFailed {
+                model,
+                attempts,
+                last,
+            } => {
                 assert_eq!(model, "m");
                 assert_eq!(attempts.len(), 2);
                 match (&attempts[0], &attempts[1]) {
@@ -1921,7 +1952,6 @@ mod tests {
             base.cooldown.clone(),
         )
     }
-
 
     /// A provider that accepts a fixed allow-list of model names; every
     /// other model is rejected at dispatch time via `can_serve_model`.
@@ -2003,9 +2033,9 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
-                reasoning_echo: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -2013,9 +2043,9 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
-                reasoning_echo: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
                 },
             ],
             models: vec![ModelConfig {
@@ -2026,8 +2056,8 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-                ..Config::default()
-            };
+            ..Config::default()
+        };
         (
             Router::new(Arc::new(cfg), providers, CooldownCache::new()),
             primary_count,
@@ -2053,7 +2083,11 @@ mod tests {
 
         let (out, attempts, _served) = router.complete(model, &req).await.unwrap();
         assert!(matches!(out, ProviderOutput::Json(_)));
-        assert_eq!(primary_count.load(Ordering::SeqCst), 0, "primary must be skipped, not called");
+        assert_eq!(
+            primary_count.load(Ordering::SeqCst),
+            0,
+            "primary must be skipped, not called"
+        );
         assert_eq!(backup_count.load(Ordering::SeqCst), 1);
         // Skipped provider recorded as RouteStep::LocalSkip::ModelUnmapped
         // (no upstream call fired against it). See plan §Phase 1 commit 2.
@@ -2079,10 +2113,8 @@ mod tests {
         // must surface a 400-level BadRequest so the operator sees that
         // the configuration gap (not a transient upstream failure) is the
         // cause — see fix-R11.
-        let (router, primary_count, backup_count) = build_restricted_router(
-            vec!["unrelated-a".into()],
-            vec!["unrelated-b".into()],
-        );
+        let (router, primary_count, backup_count) =
+            build_restricted_router(vec!["unrelated-a".into()], vec!["unrelated-b".into()]);
         let model = router.find_model("m").unwrap();
         let req = dummy_request();
 
@@ -2184,9 +2216,9 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
-                reasoning_echo: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -2194,9 +2226,9 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
-                reasoning_echo: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
                 },
             ],
             models: vec![ModelConfig {
@@ -2207,13 +2239,12 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-                ..Config::default()
-            };
+            ..Config::default()
+        };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
 
-        let (provider, _output, attempts) =
-            router.stream(model, &dummy_request()).await.unwrap();
+        let (provider, _output, attempts) = router.stream(model, &dummy_request()).await.unwrap();
         assert_eq!(provider.name(), "backup");
         // The streaming twin of `complete_skips_provider_...`:
         // primary is unmappable, so it's recorded as a
@@ -2236,10 +2267,8 @@ mod tests {
 
     #[tokio::test]
     async fn stream_returns_bad_request_when_no_provider_can_serve_model() {
-        let (router, _pc, _bc) = build_restricted_router(
-            vec!["other".into()],
-            vec!["another".into()],
-        );
+        let (router, _pc, _bc) =
+            build_restricted_router(vec!["other".into()], vec!["another".into()]);
         let model = router.find_model("m").unwrap();
 
         let err = router
@@ -2288,10 +2317,16 @@ mod tests {
             ),
             // Generic routing error must NOT match: the pattern is gated
             // on "the /" so this stays a surfaced failure.
-            (r#"{"error":{"message":"file is not accessible via fallback proxy"}}"#, false),
+            (
+                r#"{"error":{"message":"file is not accessible via fallback proxy"}}"#,
+                false,
+            ),
         ];
         for (body, expected) in cases {
-            let err = ProxyError::Upstream { status: 400, body: body.into() };
+            let err = ProxyError::Upstream {
+                status: 400,
+                body: body.into(),
+            };
             assert_eq!(
                 is_model_unsupported(&err),
                 expected,
@@ -2404,9 +2439,9 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
-                reasoning_echo: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -2414,9 +2449,9 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
-                reasoning_echo: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
                 },
             ],
             models: vec![ModelConfig {
@@ -2427,8 +2462,8 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-                ..Config::default()
-            };
+            ..Config::default()
+        };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
 
@@ -2445,7 +2480,11 @@ mod tests {
         // operator can see why it was skipped.
         assert_eq!(attempts.len(), 1);
         match &attempts[0] {
-            RouteStep::Failed { provider, status, body } => {
+            RouteStep::Failed {
+                provider,
+                status,
+                body,
+            } => {
                 assert_eq!(provider, "primary");
                 assert_eq!(*status, 400);
                 assert!(body.contains("model_not_supported"));
@@ -2488,9 +2527,9 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
-                reasoning_echo: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -2498,9 +2537,9 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
-                reasoning_echo: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
                 },
             ],
             models: vec![ModelConfig {
@@ -2511,20 +2550,23 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-                ..Config::default()
-            };
+            ..Config::default()
+        };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
 
-        let (provider, _out, attempts) =
-            router.stream(model, &dummy_request()).await.unwrap();
+        let (provider, _out, attempts) = router.stream(model, &dummy_request()).await.unwrap();
         // Backup served the stream after primary was skipped.
         assert_eq!(provider.name(), "backup");
         assert_eq!(primary.call_count.load(Ordering::SeqCst), 1);
         // The skipped primary must appear in attempts with its 400 body.
         assert_eq!(attempts.len(), 1);
         match &attempts[0] {
-            RouteStep::Failed { provider, status, body } => {
+            RouteStep::Failed {
+                provider,
+                status,
+                body,
+            } => {
                 assert_eq!(provider, "primary");
                 assert_eq!(*status, 400);
                 assert!(body.contains("model_not_supported"));
@@ -2567,9 +2609,9 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
-                reasoning_echo: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -2577,9 +2619,9 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
-                reasoning_echo: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
                 },
             ],
             models: vec![ModelConfig {
@@ -2590,8 +2632,8 @@ mod tests {
                 max_retries_per_provider: 1,
                 max_retries_total: 3,
             }],
-                ..Config::default()
-            };
+            ..Config::default()
+        };
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
 

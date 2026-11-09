@@ -256,8 +256,7 @@ impl IntoResponse for ProxyError {
             let mut resp = last.into_response();
             if !attempts.is_empty() {
                 if let Ok(v) = format_attempts_header(&attempts).parse() {
-                    resp.headers_mut()
-                        .insert("x-llmproxy-failed-providers", v);
+                    resp.headers_mut().insert("x-llmproxy-failed-providers", v);
                 }
             }
             return resp;
@@ -362,7 +361,10 @@ mod tests {
                 body: "x".into(),
             }
             .is_cooldownable();
-            assert_eq!(actual, expected, "status {status} expected cooldownable={expected}");
+            assert_eq!(
+                actual, expected,
+                "status {status} expected cooldownable={expected}"
+            );
         }
         for s in [401u16, 402, 404, 408, 429, 500, 502, 503, 504] {
             check(s, true);
@@ -609,7 +611,8 @@ mod tests {
         );
 
         // A client-side Other holds no upstream information and stays readable.
-        let client_side = ProxyError::Other(anyhow::anyhow!("copilot bootstrap already in progress"));
+        let client_side =
+            ProxyError::Other(anyhow::anyhow!("copilot bootstrap already in progress"));
         assert!(client_side
             .client_message(false)
             .contains("bootstrap already in progress"));

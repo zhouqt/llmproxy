@@ -9,9 +9,7 @@ use crate::anthropic::{
 };
 use crate::conversion::derive_cache_hints;
 use crate::conversion::util::strictify_schema;
-use crate::openai::{
-    ChatMessage, ChatRequest, ChatTool, ContentPart, FunctionDef, UserContent,
-};
+use crate::openai::{ChatMessage, ChatRequest, ChatTool, ContentPart, FunctionDef, UserContent};
 
 /// Convert an Anthropic MessagesRequest into an OpenAI ChatRequest.
 ///
@@ -79,7 +77,9 @@ pub fn anthropic_to_openai_request(
         (Some(req.max_tokens), None)
     };
 
-    let reasoning_effort = req.output_config.as_ref()
+    let reasoning_effort = req
+        .output_config
+        .as_ref()
         .and_then(|oc| oc.effort.clone())
         .or_else(|| extract_reasoning_effort(req));
 
@@ -96,7 +96,10 @@ pub fn anthropic_to_openai_request(
     // untouched (already populated by `convert_blocks` above).
     if reasoning_echo && reasoning_effort.is_some() {
         for m in messages.iter_mut() {
-            if let ChatMessage::Assistant { reasoning_content, .. } = m {
+            if let ChatMessage::Assistant {
+                reasoning_content, ..
+            } = m
+            {
                 if reasoning_content.is_none() {
                     *reasoning_content = Some(String::new());
                 }
@@ -135,7 +138,11 @@ pub fn anthropic_to_openai_request(
             // If the only tool was a hosted web_search, emit `None`
             // instead of an empty array. Some strict OpenAI-compat
             // upstreams 400 on `"tools": []`.
-            if result.is_empty() { None } else { Some(result) }
+            if result.is_empty() {
+                None
+            } else {
+                Some(result)
+            }
         }),
         tool_choice: {
             // If the client forced tool_choice to a hosted tool name,
@@ -148,7 +155,9 @@ pub fn anthropic_to_openai_request(
             // OpenAI-compat upstreams reject "tool_choice only supported
             // when tools are enabled".
             let non_hosted_count = req.tools.as_ref().map_or(0, |ts| {
-                ts.iter().filter(|t| !crate::conversion::util::is_web_search_tool(t)).count()
+                ts.iter()
+                    .filter(|t| !crate::conversion::util::is_web_search_tool(t))
+                    .count()
             });
             if non_hosted_count == 0 {
                 None
@@ -206,7 +215,10 @@ pub fn anthropic_to_openai_request(
         // PR-8: `verbosity` — string passthrough from
         // `output_config.verbosity` (Anthropic spec). Same enum on the
         // Responses path via text.verbosity.
-        verbosity: req.output_config.as_ref().and_then(|oc| oc.verbosity.clone()),
+        verbosity: req
+            .output_config
+            .as_ref()
+            .and_then(|oc| oc.verbosity.clone()),
         // PR-9 P2 fields. Anthropic has no direct equivalent for any of
         // these — pass through only if the client somehow attached
         // them. We don't synthesize them; their defaults are None so the
@@ -348,15 +360,9 @@ fn convert_blocks(role: &str, blocks: &[ContentBlock]) -> Vec<ChatMessage> {
                         text_parts.push(ContentPart::Text { text: text.clone() });
                     }
                     ContentBlock::Image { source, .. } => {
-                        let url = format!(
-                            "data:{};base64,{}",
-                            source.media_type, source.data
-                        );
+                        let url = format!("data:{};base64,{}", source.media_type, source.data);
                         text_parts.push(ContentPart::ImageUrl {
-                            image_url: crate::openai::ImageUrl {
-                                url,
-                                detail: None,
-                            },
+                            image_url: crate::openai::ImageUrl { url, detail: None },
                         });
                     }
                     ContentBlock::ToolResult {
@@ -422,7 +428,9 @@ fn convert_blocks(role: &str, blocks: &[ContentBlock]) -> Vec<ChatMessage> {
                     ContentBlock::Thinking { thinking, .. } => {
                         reasoning_acc.push_str(thinking);
                     }
-                    ContentBlock::ToolUse { id, name, input, .. } => {
+                    ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => {
                         tool_calls.push(crate::openai::ToolCall {
                             id: id.clone(),
                             kind: "function".to_string(),
@@ -534,7 +542,10 @@ mod tests {
 
     #[test]
     fn strip_date_suffix_claude() {
-        assert_eq!(strip_date_suffix("claude-sonnet-4-20250514"), "claude-sonnet-4");
+        assert_eq!(
+            strip_date_suffix("claude-sonnet-4-20250514"),
+            "claude-sonnet-4"
+        );
         assert_eq!(strip_date_suffix("claude-sonnet-4"), "claude-sonnet-4");
         assert_eq!(strip_date_suffix("gpt-4"), "gpt-4");
         assert_eq!(strip_date_suffix("claude-sonnet-4-5"), "claude-sonnet-4-5");
@@ -547,7 +558,10 @@ mod tests {
     /// `request.rs:292`.
     #[test]
     fn strip_date_suffix_drops_tail_when_hyphen_found_but_tail_is_not_date() {
-        assert_eq!(strip_date_suffix("claude-sonnet-4-snapshot"), "claude-sonnet-4-snapshot");
+        assert_eq!(
+            strip_date_suffix("claude-sonnet-4-snapshot"),
+            "claude-sonnet-4-snapshot"
+        );
         assert_eq!(strip_date_suffix("model-latest"), "model-latest");
         // Edge case: hyphen followed by a non-digit char (not even 8 chars)
         assert_eq!(strip_date_suffix("m-x"), "m-x");
@@ -664,13 +678,18 @@ mod tests {
         assert_eq!(converted.stop.as_ref().unwrap(), &["STOP"]);
         assert_eq!(converted.user.as_deref(), Some("user-1"));
         assert_eq!(converted.tool_choice, Some(json!("required")));
-        assert_eq!(converted.tools.as_ref().unwrap()[0].function.description, "");
+        assert_eq!(
+            converted.tools.as_ref().unwrap()[0].function.description,
+            ""
+        );
 
         let mut named_tool = base.clone();
         named_tool["tool_choice"] = json!({"type": "tool", "name": "tool"});
         let req: MessagesRequest = serde_json::from_value(named_tool).unwrap();
         assert_eq!(
-            anthropic_to_openai_request(&req, &Default::default(), false).unwrap().tool_choice,
+            anthropic_to_openai_request(&req, &Default::default(), false)
+                .unwrap()
+                .tool_choice,
             Some(json!({"type": "function", "function": {"name": "tool"}}))
         );
 
@@ -678,7 +697,9 @@ mod tests {
         none["tool_choice"] = json!({"type": "future_choice"});
         let req: MessagesRequest = serde_json::from_value(none).unwrap();
         assert_eq!(
-            anthropic_to_openai_request(&req, &Default::default(), false).unwrap().tool_choice,
+            anthropic_to_openai_request(&req, &Default::default(), false)
+                .unwrap()
+                .tool_choice,
             Some(json!("none"))
         );
     }
@@ -743,7 +764,8 @@ mod tests {
             .unwrap();
 
             assert_eq!(
-                anthropic_to_openai_request(&req, &Default::default(), false).unwrap()
+                anthropic_to_openai_request(&req, &Default::default(), false)
+                    .unwrap()
                     .reasoning_effort
                     .as_deref(),
                 expected
@@ -797,7 +819,10 @@ mod tests {
         assert_eq!(converted.messages.len(), 1);
         assert!(matches!(
             &converted.messages[0],
-            ChatMessage::User { content: UserContent::Parts(_), .. }
+            ChatMessage::User {
+                content: UserContent::Parts(_),
+                ..
+            }
         ));
     }
 
@@ -820,7 +845,10 @@ mod tests {
         assert_eq!(converted.messages.len(), 1);
         assert!(matches!(
             &converted.messages[0],
-            ChatMessage::User { content: UserContent::Parts(_), .. }
+            ChatMessage::User {
+                content: UserContent::Parts(_),
+                ..
+            }
         ));
     }
 
@@ -868,7 +896,10 @@ mod tests {
         assert_eq!(converted.messages.len(), 1);
         assert!(matches!(
             &converted.messages[0],
-            ChatMessage::User { content: UserContent::Parts(_), .. }
+            ChatMessage::User {
+                content: UserContent::Parts(_),
+                ..
+            }
         ));
     }
 
@@ -992,7 +1023,10 @@ mod tests {
         let mut rewrite2 = std::collections::HashMap::new();
         rewrite2.insert("claude-sonnet-4-5".to_string(), "o3-mini".to_string());
         let converted2 = anthropic_to_openai_request(&req, &rewrite2, false).unwrap();
-        assert_eq!(converted2.max_tokens, None, "o3-mini must not emit max_tokens");
+        assert_eq!(
+            converted2.max_tokens, None,
+            "o3-mini must not emit max_tokens"
+        );
         assert_eq!(
             converted2.max_completion_tokens,
             Some(200),
@@ -1017,8 +1051,7 @@ mod tests {
             "non-gpt-5 must emit max_tokens"
         );
         assert_eq!(
-            converted.max_completion_tokens,
-            None,
+            converted.max_completion_tokens, None,
             "non-gpt-5 must not emit max_completion_tokens"
         );
     }
@@ -1041,11 +1074,17 @@ mod tests {
         .unwrap();
         let out = anthropic_to_openai_request(&req, &Default::default(), false).unwrap();
         let resp_format = out.extra.get("response_format").unwrap();
-        assert_eq!(resp_format.get("type").and_then(|v| v.as_str()), Some("json_schema"));
+        assert_eq!(
+            resp_format.get("type").and_then(|v| v.as_str()),
+            Some("json_schema")
+        );
         // Anthropic doesn't carry a schema name; OpenAI requires one inside
         // the nested json_schema object. Synthesized default + strict: true.
         let inner = resp_format.get("json_schema").unwrap();
-        assert_eq!(inner.get("name").and_then(|v| v.as_str()), Some("structured_output"));
+        assert_eq!(
+            inner.get("name").and_then(|v| v.as_str()),
+            Some("structured_output")
+        );
         assert_eq!(inner.get("strict").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(out.reasoning_effort.as_deref(), Some("high"));
     }
@@ -1096,7 +1135,10 @@ mod tests {
         let out = anthropic_to_openai_request(&req, &Default::default(), false).unwrap();
         let resp_format = out.extra.get("response_format").unwrap();
         let inner = resp_format.get("json_schema").unwrap();
-        assert_eq!(inner.get("name").and_then(|v| v.as_str()), Some("my_schema"));
+        assert_eq!(
+            inner.get("name").and_then(|v| v.as_str()),
+            Some("my_schema")
+        );
     }
 
     #[test]
@@ -1120,16 +1162,30 @@ mod tests {
                     "required": ["ok", "reason"]
                 }}
             }
-        })).unwrap();
+        }))
+        .unwrap();
         let out = anthropic_to_openai_request(&req, &Default::default(), false).unwrap();
-        let inner = out.extra.get("response_format").and_then(|v| v.get("json_schema")).unwrap();
-        assert_eq!(inner.get("name").and_then(|v| v.as_str()), Some("structured_output"));
+        let inner = out
+            .extra
+            .get("response_format")
+            .and_then(|v| v.get("json_schema"))
+            .unwrap();
+        assert_eq!(
+            inner.get("name").and_then(|v| v.as_str()),
+            Some("structured_output")
+        );
         assert_eq!(inner.get("strict").and_then(|v| v.as_bool()), Some(true));
         let schema = inner.get("schema").unwrap();
         let required = schema.get("required").and_then(|v| v.as_array()).unwrap();
         let required: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
-        assert!(required.contains(&"impossible"), "optional property must be promoted to required under strict mode");
-        assert_eq!(schema.get("additionalProperties").and_then(|v| v.as_bool()), Some(false));
+        assert!(
+            required.contains(&"impossible"),
+            "optional property must be promoted to required under strict mode"
+        );
+        assert_eq!(
+            schema.get("additionalProperties").and_then(|v| v.as_bool()),
+            Some(false)
+        );
     }
 
     #[test]
@@ -1548,7 +1604,10 @@ mod tests {
             .messages
             .iter()
             .find_map(|m| match m {
-                ChatMessage::Assistant { tool_calls: Some(_), .. } => Some(m),
+                ChatMessage::Assistant {
+                    tool_calls: Some(_),
+                    ..
+                } => Some(m),
                 _ => None,
             })
             .expect("tool-call assistant turn present");

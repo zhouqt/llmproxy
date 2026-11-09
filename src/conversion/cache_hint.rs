@@ -7,7 +7,9 @@
 //! "Option::is_none"`) emit nothing extra on the wire when the client
 //! didn't ask for caching.
 
-use crate::anthropic::{CacheControlEphemeral, ContentBlock, MessageContent, MessagesRequest, SystemPrompt};
+use crate::anthropic::{
+    CacheControlEphemeral, ContentBlock, MessageContent, MessagesRequest, SystemPrompt,
+};
 
 /// Cache hints derived from an Anthropic `MessagesRequest`. Either
 /// field is `None` when the request carries no `cache_control`
@@ -98,8 +100,7 @@ fn block_cache_control(b: &ContentBlock) -> Option<&CacheControlEphemeral> {
 /// everything else (incl. `ephemeral`, `ephemeral_5m`/`5m`, missing
 /// `type`, future unknown values) is the default in-memory tier.
 fn cc_is_24h(cc: &CacheControlEphemeral) -> bool {
-    cc.ttl.as_deref() == Some("1h")
-        || cc.kind == "ephemeral_1h"
+    cc.ttl.as_deref() == Some("1h") || cc.kind == "ephemeral_1h"
 }
 
 #[cfg(test)]

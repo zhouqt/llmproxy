@@ -187,7 +187,10 @@ impl MessageDeltaUsage {
     /// `output_tokens_details` JSON object, if present and parseable.
     /// Absent keys stay silent (no warn); malformed values log once.
     pub fn thinking_tokens(&self) -> Option<u32> {
-        let v = self.output_tokens_details.as_ref()?.get("thinking_tokens")?;
+        let v = self
+            .output_tokens_details
+            .as_ref()?
+            .get("thinking_tokens")?;
         if v.is_null() {
             return None;
         }
@@ -208,11 +211,8 @@ impl MessageDeltaUsage {
                 // misses log every 1000 envelopes. A runaway upstream
                 // emitting malformed values per delta can no longer
                 // flood the log.
-                let count = THINKING_TOKENS_MALFORMED_COUNT
-                    .fetch_add(1, Ordering::Relaxed) + 1;
-                if count == 1
-                    || count % THINKING_TOKENS_WARN_STEP == 0
-                {
+                let count = THINKING_TOKENS_MALFORMED_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if count == 1 || count % THINKING_TOKENS_WARN_STEP == 0 {
                     tracing::warn!(
                         count,
                         step = THINKING_TOKENS_WARN_STEP,
@@ -590,10 +590,7 @@ impl UsageStats {
         if self.capacity == 0 {
             return (Vec::new(), Vec::new());
         }
-        let records_limit = records_limit
-            .unwrap_or(DEFAULT_LIMIT)
-            .min(MAX_LIMIT)
-            .max(1);
+        let records_limit = records_limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT).max(1);
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
 
         // Rollup: two-level `BTreeMap<String, BTreeMap<String, UsageRollup>>`.
@@ -669,10 +666,8 @@ impl UsageStats {
             let u = r.usage.as_ref();
             let input = u.and_then(|x| x.input_tokens).unwrap_or(0) as u64;
             let output = u.and_then(|x| x.output_tokens).unwrap_or(0) as u64;
-            let cache_read =
-                u.and_then(|x| x.cache_read_input_tokens).unwrap_or(0) as u64;
-            let cache_creation =
-                u.and_then(|x| x.cache_creation_input_tokens).unwrap_or(0) as u64;
+            let cache_read = u.and_then(|x| x.cache_read_input_tokens).unwrap_or(0) as u64;
+            let cache_creation = u.and_then(|x| x.cache_creation_input_tokens).unwrap_or(0) as u64;
             let reasoning = u.and_then(|x| x.thinking_tokens).unwrap_or(0) as u64;
 
             // Hot path: outer model exists, inner provider exists.
@@ -681,7 +676,29 @@ impl UsageStats {
                 if let Some(e) = inner.get_mut(provider_key) {
                     e
                 } else {
-                    inner.entry(provider_key.to_string()).or_insert_with(|| UsageRollup {
+                    inner
+                        .entry(provider_key.to_string())
+                        .or_insert_with(|| UsageRollup {
+                            model: None,
+                            provider: None,
+                            requests: 0,
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            total_tokens: 0,
+                            cache_read_tokens: 0,
+                            cache_creation_tokens: 0,
+                            reasoning_tokens: 0,
+                            cache_read_ratio: None,
+                        })
+                }
+            } else {
+                // Cold: outer miss. Allocate the outer model key
+                // (once per new model across the entire query) and
+                // the inner provider key (once per new pair).
+                let inner = buckets.entry(model_key.to_string()).or_default();
+                inner
+                    .entry(provider_key.to_string())
+                    .or_insert_with(|| UsageRollup {
                         model: None,
                         provider: None,
                         requests: 0,
@@ -693,35 +710,13 @@ impl UsageStats {
                         reasoning_tokens: 0,
                         cache_read_ratio: None,
                     })
-                }
-            } else {
-                // Cold: outer miss. Allocate the outer model key
-                // (once per new model across the entire query) and
-                // the inner provider key (once per new pair).
-                let inner = buckets
-                    .entry(model_key.to_string())
-                    .or_default();
-                inner.entry(provider_key.to_string()).or_insert_with(|| UsageRollup {
-                    model: None,
-                    provider: None,
-                    requests: 0,
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    total_tokens: 0,
-                    cache_read_tokens: 0,
-                    cache_creation_tokens: 0,
-                    reasoning_tokens: 0,
-                    cache_read_ratio: None,
-                })
             };
             entry.requests += 1;
             entry.input_tokens += input;
             entry.output_tokens += output;
             entry.cache_read_tokens += cache_read;
             entry.cache_creation_tokens += cache_creation;
-            entry.reasoning_tokens = entry
-                .reasoning_tokens
-                .saturating_add(reasoning);
+            entry.reasoning_tokens = entry.reasoning_tokens.saturating_add(reasoning);
 
             // Records page — index ring (Review #7). Push the buffer
             // index; materialize only the trailing `records_limit`
@@ -740,7 +735,11 @@ impl UsageStats {
             .into_iter()
             .flat_map(|(model, inner)| {
                 inner.into_iter().map(move |(provider, mut entry)| {
-                    entry.model = if model.is_empty() { None } else { Some(model.clone()) };
+                    entry.model = if model.is_empty() {
+                        None
+                    } else {
+                        Some(model.clone())
+                    };
                     entry.provider = if provider.is_empty() {
                         None
                     } else {
@@ -748,11 +747,12 @@ impl UsageStats {
                     };
                     entry.total_tokens =
                         entry.input_tokens + entry.output_tokens + entry.cache_creation_tokens;
-                    entry.cache_read_ratio = if entry.cache_read_tokens > 0 && entry.input_tokens > 0 {
-                        Some(entry.cache_read_tokens as f64 / entry.input_tokens as f64)
-                    } else {
-                        None
-                    };
+                    entry.cache_read_ratio =
+                        if entry.cache_read_tokens > 0 && entry.input_tokens > 0 {
+                            Some(entry.cache_read_tokens as f64 / entry.input_tokens as f64)
+                        } else {
+                            None
+                        };
                     entry
                 })
             })
@@ -763,8 +763,7 @@ impl UsageStats {
         // each index and clone — exactly `records_limit` deep-clones,
         // not `matches` deep-clones (Review #7). Newest-first: the
         // indices are in ascending order, so reverse for descending.
-        let mut records: Vec<UsageRecord> =
-            Vec::with_capacity(page.len());
+        let mut records: Vec<UsageRecord> = Vec::with_capacity(page.len());
         for &idx in page.iter().rev() {
             if let Some(r) = guard.get(idx) {
                 records.push(r.clone());
@@ -902,8 +901,7 @@ pub fn rollup(records: &[UsageRecord], group_by: GroupBy) -> Vec<UsageRollup> {
         } else {
             Some(provider)
         };
-        entry.total_tokens =
-            entry.input_tokens + entry.output_tokens + entry.cache_creation_tokens;
+        entry.total_tokens = entry.input_tokens + entry.output_tokens + entry.cache_creation_tokens;
         entry.cache_read_ratio = if entry.cache_read_tokens > 0 && entry.input_tokens > 0 {
             Some(entry.cache_read_tokens as f64 / entry.input_tokens as f64)
         } else {
@@ -1048,8 +1046,7 @@ impl UsageScanner {
         let total = self.carry.len() - self.carry_start;
         if total + bytes.len() > SCAN_MAX_CARRY {
             let keep = SCAN_MAX_CARRY / 2;
-            let count = SCANNER_OVERFLOW_COUNT
-                .fetch_add(1, Ordering::Relaxed) + 1;
+            let count = SCANNER_OVERFLOW_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
             if count == 1 || count % SCANNER_OVERFLOW_WARN_STEP == 0 {
                 tracing::warn!(
                     carry_before = total,
@@ -1204,7 +1201,9 @@ impl UsageScanner {
         // but the very last byte of the event may still be `\r`
         // (e.g. `...\r\n\r\n` collapses to `...\r` after the LF
         // split, leaving a stray `\r` glued to the final data: line).
-        let mut joined = Vec::with_capacity(data_lines.iter().map(|l| l.len()).sum::<usize>() + data_lines.len());
+        let mut joined = Vec::with_capacity(
+            data_lines.iter().map(|l| l.len()).sum::<usize>() + data_lines.len(),
+        );
         for (i, line) in data_lines.iter().enumerate() {
             if i > 0 {
                 joined.push(b'\n');
@@ -1585,7 +1584,10 @@ mod tests {
         assert_eq!(u.output_tokens, Some(2));
         assert_eq!(u.thinking_tokens, Some(2));
         assert_eq!(
-            u.server_tool_use.as_ref().and_then(|v| v.get("web_search_requests")).and_then(|v| v.as_i64()),
+            u.server_tool_use
+                .as_ref()
+                .and_then(|v| v.get("web_search_requests"))
+                .and_then(|v| v.as_i64()),
             Some(1)
         );
     }
@@ -1676,23 +1678,21 @@ mod tests {
     async fn usage_stats_records_and_snapshots() {
         let stats = UsageStats::new(8);
         for i in 0..3u32 {
-            stats
-                .record(UsageRecord {
-                    started_at: Utc.timestamp_opt(1_700_000_000 + i as i64, 0).unwrap(),
-                    ended_at: Utc.timestamp_opt(1_700_000_000 + i as i64, 0).unwrap(),
-                    elapsed_ms: i as u64,
-                    provider: "p".into(),
-                    model: "m".into(),
-                    stream: false,
-                    outcome: Outcome::Success,
-                    usage: Some(StreamUsage {
-                        input_tokens: Some(i),
-                        ..Default::default()
-                    }),
-                    failed_providers: vec![],
+            stats.record(UsageRecord {
+                started_at: Utc.timestamp_opt(1_700_000_000 + i as i64, 0).unwrap(),
+                ended_at: Utc.timestamp_opt(1_700_000_000 + i as i64, 0).unwrap(),
+                elapsed_ms: i as u64,
+                provider: "p".into(),
+                model: "m".into(),
+                stream: false,
+                outcome: Outcome::Success,
+                usage: Some(StreamUsage {
+                    input_tokens: Some(i),
+                    ..Default::default()
+                }),
+                failed_providers: vec![],
                 total_tokens: 0,
-                })
-                ;
+            });
         }
         let snap = stats.snapshot(None, None, None);
         assert_eq!(snap.len(), 3);
@@ -1704,20 +1704,18 @@ mod tests {
     async fn usage_stats_evicts_oldest_when_full() {
         let stats = UsageStats::new(2);
         for i in 0..4u32 {
-            stats
-                .record(UsageRecord {
-                    started_at: Utc.timestamp_opt(1_700_000_000 + i as i64, 0).unwrap(),
-                    ended_at: Utc.timestamp_opt(1_700_000_000 + i as i64, 0).unwrap(),
-                    elapsed_ms: 0,
-                    provider: "p".into(),
-                    model: "m".into(),
-                    stream: false,
-                    outcome: Outcome::Success,
-                    usage: None,
-                    failed_providers: vec![],
+            stats.record(UsageRecord {
+                started_at: Utc.timestamp_opt(1_700_000_000 + i as i64, 0).unwrap(),
+                ended_at: Utc.timestamp_opt(1_700_000_000 + i as i64, 0).unwrap(),
+                elapsed_ms: 0,
+                provider: "p".into(),
+                model: "m".into(),
+                stream: false,
+                outcome: Outcome::Success,
+                usage: None,
+                failed_providers: vec![],
                 total_tokens: 0,
-                })
-                ;
+            });
         }
         let snap = stats.snapshot(None, None, None);
         // Oldest two (i=0,1) evicted; newest two (i=2,3) remain.
@@ -1748,7 +1746,7 @@ mod tests {
             outcome: Outcome::Success,
             usage: None,
             failed_providers: vec![],
-        total_tokens: 0,
+            total_tokens: 0,
         });
         assert_eq!(stats.snapshot(None, None, None).len(), 0);
         assert_eq!(stats.evicted_total(), 0);
@@ -1779,20 +1777,18 @@ mod tests {
         let stats = UsageStats::new(8);
         for i in 0..5u32 {
             let t = Utc.timestamp_opt(1_700_000_000 + i as i64, 0).unwrap();
-            stats
-                .record(UsageRecord {
-                    started_at: t,
-                    ended_at: t,
-                    elapsed_ms: 0,
-                    provider: "p".into(),
-                    model: "m".into(),
-                    stream: false,
-                    outcome: Outcome::Success,
-                    usage: None,
-                    failed_providers: vec![],
+            stats.record(UsageRecord {
+                started_at: t,
+                ended_at: t,
+                elapsed_ms: 0,
+                provider: "p".into(),
+                model: "m".into(),
+                stream: false,
+                outcome: Outcome::Success,
+                usage: None,
+                failed_providers: vec![],
                 total_tokens: 0,
-                })
-                ;
+            });
         }
         // Window covers the middle three (i=1,2,3); limit caps at 2.
         let since = Utc.timestamp_opt(1_700_000_001, 0).unwrap();
@@ -1812,27 +1808,23 @@ mod tests {
     #[tokio::test]
     async fn usage_stats_snapshot_with_inverted_range_returns_empty() {
         let stats = UsageStats::new(4);
-        stats
-            .record(UsageRecord {
-                started_at: ts("2026-09-09T10:00:00Z"),
-                ended_at: ts("2026-09-09T10:00:00Z"),
-                elapsed_ms: 0,
-                provider: "p".into(),
-                model: "m".into(),
-                stream: false,
-                outcome: Outcome::Success,
-                usage: None,
-                failed_providers: vec![],
+        stats.record(UsageRecord {
+            started_at: ts("2026-09-09T10:00:00Z"),
+            ended_at: ts("2026-09-09T10:00:00Z"),
+            elapsed_ms: 0,
+            provider: "p".into(),
+            model: "m".into(),
+            stream: false,
+            outcome: Outcome::Success,
+            usage: None,
+            failed_providers: vec![],
             total_tokens: 0,
-            })
-            ;
-        let snap = stats
-            .snapshot(
-                Some(ts("2026-09-09T11:00:00Z")),
-                Some(ts("2026-09-09T09:00:00Z")),
-                None,
-            )
-            ;
+        });
+        let snap = stats.snapshot(
+            Some(ts("2026-09-09T11:00:00Z")),
+            Some(ts("2026-09-09T09:00:00Z")),
+            None,
+        );
         assert!(snap.is_empty());
     }
 
@@ -1848,7 +1840,7 @@ mod tests {
             outcome: Outcome::Success,
             usage: None,
             failed_providers: vec![],
-        total_tokens: 0,
+            total_tokens: 0,
         };
         let v = serde_json::to_value(&rec).unwrap();
         assert_eq!(v["started_at"], "2026-09-09T10:00:00Z");
@@ -1922,7 +1914,9 @@ mod tests {
     #[test]
     fn scanner_does_not_panic_on_consecutive_blank_lines() {
         let mut s = scanner();
-        s.observe(&Bytes::from_static(b"\n\n\n\nevent: ping\ndata: {}\n\n\n\n"));
+        s.observe(&Bytes::from_static(
+            b"\n\n\n\nevent: ping\ndata: {}\n\n\n\n",
+        ));
         let u = s.finalize();
         assert_eq!(u, StreamUsage::default());
     }
@@ -1945,9 +1939,8 @@ mod tests {
                         outcome: Outcome::Success,
                         usage: None,
                         failed_providers: vec![],
-                    total_tokens: 0,
-                    })
-                    ;
+                        total_tokens: 0,
+                    });
                 }
             }));
         }
@@ -1973,27 +1966,23 @@ mod tests {
     fn thinking_tokens_handles_null_and_overflow() {
         // Null inside output_tokens_details must short-circuit before
         // the as_u64 branch fires.
-        let u: MessageDeltaUsage = serde_json::from_slice(
-            br#"{"output_tokens_details":{"thinking_tokens":null}}"#,
-        )
-        .unwrap();
+        let u: MessageDeltaUsage =
+            serde_json::from_slice(br#"{"output_tokens_details":{"thinking_tokens":null}}"#)
+                .unwrap();
         assert_eq!(u.thinking_tokens(), None);
 
         // A negative i64 should not collapse to Some(0); u64 saturates
         // to 0 but the u32::try_from of 0 is fine, so use a value too
         // large for u32 to trip the overflow branch instead.
-        let u: MessageDeltaUsage = serde_json::from_slice(
-            br#"{"output_tokens_details":{"thinking_tokens":5000000000}}"#,
-        )
-        .unwrap();
+        let u: MessageDeltaUsage =
+            serde_json::from_slice(br#"{"output_tokens_details":{"thinking_tokens":5000000000}}"#)
+                .unwrap();
         assert_eq!(u.thinking_tokens(), None);
 
         // output_tokens_details present but missing thinking_tokens key
         // entirely — must not warn, must return None.
-        let u: MessageDeltaUsage = serde_json::from_slice(
-            br#"{"output_tokens_details":{}}"#,
-        )
-        .unwrap();
+        let u: MessageDeltaUsage =
+            serde_json::from_slice(br#"{"output_tokens_details":{}}"#).unwrap();
         assert_eq!(u.thinking_tokens(), None);
     }
 
@@ -2075,7 +2064,10 @@ mod tests {
             ..Default::default()
         };
         let merged_only_start = StreamUsage::merge(Some(&start), None);
-        assert_eq!(merged_only_start.server_tool_use, Some(serde_json::json!({"a": 1})));
+        assert_eq!(
+            merged_only_start.server_tool_use,
+            Some(serde_json::json!({"a": 1}))
+        );
 
         let delta = MessageDeltaUsage {
             server_tool_use: Some(serde_json::json!({"b": 2})),
@@ -2129,9 +2121,9 @@ mod tests {
             // where the cap path silently disappears.
             assert!(
                 s.carry.len() <= 2 * SCAN_MAX_CARRY,
-                    "carry buffer grew unbounded across overflows: len={}",
-                    s.carry.len()
-                );
+                "carry buffer grew unbounded across overflows: len={}",
+                s.carry.len()
+            );
         }
         assert_eq!(s.finalize(), StreamUsage::default());
     }
@@ -2177,7 +2169,11 @@ mod tests {
         ));
         assert!(s.saw_error(), "scanner must flag in-band event:error");
         let u = s.finalize();
-        assert_eq!(u.input_tokens, Some(7), "error frame must not affect usage lift");
+        assert_eq!(
+            u.input_tokens,
+            Some(7),
+            "error frame must not affect usage lift"
+        );
     }
 
     #[test]
@@ -2217,7 +2213,8 @@ mod tests {
         // unknown (no event type), dropped from usage, and the
         // scanner still has the input_tokens lifted from frame 1.
         assert_eq!(
-            u.input_tokens, Some(7),
+            u.input_tokens,
+            Some(7),
             "first message_start must still lift input"
         );
         assert_eq!(
@@ -2298,9 +2295,7 @@ mod tests {
         s.observe(&Bytes::from_static(
             b"event: message_delta\r\ndata: {\"usage\":",
         ));
-        s.observe(&Bytes::from_static(
-            b"{\"output_tokens\":3}}\r\n\r\n",
-        ));
+        s.observe(&Bytes::from_static(b"{\"output_tokens\":3}}\r\n\r\n"));
         let u = s.finalize();
         assert_eq!(u.input_tokens, Some(99));
         assert_eq!(u.output_tokens, Some(3));
@@ -2407,7 +2402,7 @@ mod tests {
             outcome: Outcome::Success,
             usage: None,
             failed_providers: vec![],
-        total_tokens: 0,
+            total_tokens: 0,
         };
         stats.record(mk(0));
         stats.record(mk(10));
@@ -2428,9 +2423,7 @@ mod tests {
         assert_eq!(snap.len(), 1);
 
         // since > until → empty (defensive branch).
-        let snap = stats
-            .snapshot(Some(until), Some(since), None)
-            ;
+        let snap = stats.snapshot(Some(until), Some(since), None);
         assert!(snap.is_empty());
 
         // limit caps post-filter result, not the buffer.
@@ -2463,7 +2456,7 @@ mod tests {
             outcome: Outcome::Success,
             usage: None,
             failed_providers: vec![],
-        total_tokens: 0,
+            total_tokens: 0,
         };
         stats.record(rec);
         let snap = stats.snapshot(None, None, None);
@@ -2486,7 +2479,7 @@ mod tests {
             outcome: Outcome::Success,
             usage,
             failed_providers: vec![],
-        total_tokens: 0,
+            total_tokens: 0,
         }
     }
 
@@ -2548,10 +2541,7 @@ mod tests {
         assert_eq!(ma_p2.cache_read_tokens, 50);
         assert_eq!(ma_p2.input_tokens, 100);
         assert_eq!(ma_p2.reasoning_tokens, 7);
-        assert_eq!(
-            ma_p2.cache_read_ratio,
-            Some(50.0 / 100.0)
-        );
+        assert_eq!(ma_p2.cache_read_ratio, Some(50.0 / 100.0));
         let mb_p1 = &rows[2];
         assert_eq!(mb_p1.model.as_deref(), Some("m-b"));
         assert_eq!(mb_p1.requests, 1);
@@ -2717,7 +2707,7 @@ mod tests {
             outcome: Outcome::Success,
             usage: None,
             failed_providers: vec![],
-        total_tokens: 0,
+            total_tokens: 0,
         };
         stats.record(mk(1));
         stats.record(mk(2));

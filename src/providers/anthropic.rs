@@ -450,13 +450,9 @@ impl Provider for AnthropicProvider {
 
             // Decide whether to strip thinking blocks and retry.
             let status_code = status.as_u16();
-            let is_thinking_400 =
-                status_code == 400 && has_thinking_error(&text);
+            let is_thinking_400 = status_code == 400 && has_thinking_error(&text);
 
-            if is_thinking_400
-                && attempt < max_attempts
-                && should_strip_and_retry(req, &text)
-            {
+            if is_thinking_400 && attempt < max_attempts && should_strip_and_retry(req, &text) {
                 tracing::warn!(
                     provider = %self.name,
                     client_model = %req.model,
@@ -629,7 +625,10 @@ impl Provider for AnthropicProvider {
             if status.as_u16() == 400 && has_thinking_error(&text) {
                 return Err(self.thinking_not_supported_error(
                     &req.model,
-                    &merged.get(&req.model).cloned().unwrap_or_else(|| req.model.clone()),
+                    &merged
+                        .get(&req.model)
+                        .cloned()
+                        .unwrap_or_else(|| req.model.clone()),
                     &text,
                 ));
             }
@@ -753,10 +752,12 @@ fn strip_thinking_blocks(body: &mut Value) {
     if let Some(messages) = body.get_mut("messages").and_then(|v| v.as_array_mut()) {
         messages.retain_mut(|msg| {
             if let Some(blocks) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
-                blocks.retain(|b| !matches!(
-                    b.get("type").and_then(|t| t.as_str()),
-                    Some("thinking") | Some("redacted_thinking")
-                ));
+                blocks.retain(|b| {
+                    !matches!(
+                        b.get("type").and_then(|t| t.as_str()),
+                        Some("thinking") | Some("redacted_thinking")
+                    )
+                });
                 !blocks.is_empty() // keep only if there's still content
             } else {
                 true
@@ -844,7 +845,9 @@ mod tests {
             r#"{"error":{"message":"The `content[].thinking` in the thinking mode must be passed back to the API."}}"#
         ));
         // Non-thinking errors must NOT match.
-        assert!(!has_thinking_error(r#"{"error":{"message":"model not found"}}"#));
+        assert!(!has_thinking_error(
+            r#"{"error":{"message":"model not found"}}"#
+        ));
         assert!(!has_thinking_error("rate limited"));
         assert!(!has_thinking_error(""));
     }
@@ -1101,7 +1104,10 @@ mod tests {
             reqwest::Client::new(),
         )
         .unwrap();
-        let output = provider.complete(&request(false), &empty_rewrite()).await.unwrap();
+        let output = provider
+            .complete(&request(false), &empty_rewrite())
+            .await
+            .unwrap();
         expect_variant!(output, ProviderOutput::Json(body) => {
             let thinking = body["content"].as_array().unwrap().iter()
                 .find(|b| b["type"] == "thinking")
@@ -1192,7 +1198,10 @@ mod tests {
         )
         .unwrap();
 
-        let output = provider.complete(&request(false), &empty_rewrite()).await.unwrap();
+        let output = provider
+            .complete(&request(false), &empty_rewrite())
+            .await
+            .unwrap();
 
         assert_eq!(provider.name(), "router");
         expect_variant!(output, ProviderOutput::Json(body) => {
@@ -1226,7 +1235,10 @@ mod tests {
         )
         .unwrap();
 
-        let output = provider.stream(&request(true), &empty_rewrite()).await.unwrap();
+        let output = provider
+            .stream(&request(true), &empty_rewrite())
+            .await
+            .unwrap();
         expect_variant!(output, ProviderOutput::Stream(mut output) => {
             let mut bytes = Vec::new();
             while let Some(item) = output.next().await {
@@ -1612,7 +1624,11 @@ mod tests {
         // assistant message (index 1) keeps its text block. These pinned
         // assertions make a "strip everything / strip nothing" false
         // green impossible.
-        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("second body captured");
         assert_eq!(sent["messages"].as_array().unwrap().len(), 3);
         let assistant = &sent["messages"][1];
         assert_eq!(assistant["role"], "assistant");
@@ -1808,7 +1824,11 @@ mod tests {
             .await
             .expect("strip then 200 must succeed");
 
-        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("second body captured");
         assert!(
             sent.as_object().unwrap().get("thinking").is_none(),
             "top-level thinking must be removed, not nulled"
@@ -1879,7 +1899,11 @@ mod tests {
         // Assert the top-level thinking param is REMOVED (not nulled) and
         // that stripping only dropped thinking blocks — all 3 messages
         // survive and the assistant message (index 1) keeps its text.
-        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("second body captured");
         assert!(
             sent.as_object().unwrap().get("thinking").is_none(),
             "top-level thinking must be removed, not nulled"
@@ -2468,7 +2492,11 @@ mod tests {
             .unwrap();
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
 
-        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("second body captured");
         assert_eq!(
             sent["provider"],
             json!({"ignore": ["Inceptron", "Azure"]}),
@@ -2927,7 +2955,11 @@ mod tests {
             .unwrap();
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
 
-        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("second body captured");
         assert_eq!(
             sent["provider"],
             json!({"only": ["DeepInfra", "Together"]}),

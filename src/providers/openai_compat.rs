@@ -18,7 +18,9 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::{json, Value};
 
 use crate::anthropic::{MessagesRequest, StreamEvent};
-use crate::conversion::{anthropic_to_openai_request, make_message_id, openai_to_anthropic_response};
+use crate::conversion::{
+    anthropic_to_openai_request, make_message_id, openai_to_anthropic_response,
+};
 use crate::error::{ProxyError, Result};
 use crate::openai::{looks_like_error_envelope, ChatMessage, ChatRequest};
 use crate::providers::{Provider, ProviderOutput};
@@ -276,7 +278,10 @@ fn has_reasoning_echo_error(body: &str) -> bool {
 /// signals it is a pure no-op.
 fn strip_reasoning_echo(req: &mut ChatRequest) {
     for m in &mut req.messages {
-        if let ChatMessage::Assistant { reasoning_content, .. } = m {
+        if let ChatMessage::Assistant {
+            reasoning_content, ..
+        } = m
+        {
             *reasoning_content = None;
         }
     }
@@ -446,7 +451,10 @@ impl Provider for OpenAiCompatProvider {
                     // so this 400 is no longer expected; skip the strip-and-
                     // retry path entirely and surface any 400 verbatim (a real
                     // protocol violation rather than the known gap).
-                    if !reasoning_stripped && !self.reasoning_echo && has_reasoning_echo_error(&body) {
+                    if !reasoning_stripped
+                        && !self.reasoning_echo
+                        && has_reasoning_echo_error(&body)
+                    {
                         tracing::warn!(
                             provider = %self.name,
                             client_model = %req.model,
@@ -486,10 +494,7 @@ impl Provider for OpenAiCompatProvider {
                 // with an OpenAI error envelope instead of a chat response. Treat
                 // it as a 400-class upstream failure so the client sees the real
                 // message instead of a generic 500 "missing field `object`".
-                return Err(ProxyError::Upstream {
-                    status: 400,
-                    body,
-                });
+                return Err(ProxyError::Upstream { status: 400, body });
             }
             let chat: crate::openai::ChatResponse = serde_json::from_value(parsed)?;
             let msg_id = make_message_id();
@@ -678,7 +683,10 @@ where
             let parsed = match serde_json::from_str::<Value>(payload) {
                 Ok(value) => value,
                 Err(e) => {
-                    tracing::debug!("skipping malformed SSE line: {} ({e})", crate::util::summarize_for_log(payload, "<empty payload>"));
+                    tracing::debug!(
+                        "skipping malformed SSE line: {} ({e})",
+                        crate::util::summarize_for_log(payload, "<empty payload>")
+                    );
                     continue;
                 }
             };
@@ -721,7 +729,10 @@ where
                     }
                 }
                 Err(e) => {
-                    tracing::debug!("skipping malformed SSE line: {} ({e})", crate::util::summarize_for_log(payload, "<empty payload>"));
+                    tracing::debug!(
+                        "skipping malformed SSE line: {} ({e})",
+                        crate::util::summarize_for_log(payload, "<empty payload>")
+                    );
                 }
             }
         }
@@ -862,7 +873,6 @@ mod tests {
             configured_rewrite,
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -873,7 +883,10 @@ mod tests {
             "runtime-model".to_string(),
         );
 
-        let output = provider.complete(&request(false), &runtime_rewrite).await.unwrap();
+        let output = provider
+            .complete(&request(false), &runtime_rewrite)
+            .await
+            .unwrap();
 
         assert_eq!(provider.name(), "test");
         expect_variant!(output, ProviderOutput::Json(body) => {
@@ -901,7 +914,6 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -947,7 +959,6 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -992,7 +1003,6 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -1083,7 +1093,6 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -1151,7 +1160,6 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -1366,10 +1374,8 @@ mod tests {
         // Pending without flipping finished. Using a noop waker makes this
         // deterministic.
         use futures_util::stream;
-        let mut adapter = OpenAiSseToAnthropic::new(
-            stream::pending::<reqwest::Result<Bytes>>(),
-            "model",
-        );
+        let mut adapter =
+            OpenAiSseToAnthropic::new(stream::pending::<reqwest::Result<Bytes>>(), "model");
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
         let poll = std::pin::Pin::new(&mut adapter).poll_next(&mut cx);
@@ -1406,8 +1412,14 @@ mod tests {
     #[test]
     fn can_serve_model_matches_keys_when_rewrite_is_non_empty() {
         let mut rewrite = HashMap::new();
-        rewrite.insert("claude-haiku-4.6".to_string(), "deepseek-v4-flash".to_string());
-        rewrite.insert("claude-sonnet-4.6".to_string(), "deepseek-v4-flash".to_string());
+        rewrite.insert(
+            "claude-haiku-4.6".to_string(),
+            "deepseek-v4-flash".to_string(),
+        );
+        rewrite.insert(
+            "claude-sonnet-4.6".to_string(),
+            "deepseek-v4-flash".to_string(),
+        );
         let p = provider_with_rewrite(rewrite);
 
         // Mapped names are accepted.
@@ -1434,8 +1446,14 @@ mod tests {
 
         let merged = p.merged_rewrite(&runtime);
         // runtime wins on key collision; configured-only entries survive.
-        assert_eq!(merged.get("claude-a").map(String::as_str), Some("runtime-model"));
-        assert_eq!(merged.get("claude-b").map(String::as_str), Some("runtime-b"));
+        assert_eq!(
+            merged.get("claude-a").map(String::as_str),
+            Some("runtime-model")
+        );
+        assert_eq!(
+            merged.get("claude-b").map(String::as_str),
+            Some("runtime-b")
+        );
         assert_eq!(
             merged.get("claude-c").map(String::as_str),
             Some("configured-only-model")
@@ -1469,14 +1487,16 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
         .unwrap();
 
         let _ = provider
-            .complete(&cache_request_with("ephemeral", Some("u-42")), &HashMap::new())
+            .complete(
+                &cache_request_with("ephemeral", Some("u-42")),
+                &HashMap::new(),
+            )
             .await
             .unwrap();
     }
@@ -1505,14 +1525,16 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
         .unwrap();
 
         let _ = provider
-            .complete(&cache_request_with("ephemeral_1h", Some("u-9")), &HashMap::new())
+            .complete(
+                &cache_request_with("ephemeral_1h", Some("u-9")),
+                &HashMap::new(),
+            )
             .await
             .unwrap();
     }
@@ -1543,7 +1565,6 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -1580,7 +1601,6 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -1600,7 +1620,8 @@ mod tests {
         // We can't easily capture tracing output in a unit test, so
         // verify the function is wired up correctly by calling it with
         // HTML that the summarizer must strip.
-        let html = "<html><head><style>body{color:red}</style></head><body>rate limited</body></html>";
+        let html =
+            "<html><head><style>body{color:red}</style></head><body>rate limited</body></html>";
         let result = crate::util::summarize_for_log(html, "<empty payload>");
         assert!(!result.contains("style"), "CSS stripped: {result}");
         assert!(!result.contains("<html"), "HTML stripped: {result}");
@@ -1628,7 +1649,11 @@ mod tests {
         assert!(encoded.contains("\"text\":\"hello\""));
         assert!(encoded.contains("message_stop"));
         // Count message_start — should be exactly 1 (metadata line must not trigger a second start)
-        assert_eq!(encoded.matches("event: message_start").count(), 1, "metadata line should not emit extra message_start");
+        assert_eq!(
+            encoded.matches("event: message_start").count(),
+            1,
+            "metadata line should not emit extra message_start"
+        );
     }
 
     #[tokio::test]
@@ -1694,7 +1719,6 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -1736,7 +1760,6 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -1762,7 +1785,6 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -1788,7 +1810,6 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -1816,7 +1837,6 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -1839,7 +1859,9 @@ mod tests {
         // Neither substring alone matches; bare 400 / model-not-found /
         // rate-limited / empty bodies never trigger a strip.
         assert!(!has_reasoning_echo_error("400 Bad Request"));
-        assert!(!has_reasoning_echo_error(r#"{"error":{"message":"model not found"}}"#));
+        assert!(!has_reasoning_echo_error(
+            r#"{"error":{"message":"model not found"}}"#
+        ));
         assert!(!has_reasoning_echo_error("rate limited"));
         assert!(!has_reasoning_echo_error(""));
         assert!(!has_reasoning_echo_error("must be passed back"));
@@ -1912,7 +1934,10 @@ mod tests {
 
         // Every assistant message's reasoning_content is cleared.
         for m in &req.messages {
-            if let ChatMessage::Assistant { reasoning_content, .. } = m {
+            if let ChatMessage::Assistant {
+                reasoning_content, ..
+            } = m
+            {
                 assert!(reasoning_content.is_none());
             }
         }
@@ -1927,9 +1952,11 @@ mod tests {
             ChatMessage::User { content: UserContent::Text(t), .. } if t == "hello"
         ));
         let (content, tool_calls, reasoning_content) = match &req.messages[1] {
-            ChatMessage::Assistant { content, tool_calls, reasoning_content } => {
-                (content, tool_calls, reasoning_content)
-            }
+            ChatMessage::Assistant {
+                content,
+                tool_calls,
+                reasoning_content,
+            } => (content, tool_calls, reasoning_content),
             other => panic!("expected Assistant, got {other:?}"),
         };
         assert_eq!(content.as_deref(), Some("previous answer"));
@@ -2009,7 +2036,10 @@ mod tests {
         assert!(req.extra.is_null());
         assert!(req.reasoning_effort.is_none());
         for m in &req.messages {
-            if let ChatMessage::Assistant { reasoning_content, .. } = m {
+            if let ChatMessage::Assistant {
+                reasoning_content, ..
+            } = m
+            {
                 assert!(reasoning_content.is_none());
             }
         }
@@ -2039,9 +2069,8 @@ mod tests {
                 if n == 0 {
                     ResponseTemplate::new(400).set_body_string(REASONING_ECHO_400)
                 } else {
-                    *captured_for_responder.lock().unwrap() = Some(
-                        serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
-                    );
+                    *captured_for_responder.lock().unwrap() =
+                        Some(serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({})));
                     ResponseTemplate::new(200).set_body_json(chat_response())
                 }
             })
@@ -2056,7 +2085,6 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -2072,7 +2100,11 @@ mod tests {
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
 
         // Retried body: only reasoning signals stripped, structure intact.
-        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("second body captured");
         let messages = sent["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 3, "must not drop/merge messages: {sent}");
         assert_eq!(messages[0]["role"], "user");
@@ -2138,7 +2170,6 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -2160,7 +2191,11 @@ mod tests {
             "must surface the SECOND attempt's body, got: {body}"
         );
 
-        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("second body captured");
         let messages = sent["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 3, "must not drop/merge messages: {sent}");
         assert_eq!(messages[0]["content"], "hello");
@@ -2197,7 +2232,6 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -2239,7 +2273,6 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -2283,7 +2316,6 @@ mod tests {
             rewrite,
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -2330,7 +2362,9 @@ mod tests {
         // Neither substring alone matches; bare 400 / model-not-found /
         // rate-limited / empty bodies never trigger a downgrade.
         assert!(!has_response_format_error("400 Bad Request"));
-        assert!(!has_response_format_error(r#"{"error":{"message":"model not found"}}"#));
+        assert!(!has_response_format_error(
+            r#"{"error":{"message":"model not found"}}"#
+        ));
         assert!(!has_response_format_error("rate limited"));
         assert!(!has_response_format_error(""));
         assert!(!has_response_format_error("unavailable"));
@@ -2393,7 +2427,10 @@ mod tests {
         };
 
         let downgraded = downgrade_response_format(&mut req);
-        assert!(downgraded, "a json_schema response_format must trigger downgrade");
+        assert!(
+            downgraded,
+            "a json_schema response_format must trigger downgrade"
+        );
 
         let obj = req.extra.as_object().unwrap();
         assert_eq!(
@@ -2446,7 +2483,10 @@ mod tests {
             extra: json!({"response_format": {"type": "json_object"}}),
         };
         assert!(!downgrade_response_format(&mut req));
-        assert_eq!(req.extra, json!({"response_format": {"type": "json_object"}}));
+        assert_eq!(
+            req.extra,
+            json!({"response_format": {"type": "json_object"}})
+        );
 
         // text — must pass through verbatim.
         req.extra = json!({"response_format": {"type": "text"}});
@@ -2533,9 +2573,8 @@ mod tests {
                 if n == 0 {
                     ResponseTemplate::new(400).set_body_string(RESPONSE_FORMAT_400)
                 } else {
-                    *captured_for_responder.lock().unwrap() = Some(
-                        serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
-                    );
+                    *captured_for_responder.lock().unwrap() =
+                        Some(serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({})));
                     ResponseTemplate::new(200).set_body_json(chat_response())
                 }
             })
@@ -2550,7 +2589,6 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -2567,7 +2605,11 @@ mod tests {
 
         // Retried body: response_format must be downgraded to json_object;
         // messages and model must be intact.
-        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("second body captured");
         assert_eq!(
             sent["response_format"],
             json!({"type": "json_object"}),
@@ -2620,7 +2662,6 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -2643,7 +2684,11 @@ mod tests {
         );
 
         // The second body must already carry the downgraded response_format.
-        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("second body captured");
         assert_eq!(
             sent["response_format"],
             json!({"type": "json_object"}),
@@ -2674,7 +2719,6 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -2709,8 +2753,7 @@ mod tests {
             .and(path("/chat/completions"))
             .respond_with(move |req: &wiremock::Request| {
                 let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let parsed: Value = serde_json::from_slice(&req.body)
-                    .unwrap_or_else(|_| json!({}));
+                let parsed: Value = serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}));
                 captured_for_responder.lock().unwrap().push(parsed);
                 match n {
                     0 => ResponseTemplate::new(400).set_body_string(REASONING_ECHO_400),
@@ -2729,7 +2772,6 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -2797,9 +2839,8 @@ mod tests {
                 if n == 0 {
                     ResponseTemplate::new(400).set_body_string(RESPONSE_FORMAT_400)
                 } else {
-                    *captured_for_responder.lock().unwrap() = Some(
-                        serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
-                    );
+                    *captured_for_responder.lock().unwrap() =
+                        Some(serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({})));
                     ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream")
                 }
             })
@@ -2814,7 +2855,6 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -2836,7 +2876,11 @@ mod tests {
         });
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
 
-        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("second body captured");
         assert_eq!(
             sent["response_format"],
             json!({"type": "json_object"}),
@@ -2886,7 +2930,6 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -2908,7 +2951,11 @@ mod tests {
             "must surface the SECOND attempt's body, got: {body}"
         );
 
-        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("second body captured");
         assert_eq!(
             sent["response_format"],
             json!({"type": "json_object"}),
@@ -2937,7 +2984,6 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-
             false,
             reqwest::Client::new(),
         )
@@ -2986,7 +3032,7 @@ mod tests {
             vec!["Azure".to_string()],
             Vec::new(),
             false,
-            true,  // force_openrouter
+            true, // force_openrouter
             reqwest::Client::new(),
         )
         .unwrap();
@@ -3096,7 +3142,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             false,
-            true,  // force_openrouter (even so, empty list means no injection)
+            true, // force_openrouter (even so, empty list means no injection)
             reqwest::Client::new(),
         )
         .unwrap();
@@ -3127,9 +3173,8 @@ mod tests {
                 if n == 0 {
                     ResponseTemplate::new(400).set_body_string(REASONING_ECHO_400)
                 } else {
-                    *captured_for_responder.lock().unwrap() = Some(
-                        serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
-                    );
+                    *captured_for_responder.lock().unwrap() =
+                        Some(serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({})));
                     ResponseTemplate::new(200).set_body_json(chat_response())
                 }
             })
@@ -3145,7 +3190,7 @@ mod tests {
             vec!["Azure".to_string()],
             Vec::new(),
             false,
-            true,  // force_openrouter
+            true, // force_openrouter
             reqwest::Client::new(),
         )
         .unwrap();
@@ -3159,7 +3204,11 @@ mod tests {
         // Retried body: provider ignore list survived the
         // reasoning-echo strip (only reasoning signals are removed,
         // not extra keys).
-        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("second body captured");
         assert_eq!(
             sent["provider"]["ignore"],
             json!(["Azure"]),
@@ -3200,9 +3249,8 @@ mod tests {
                     // assertion below. The retry body must STILL carry
                     // `provider: {ignore:[...]}` — that's the load-
                     // bearing guarantee.
-                    *captured_for_responder.lock().unwrap() = Some(
-                        serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
-                    );
+                    *captured_for_responder.lock().unwrap() =
+                        Some(serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({})));
                     ResponseTemplate::new(200).set_body_json(chat_response())
                 }
             })
@@ -3241,7 +3289,11 @@ mod tests {
         // Retried body: provider.ignore survived the downgrade, AND
         // response_format was actually rewritten to json_object (the
         // downgrade path actually ran, otherwise this test is no-op).
-        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("second body captured");
         assert_eq!(
             sent["provider"]["ignore"],
             json!(["Azure"]),
@@ -3282,7 +3334,7 @@ mod tests {
             vec!["Azure".to_string(), "Together".to_string()],
             Vec::new(),
             false,
-            true,  // force_openrouter
+            true, // force_openrouter
             reqwest::Client::new(),
         )
         .unwrap();
@@ -3651,7 +3703,11 @@ mod tests {
             .unwrap();
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
 
-        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("second body captured");
         assert_eq!(
             sent["provider"]["only"],
             json!(["DeepInfra", "Together"]),
@@ -3716,7 +3772,11 @@ mod tests {
         let _ = provider.complete(&req, &HashMap::new()).await.unwrap();
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
 
-        let sent = captured.lock().unwrap().clone().expect("second body captured");
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("second body captured");
         assert_eq!(
             sent["provider"]["only"],
             json!(["DeepInfra"]),
@@ -4048,7 +4108,9 @@ mod tests {
                 let Some(messages) = body.get("messages").and_then(|m| m.as_array()) else {
                     return false;
                 };
-                !messages.iter().any(|m| m.get("reasoning_content").is_some())
+                !messages
+                    .iter()
+                    .any(|m| m.get("reasoning_content").is_some())
             }
         }
         Mock::given(method("POST"))

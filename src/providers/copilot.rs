@@ -27,8 +27,7 @@ use crate::providers::{Provider, ProviderOutput};
 
 const EDITOR_PLUGIN_VERSION: &str = "copilot-chat/0.26.7";
 const GITHUB_API_VERSION: &str = "2025-04-01";
-const COPILOT_INTERNAL_TOKEN_URL: &str =
-    "https://api.github.com/copilot_internal/v2/token";
+const COPILOT_INTERNAL_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/token";
 
 /// A Copilot-discovered model stripped to the fields `/v1/models` needs.
 /// Policy state and capabilities from the upstream response are discarded
@@ -129,10 +128,9 @@ enum HeaderBuildError {
 impl std::fmt::Display for HeaderBuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HeaderBuildError::CorruptToken => write!(
-                f,
-                "stored copilot token is not a valid HTTP header value"
-            ),
+            HeaderBuildError::CorruptToken => {
+                write!(f, "stored copilot token is not a valid HTTP header value")
+            }
             HeaderBuildError::CorruptVersion => write!(
                 f,
                 "configured vscode_version is not a valid HTTP header value"
@@ -697,7 +695,10 @@ impl CopilotProvider {
         Ok(())
     }
 
-    async fn fetch_copilot_token(&self, github_token: &str) -> std::result::Result<StoredTokens, CopilotFetchError> {
+    async fn fetch_copilot_token(
+        &self,
+        github_token: &str,
+    ) -> std::result::Result<StoredTokens, CopilotFetchError> {
         // A github token read from a corrupt store file can itself be
         // non-header-safe; reqwest's `.header()` panics on that, so
         // build the value explicitly and classify it as rejected
@@ -769,14 +770,20 @@ impl CopilotProvider {
                 ));
             }
         };
-        let expires_at = body.get("expires_at").and_then(|v| v.as_i64()).unwrap_or_else(|| {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-            now + 1500
-        });
-        let refresh_in = body.get("refresh_in").and_then(|v| v.as_i64()).unwrap_or(1500);
+        let expires_at = body
+            .get("expires_at")
+            .and_then(|v| v.as_i64())
+            .unwrap_or_else(|| {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                now + 1500
+            });
+        let refresh_in = body
+            .get("refresh_in")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(1500);
         Ok(StoredTokens {
             github_access_token: github_token.to_string(),
             copilot_token: token,
@@ -934,10 +941,7 @@ impl CopilotProvider {
                 // iteration, so this is TRACE — the count is useful only
                 // when debugging model-cache issues, and at INFO/DEBUG it
                 // would just pollute the log.
-                tracing::trace!(
-                    model_count = models.len(),
-                    "copilot models cached"
-                );
+                tracing::trace!(model_count = models.len(), "copilot models cached");
                 // Persist FIRST, then move into memory: `save_models_to_disk`
                 // borrows, `Some(models)` moves.
                 self.save_models_to_disk(&models);
@@ -1067,18 +1071,11 @@ impl CopilotProvider {
             });
         }
         let body: Value = resp.json().await.map_err(|e| {
-            CopilotFetchError::Transient(format!(
-                "copilot models response not valid JSON: {e}"
-            ))
+            CopilotFetchError::Transient(format!("copilot models response not valid JSON: {e}"))
         })?;
-        let data = body
-            .get("data")
-            .and_then(|d| d.as_array())
-            .ok_or_else(|| {
-                CopilotFetchError::Transient(
-                    "copilot models response missing 'data' array".to_string(),
-                )
-            })?;
+        let data = body.get("data").and_then(|d| d.as_array()).ok_or_else(|| {
+            CopilotFetchError::Transient("copilot models response missing 'data' array".to_string())
+        })?;
         let enabled: Vec<CopilotModel> = data
             .iter()
             .filter(|entry| {
@@ -1088,14 +1085,11 @@ impl CopilotProvider {
                     .and_then(|s| s.as_str())
                     == Some("enabled")
             })
-            .filter_map(|entry| {
-                match serde_json::from_value::<CopilotModel>(entry.clone()) {
+            .filter_map(
+                |entry| match serde_json::from_value::<CopilotModel>(entry.clone()) {
                     Ok(m) => Some(m),
                     Err(e) => {
-                        let id = entry
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("?");
+                        let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or("?");
                         tracing::warn!(
                             entry_id = id,
                             error = %e,
@@ -1103,17 +1097,13 @@ impl CopilotProvider {
                         );
                         None
                     }
-                }
-            })
+                },
+            )
             .collect();
         Ok(enabled)
     }
 
-    async fn send_with_token(
-        &self,
-        url: &str,
-        body: &Value,
-    ) -> Result<reqwest::Response> {
+    async fn send_with_token(&self, url: &str, body: &Value) -> Result<reqwest::Response> {
         let token = self.ensure_token().await?;
         let headers = self.request_headers(&token)?;
         let resp = self
@@ -1151,8 +1141,7 @@ impl CopilotProvider {
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
         let merged = self.merged_rewrite(model_rewrite);
-        let mut responses_req =
-            crate::conversion::anthropic_to_responses_request(req, &merged)?;
+        let mut responses_req = crate::conversion::anthropic_to_responses_request(req, &merged)?;
         responses_req.stream = false;
         // PR-9: Copilot strips high-risk fields before serialization.
         // Copilot's request-side tolerance is unverified (closed source,
@@ -1174,11 +1163,8 @@ impl CopilotProvider {
         }
         let parsed: crate::responses::ResponsesResponse = serde_json::from_str(&text)?;
         let msg_id = crate::conversion::make_message_id();
-        let anthropic = crate::conversion::responses_to_anthropic_response(
-            &parsed,
-            &req.model,
-            &msg_id,
-        )?;
+        let anthropic =
+            crate::conversion::responses_to_anthropic_response(&parsed, &req.model, &msg_id)?;
         Ok(ProviderOutput::Json(serde_json::to_value(anthropic)?))
     }
 
@@ -1189,8 +1175,7 @@ impl CopilotProvider {
         model_rewrite: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
         let merged = self.merged_rewrite(model_rewrite);
-        let mut responses_req =
-            crate::conversion::anthropic_to_responses_request(req, &merged)?;
+        let mut responses_req = crate::conversion::anthropic_to_responses_request(req, &merged)?;
         responses_req.stream = true;
         // PR-9: strip high-risk fields before serialization (see
         // complete_responses for rationale).
@@ -1207,11 +1192,9 @@ impl CopilotProvider {
             });
         }
         let stream = resp.bytes_stream();
-        let sse = crate::providers::openai_responses::ResponsesSseToAnthropic::new(
-            stream,
-            &req.model,
-        )
-        .with_expose_upstream_details(self.expose_upstream_details);
+        let sse =
+            crate::providers::openai_responses::ResponsesSseToAnthropic::new(stream, &req.model)
+                .with_expose_upstream_details(self.expose_upstream_details);
         Ok(ProviderOutput::Stream(Box::new(sse)))
     }
 }
@@ -1314,8 +1297,7 @@ impl Provider for CopilotProvider {
             return self.complete_responses(req, &merged).await;
         }
 
-        let mut openai_req =
-            crate::conversion::anthropic_to_openai_request(req, &merged, false)?;
+        let mut openai_req = crate::conversion::anthropic_to_openai_request(req, &merged, false)?;
         openai_req.stream = false;
         openai_req.stream_options = None;
         // PR-9: strip high-risk fields before serialization (see
@@ -1338,10 +1320,12 @@ impl Provider for CopilotProvider {
         // so the client sees the real upstream message rather than a
         // generic 500 "missing field `object`" — see fix-R8 in
         // docs/TEST_ISSUES.md.
-        let parsed: serde_json::Value = serde_json::from_str(&text)
-            .map_err(ProxyError::Json)?;
+        let parsed: serde_json::Value = serde_json::from_str(&text).map_err(ProxyError::Json)?;
         if crate::openai::looks_like_error_envelope(&parsed) {
-            return Err(ProxyError::Upstream { status: 400, body: text });
+            return Err(ProxyError::Upstream {
+                status: 400,
+                body: text,
+            });
         }
         let chat: crate::openai::ChatResponse = serde_json::from_value(parsed)?;
         let msg_id = crate::conversion::make_message_id();
@@ -1365,8 +1349,7 @@ impl Provider for CopilotProvider {
             return self.stream_responses(req, &merged).await;
         }
 
-        let mut openai_req =
-            crate::conversion::anthropic_to_openai_request(req, &merged, false)?;
+        let mut openai_req = crate::conversion::anthropic_to_openai_request(req, &merged, false)?;
         openai_req.stream = true;
         openai_req.stream_options = Some(crate::openai::StreamOptions {
             include_usage: true,
@@ -1506,8 +1489,7 @@ mod tests {
         assert!(req.service_tier.is_none());
         // format is preserved.
         assert_eq!(
-            req.extra["text"]["format"]["type"],
-            "json_schema",
+            req.extra["text"]["format"]["type"], "json_schema",
             "format must survive the strip; got {}",
             req.extra
         );
@@ -1810,7 +1792,10 @@ mod tests {
             Some(stored_tokens("github-token", "bad\u{0}token", 600)),
         );
         let err = provider
-            .send_with_token("http://127.0.0.1:1/chat/completions", &serde_json::json!({}))
+            .send_with_token(
+                "http://127.0.0.1:1/chat/completions",
+                &serde_json::json!({}),
+            )
             .await
             .unwrap_err();
         expect_variant!(err, ProxyError::Upstream { status, body } => {
@@ -1849,7 +1834,10 @@ mod tests {
         );
         provider.vscode_version = "bad\u{0}".to_string();
         let err = provider
-            .send_with_token("http://127.0.0.1:1/chat/completions", &serde_json::json!({}))
+            .send_with_token(
+                "http://127.0.0.1:1/chat/completions",
+                &serde_json::json!({}),
+            )
             .await
             .unwrap_err();
         expect_variant!(err, ProxyError::Upstream { status, body } => {
@@ -1940,10 +1928,7 @@ mod tests {
             .mount(&server)
             .await;
         let (_dir, provider) = test_provider(Some(&server), None);
-        let error = provider
-            .fetch_copilot_token("github")
-            .await
-            .unwrap_err();
+        let error = provider.fetch_copilot_token("github").await.unwrap_err();
         // 403 is now classified as AuthRejected (not Transient), so the
         // error message reflects that — the caller uses this to decide
         // whether to clear the store.
@@ -1957,10 +1942,7 @@ mod tests {
             .mount(&server)
             .await;
         let (_dir, provider) = test_provider(Some(&server), None);
-        let error = provider
-            .fetch_copilot_token("github")
-            .await
-            .unwrap_err();
+        let error = provider.fetch_copilot_token("github").await.unwrap_err();
         assert!(error.to_string().contains("missing token"));
     }
 
@@ -2024,7 +2006,10 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         assert!(!msg.contains("font-family"), "CSS leaked: {msg}");
         assert!(!msg.contains("example.test"), "URL leaked: {msg}");
         assert!(!msg.contains("background:"), "CSS url() leaked: {msg}");
-        assert!(!msg.contains("github.com/styleguide"), "comment URL leaked: {msg}");
+        assert!(
+            !msg.contains("github.com/styleguide"),
+            "comment URL leaked: {msg}"
+        );
         assert!(!msg.contains(".css"), "stylesheet URL leaked: {msg}");
         assert!(!msg.contains(".png"), "image URL leaked: {msg}");
         assert!(!msg.contains("<html"), "raw HTML leaked: {msg}");
@@ -2072,7 +2057,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
                 tokens: RwLock::new(None),
                 store,
                 refresh_lock: Mutex::new(()),
-            cached_models: RwLock::new(None),
+                cached_models: RwLock::new(None),
             }),
             api_base_override: None,
             // 127.0.0.1:1 is in the reserved low-port range; nothing
@@ -2422,10 +2407,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         let mut gpt5_req = request(true);
         gpt5_req.model = "gpt-5".to_string();
 
-        let output = provider
-            .stream(&gpt5_req, &HashMap::new())
-            .await
-            .unwrap();
+        let output = provider.stream(&gpt5_req, &HashMap::new()).await.unwrap();
         expect_variant!(output, ProviderOutput::Stream(mut output) => {
             let mut encoded = String::new();
             while let Some(item) = output.next().await {
@@ -2481,10 +2463,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         let mut gpt5_req = request(false);
         gpt5_req.model = "gpt-5".to_string();
 
-        let output = provider
-            .complete(&gpt5_req, &HashMap::new())
-            .await
-            .unwrap();
+        let output = provider.complete(&gpt5_req, &HashMap::new()).await.unwrap();
         expect_variant!(output, ProviderOutput::Json(body) => {
             assert_eq!(body["content"][0]["text"], "ok");
         });
@@ -2508,7 +2487,9 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             .await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(body_partial_json(json!({"model": "gpt-5", "stream": false})))
+            .and(body_partial_json(
+                json!({"model": "gpt-5", "stream": false}),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "chatcmpl-1",
                 "object": "chat.completion",
@@ -2533,18 +2514,12 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             id: "gpt-5".to_string(),
             name: "GPT-5".to_string(),
             vendor: "openai".to_string(),
-            supported_endpoints: vec![
-                "/chat/completions".to_string(),
-                "/responses".to_string(),
-            ],
+            supported_endpoints: vec!["/chat/completions".to_string(), "/responses".to_string()],
         }]);
         let mut gpt5_req = request(false);
         gpt5_req.model = "gpt-5".to_string();
 
-        let output = provider
-            .complete(&gpt5_req, &HashMap::new())
-            .await
-            .unwrap();
+        let output = provider.complete(&gpt5_req, &HashMap::new()).await.unwrap();
         expect_variant!(output, ProviderOutput::Json(body) => {
             assert_eq!(body["content"][0]["text"], "hello-from-chat");
         });
@@ -2641,10 +2616,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         let mut gpt5_req = request(false);
         gpt5_req.model = "gpt-5".to_string();
 
-        let output = provider
-            .complete(&gpt5_req, &HashMap::new())
-            .await
-            .unwrap();
+        let output = provider.complete(&gpt5_req, &HashMap::new()).await.unwrap();
         expect_variant!(output, ProviderOutput::Json(body) => {
             assert_eq!(body["content"][0]["text"], "ok");
         });
@@ -2667,9 +2639,9 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         Mock::given(method("POST"))
             .and(path("/responses"))
             .and(body_partial_json(json!({"model": "grok-4.5"})))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                responses_response_json("via-responses"),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(responses_response_json("via-responses")),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -2682,10 +2654,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         // No rewrite: upstream_model == req.model, cold cache -> responses.
         let rewrite = HashMap::new();
 
-        let output = provider
-            .complete(&req, &rewrite)
-            .await
-            .unwrap();
+        let output = provider.complete(&req, &rewrite).await.unwrap();
         expect_variant!(output, ProviderOutput::Json(body) => {
             assert_eq!(body["content"][0]["text"], "via-responses");
         });
@@ -2700,9 +2669,9 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         Mock::given(method("POST"))
             .and(path("/responses"))
             .and(body_partial_json(json!({"model": "gpt-5.5"})))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                responses_response_json("via-responses"),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(responses_response_json("via-responses")),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -2721,10 +2690,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         let mut rewrite = HashMap::new();
         rewrite.insert("work-high".to_string(), "gpt-5.5".to_string());
 
-        let output = provider
-            .complete(&req, &rewrite)
-            .await
-            .unwrap();
+        let output = provider.complete(&req, &rewrite).await.unwrap();
         expect_variant!(output, ProviderOutput::Json(body) => {
             assert_eq!(body["content"][0]["text"], "via-responses");
         });
@@ -2803,7 +2769,10 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             vendor: "anthropic".to_string(),
             supported_endpoints: vec!["/chat/completions".to_string()],
         }]);
-        assert_eq!(p.endpoint_for_model("claude-sonnet-4.6").await, "chat_completions");
+        assert_eq!(
+            p.endpoint_for_model("claude-sonnet-4.6").await,
+            "chat_completions"
+        );
     }
 
     #[tokio::test]
@@ -2881,7 +2850,10 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         // The router relies on this to skip Copilot for unsupported
         // models without making a doomed HTTP call.
         let mut rewrite = HashMap::new();
-        rewrite.insert("claude-sonnet-4.6".to_string(), "copilot-claude".to_string());
+        rewrite.insert(
+            "claude-sonnet-4.6".to_string(),
+            "copilot-claude".to_string(),
+        );
         let (_dir, mut provider) = test_provider(None, None);
         provider.model_rewrite = rewrite;
         assert!(provider.can_serve_model("claude-sonnet-4.6"));
@@ -2957,9 +2929,9 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         Mock::given(method("POST"))
             .and(path("/responses"))
             .and(header("authorization", "Bearer new-token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                responses_response_json("retried"),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(responses_response_json("retried")),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -2971,10 +2943,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         let mut req = request(false);
         req.model = "gpt-5".to_string();
 
-        let output = provider
-            .complete(&req, &HashMap::new())
-            .await
-            .unwrap();
+        let output = provider.complete(&req, &HashMap::new()).await.unwrap();
 
         expect_variant!(output, ProviderOutput::Json(body) => {
             assert_eq!(body["content"][0]["text"], "retried");
@@ -3069,8 +3038,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         Mock::given(method("POST"))
             .and(path("/responses"))
             .respond_with(
-                ResponseTemplate::new(402)
-                    .set_body_string("You have exceeded your monthly quota"),
+                ResponseTemplate::new(402).set_body_string("You have exceeded your monthly quota"),
             )
             .mount(&server)
             .await;
@@ -3104,8 +3072,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         Mock::given(method("POST"))
             .and(path("/responses"))
             .respond_with(
-                ResponseTemplate::new(402)
-                    .set_body_string("You have exceeded your monthly quota"),
+                ResponseTemplate::new(402).set_body_string("You have exceeded your monthly quota"),
             )
             .mount(&server)
             .await;
@@ -3139,8 +3106,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(
-                ResponseTemplate::new(402)
-                    .set_body_string("You have exceeded your monthly quota"),
+                ResponseTemplate::new(402).set_body_string("You have exceeded your monthly quota"),
             )
             .mount(&server)
             .await;
@@ -3173,8 +3139,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(
-                ResponseTemplate::new(402)
-                    .set_body_string("You have exceeded your monthly quota"),
+                ResponseTemplate::new(402).set_body_string("You have exceeded your monthly quota"),
             )
             .mount(&server)
             .await;
@@ -3282,10 +3247,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             .expect("refresh_once should complete within 5s");
 
         let memory = provider.state.tokens.read().await;
-        assert_eq!(
-            memory.as_ref().unwrap().copilot_token,
-            "loop-copilot-token"
-        );
+        assert_eq!(memory.as_ref().unwrap().copilot_token, "loop-copilot-token");
         let cached = provider.cached_models().await.expect("models were cached");
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].id, "m1");
@@ -3386,10 +3348,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             .expect("refresh_once should complete within 5s");
 
         let memory = provider.state.tokens.read().await;
-        assert_eq!(
-            memory.as_ref().unwrap().copilot_token,
-            "empty-loop-token"
-        );
+        assert_eq!(memory.as_ref().unwrap().copilot_token, "empty-loop-token");
     }
 
     #[tokio::test]
@@ -3428,7 +3387,12 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         // The store must still hold the original credentials — the
         // refresh failure was transient, so the loop must not have
         // cleared it.
-        let disk = provider.state.store.load(None).unwrap().expect("store intact");
+        let disk = provider
+            .state
+            .store
+            .load(None)
+            .unwrap()
+            .expect("store intact");
         assert_eq!(disk.github_access_token, "loop-fail-github");
     }
 
@@ -3603,7 +3567,11 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         };
         let _auto_advance = spawn_test_time_advance();
 
-        let err = provider.refresh_token().await.err().expect("must fast-fail");
+        let err = provider
+            .refresh_token()
+            .await
+            .err()
+            .expect("must fast-fail");
         match err {
             ProxyError::Upstream { status, body } => {
                 assert_eq!(status, 401);
@@ -3614,7 +3582,10 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
 
         // Memory cache stays empty; bootstrap hasn't run.
         let memory = provider.state.tokens.read().await;
-        assert!(memory.is_none(), "refresh_token must not populate cache on fast-fail");
+        assert!(
+            memory.is_none(),
+            "refresh_token must not populate cache on fast-fail"
+        );
         // Store stays empty (no file written).
         assert!(provider.state.store.load(None).unwrap().is_none());
     }
@@ -3669,7 +3640,11 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         };
         let _auto_advance = spawn_test_time_advance();
 
-        let err = provider.refresh_token().await.err().expect("must fast-fail");
+        let err = provider
+            .refresh_token()
+            .await
+            .err()
+            .expect("must fast-fail");
         match err {
             ProxyError::Upstream { status, body } => {
                 assert_eq!(status, 401);
@@ -3724,11 +3699,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             .save(&stored_tokens("stale-github", "old-copilot", -10), None)
             .unwrap();
         let state = Arc::new(CopilotState {
-            tokens: RwLock::new(Some(stored_tokens(
-                "stale-github",
-                "old-copilot",
-                -10,
-            ))),
+            tokens: RwLock::new(Some(stored_tokens("stale-github", "old-copilot", -10))),
             store: store.clone(),
             refresh_lock: Mutex::new(()),
             cached_models: RwLock::new(None),
@@ -3747,7 +3718,11 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         };
         let _auto_advance = spawn_test_time_advance();
 
-        let err = provider.refresh_token().await.err().expect("must fast-fail");
+        let err = provider
+            .refresh_token()
+            .await
+            .err()
+            .expect("must fast-fail");
         match err {
             ProxyError::Upstream { status, body } => {
                 assert_eq!(status, 401);
@@ -3869,20 +3844,17 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         // write fill cached_models, so observing tokens alone races the
         // cache write (deterministically reproducible under slow /
         // instrumented runs, e.g. llvm-cov).
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            async {
-                loop {
-                    let tokens_set = provider.state.tokens.read().await.is_some();
-                    let models_set = provider.cached_models().await.is_some();
-                    if tokens_set && models_set {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let tokens_set = provider.state.tokens.read().await.is_some();
+                let models_set = provider.cached_models().await.is_some();
+                if tokens_set && models_set {
+                    break;
                 }
-            },
-        )
+                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
         .await;
         assert!(result.is_ok(), "bootstrap task did not complete in 30s");
 
@@ -4039,10 +4011,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
     fn models_url_returns_expected_path() {
         let (dir, p) = test_provider(None, None);
         drop(dir);
-        assert_eq!(
-            p.models_url(),
-            "https://api.githubcopilot.com/models"
-        );
+        assert_eq!(p.models_url(), "https://api.githubcopilot.com/models");
     }
 
     #[tokio::test]
@@ -4135,10 +4104,17 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         p.save_models_to_disk(&models);
 
         let path = models_cache_path_for(&p.state.store);
-        assert!(path.exists(), "models cache must be written next to token store");
+        assert!(
+            path.exists(),
+            "models cache must be written next to token store"
+        );
         let loaded = load_models_from_disk(&path).expect("roundtrip load must succeed");
         let ids: Vec<_> = loaded.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, vec!["a-model", "z-model"], "disk snapshot is sorted by id");
+        assert_eq!(
+            ids,
+            vec!["a-model", "z-model"],
+            "disk snapshot is sorted by id"
+        );
 
         // No `.tmp` residue: write_atomic writes a temp file and renames.
         let leftover: Vec<_> = std::fs::read_dir(dir.path())
@@ -4152,7 +4128,10 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o644, "models cache holds no secrets; must be group-readable");
+            assert_eq!(
+                mode, 0o644,
+                "models cache holds no secrets; must be group-readable"
+            );
         }
     }
 
@@ -4381,7 +4360,10 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             .unwrap(),
         )
         .unwrap();
-        assert!(path.exists(), "precondition: stale previous-account cache exists");
+        assert!(
+            path.exists(),
+            "precondition: stale previous-account cache exists"
+        );
 
         let dc = DeviceCodeResponse {
             device_code: "sb-device".to_string(),
@@ -4390,7 +4372,9 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             expires_in: 600,
             interval: 5,
         };
-        p.complete_bootstrap(dc).await.expect("bootstrap must succeed despite /models 5xx");
+        p.complete_bootstrap(dc)
+            .await
+            .expect("bootstrap must succeed despite /models 5xx");
 
         assert!(
             !path.exists(),
@@ -4415,7 +4399,10 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             .await;
 
         let (_dir, p) = test_provider(Some(&server), None);
-        let result = p.fetch_models("test-token").await.expect("fetch should succeed");
+        let result = p
+            .fetch_models("test-token")
+            .await
+            .expect("fetch should succeed");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, "enabled-model");
     }
@@ -4437,7 +4424,10 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             .await;
 
         let (_dir, p) = test_provider(Some(&server), None);
-        let result = p.fetch_models("test-token").await.expect("fetch should succeed");
+        let result = p
+            .fetch_models("test-token")
+            .await
+            .expect("fetch should succeed");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, "has-policy");
     }
@@ -4693,18 +4683,15 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         let provider = Arc::new(p);
         let handle = provider.clone().spawn_refresh_loop();
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            async {
-                loop {
-                    if provider.cached_models().await.is_some() {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if provider.cached_models().await.is_some() {
+                    break;
                 }
-            },
-        )
+                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
         .await;
 
         handle.abort();
@@ -4805,18 +4792,15 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         // Poll for cache population. The spawned task's device-flow
         // poll loop sleeps interval+1 = 6 s between attempts, so allow
         // enough wall-clock time for bootstrap + cache_models to finish.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            async {
-                loop {
-                    if provider.cached_models().await.is_some() {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                if provider.cached_models().await.is_some() {
+                    break;
                 }
-            },
-        )
+                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
         .await;
 
         assert!(
@@ -4855,18 +4839,15 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
         // Poll until the initial cache_models() call completes (the
         // spawned task makes a real HTTP request to wiremock, which
         // needs actual wall-clock time — not just paused-time advances).
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            async {
-                loop {
-                    if provider.cached_models().await.is_some() {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if provider.cached_models().await.is_some() {
+                    break;
                 }
-            },
-        )
+                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
         .await;
 
         handle.abort();
@@ -4916,8 +4897,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
     /// reads the tokens back.
     #[tokio::test]
     async fn the_provider_encrypts_the_token_store_when_a_key_is_configured() {
-        const KEY: &str =
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("github_token.json");
@@ -4958,8 +4938,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
     /// failing to start.
     #[tokio::test]
     async fn a_provider_without_a_key_cannot_read_an_encrypted_store() {
-        const KEY: &str =
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("github_token.json");

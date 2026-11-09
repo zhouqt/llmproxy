@@ -153,13 +153,15 @@ pub fn anthropic_to_responses_request(
                             // mapping is approximate; a future change
                             // may drop the field entirely (see
                             // docs/PLANS/web-search-followup.md).
-                            t.extra.get("max_uses")
-                                .and_then(|v| v.as_u64())
-                                .map(|u| {
-                                    if u >= 10 { "high".to_string() }
-                                    else if u >= 5 { "medium".to_string() }
-                                    else { "low".to_string() }
-                                })
+                            t.extra.get("max_uses").and_then(|v| v.as_u64()).map(|u| {
+                                if u >= 10 {
+                                    "high".to_string()
+                                } else if u >= 5 {
+                                    "medium".to_string()
+                                } else {
+                                    "low".to_string()
+                                }
+                            })
                         }),
                     user_location: t.extra.get("user_location").cloned(),
                 });
@@ -226,9 +228,14 @@ pub fn anthropic_to_responses_request(
             .map(|u| truncate_user(u)),
         prompt_cache_key: hints.prompt_cache_key,
         prompt_cache_retention,
-        reasoning: req.output_config.as_ref()
+        reasoning: req
+            .output_config
+            .as_ref()
             .and_then(|oc| oc.effort.clone())
-            .map(|e| ReasoningConfig { effort: Some(e), summary: Some(ReasoningSummary::Auto) })
+            .map(|e| ReasoningConfig {
+                effort: Some(e),
+                summary: Some(ReasoningSummary::Auto),
+            })
             .or_else(|| req.thinking.as_ref().and_then(convert_thinking)),
         // PR-3: keep OpenAI's default (Responses `store: true`) — do not
         // send the field. See `ResponsesRequest.store` doc.
@@ -245,7 +252,11 @@ pub fn anthropic_to_responses_request(
             // `text.verbosity` (same enum as Chat top-level `verbosity`).
             // Build the text object once and merge in format if any.
             let mut text_obj = serde_json::Map::new();
-            if let Some(v) = req.output_config.as_ref().and_then(|oc| oc.verbosity.clone()) {
+            if let Some(v) = req
+                .output_config
+                .as_ref()
+                .and_then(|oc| oc.verbosity.clone())
+            {
                 text_obj.insert("verbosity".into(), Value::String(v));
             }
             if let Some(fmt) = req.output_config.as_ref().and_then(|oc| oc.format.as_ref()) {
@@ -311,10 +322,7 @@ fn convert_blocks(role: &str, blocks: &[ContentBlock]) -> Vec<ResponseInputItem>
                         });
                     }
                     ContentBlock::Image { source, .. } => {
-                        let url = format!(
-                            "data:{};base64,{}",
-                            source.media_type, source.data
-                        );
+                        let url = format!("data:{};base64,{}", source.media_type, source.data);
                         parts.push(ResponseInputPart::InputImage {
                             image_url: url,
                             detail: None,
@@ -383,7 +391,9 @@ fn convert_blocks(role: &str, blocks: &[ContentBlock]) -> Vec<ResponseInputItem>
                         // Reasoning isn't replayed in subsequent turns via
                         // the Responses input[] — drop it.
                     }
-                    ContentBlock::ToolUse { id, name, input, .. } => {
+                    ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => {
                         tool_calls.push((
                             id.clone(),
                             name.clone(),
@@ -491,14 +501,15 @@ pub fn responses_to_anthropic_response(
 
     for item in &resp.output {
         match item {
-            OutputItem::Message {
-                content: parts, ..
-            } => {
+            OutputItem::Message { content: parts, .. } => {
                 for part in parts {
                     match part {
                         OutputContentPart::OutputText { text, .. } => {
                             if !text.is_empty() {
-                                content.push(ResponseBlock::Text { text: text.clone(), citations: None });
+                                content.push(ResponseBlock::Text {
+                                    text: text.clone(),
+                                    citations: None,
+                                });
                             }
                         }
                         // PR-5 (G3/G4 inbound): a refusal content part maps
@@ -531,8 +542,7 @@ pub fn responses_to_anthropic_response(
                 // surface as an empty-input ToolUse — that would hand the
                 // client a phantom tool call. Skip it; the `max_tokens`
                 // stop_reason below already signals the turn was cut off.
-                if resp.status == "incomplete"
-                    && serde_json::from_str::<Value>(arguments).is_err()
+                if resp.status == "incomplete" && serde_json::from_str::<Value>(arguments).is_err()
                 {
                     continue;
                 }
@@ -568,7 +578,11 @@ pub fn responses_to_anthropic_response(
     // truncated function_call must read as `max_tokens`, never `tool_use`.
     let stop_reason = match resp.status.as_str() {
         "incomplete" => Some(
-            match resp.incomplete_details.as_ref().and_then(|d| d.reason.as_deref()) {
+            match resp
+                .incomplete_details
+                .as_ref()
+                .and_then(|d| d.reason.as_deref())
+            {
                 Some("content_filter") => "refusal".to_string(),
                 _ => "max_tokens".to_string(),
             },
@@ -757,10 +771,7 @@ mod tests {
         }))
         .unwrap();
         let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
-        assert_eq!(
-            out.tool_choice.as_ref().unwrap(),
-            &json!("required")
-        );
+        assert_eq!(out.tool_choice.as_ref().unwrap(), &json!("required"));
         match out.reasoning.as_ref().unwrap() {
             ReasoningConfig {
                 effort,
@@ -773,7 +784,9 @@ mod tests {
         let tools = out.tools.as_ref().unwrap();
         assert_eq!(tools.len(), 1);
         match &tools[0] {
-            ResponsesTool::Function { name, parameters, .. } => {
+            ResponsesTool::Function {
+                name, parameters, ..
+            } => {
                 assert_eq!(name, "f");
                 assert!(parameters.is_some());
             }
@@ -932,7 +945,9 @@ mod tests {
             out.stop_reason
         );
         assert!(
-            !out.content.iter().any(|b| matches!(b, ResponseBlock::ToolUse { .. })),
+            !out.content
+                .iter()
+                .any(|b| matches!(b, ResponseBlock::ToolUse { .. })),
             "truncated function_call must not produce an empty-input ToolUse; got {:?}",
             out.content
         );
@@ -957,7 +972,10 @@ mod tests {
         let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
         let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_cfc").unwrap();
         assert_eq!(out.stop_reason.as_deref(), Some("tool_use"));
-        assert!(out.content.iter().any(|b| matches!(b, ResponseBlock::ToolUse { .. })));
+        assert!(out
+            .content
+            .iter()
+            .any(|b| matches!(b, ResponseBlock::ToolUse { .. })));
     }
 
     /// Official `cancelled` status → end_turn + empty content (deliberate
@@ -1064,9 +1082,10 @@ mod tests {
         });
         let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
         let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_t").unwrap();
-        let details = out.usage.output_tokens_details.expect(
-            "reasoning_tokens>0 must surface output_tokens_details",
-        );
+        let details = out
+            .usage
+            .output_tokens_details
+            .expect("reasoning_tokens>0 must surface output_tokens_details");
         assert_eq!(details["thinking_tokens"], 18);
         assert!(
             details.get("reasoning_tokens").is_none(),
@@ -1104,7 +1123,9 @@ mod tests {
             "reasoning_tokens==0 → must be absent"
         );
         // Sanity: the OutputTokensDetails struct still reads reasoning_tokens.
-        let _ = OutputTokensDetails { reasoning_tokens: 0 };
+        let _ = OutputTokensDetails {
+            reasoning_tokens: 0,
+        };
     }
 
     // silence unused warnings for the helper kept to ensure imports stay live
@@ -1154,7 +1175,11 @@ mod tests {
         let msg = Message {
             role: "user".into(),
             content: MessageContent::Blocks(vec![
-                ContentBlock::Text { text: "before".into(), cache_control: None, citations: None },
+                ContentBlock::Text {
+                    text: "before".into(),
+                    cache_control: None,
+                    citations: None,
+                },
                 ContentBlock::ToolUse {
                     id: "t1".into(),
                     name: "f".into(),
@@ -1185,7 +1210,11 @@ mod tests {
                     thinking: "internal".into(),
                     signature: None,
                 },
-                ContentBlock::Text { text: "final".into(), cache_control: None, citations: None },
+                ContentBlock::Text {
+                    text: "final".into(),
+                    cache_control: None,
+                    citations: None,
+                },
             ]),
         };
         let out = convert_message(&msg);
@@ -1253,7 +1282,10 @@ mod tests {
         }))
         .unwrap();
         let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
-        assert_eq!(out.instructions.as_deref(), Some("first half\n\nsecond half"));
+        assert_eq!(
+            out.instructions.as_deref(),
+            Some("first half\n\nsecond half")
+        );
     }
 
     #[test]
@@ -1715,8 +1747,16 @@ mod tests {
         let msg = Message {
             role: "assistant".into(),
             content: MessageContent::Blocks(vec![
-                ContentBlock::Text { text: "line one".into(), cache_control: None, citations: None },
-                ContentBlock::Text { text: "line two".into(), cache_control: None, citations: None },
+                ContentBlock::Text {
+                    text: "line one".into(),
+                    cache_control: None,
+                    citations: None,
+                },
+                ContentBlock::Text {
+                    text: "line two".into(),
+                    cache_control: None,
+                    citations: None,
+                },
             ]),
         };
         let out = convert_message(&msg);
@@ -1738,7 +1778,11 @@ mod tests {
         let msg = Message {
             role: "assistant".into(),
             content: MessageContent::Blocks(vec![
-                ContentBlock::Text { text: "keep me".into(), cache_control: None, citations: None },
+                ContentBlock::Text {
+                    text: "keep me".into(),
+                    cache_control: None,
+                    citations: None,
+                },
                 ContentBlock::Image {
                     source: crate::anthropic::ImageSource {
                         kind: "base64".into(),
@@ -1774,7 +1818,11 @@ mod tests {
         // yields nothing.
         let out = convert_blocks(
             "tool",
-            &[ContentBlock::Text { text: "orphan".into(), cache_control: None, citations: None }],
+            &[ContentBlock::Text {
+                text: "orphan".into(),
+                cache_control: None,
+                citations: None,
+            }],
         );
         assert!(out.is_empty());
     }
@@ -1870,7 +1918,10 @@ mod tests {
             "thinking": {"type": "enabled", "budget_tokens": 2000},
         }))
         .unwrap();
-        for (req, expected) in [(via_output_config, Some("xhigh")), (via_thinking, Some("medium"))] {
+        for (req, expected) in [
+            (via_output_config, Some("xhigh")),
+            (via_thinking, Some("medium")),
+        ] {
             let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
             match out.reasoning.as_ref() {
                 Some(ReasoningConfig {
@@ -1879,7 +1930,9 @@ mod tests {
                 }) => {
                     assert_eq!(effort.as_deref(), expected);
                 }
-                other => panic!("expected ReasoningConfig struct with effort {expected:?}, got {other:?}"),
+                other => panic!(
+                    "expected ReasoningConfig struct with effort {expected:?}, got {other:?}"
+                ),
             }
         }
     }
@@ -1961,7 +2014,11 @@ mod tests {
         });
         let resp: ResponsesResponse = serde_json::from_value(raw).unwrap();
         let out = responses_to_anthropic_response(&resp, "gpt-5", "msg_rf").unwrap();
-        assert_eq!(out.content.len(), 1, "refusal must surface as one text block");
+        assert_eq!(
+            out.content.len(),
+            1,
+            "refusal must surface as one text block"
+        );
         match &out.content[0] {
             ResponseBlock::Text { text, .. } => {
                 assert_eq!(text, "I cannot comply with this request.");
@@ -1996,7 +2053,9 @@ mod tests {
             "content_filter + refusal must finalize as refusal"
         );
         assert_eq!(out.content.len(), 1);
-        assert!(matches!(&out.content[0], ResponseBlock::Text { text, .. } if text == "blocked by content policy"));
+        assert!(
+            matches!(&out.content[0], ResponseBlock::Text { text, .. } if text == "blocked by content policy")
+        );
     }
 
     #[test]
@@ -2069,11 +2128,20 @@ mod tests {
         .unwrap();
         let out = anthropic_to_responses_request(&req, &Default::default()).unwrap();
         let text_format = out.extra.get("text").and_then(|v| v.get("format")).unwrap();
-        assert_eq!(text_format.get("type").and_then(|v| v.as_str()), Some("json_schema"));
+        assert_eq!(
+            text_format.get("type").and_then(|v| v.as_str()),
+            Some("json_schema")
+        );
         // Anthropic doesn't carry a schema name; OpenAI requires one. The
         // translator synthesizes a stable default and pins strict: true.
-        assert_eq!(text_format.get("name").and_then(|v| v.as_str()), Some("structured_output"));
-        assert_eq!(text_format.get("strict").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            text_format.get("name").and_then(|v| v.as_str()),
+            Some("structured_output")
+        );
+        assert_eq!(
+            text_format.get("strict").and_then(|v| v.as_bool()),
+            Some(true)
+        );
         let schema = text_format.get("schema").unwrap();
         assert_eq!(
             schema.get("additionalProperties").and_then(|v| v.as_bool()),
@@ -2112,10 +2180,7 @@ mod tests {
             matches!(err, ProxyError::Schema(_)),
             "expected ProxyError::Schema, got {err:?}"
         );
-        assert_eq!(
-            err.status_code(),
-            axum::http::StatusCode::BAD_REQUEST
-        );
+        assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -2192,7 +2257,10 @@ mod tests {
             "schema": {"type": "object", "properties": {"x": {"type": "integer"}}}
         });
         let out = ensure_json_schema_name(&input).unwrap();
-        assert_eq!(out.get("name").and_then(|v| v.as_str()), Some("my_response"));
+        assert_eq!(
+            out.get("name").and_then(|v| v.as_str()),
+            Some("my_response")
+        );
         assert_eq!(out.get("strict").and_then(|v| v.as_bool()), Some(true));
     }
 

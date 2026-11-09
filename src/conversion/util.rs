@@ -263,7 +263,15 @@ fn strictify_inner(
             }
         }
     }
-    for key in ["not", "if", "then", "else", "contains", "propertyNames", "unevaluatedItems"] {
+    for key in [
+        "not",
+        "if",
+        "then",
+        "else",
+        "contains",
+        "propertyNames",
+        "unevaluatedItems",
+    ] {
         if let Some(sub) = obj.get_mut(key) {
             strictify_inner(sub, &format!("{path}.{key}"), defs)?;
         }
@@ -348,8 +356,14 @@ mod tests {
         // Top-level: all keys promoted to required, additionalProperties: false.
         let top_required = schema.get("required").and_then(|v| v.as_array()).unwrap();
         let top_required: Vec<&str> = top_required.iter().filter_map(|v| v.as_str()).collect();
-        assert!(top_required.contains(&"user"), "top-level required must include `user`");
-        assert!(top_required.contains(&"tags"), "top-level required must include `tags`");
+        assert!(
+            top_required.contains(&"user"),
+            "top-level required must include `user`"
+        );
+        assert!(
+            top_required.contains(&"tags"),
+            "top-level required must include `tags`"
+        );
         assert_eq!(
             schema.get("additionalProperties").and_then(|v| v.as_bool()),
             Some(false)
@@ -410,7 +424,10 @@ mod tests {
             }
         });
         strictify_schema(&mut schema).expect("strictify must succeed");
-        let result = schema.get("properties").and_then(|p| p.get("result")).unwrap();
+        let result = schema
+            .get("properties")
+            .and_then(|p| p.get("result"))
+            .unwrap();
         let branches = result.get("anyOf").and_then(|v| v.as_array()).unwrap();
         assert_eq!(branches.len(), 2);
         for (i, branch) in branches.iter().enumerate() {
@@ -451,7 +468,10 @@ mod tests {
             }
         });
         strictify_schema(&mut schema).expect("strictify must succeed");
-        let value = schema.get("properties").and_then(|p| p.get("value")).unwrap();
+        let value = schema
+            .get("properties")
+            .and_then(|p| p.get("value"))
+            .unwrap();
         let branch = &value.get("oneOf").and_then(|v| v.as_array()).unwrap()[0];
         assert_eq!(
             branch.get("additionalProperties").and_then(|v| v.as_bool()),
@@ -542,7 +562,9 @@ mod tests {
             .and_then(|d| d.get("User"))
             .expect("User definition must remain");
         assert_eq!(
-            def_user.get("additionalProperties").and_then(|v| v.as_bool()),
+            def_user
+                .get("additionalProperties")
+                .and_then(|v| v.as_bool()),
             Some(false)
         );
     }
@@ -581,10 +603,10 @@ mod tests {
                 "B": {"$ref": "#/$defs/A"}
             }
         });
-        let err = strictify_schema(&mut schema)
-            .expect_err("circular $ref chain must be rejected");
+        let err = strictify_schema(&mut schema).expect_err("circular $ref chain must be rejected");
         assert!(
-            err.message.starts_with("strictify_schema: circular $ref at "),
+            err.message
+                .starts_with("strictify_schema: circular $ref at "),
             "unexpected message: {}",
             err.message
         );
@@ -618,8 +640,7 @@ mod tests {
             "properties": {"z": {"$ref": "#/$defs/Z"}},
             "$defs": {"Z": "just a string"}
         });
-        strictify_schema(&mut non_object_target)
-            .expect("non-object def target must be accepted");
+        strictify_schema(&mut non_object_target).expect("non-object def target must be accepted");
 
         let mut malformed_ref = json!({
             "type": "object",
@@ -844,7 +865,7 @@ mod tests {
             else_schema
                 .get("additionalProperties")
                 .and_then(|v| v.as_bool()),
-                Some(false)
+            Some(false)
         );
     }
 
@@ -1016,12 +1037,7 @@ mod tests {
         // Schemas that are not objects (numbers, booleans, arrays) must
         // pass through unchanged. These are not object schemas so
         // strict mode rules don't apply.
-        for value in [
-            json!(42),
-            json!(true),
-            json!("string"),
-            json!([1, 2, 3]),
-        ] {
+        for value in [json!(42), json!(true), json!("string"), json!([1, 2, 3])] {
             let mut schema = value.clone();
             let original = schema.clone();
             strictify_schema(&mut schema).expect("strictify must succeed");
