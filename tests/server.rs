@@ -71,6 +71,11 @@ enum CompleteBehavior {
         /// invocations see each other's increments.
         counter: Arc<AtomicU32>,
     },
+    /// Counts the call and succeeds. Lets a test assert that a request
+    /// was (or was not) forwarded to the provider.
+    CountCalls {
+        counter: Arc<AtomicU32>,
+    },
 }
 
 enum StreamBehavior {
@@ -148,6 +153,19 @@ impl Provider for TestProvider {
                         "usage": {"input_tokens": 2, "output_tokens": 1}
                     })))
                 }
+            }
+            CompleteBehavior::CountCalls { counter } => {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(ProviderOutput::Json(json!({
+                    "id": "msg_test",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "model": "upstream-model",
+                    "stop_reason": "end_turn",
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 2, "output_tokens": 1}
+                })))
             }
         }
     }
@@ -235,6 +253,26 @@ fn build_app_full(
     usage: UsageStats,
     expose_upstream_details: bool,
 ) -> (axum::Router, CooldownCache) {
+    build_app_full_with_limit(
+        api_key,
+        primary,
+        backup,
+        usage,
+        expose_upstream_details,
+        llmproxy::config::default_max_request_bytes(),
+    )
+}
+
+/// Like [`build_app_full`] but with the inbound request-body limit
+/// under the test's control (`server.max_request_bytes`).
+fn build_app_full_with_limit(
+    api_key: Option<&str>,
+    primary: SharedProvider,
+    backup: Option<SharedProvider>,
+    usage: UsageStats,
+    expose_upstream_details: bool,
+    max_request_bytes: usize,
+) -> (axum::Router, CooldownCache) {
     let mut providers = HashMap::new();
     providers.insert("primary".to_string(), primary);
     let mut provider_configs = vec![ProviderConfig::OpenaiCompat {
@@ -269,6 +307,7 @@ fn build_app_full(
             listen: "127.0.0.1:0".to_string(),
             api_key: api_key.map(secret_string),
             expose_upstream_details,
+            max_request_bytes,
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -1134,6 +1173,7 @@ fn build_app_with_sse_error_provider(
             listen: "127.0.0.1:0".to_string(),
             api_key: None,
             expose_upstream_details,
+            max_request_bytes: llmproxy::config::default_max_request_bytes(),
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -1352,6 +1392,7 @@ async fn streaming_fallback_with_an_illegal_provider_name_still_returns_200() {
             listen: "127.0.0.1:0".to_string(),
             api_key: None,
             expose_upstream_details: true,
+            max_request_bytes: llmproxy::config::default_max_request_bytes(),
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -1552,6 +1593,7 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
             listen: "127.0.0.1:0".to_string(),
             api_key: Some(secret_string("test-key")),
             expose_upstream_details: true,
+            max_request_bytes: llmproxy::config::default_max_request_bytes(),
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -1708,6 +1750,7 @@ async fn list_models_collision_winner_follows_chain_order_deterministically() {
             listen: "127.0.0.1:0".to_string(),
             api_key: Some(secret_string("test-key")),
             expose_upstream_details: true,
+            max_request_bytes: llmproxy::config::default_max_request_bytes(),
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -1817,6 +1860,7 @@ async fn admin_models_lists_every_provider_without_dedup() {
             listen: "127.0.0.1:0".to_string(),
             api_key: Some(secret_string("test-key")),
             expose_upstream_details: true,
+            max_request_bytes: llmproxy::config::default_max_request_bytes(),
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -1957,6 +2001,7 @@ async fn admin_models_reports_fetch_failed_for_provider_without_catalog() {
             listen: "127.0.0.1:0".to_string(),
             api_key: Some(secret_string("test-key")),
             expose_upstream_details: true,
+            max_request_bytes: llmproxy::config::default_max_request_bytes(),
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -3061,6 +3106,7 @@ async fn admin_usage_excludes_serving_provider_from_failed_providers_on_retry() 
             listen: "127.0.0.1:0".into(),
             api_key: Some(secret_string("secret")),
             expose_upstream_details: true,
+            max_request_bytes: llmproxy::config::default_max_request_bytes(),
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -3170,6 +3216,7 @@ async fn admin_usage_keeps_fallback_failures_when_serving_provider_is_different(
             listen: "127.0.0.1:0".into(),
             api_key: Some(secret_string("secret")),
             expose_upstream_details: true,
+            max_request_bytes: llmproxy::config::default_max_request_bytes(),
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),
@@ -3884,4 +3931,220 @@ async fn streaming_non_stream_output_emits_paired_aborted() {
         !captured.contains("streaming completed"),
         "must NOT emit `streaming completed` on contract violation: {captured:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Inbound request-body limit (`server.max_request_bytes`).
+//
+// axum's `DefaultBodyLimit` defaults to 2 MiB and every extractor built on
+// `Bytes` (which includes `Json`) honours it. A long Claude Code session
+// exceeds that, and the request was then rejected by the proxy itself —
+// before it reached any provider, with a 400 that said nothing useful and
+// with nothing at all in the container log.
+//
+// These tests pin the new behaviour:
+//   * over the limit  → 413 (not 400), the provider is never called,
+//   * under the limit → forwarded normally,
+//   * auth runs first → an unauthenticated oversize body is a 401,
+//   * the limit is the configured one, not a hard-coded constant.
+// ---------------------------------------------------------------------------
+
+/// A Messages request whose body is `padding` bytes long.
+fn large_messages_request(padding: usize) -> Value {
+    json!({
+        "model": "claude-test",
+        "max_tokens": 32,
+        "stream": false,
+        "messages": [{"role": "user", "content": "x".repeat(padding)}]
+    })
+}
+
+#[tokio::test]
+async fn oversize_request_body_returns_413_and_never_reaches_the_provider() {
+    let counter = Arc::new(AtomicU32::new(0));
+    let (app, _cooldown) = build_app_full_with_limit(
+        None,
+        provider(
+            "primary",
+            CompleteBehavior::CountCalls {
+                counter: counter.clone(),
+            },
+            StreamBehavior::Bytes("unused"),
+        ),
+        None,
+        UsageStats::new(0),
+        true,
+        // 1 KiB limit, 64 KiB body.
+        1024,
+    );
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(large_messages_request(64 * 1024).to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "an oversize body must be 413, not a generic 400"
+    );
+    let body = body_json(resp).await;
+    assert_eq!(body["type"], "error");
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("request body too large"),
+        "message should name the problem, got: {msg}"
+    );
+    assert!(
+        msg.contains("1024"),
+        "message should name the limit, got: {msg}"
+    );
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        0,
+        "the request must be rejected before any provider call"
+    );
+    drop(app);
+}
+
+#[tokio::test]
+async fn request_body_within_the_limit_is_forwarded_to_the_provider() {
+    let counter = Arc::new(AtomicU32::new(0));
+    let (app, _cooldown) = build_app_full_with_limit(
+        None,
+        provider(
+            "primary",
+            CompleteBehavior::CountCalls {
+                counter: counter.clone(),
+            },
+            StreamBehavior::Bytes("unused"),
+        ),
+        None,
+        UsageStats::new(0),
+        true,
+        // 1 MiB limit, 64 KiB body.
+        1024 * 1024,
+    );
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(large_messages_request(64 * 1024).to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "a body under the limit must reach the provider"
+    );
+    drop(app);
+}
+
+#[tokio::test]
+async fn count_tokens_rejects_an_oversize_body_with_413() {
+    let (app, _cooldown) = build_app_full_with_limit(
+        None,
+        provider(
+            "primary",
+            CompleteBehavior::Json,
+            StreamBehavior::Bytes("unused"),
+        ),
+        None,
+        UsageStats::new(0),
+        true,
+        1024,
+    );
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages/count_tokens")
+        .header("content-type", "application/json")
+        .body(Body::from(large_messages_request(64 * 1024).to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    drop(app);
+}
+
+#[tokio::test]
+async fn an_unauthenticated_oversize_body_is_a_401_not_a_413() {
+    // The auth middleware sits outside the body limit, so an
+    // unauthenticated caller learns nothing about the limit.
+    let (app, _cooldown) = build_app_full_with_limit(
+        Some("test-key"),
+        provider(
+            "primary",
+            CompleteBehavior::Json,
+            StreamBehavior::Bytes("unused"),
+        ),
+        None,
+        UsageStats::new(0),
+        true,
+        1024,
+    );
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(large_messages_request(64 * 1024).to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    drop(app);
+}
+
+#[tokio::test]
+async fn the_body_limit_is_the_configured_one() {
+    // The same body is accepted by one router and rejected by another,
+    // so the limit really comes from `server.max_request_bytes`.
+    let counter = Arc::new(AtomicU32::new(0));
+    let provider_for = || {
+        provider(
+            "primary",
+            CompleteBehavior::CountCalls {
+                counter: counter.clone(),
+            },
+            StreamBehavior::Bytes("unused"),
+        )
+    };
+
+    let (small, _c) =
+        build_app_full_with_limit(None, provider_for(), None, UsageStats::new(0), true, 1024);
+    let (large, _c) = build_app_full_with_limit(
+        None,
+        provider_for(),
+        None,
+        UsageStats::new(0),
+        true,
+        1024 * 1024,
+    );
+
+    let body = large_messages_request(64 * 1024).to_string();
+    let make_req = || {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .body(Body::from(body.clone()))
+            .unwrap()
+    };
+
+    let small_resp = small.clone().oneshot(make_req()).await.unwrap();
+    assert_eq!(small_resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let large_resp = large.clone().oneshot(make_req()).await.unwrap();
+    assert_eq!(large_resp.status(), StatusCode::OK);
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+    drop(small);
+    drop(large);
 }

@@ -62,6 +62,32 @@ services:
     security_opt:
       - no-new-privileges
 
+    # Memory ceiling: a bound on the one resource the proxy can be made
+    # to spend in large quantities, and the reason it is not "as much as
+    # the host has".
+    #
+    # Every inbound body is buffered in full (server.max_request_bytes,
+    # 32 MiB by default) and roughly three copies of it are alive at
+    # once during the outbound call: the parsed MessagesRequest, the
+    # provider-native request it is converted into, and the serialized
+    # JSON handed to reqwest. One in-flight max-size request therefore
+    # costs ~96 MiB. The process has no concurrency cap (no semaphore,
+    # no connection limit), so without a ceiling a burst of large-context
+    # sessions is bounded only by the host's RAM -- and the kernel OOM
+    # killer then picks a victim on the whole machine, not in this
+    # container.
+    #
+    # 2 GiB holds ~20 concurrent max-size requests, i.e. more than an
+    # order of magnitude above the normal footprint (a few tens of MiB;
+    # an ordinary 1 MiB request costs ~3 MiB). Raising it is legitimate
+    # when large-context concurrency needs more -- but raise it together
+    # with server.max_request_bytes, since the two multiply.
+    mem_limit: 2g
+    # No swap for this container: the point of the ceiling is a fast,
+    # local OOM kill, not a long crawl through swap that drags the host
+    # (which already runs other services) down with it.
+    memswap_limit: 2g
+
     # TPM access for the in-container unseal. The entrypoint refuses to
     # run in TPM mode if /run is not a tmpfs.
     devices:

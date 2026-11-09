@@ -45,6 +45,7 @@ async fn async_main() -> anyhow::Result<()> {
         .with_context(|| format!("loading config from {}", config_path.display()))?;
 
     let listen = resolve_listen_addr(&args, &cfg);
+    let max_request_bytes = cfg.server.max_request_bytes;
     let proxied_http = proxy_client::build_client(&cfg.proxy, &cfg.user_agent)?;
     let direct_http = proxy_client::build_direct_client(&cfg.proxy, &cfg.user_agent)?;
 
@@ -56,7 +57,11 @@ async fn async_main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .with_context(|| format!("binding {listen}"))?;
-    tracing::info!(listen = listen.as_str(), "llmproxy listening");
+    tracing::info!(
+        listen = listen.as_str(),
+        max_request_bytes = max_request_bytes,
+        "llmproxy listening"
+    );
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

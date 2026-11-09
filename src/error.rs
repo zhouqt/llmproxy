@@ -73,6 +73,22 @@ pub enum ProxyError {
     #[error("bad request: {0}")]
     BadRequest(String),
 
+    /// The inbound request body exceeded the configured limit
+    /// (`server.max_request_bytes`).
+    ///
+    /// This is a client-side problem, not an upstream one: the request
+    /// was rejected before it was ever forwarded, so it must not be
+    /// genericised by `without_upstream_details()` and must not take
+    /// part in the cooldown decision.
+    ///
+    /// The status is 413 (Payload Too Large), not 400: the body was
+    /// well-formed, it was simply too big. Before this variant existed
+    /// the extractor mapped *every* rejection to 400, which flattened
+    /// axum's native 413 into a generic "bad request" and hid the
+    /// real cause from the client.
+    #[error("request body too large{}", limit_bytes.map(|l| format!(": limit is {l} bytes")).unwrap_or_default())]
+    PayloadTooLarge { limit_bytes: Option<usize> },
+
     /// Router-side all-unmappable terminal: every chain entry was
     /// excluded by `model_rewrite`, so no upstream call could fire.
     /// Carries `attempts` so the header/log/UsageRecord paths can
@@ -121,6 +137,7 @@ impl ProxyError {
         match self {
             ProxyError::Unauthorized => StatusCode::UNAUTHORIZED,
             ProxyError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ProxyError::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             ProxyError::RouterBadRequest { .. } => StatusCode::BAD_REQUEST,
             ProxyError::ProviderNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::AllProvidersCoolingDown { .. } => StatusCode::SERVICE_UNAVAILABLE,
@@ -312,6 +329,13 @@ mod tests {
         assert_eq!(
             ProxyError::BadRequest("x".into()).status_code(),
             StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            ProxyError::PayloadTooLarge {
+                limit_bytes: Some(32 * 1024 * 1024)
+            }
+            .status_code(),
+            StatusCode::PAYLOAD_TOO_LARGE
         );
         assert_eq!(
             ProxyError::ProviderNotFound("x".into()).status_code(),
@@ -584,6 +608,22 @@ mod tests {
         // stays informative.
         let bad = ProxyError::BadRequest("model 'x' is not configured".into());
         assert_eq!(bad.client_message(false), bad.to_string());
+    }
+
+    /// An oversize body is a client-side problem: it never reached a
+    /// backend, so hiding "upstream details" must not hide it.
+    #[test]
+    fn payload_too_large_stays_readable_when_upstream_details_are_hidden() {
+        let err = ProxyError::PayloadTooLarge {
+            limit_bytes: Some(1024),
+        };
+        assert!(err.client_message(false).contains("request body too large"));
+        assert!(err.client_message(true).contains("request body too large"));
+        // And the limit is named when we know it.
+        assert!(err.client_message(false).contains("1024"));
+        // A body-limit error must never be treated as a provider
+        // failure: it did not reach one.
+        assert!(!err.is_cooldownable());
     }
 
     /// A2: an error carrying upstream text (`UpstreamText`) becomes the generic

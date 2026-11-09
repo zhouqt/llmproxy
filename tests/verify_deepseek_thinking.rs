@@ -131,6 +131,7 @@ fn build_router(
             listen: "127.0.0.1:0".to_string(),
             api_key: None,
             expose_upstream_details: true,
+            max_request_bytes: llmproxy::config::default_max_request_bytes(),
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),

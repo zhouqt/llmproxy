@@ -19,7 +19,7 @@ use serde_json::json;
 
 use crate::anthropic::{MessagesRequest, MessagesResponse};
 use crate::error::{ProxyError, Result};
-use crate::extractor::{AppJson, AppQuery};
+use crate::extractor::{AppJson, AppQuery, InboundBodyLimit};
 use crate::providers::ProviderOutput;
 use crate::state::AppState;
 use crate::tokenize::estimate_request_tokens;
@@ -28,10 +28,21 @@ use crate::usage::{
 };
 
 pub fn build_router(state: AppState) -> AxumRouter {
+    // axum's `DefaultBodyLimit` defaults to 2 MiB, and every extractor
+    // built on `Bytes` (which includes `Json`) honours it — so a long
+    // Claude Code session used to be rejected by the proxy itself,
+    // before it ever reached a provider, with nothing in the log. The
+    // limit is now the operator's `server.max_request_bytes`.
+    //
+    // `InboundBodyLimit` travels next to it as a request extension so
+    // the extractor can name the limit in its 413 and in its log line.
+    let max_body = state.config.server.max_request_bytes;
     let api = AxumRouter::new()
         .route("/v1/messages", post(messages_handler))
         .route("/v1/messages/count_tokens", post(count_tokens_handler))
         .route("/v1/models", get(list_models_handler))
+        .layer(axum::extract::DefaultBodyLimit::max(max_body))
+        .layer(axum::Extension(InboundBodyLimit(max_body)))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             crate::auth::require_auth,
@@ -1964,6 +1975,7 @@ mod tests {
                     listen: "127.0.0.1:0".to_string(),
                     api_key: None,
                     expose_upstream_details: true,
+                    max_request_bytes: crate::config::default_max_request_bytes(),
                 },
                 proxy: Default::default(),
                 user_agent: crate::config::default_user_agent(),
@@ -2246,6 +2258,7 @@ mod tests {
                     listen: "127.0.0.1:0".to_string(),
                     api_key: None,
                     expose_upstream_details: true,
+                    max_request_bytes: crate::config::default_max_request_bytes(),
                 },
                 proxy: Default::default(),
                 user_agent: crate::config::default_user_agent(),
@@ -2324,6 +2337,7 @@ mod tests {
                 listen: "127.0.0.1:0".to_string(),
                 api_key: None,
                 expose_upstream_details: true,
+                max_request_bytes: crate::config::default_max_request_bytes(),
             },
             proxy: Default::default(),
             user_agent: crate::config::default_user_agent(),
@@ -2415,6 +2429,7 @@ mod tests {
                 listen: "127.0.0.1:0".to_string(),
                 api_key: None,
                 expose_upstream_details: true,
+                max_request_bytes: crate::config::default_max_request_bytes(),
             },
             proxy: Default::default(),
             user_agent: crate::config::default_user_agent(),
@@ -2484,6 +2499,7 @@ mod tests {
                 listen: "127.0.0.1:0".to_string(),
                 api_key: None,
                 expose_upstream_details: true,
+                max_request_bytes: crate::config::default_max_request_bytes(),
             },
             proxy: Default::default(),
             user_agent: crate::config::default_user_agent(),

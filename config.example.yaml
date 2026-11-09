@@ -109,6 +109,27 @@ server:
   # Purely client-side errors keep their own wording.
   expose_upstream_details: true
 
+  # Maximum accepted INBOUND request body, in bytes.
+  #
+  # The body is buffered in memory before it is parsed, so this also
+  # bounds what one request can make the proxy hold. The default is
+  # 32 MiB (33554432) — large enough for a long Claude Code session
+  # (large context, base64 images), which axum's stock 2 MiB limit
+  # rejects outright: the request then never reaches a provider and
+  # the client gets a 413 from the proxy.
+  #
+  # A body over the limit is answered with 413 and a
+  # "request body too large" message; a malformed body still gets the
+  # usual 400.
+  #
+  # 0 is NOT "unlimited" and is rejected at startup: axum has no
+  # numeric unlimited mode, and a zero limit rejects every non-empty
+  # body. There is deliberately no unlimited setting — an unbounded
+  # body would be an unbounded-memory target for anyone holding the
+  # bearer token. Raise the number instead.
+  # Default if omitted: 33554432 (32 MiB).
+  max_request_bytes: 33554432
+
 # ───────────────────────────────────────────────────────────────────────
 # proxy: outgoing proxy used by providers with `use_proxy: true`
 # ───────────────────────────────────────────────────────────────────────
