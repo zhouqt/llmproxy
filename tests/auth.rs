@@ -22,6 +22,7 @@ fn dummy_state(api_key: Option<String>) -> AppState {
             listen: "127.0.0.1:0".into(),
             api_key: api_key.map(secret_string),
             expose_upstream_details: true,
+            max_request_bytes: llmproxy::config::default_max_request_bytes(),
         },
         proxy: Default::default(),
         user_agent: llmproxy::config::default_user_agent(),

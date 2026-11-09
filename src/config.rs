@@ -137,6 +137,26 @@ pub struct ServerConfig {
     /// describe the request, not the backend.
     #[serde(default = "default_expose_upstream_details")]
     pub expose_upstream_details: bool,
+
+    /// Maximum accepted inbound request body, in bytes.
+    ///
+    /// axum's `DefaultBodyLimit` defaults to 2 MiB, and every extractor
+    /// built on `Bytes` (which includes `Json`) honours it. A long
+    /// Claude Code session — large context, base64 images — exceeds that
+    /// and is then rejected *before* it ever reaches a provider, so the
+    /// proxy silently becomes the component that decides the session has
+    /// grown too large. This limit is sized for a large session while
+    /// still bounding how much a single request can make the proxy
+    /// buffer.
+    ///
+    /// `0` is **not** "unlimited" and is refused by `Config::validate`:
+    /// axum has no numeric unlimited mode, and `DefaultBodyLimit::max(0)`
+    /// rejects every body that carries data. The only truly unlimited
+    /// mode is `DefaultBodyLimit::disable()`, which this proxy does not
+    /// offer — it would turn the proxy into an unbounded-memory target
+    /// for anyone holding the bearer token.
+    #[serde(default = "default_max_request_bytes")]
+    pub max_request_bytes: usize,
 }
 
 fn default_listen() -> String {
@@ -150,12 +170,19 @@ fn default_expose_upstream_details() -> bool {
     true
 }
 
+/// 32 MiB — large enough for a long Claude Code session, small enough to
+/// bound what one request can make the proxy buffer.
+pub fn default_max_request_bytes() -> usize {
+    32 * 1024 * 1024
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen: default_listen(),
             api_key: None,
             expose_upstream_details: default_expose_upstream_details(),
+            max_request_bytes: default_max_request_bytes(),
         }
     }
 }
@@ -580,6 +607,18 @@ impl Config {
                 "authentication is DISABLED (no server.api_key); any client that can reach the port can use every configured provider key"
             );
         }
+        // A zero body limit is not "unlimited" -- axum has no numeric
+        // unlimited mode, and `DefaultBodyLimit::max(0)` wraps the body
+        // in `Limited::new(body, 0)`, which rejects *every* body that
+        // carries data. Wiring 0 through would make the proxy refuse
+        // every non-empty request, so refuse the configuration instead.
+        if self.server.max_request_bytes == 0 {
+            return Err(ProxyError::Config(
+                "server.max_request_bytes must be greater than 0 (0 is not 'unlimited' -- \
+                 axum rejects every non-empty body under a zero limit)"
+                    .into(),
+            ));
+        }
         if self.providers.is_empty() {
             return Err(ProxyError::Config("at least one provider required".into()));
         }
@@ -932,6 +971,57 @@ models:
         assert_eq!(cfg.providers.len(), 1);
         assert_eq!(cfg.models.len(), 1);
         assert_eq!(cfg.server.listen, "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn max_request_bytes_defaults_to_32_mib_and_can_be_overridden() {
+        let raw = r#"
+providers:
+  - name: copilot
+    type: github_copilot
+models:
+  - name: gpt-4
+    primary: copilot
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        assert_eq!(cfg.server.max_request_bytes, default_max_request_bytes());
+        assert_eq!(cfg.server.max_request_bytes, 32 * 1024 * 1024);
+
+        let raw = r#"
+server:
+  max_request_bytes: 1048576
+providers:
+  - name: copilot
+    type: github_copilot
+models:
+  - name: gpt-4
+    primary: copilot
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        assert_eq!(cfg.server.max_request_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn validation_rejects_a_zero_body_limit() {
+        // 0 is NOT "unlimited" in axum: `DefaultBodyLimit::max(0)` wraps
+        // the body in `Limited::new(body, 0)`, which rejects every body
+        // that carries data. Wiring it through would brick the proxy,
+        // so the configuration is refused at startup instead.
+        let raw = r#"
+server:
+  max_request_bytes: 0
+providers:
+  - name: copilot
+    type: github_copilot
+models:
+  - name: gpt-4
+    primary: copilot
+"#;
+        let err = Config::parse(raw).unwrap_err();
+        assert!(
+            format!("{err}").contains("max_request_bytes"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -2295,6 +2385,7 @@ models:
                 listen: "127.0.0.1:0".to_string(),
                 api_key: Some(secret_string("sk-server-secret-value")),
                 expose_upstream_details: true,
+                max_request_bytes: crate::config::default_max_request_bytes(),
             },
             providers: vec![provider_with_secret()],
             ..Config::default()
@@ -2317,6 +2408,7 @@ models:
                 listen: "127.0.0.1:0".to_string(),
                 api_key: Some(secret_string("sk-server-secret-value")),
                 expose_upstream_details: true,
+                max_request_bytes: crate::config::default_max_request_bytes(),
             },
             providers: vec![provider_with_secret()],
             ..Config::default()
@@ -2355,6 +2447,7 @@ models:
                 listen: "127.0.0.1:0".to_string(),
                 api_key: Some(secret_string("sk-server-secret-value")),
                 expose_upstream_details: true,
+                max_request_bytes: crate::config::default_max_request_bytes(),
             },
             providers: vec![provider_with_secret()],
             models: vec![ModelConfig {
