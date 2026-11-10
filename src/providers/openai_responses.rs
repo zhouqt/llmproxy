@@ -1555,3 +1555,135 @@ mod tests {
         assert!(provider.list_models().await.is_none());
     }
 }
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use crate::expect_variant;
+    use crate::identity::OutboundIdentity;
+    use crate::secrets::secret_string;
+    use crate::test_support::HeaderAbsent;
+    use serde_json::json;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
+
+    /// wiremock's `header()` matcher splits values on commas, which
+    /// breaks a User-Agent like `claude-cli/2.1.224 (external, ...)`.
+    /// Compare the raw value verbatim instead.
+    struct HeaderVerbatim(&'static str, &'static str);
+
+    impl Match for HeaderVerbatim {
+        fn matches(&self, request: &Request) -> bool {
+            request.headers.get(self.0).and_then(|v| v.to_str().ok()) == Some(self.1)
+        }
+    }
+
+    fn request() -> MessagesRequest {
+        serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 32,
+            "stream": false,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap()
+    }
+
+    fn provider(server: &MockServer, identity: OutboundIdentity) -> OpenaiResponsesProvider {
+        let mut provider = OpenaiResponsesProvider::new(
+            "responses".to_string(),
+            server.uri(),
+            secret_string("test-key"),
+            HashMap::new(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        provider.set_outbound_identity(identity);
+        provider
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn responses_body() -> serde_json::Value {
+        json!({
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "world"}]
+            }],
+            "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+        })
+    }
+
+    #[tokio::test]
+    async fn the_user_agent_override_reaches_the_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(HeaderVerbatim("user-agent", "omp/18.14.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(responses_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let identity = OutboundIdentity::from_parts(
+            "responses",
+            Some("omp/18.14.0"),
+            None,
+            &Default::default(),
+        );
+        let provider = provider(&server, identity);
+        let output = provider.complete(&request(), &HashMap::new()).await.unwrap();
+        expect_variant!(output, ProviderOutput::Json(_) => {});
+    }
+
+    #[tokio::test]
+    async fn the_referer_and_custom_headers_reach_the_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("http-referer", "https://omp.sh/"))
+            .and(header("x-title", "omp"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(responses_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let identity = OutboundIdentity::from_parts(
+            "responses",
+            None,
+            Some("https://omp.sh/"),
+            &headers(&[("x-title", "omp")]),
+        );
+        let provider = provider(&server, identity);
+        let output = provider.complete(&request(), &HashMap::new()).await.unwrap();
+        expect_variant!(output, ProviderOutput::Json(_) => {});
+    }
+
+    #[tokio::test]
+    async fn an_unset_referer_is_not_sent() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(HeaderAbsent("http-referer"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(responses_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider(&server, OutboundIdentity::default());
+        let output = provider.complete(&request(), &HashMap::new()).await.unwrap();
+        expect_variant!(output, ProviderOutput::Json(_) => {});
+    }
+}

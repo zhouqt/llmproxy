@@ -6,6 +6,8 @@
 //!   only checks presence; the complement is needed for "the proxy
 //!   must NOT send field X when the client didn't ask" assertions
 //!   (e.g. `prompt_cache_key` / `prompt_cache_retention`).
+//! - `HeaderAbsent` — wiremock matcher that asserts a header is
+//!   **absent** from the request.
 //! - `openai_request` / `chat_response` / `cache_request_with` — wire
 //!   fixtures shared by the OpenAI-family provider tests
 //!   (openai_compat / openai_responses); previously duplicated inline.
@@ -37,6 +39,20 @@ impl Match for JsonFieldAbsent {
             Err(_) => return false,
         };
         body.get(self.0).is_none()
+    }
+}
+
+/// Wire-level "header X must NOT be present" matcher.
+///
+/// wiremock 0.6.5 has no `missing(...)` matcher (it offers `header`,
+/// `headers`, `header_exists`, `header_regex`), so asserting the
+/// *absence* of a header needs a hand-rolled complement — the same
+/// reason `JsonFieldAbsent` exists for request bodies.
+pub struct HeaderAbsent(pub &'static str);
+
+impl Match for HeaderAbsent {
+    fn matches(&self, request: &Request) -> bool {
+        !request.headers.contains_key(self.0)
     }
 }
 

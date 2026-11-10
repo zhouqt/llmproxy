@@ -305,6 +305,43 @@ models:
         Config::parse(yaml).unwrap()
     }
 
+    /// An illegal global `user_agent:` must not stop the proxy: the
+    /// value is degraded to the built-in default *before* the shared
+    /// reqwest clients are built, because `ClientBuilder::build()`
+    /// would otherwise return `Err` and abort startup.
+    #[test]
+    fn an_illegal_global_user_agent_still_lets_the_clients_be_built() {
+        let yaml = r#"
+user_agent: "omp/1.0\nX: 1"
+providers:
+  - name: compat
+    type: openai_compat
+    api_key: "test-key"
+    api_base: "https://example.test/v1"
+models:
+  - name: m
+    primary: compat
+"#;
+        let cfg = Config::parse(yaml).unwrap();
+        let global_user_agent = identity::resolve_global_user_agent(&cfg.user_agent);
+        assert_eq!(
+            global_user_agent,
+            llmproxy::config::default_user_agent(),
+            "an illegal global User-Agent degrades to the built-in default"
+        );
+        let proxied = llmproxy::proxy_client::build_client(
+            &cfg.proxy,
+            &global_user_agent,
+        )
+        .expect("the proxy client is built");
+        let direct = llmproxy::proxy_client::build_direct_client(
+            &cfg.proxy,
+            &global_user_agent,
+        )
+        .expect("the direct client is built");
+        drop((proxied, direct));
+    }
+
     #[tokio::test]
     async fn build_state_wires_providers_router_and_cooldown() {
         let cfg = fixture_config();
