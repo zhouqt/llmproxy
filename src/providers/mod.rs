@@ -262,7 +262,8 @@ mod tests {
 
                 user_agent: None,
                 referer: None,
-                headers: std::collections::BTreeMap::new(),            },
+                headers: std::collections::BTreeMap::new(),
+            },
             reqwest::Client::new(),
             true,
         )
@@ -283,7 +284,8 @@ mod tests {
 
                 user_agent: None,
                 referer: None,
-                headers: std::collections::BTreeMap::new(),            },
+                headers: std::collections::BTreeMap::new(),
+            },
             reqwest::Client::new(),
             true,
         )
@@ -304,7 +306,8 @@ mod tests {
 
                 user_agent: None,
                 referer: None,
-                headers: std::collections::BTreeMap::new(),            },
+                headers: std::collections::BTreeMap::new(),
+            },
             reqwest::Client::new(),
             true,
         )

@@ -1662,7 +1662,8 @@ models:
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
                 "anthropic",
             ),
             (
@@ -1678,7 +1679,8 @@ models:
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
                 "openai_compat",
             ),
             (
@@ -1691,7 +1693,8 @@ models:
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
                 "openai_responses",
             ),
         ];
@@ -2467,7 +2470,8 @@ models:
 
             user_agent: None,
             referer: None,
-            headers: std::collections::BTreeMap::new(),        }
+            headers: std::collections::BTreeMap::new(),
+        }
     }
 
     #[test]

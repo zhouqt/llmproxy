@@ -2354,7 +2354,8 @@ mod tests {
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
                 ProviderConfig::GithubCopilot {
                     name: "copilot".to_string(),
                     vscode_version: "1.95.0".to_string(),
@@ -2449,7 +2450,8 @@ mod tests {
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
                 ProviderConfig::GithubCopilot {
                     name: "copilot".to_string(),
                     vscode_version: "1.95.0".to_string(),
@@ -2692,7 +2694,8 @@ mod tests {
 
                 user_agent: None,
                 referer: None,
-                headers: std::collections::BTreeMap::new(),            },
+                headers: std::collections::BTreeMap::new(),
+            },
             reqwest::Client::new(),
             true,
         )

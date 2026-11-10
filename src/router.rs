@@ -947,7 +947,8 @@ mod tests {
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
                     api_key: secret_string("k"),
@@ -960,7 +961,8 @@ mod tests {
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
             ],
             models: vec![ModelConfig {
                 name: "m".into(),
@@ -1043,7 +1045,8 @@ mod tests {
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
                     api_key: secret_string("k"),
@@ -1056,7 +1059,8 @@ mod tests {
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
             ],
             models: vec![ModelConfig {
                 name: "m".into(),
@@ -1372,7 +1376,8 @@ mod tests {
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
                     api_key: secret_string("k"),
@@ -1385,7 +1390,8 @@ mod tests {
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
             ],
             models: vec![ModelConfig {
                 name: "m".into(),
@@ -1468,7 +1474,8 @@ mod tests {
 
                 user_agent: None,
                 referer: None,
-                headers: std::collections::BTreeMap::new(),            }],
+                headers: std::collections::BTreeMap::new(),
+            }],
             models: vec![ModelConfig {
                 name: "m".into(),
                 primary: "primary".into(),
@@ -1687,7 +1694,8 @@ mod tests {
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
                     api_key: secret_string("k"),
@@ -1700,7 +1708,8 @@ mod tests {
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
             ],
             models: vec![ModelConfig {
                 name: "m".into(),
@@ -1766,7 +1775,8 @@ mod tests {
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
                     api_key: secret_string("k"),
@@ -1779,7 +1789,8 @@ mod tests {
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
             ],
             models: vec![ModelConfig {
                 name: "m".into(),
@@ -1873,7 +1884,8 @@ mod tests {
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
                     api_key: secret_string("k"),
@@ -1886,7 +1898,8 @@ mod tests {
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
             ],
             models: vec![ModelConfig {
                 name: "m".into(),
@@ -2078,7 +2091,8 @@ mod tests {
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
                     api_key: secret_string("k"),
@@ -2091,7 +2105,8 @@ mod tests {
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
             ],
             models: vec![ModelConfig {
                 name: "m".into(),
@@ -2267,7 +2282,8 @@ mod tests {
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
                     api_key: secret_string("k"),
@@ -2280,7 +2296,8 @@ mod tests {
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
             ],
             models: vec![ModelConfig {
                 name: "m".into(),
@@ -2496,7 +2513,8 @@ mod tests {
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
                     api_key: secret_string("k"),
@@ -2509,7 +2527,8 @@ mod tests {
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
             ],
             models: vec![ModelConfig {
                 name: "m".into(),
@@ -2590,7 +2609,8 @@ mod tests {
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
                     api_key: secret_string("k"),
@@ -2603,7 +2623,8 @@ mod tests {
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
             ],
             models: vec![ModelConfig {
                 name: "m".into(),
@@ -2678,7 +2699,8 @@ mod tests {
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
                     api_key: secret_string("k"),
@@ -2691,7 +2713,8 @@ mod tests {
 
                     user_agent: None,
                     referer: None,
-                    headers: std::collections::BTreeMap::new(),                },
+                    headers: std::collections::BTreeMap::new(),
+                },
             ],
             models: vec![ModelConfig {
                 name: "m".into(),

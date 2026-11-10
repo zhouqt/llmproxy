@@ -120,7 +120,8 @@ fn make_anthropic_config(name: &str, server: &MockServer) -> ProviderConfig {
 
         user_agent: None,
         referer: None,
-        headers: std::collections::BTreeMap::new(),    }
+        headers: std::collections::BTreeMap::new(),
+    }
 }
 
 /// Build a Router with the given providers and model chain (first = primary, rest = fallback).
