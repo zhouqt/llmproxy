@@ -371,12 +371,12 @@ impl Provider for OpenAiCompatProvider {
 
     async fn list_models(&self) -> Option<Vec<serde_json::Value>> {
         let url = self.models_url();
-        let req = self
+        let rb = self
             .http
             .get(&url)
             .bearer_auth(self.api_key.expose_secret())
             .header("accept", "application/json");
-        let resp = self.identity.apply(req).send().await.ok()?;
+        let resp = self.identity.apply(rb).send().await.ok()?;
         if !resp.status().is_success() {
             tracing::warn!(
                 status = %resp.status(),
@@ -443,13 +443,13 @@ impl Provider for OpenAiCompatProvider {
         let mut format_downgraded = false;
         loop {
             attempt += 1;
-            let req = self
+            let rb = self
                 .http
                 .post(self.chat_url())
                 .bearer_auth(self.api_key.expose_secret())
                 .header("content-type", "application/json")
                 .json(&openai_req);
-            let resp = self.identity.apply(req).send().await?;
+            let resp = self.identity.apply(rb).send().await?;
 
             let status = resp.status();
             let body = resp.text().await?;
@@ -554,13 +554,13 @@ impl Provider for OpenAiCompatProvider {
         let mut format_downgraded = false;
         loop {
             attempt += 1;
-            let req = self
+            let rb = self
                 .http
                 .post(self.chat_url())
                 .bearer_auth(self.api_key.expose_secret())
                 .header("content-type", "application/json")
                 .json(&openai_req);
-            let resp = self.identity.apply(req).send().await?;
+            let resp = self.identity.apply(rb).send().await?;
 
             let status = resp.status();
             if status.is_success() {

@@ -1865,7 +1865,7 @@ models:
 
                 user_agent: None,
                 referer: None,
-                headers: std::collections::BTreeMap::new(),            } => {
+            } => {
                 assert_eq!(name, "openai_direct");
                 assert_eq!(api_base, "https://api.openai.com/v1");
                 // api_key is the env-expanded value of ${OPENAI_API_KEY}

@@ -110,12 +110,12 @@ impl Provider for OpenaiResponsesProvider {
 
     async fn list_models(&self) -> Option<Vec<serde_json::Value>> {
         let url = self.models_url();
-        let req = self
+        let rb = self
             .http
             .get(&url)
             .bearer_auth(self.api_key.expose_secret())
             .header("accept", "application/json");
-        let resp = self.identity.apply(req).send().await.ok()?;
+        let resp = self.identity.apply(rb).send().await.ok()?;
         if !resp.status().is_success() {
             tracing::warn!(
                 status = %resp.status(),
@@ -163,13 +163,13 @@ impl Provider for OpenaiResponsesProvider {
         let mut responses_req = anthropic_to_responses_request(req, &merged)?;
         responses_req.stream = false;
 
-        let req = self
+        let rb = self
             .http
             .post(self.responses_url())
             .bearer_auth(self.api_key.expose_secret())
             .header("content-type", "application/json")
             .json(&responses_req);
-        let resp = self.identity.apply(req).send().await?;
+        let resp = self.identity.apply(rb).send().await?;
 
         let status = resp.status();
         let body = resp.text().await?;
@@ -196,13 +196,13 @@ impl Provider for OpenaiResponsesProvider {
         let mut responses_req = anthropic_to_responses_request(req, &merged)?;
         responses_req.stream = true;
 
-        let req = self
+        let rb = self
             .http
             .post(self.responses_url())
             .bearer_auth(self.api_key.expose_secret())
             .header("content-type", "application/json")
             .json(&responses_req);
-        let resp = self.identity.apply(req).send().await?;
+        let resp = self.identity.apply(rb).send().await?;
 
         let status = resp.status();
         if !status.is_success() {
