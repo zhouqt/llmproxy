@@ -187,6 +187,70 @@ firmware upgrade or a Secure Boot policy change, and those are exactly
 the events a re-seal should follow. On a machine with Secure Boot off,
 PCR 7 is constant zero and the policy reduces to "PCR 0 unchanged".
 
+### The seal belongs to one machine and one boot state
+
+A seal is bound to two independent things:
+
+* **the TPM** — the chunks live under the persistent primary
+  `0x81000001` on the machine that sealed them, and
+* **the boot state** — the PCR 0/7 values that were current when the
+  policy was written.
+
+Break either one and the unseal fails. The TPM's own error for the
+second case is `TPM_RC_POLICY_FAIL` (`0x99D`), which in the log looks
+like this and says nothing about the cause:
+
+```
+ERROR:esys:src/tss2-esys/api/Esys_Unseal.c:98:Esys_Unseal() Esys Finish ErrorCode (0x0000099d)
+ERROR: Esys_Unseal(0x99D) - tpm:session(1):a policy check failed
+ERROR: Unable to run tpm2_unseal
+```
+
+The usual cause is a **boot state that moved after the seal was
+made**: a firmware update, a Secure Boot policy or dbx change, or a
+seal directory that was carried over from another machine (or from a
+cloned vTPM state). The remedy is the same in all three cases: **re-seal
+on the host that will run the container**.
+
+To make that diagnosis possible instead of guesswork, `seal.sh` records
+two extra files next to the chunks:
+
+| File | Content |
+|---|---|
+| `llmproxy.pcrs` | The PCR 0/7 values the policy is bound to, one `sha256:<index>=<hex>` line each |
+| `llmproxy.host` | The SHA-256 of `/etc/machine-id` — a fingerprint of the machine that made the seal |
+
+A seal made by an older `seal.sh` has neither file; the checks are
+skipped for it (with a warning) and the unseal is attempted as before.
+Re-sealing once adds them.
+
+The entrypoint compares `llmproxy.pcrs` against the machine's current
+PCR values before it unseals, and refuses to start with the sealed and
+current values side by side when they differ. The values are normalized
+on both sides, because `tpm2_pcrread` prints a different layout in
+different `tpm2-tools` releases and the seal is made with the host's
+tools while the unseal runs with the image's.
+
+The same comparison is available on the host, before the container is
+started at all:
+
+```bash
+# read-only: the unsealed bytes go to /dev/null
+deploy/seal-check.sh deploy/secrets/seal
+```
+
+It reports which binding broke — the TPM, the boot state, or the
+machine — and exits non-zero when the seal cannot be used here. Exit
+code `2` means the seal directory or the tooling is missing, `1` means
+the seal is unusable on this machine.
+
+When the check fails, re-seal and recreate the container:
+
+```bash
+deploy/seal.sh /path/to/plaintext.env deploy/secrets/seal
+podman compose up -d --force-recreate
+```
+
 ## Configure llmproxy
 
 `config.yaml` uses `${VAR}` references as before; point the `secrets:`
@@ -425,6 +489,7 @@ writable layer (i.e. onto the host disk, at
 | `Could not load tcti, got: "(null)"` | Device TCTI package missing | Install the TCTI package (`tpm2-tss-tcti-device` on Alpine, `libtss2-tcti-device0` on Debian) |
 | `tpm2_load` fails, handle invalid | Persistent `0x81000001` gone (vTPM state lost) | Re-seal, then recreate the container |
 | `tpm2_unseal` fails, policy check | PCR 0/7 changed (firmware or Secure Boot update) | Confirm with `tpm2_pcrread sha256:0,7`, re-seal |
+| `Esys_Unseal(0x99D) - a policy check failed` | The boot state moved after the seal (firmware update, Secure Boot/dbx change), or the seal directory came from another machine | Run `deploy/seal-check.sh deploy/secrets/seal`; it prints the sealed and the current PCR values. Re-seal on this host and recreate the container |
 | Third consecutive start fails, `0x902` | Transient slots leaked | The entrypoint flushes on exit; if it recurs, check for other `tpm2_*` users on the host |
 | `ERROR: /run/llmproxy is not on a tmpfs` | `tmpfs:` missing from the compose service | Restore it; do not "fix" this by disabling the check |
 | `ERROR: /run/llmproxy is on a read-only mount` | The payload path sits under a mount podman reserves (`/run/secrets`, `/run/.containerenv`) | Move the payload to a directory of your own (`/run/llmproxy`) and point `LLMPROXY_KEYS` and `secrets.file.path` at it |

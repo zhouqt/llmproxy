@@ -174,6 +174,99 @@ require_tmpfs_target() {
     exit 1
 }
 
+# The current values of the PCRs the policy is bound to, normalized to
+# one "sha256:<index>=<hex>" line per PCR, sorted by index.
+#
+# tpm2_pcrread prints a different layout in different tpm2-tools
+# releases ("    0 : 0xABCD", "  0=0xabcd", "sha256:0=0xabcd"), and
+# the seal is made with the host's tools while the unseal runs with
+# the image's, so the two outputs cannot be compared raw. Both sides
+# normalize to the same shape before comparing.
+#
+# Keep this in sync with deploy/seal.sh and deploy/seal-check.sh.
+current_pcrs() {
+    command -v tpm2_pcrread > /dev/null 2>&1 || return 0
+    tpm2_pcrread "$PCR_LIST" 2>/dev/null | awk '
+        {
+            if (match($0, /0x[0-9A-Fa-f]+/)) {
+                val = substr($0, RSTART, RLENGTH)
+                pre = substr($0, 1, RSTART - 1)
+                if (match(pre, /[0-9]+[ \t]*[:=]?[ \t]*$/)) {
+                    idx = substr(pre, RSTART, RLENGTH)
+                    gsub(/[^0-9]/, "", idx)
+                    printf "sha256:%s=%s\n", idx, tolower(val)
+                }
+            }
+        }
+    ' | sort
+}
+
+# Is the seal still bound to this machine's boot state?
+#
+# A sealed chunk is bound to two things: the TPM that holds it (the
+# persistent primary 0x81000001) and the exact PCR 0/7 values that
+# were current when it was sealed -- a PolicyPCR assertion names the
+# values, so the object's policy is the digest of those values. When
+# they no longer match, the TPM refuses the policy session with
+# TPM_RC_POLICY_FAIL (0x99D), which on its own says nothing about
+# the cause.
+#
+# So the recorded values are compared with the current ones before
+# the TPM is asked to unseal. A mismatch is fatal (the unseal would
+# fail anyway) and is reported as what it is.
+check_seal_binding() {
+    PCR_FILE="$SEAL/llmproxy.pcrs"
+
+    CURRENT=$(current_pcrs || true)
+    if [ -z "$CURRENT" ]; then
+        # The PCR values could not be read at all (no tpm2_pcrread in
+        # the image, or the TPM refused the read). The drift check
+        # below cannot run -- say so instead of pretending it passed.
+        if [ -s "$PCR_FILE" ]; then
+            echo "WARN: could not read the current PCR values;" >&2
+            echo "      the boot-state check against the seal was skipped." >&2
+            echo "      If the unseal fails with a policy error, the boot" >&2
+            echo "      state has most likely changed -- re-seal on this host." >&2
+        fi
+    else
+        SEALED=$(sort "$PCR_FILE" 2>/dev/null || true)
+        if [ -n "$SEALED" ] && [ "$SEALED" != "$CURRENT" ]; then
+            echo "ERROR: the machine's boot state no longer matches the seal." >&2
+            echo "       The sealed chunks are bound to the PCR values that" >&2
+            echo "       were current when they were sealed; those values" >&2
+            echo "       have changed since:" >&2
+            echo "         sealed:   $(echo "$SEALED" | tr '\n' ' ' | sed 's/ $//')" >&2
+            echo "         current:  $(echo "$CURRENT" | tr '\n' ' ' | sed 's/ $//')" >&2
+            echo "       A firmware update, a Secure Boot policy or dbx" >&2
+            echo "       change, or a seal directory carried over from" >&2
+            echo "       another machine all move them." >&2
+            echo "       Remedy: re-seal on THIS host --" >&2
+            echo "         deploy/seal.sh /path/to/plaintext.env deploy/secrets/seal" >&2
+            echo "       and recreate the container." >&2
+            exit 1
+        fi
+    fi
+
+    # A seal directory that was made on another machine cannot be
+    # loaded here at all (the chunks live under this TPM's persistent
+    # primary). The machine-id fingerprint only says so in advance;
+    # it is a warning, not a refusal, because the container's
+    # /etc/machine-id is not necessarily the host's.
+    HOST_FILE="$SEAL/llmproxy.host"
+    if [ -f "$HOST_FILE" ] && [ -r /etc/machine-id ] \
+        && command -v sha256sum > /dev/null 2>&1; then
+        SEALED_HOST=$(tr -d ' \t\r\n' < "$HOST_FILE")
+        CURRENT_HOST=$(sha256sum /etc/machine-id | cut -d' ' -f1)
+        if [ -n "$SEALED_HOST" ] && [ -n "$CURRENT_HOST" ] \
+            && [ "$SEALED_HOST" != "$CURRENT_HOST" ]; then
+            echo "WARN: this seal directory was produced on a different" >&2
+            echo "      machine (machine-id fingerprint differs)." >&2
+            echo "      Its chunks live under that machine's TPM and" >&2
+            echo "      cannot be loaded here; re-seal on this host." >&2
+        fi
+    fi
+}
+
 # Check the mount BEFORE creating the directory: on a read-only mount
 # the mkdir itself would fail with EROFS and hide the real cause.
 require_writable_target "$KEYS_DIR"
@@ -222,6 +315,11 @@ elif ls "$SEAL"/llmproxy.*.pub > /dev/null 2>&1; then
     # plaintext on disk, with the knowledge that they do).
     require_tmpfs_target "$KEYS_DIR"
 
+    # A seal that no longer matches this machine's boot state cannot
+    # be unsealed here: the TPM would refuse the policy session with a
+    # bare 0x99D. Check first, so the operator gets the reason.
+    check_seal_binding
+
     # The parent must be the PERSISTENT primary at 0x81000001, not a
     # freshly created one: tpm2_createprimary derives a different
     # sensitive seed every time, so a new primary cannot unseal a blob
@@ -268,9 +366,21 @@ elif ls "$SEAL"/llmproxy.*.pub > /dev/null 2>&1; then
             echo "       (the private half must be readable, and the" >&2
             echo "        scratch file's directory -- $SCRATCH -- must be" >&2
             echo "        on a writable mount)" >&2
+            echo "       (the chunk must also exist under the persistent" >&2
+            echo "        parent 0x81000001 of THIS TPM: a seal directory" >&2
+            echo "        copied from another machine cannot be loaded)" >&2
             exit 1
         fi
-        tpm2_unseal -c "$SCRATCH" -p "pcr:$PCR_LIST" >> "$KEYS"
+        if ! tpm2_unseal -c "$SCRATCH" -p "pcr:$PCR_LIST" >> "$KEYS"; then
+            echo "ERROR: tpm2_unseal failed for $pub" >&2
+            echo "       (the TPM refused the policy session: the chunk is" >&2
+            echo "        bound to the PCR 0/7 values that were current when" >&2
+            echo "        it was sealed, and those values no longer match)" >&2
+            echo "       Re-seal on this host if the boot state changed --" >&2
+            echo "         deploy/seal.sh /path/to/plaintext.env deploy/secrets/seal" >&2
+            rm -f "$KEYS"
+            exit 1
+        fi
         tpm2_flushcontext -t
         rm -f "$SCRATCH"
     done

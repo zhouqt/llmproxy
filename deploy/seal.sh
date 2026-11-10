@@ -79,8 +79,11 @@ chmod 700 "$OUT"
 # Stale chunks from an earlier seal would be concatenated with the new
 # ones and corrupt the plaintext, so the target is emptied first. Only
 # the llmproxy.* blobs are removed -- anything else in the directory is
-# left alone.
-rm -f "$OUT"/llmproxy.*.pub "$OUT"/llmproxy.*.priv
+# left alone. The bookkeeping files of an earlier seal go with them: a
+# PCR record or a digest that outlives its chunks would describe a
+# payload that no longer exists.
+rm -f "$OUT"/llmproxy.*.pub "$OUT"/llmproxy.*.priv \
+      "$OUT"/llmproxy.pcrs "$OUT"/llmproxy.host "$OUT"/llmproxy.env.sha256
 
 if tpm2_getcap handles-persistent | grep -q "$PARENT"; then
     echo "persistent parent $PARENT already present; reusing"
@@ -96,6 +99,49 @@ fi
 # policy digest is reused, which is what lets an old blob be unsealed
 # after a reboot of the host.
 tpm2_createpolicy --policy-pcr -l "$PCR_LIST" -L "$TMP/pcr.policy"
+
+# Record the PCR values the policy is bound to, next to the chunks.
+#
+# A PolicyPCR assertion names the values that were current when the
+# policy was written, so the object's policy is the digest of exactly
+# those values. They stay the same across reboots of the same
+# machine, but a firmware update, a Secure Boot policy or dbx change,
+# or a different machine all move them -- and then the TPM refuses
+# the policy session with TPM_RC_POLICY_FAIL (0x99D), which says
+# nothing about the cause. With the values recorded, the unseal side
+# can compare them and report what actually happened.
+#
+# The output format of tpm2_pcrread differs between tpm2-tools
+# releases, and the unseal runs with the image's tools while the seal
+# runs with the host's, so the values are normalized into one
+# "sha256:<index>=<hex>" line per PCR.
+if command -v tpm2_pcrread > /dev/null 2>&1; then
+    tpm2_pcrread "$PCR_LIST" 2>/dev/null | awk '
+        {
+            if (match($0, /0x[0-9A-Fa-f]+/)) {
+                val = substr($0, RSTART, RLENGTH)
+                pre = substr($0, 1, RSTART - 1)
+                if (match(pre, /[0-9]+[ \t]*[:=]?[ \t]*$/)) {
+                    idx = substr(pre, RSTART, RLENGTH)
+                    gsub(/[^0-9]/, "", idx)
+                    printf "sha256:%s=%s\n", idx, tolower(val)
+                }
+            }
+        }
+    ' | sort > "$OUT/llmproxy.pcrs"
+    chmod 600 "$OUT/llmproxy.pcrs"
+fi
+
+# A fingerprint of the machine that made the seal, so a seal directory
+# that travels to another machine is recognisable as foreign: its
+# chunks live under this machine's TPM and cannot be loaded there.
+# The machine-id is hashed, not stored -- the file has to be
+# comparable across hosts, but the host's identity is nobody else's
+# business.
+if [ -r /etc/machine-id ]; then
+    sha256sum /etc/machine-id | cut -d' ' -f1 > "$OUT/llmproxy.host"
+    chmod 600 "$OUT/llmproxy.host"
+fi
 
 SIZE=$(wc -c < "$SRC")
 NCHUNKS=$(( (SIZE + CHUNK - 1) / CHUNK ))
