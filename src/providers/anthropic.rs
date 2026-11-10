@@ -441,7 +441,7 @@ impl Provider for AnthropicProvider {
         let max_attempts: u32 = 2;
         loop {
             attempt += 1;
-            let req = self
+            let rb = self
                 .http
                 .post(&url)
                 .bearer_auth(api_key.expose_secret())
@@ -449,7 +449,7 @@ impl Provider for AnthropicProvider {
                 .header("anthropic-version", "2023-06-01")
                 .header("x-app", X_APP)
                 .json(&body);
-            let resp = self.identity.apply(req).send().await?;
+            let resp = self.identity.apply(rb).send().await?;
             let status = resp.status();
             let text = resp.text().await?;
             if status.is_success() {
@@ -564,7 +564,7 @@ impl Provider for AnthropicProvider {
         let max_attempts: u32 = 2;
         loop {
             attempt += 1;
-            let req = self
+            let rb = self
                 .http
                 .post(&url)
                 .bearer_auth(api_key.expose_secret())
@@ -573,7 +573,7 @@ impl Provider for AnthropicProvider {
                 .header("x-app", X_APP)
                 .header("accept", "text/event-stream")
                 .json(&body);
-            let resp = self.identity.apply(req).send().await?;
+            let resp = self.identity.apply(rb).send().await?;
             let status = resp.status();
             if status.is_success() {
                 let stream = resp.bytes_stream();

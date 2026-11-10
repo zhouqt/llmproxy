@@ -309,8 +309,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_user_agent_override_is_attached() {
+    #[tokio::test]
+    async fn a_user_agent_override_is_attached() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(HeaderVerbatim("user-agent", "omp/18.14.0"))
@@ -332,8 +332,8 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn without_an_override_the_global_default_is_left_in_place() {
+    #[tokio::test]
+    async fn without_an_override_the_global_default_is_left_in_place() {
         // Nothing is attached, so the shared client's default User-Agent
         // still reaches the wire.
         let server = MockServer::start().await;
