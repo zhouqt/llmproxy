@@ -216,6 +216,7 @@ impl OpenAiCompatProvider {
             reasoning_echo,
             http,
             expose_upstream_details: true,
+            identity: OutboundIdentity::default(),
         })
     }
 

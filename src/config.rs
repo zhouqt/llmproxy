@@ -1862,9 +1862,7 @@ models:
                 api_base,
                 model_rewrite,
                 use_proxy,
-
-                user_agent: None,
-                referer: None,
+                ..
             } => {
                 assert_eq!(name, "openai_direct");
                 assert_eq!(api_base, "https://api.openai.com/v1");

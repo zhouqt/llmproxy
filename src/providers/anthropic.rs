@@ -183,6 +183,7 @@ impl AnthropicProvider {
             provider_allow,
             is_openrouter: force_openrouter,
             thinking_when_absent,
+            identity: OutboundIdentity::default(),
             http,
         })
     }
