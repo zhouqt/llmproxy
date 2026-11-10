@@ -22,8 +22,8 @@ use serde_json::{json, Value};
 
 use crate::anthropic::{ContentBlock, MessageContent, MessagesRequest};
 use crate::config::ThinkingWhenAbsent;
-use crate::identity::OutboundIdentity;
 use crate::error::{ProxyError, Result};
+use crate::identity::OutboundIdentity;
 use crate::providers::{Provider, ProviderOutput};
 
 /// Value of the `x-app` header the real Claude Code client sends to
@@ -3850,9 +3850,13 @@ mod identity_tests {
             .mount(&server)
             .await;
 
-        let identity = OutboundIdentity::from_parts("router", Some("omp/18.14.0"), None, &Default::default());
+        let identity =
+            OutboundIdentity::from_parts("router", Some("omp/18.14.0"), None, &Default::default());
         let provider = provider(&server, identity);
-        let output = provider.complete(&request(), &HashMap::new()).await.unwrap();
+        let output = provider
+            .complete(&request(), &HashMap::new())
+            .await
+            .unwrap();
         expect_variant!(output, ProviderOutput::Json(_) => {});
     }
 
@@ -3868,11 +3872,9 @@ mod identity_tests {
             .await;
 
         // The client carries the global default; the provider adds nothing.
-        let client = crate::proxy_client::build_client(
-            &crate::config::ProxyConfig::default(),
-            "global/1.0",
-        )
-        .unwrap();
+        let client =
+            crate::proxy_client::build_client(&crate::config::ProxyConfig::default(), "global/1.0")
+                .unwrap();
         let mut provider = AnthropicProvider::new(
             "router".to_string(),
             secret_string("router-key"),
@@ -3885,7 +3887,10 @@ mod identity_tests {
         )
         .unwrap();
         provider.set_outbound_identity(OutboundIdentity::default());
-        let output = provider.complete(&request(), &HashMap::new()).await.unwrap();
+        let output = provider
+            .complete(&request(), &HashMap::new())
+            .await
+            .unwrap();
         expect_variant!(output, ProviderOutput::Json(_) => {});
     }
 
@@ -3908,7 +3913,10 @@ mod identity_tests {
             &headers(&[("x-title", "omp")]),
         );
         let provider = provider(&server, identity);
-        let output = provider.complete(&request(), &HashMap::new()).await.unwrap();
+        let output = provider
+            .complete(&request(), &HashMap::new())
+            .await
+            .unwrap();
         expect_variant!(output, ProviderOutput::Json(_) => {});
     }
 
@@ -3924,7 +3932,10 @@ mod identity_tests {
             .await;
 
         let provider = provider(&server, OutboundIdentity::default());
-        let output = provider.complete(&request(), &HashMap::new()).await.unwrap();
+        let output = provider
+            .complete(&request(), &HashMap::new())
+            .await
+            .unwrap();
         expect_variant!(output, ProviderOutput::Json(_) => {});
     }
 
@@ -3946,13 +3957,22 @@ mod identity_tests {
             &headers(&[("x-client-request-id", "auto-request")]),
         );
         let provider = provider(&server, identity);
-        provider.complete(&request(), &HashMap::new()).await.unwrap();
-        provider.complete(&request(), &HashMap::new()).await.unwrap();
+        provider
+            .complete(&request(), &HashMap::new())
+            .await
+            .unwrap();
+        provider
+            .complete(&request(), &HashMap::new())
+            .await
+            .unwrap();
 
         let requests = server.received_requests().await.unwrap();
         let first = requests[0].headers.get("x-client-request-id").unwrap();
         let second = requests[1].headers.get("x-client-request-id").unwrap();
-        assert_ne!(first, second, "auto-request must produce a fresh id per request");
+        assert_ne!(
+            first, second,
+            "auto-request must produce a fresh id per request"
+        );
     }
 
     #[tokio::test]
@@ -3969,8 +3989,14 @@ mod identity_tests {
         let identity =
             OutboundIdentity::from_parts("router", None, None, &headers(&[("x-session", "auto")]));
         let provider = provider(&server, identity);
-        provider.complete(&request(), &HashMap::new()).await.unwrap();
-        provider.complete(&request(), &HashMap::new()).await.unwrap();
+        provider
+            .complete(&request(), &HashMap::new())
+            .await
+            .unwrap();
+        provider
+            .complete(&request(), &HashMap::new())
+            .await
+            .unwrap();
 
         let requests = server.received_requests().await.unwrap();
         let first = requests[0].headers.get("x-session").unwrap();

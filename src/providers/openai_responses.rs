@@ -1644,7 +1644,10 @@ mod identity_tests {
             &Default::default(),
         );
         let provider = provider(&server, identity);
-        let output = provider.complete(&request(), &HashMap::new()).await.unwrap();
+        let output = provider
+            .complete(&request(), &HashMap::new())
+            .await
+            .unwrap();
         expect_variant!(output, ProviderOutput::Json(_) => {});
     }
 
@@ -1667,7 +1670,10 @@ mod identity_tests {
             &headers(&[("x-title", "omp")]),
         );
         let provider = provider(&server, identity);
-        let output = provider.complete(&request(), &HashMap::new()).await.unwrap();
+        let output = provider
+            .complete(&request(), &HashMap::new())
+            .await
+            .unwrap();
         expect_variant!(output, ProviderOutput::Json(_) => {});
     }
 
@@ -1683,7 +1689,10 @@ mod identity_tests {
             .await;
 
         let provider = provider(&server, OutboundIdentity::default());
-        let output = provider.complete(&request(), &HashMap::new()).await.unwrap();
+        let output = provider
+            .complete(&request(), &HashMap::new())
+            .await
+            .unwrap();
         expect_variant!(output, ProviderOutput::Json(_) => {});
     }
 }

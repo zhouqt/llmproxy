@@ -4277,7 +4277,10 @@ mod identity_tests {
         let identity =
             OutboundIdentity::from_parts("compat", Some("omp/18.14.0"), None, &Default::default());
         let provider = provider(&server, identity);
-        let output = provider.complete(&request(), &HashMap::new()).await.unwrap();
+        let output = provider
+            .complete(&request(), &HashMap::new())
+            .await
+            .unwrap();
         expect_variant!(output, ProviderOutput::Json(_) => {});
     }
 
@@ -4302,7 +4305,10 @@ mod identity_tests {
             &headers(&[("x-title", "omp")]),
         );
         let provider = provider(&server, identity);
-        let output = provider.complete(&request(), &HashMap::new()).await.unwrap();
+        let output = provider
+            .complete(&request(), &HashMap::new())
+            .await
+            .unwrap();
         expect_variant!(output, ProviderOutput::Json(_) => {});
     }
 
@@ -4320,7 +4326,10 @@ mod identity_tests {
             .await;
 
         let provider = provider(&server, OutboundIdentity::default());
-        let output = provider.complete(&request(), &HashMap::new()).await.unwrap();
+        let output = provider
+            .complete(&request(), &HashMap::new())
+            .await
+            .unwrap();
         expect_variant!(output, ProviderOutput::Json(_) => {});
     }
 
@@ -4344,12 +4353,21 @@ mod identity_tests {
             &headers(&[("x-client-request-id", "auto-request")]),
         );
         let provider = provider(&server, identity);
-        provider.complete(&request(), &HashMap::new()).await.unwrap();
-        provider.complete(&request(), &HashMap::new()).await.unwrap();
+        provider
+            .complete(&request(), &HashMap::new())
+            .await
+            .unwrap();
+        provider
+            .complete(&request(), &HashMap::new())
+            .await
+            .unwrap();
 
         let requests = server.received_requests().await.unwrap();
         let first = requests[0].headers.get("x-client-request-id").unwrap();
         let second = requests[1].headers.get("x-client-request-id").unwrap();
-        assert_ne!(first, second, "auto-request must produce a fresh id per request");
+        assert_ne!(
+            first, second,
+            "auto-request must produce a fresh id per request"
+        );
     }
 }

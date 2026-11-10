@@ -166,17 +166,15 @@ impl OutboundIdentity {
             entries.push((header_name, resolved));
         }
 
-        let user_agent = user_agent.and_then(|raw| {
-            match header_value(raw) {
-                Some(value) => Some(value),
-                None => {
-                    tracing::warn!(
-                        provider = %provider,
-                        "provider.user_agent: not a legal http header value; \
-                         the global default User-Agent is used"
-                    );
-                    None
-                }
+        let user_agent = user_agent.and_then(|raw| match header_value(raw) {
+            Some(value) => Some(value),
+            None => {
+                tracing::warn!(
+                    provider = %provider,
+                    "provider.user_agent: not a legal http header value; \
+                     the global default User-Agent is used"
+                );
+                None
             }
         });
 
@@ -215,8 +213,10 @@ impl OutboundIdentity {
                 OutboundValue::Literal(v) => v.clone(),
                 OutboundValue::Session => HeaderValue::from_str(&self.session_id)
                     .expect("a uuid is a legal http header value"),
-                OutboundValue::PerRequest => HeaderValue::from_str(&uuid::Uuid::new_v4().to_string())
-                    .expect("a uuid is a legal http header value"),
+                OutboundValue::PerRequest => {
+                    HeaderValue::from_str(&uuid::Uuid::new_v4().to_string())
+                        .expect("a uuid is a legal http header value")
+                }
             };
             map.insert(name.clone(), value);
         }
@@ -234,9 +234,7 @@ impl OutboundIdentity {
 pub fn resolve_global_user_agent(configured: &str) -> String {
     let trimmed = configured.trim();
     if trimmed.is_empty() {
-        tracing::warn!(
-            "user_agent: the configured value is empty; the built-in default is used"
-        );
+        tracing::warn!("user_agent: the configured value is empty; the built-in default is used");
         return default_user_agent();
     }
     if HeaderValue::from_str(trimmed).is_err() {
@@ -319,12 +317,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let identity = OutboundIdentity::from_parts(
-            "p",
-            Some("omp/18.14.0"),
-            None,
-            &BTreeMap::new(),
-        );
+        let identity =
+            OutboundIdentity::from_parts("p", Some("omp/18.14.0"), None, &BTreeMap::new());
         identity
             .apply(reqwest::Client::new().get(&server.uri()))
             .send()
@@ -344,34 +338,28 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = crate::proxy_client::build_client(
-            &crate::config::ProxyConfig::default(),
-            "global/1.0",
-        )
-        .unwrap();
+        let client =
+            crate::proxy_client::build_client(&crate::config::ProxyConfig::default(), "global/1.0")
+                .unwrap();
         let identity = OutboundIdentity::from_parts("p", None, None, &BTreeMap::new());
-        identity.apply(client.get(&server.uri())).send().await.unwrap();
+        identity
+            .apply(client.get(&server.uri()))
+            .send()
+            .await
+            .unwrap();
     }
 
     #[test]
     fn an_illegal_user_agent_override_is_dropped() {
-        let identity = OutboundIdentity::from_parts(
-            "p",
-            Some("omp/1.0\nX: 1"),
-            None,
-            &BTreeMap::new(),
-        );
+        let identity =
+            OutboundIdentity::from_parts("p", Some("omp/1.0\nX: 1"), None, &BTreeMap::new());
         assert!(identity.user_agent.is_none());
     }
 
     #[test]
     fn the_referer_becomes_a_http_referer_header() {
-        let identity = OutboundIdentity::from_parts(
-            "p",
-            None,
-            Some("https://omp.sh/"),
-            &BTreeMap::new(),
-        );
+        let identity =
+            OutboundIdentity::from_parts("p", None, Some("https://omp.sh/"), &BTreeMap::new());
         let map = identity.header_map();
         assert_eq!(map.get("http-referer").unwrap(), "https://omp.sh/");
     }
@@ -390,7 +378,8 @@ mod tests {
 
     #[test]
     fn an_illegal_referer_is_dropped() {
-        let identity = OutboundIdentity::from_parts("p", None, Some("bad\nvalue"), &BTreeMap::new());
+        let identity =
+            OutboundIdentity::from_parts("p", None, Some("bad\nvalue"), &BTreeMap::new());
         assert!(identity.header_map().is_empty());
     }
 
@@ -416,10 +405,7 @@ mod tests {
             "p",
             None,
             None,
-            &headers(&[
-                ("x-session", VALUE_AUTO),
-                ("x-request", VALUE_AUTO_REQUEST),
-            ]),
+            &headers(&[("x-session", VALUE_AUTO), ("x-request", VALUE_AUTO_REQUEST)]),
         );
         let first = identity.header_map();
         let second = identity.header_map();
