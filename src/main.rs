@@ -8,8 +8,7 @@ use tracing_subscriber::EnvFilter;
 #[allow(unused_imports)]
 use llmproxy::{
     anthropic, auth, config, conversion, cooldown, error, identity, oauth, openai, providers,
-    proxy_client,
-    router, server, state,
+    proxy_client, router, server, state,
 };
 
 use crate::config::Config;
@@ -329,16 +328,10 @@ models:
             llmproxy::config::default_user_agent(),
             "an illegal global User-Agent degrades to the built-in default"
         );
-        let proxied = llmproxy::proxy_client::build_client(
-            &cfg.proxy,
-            &global_user_agent,
-        )
-        .expect("the proxy client is built");
-        let direct = llmproxy::proxy_client::build_direct_client(
-            &cfg.proxy,
-            &global_user_agent,
-        )
-        .expect("the direct client is built");
+        let proxied = llmproxy::proxy_client::build_client(&cfg.proxy, &global_user_agent)
+            .expect("the proxy client is built");
+        let direct = llmproxy::proxy_client::build_direct_client(&cfg.proxy, &global_user_agent)
+            .expect("the direct client is built");
         drop((proxied, direct));
     }
 
