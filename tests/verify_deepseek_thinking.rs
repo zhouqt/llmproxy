@@ -117,7 +117,10 @@ fn make_anthropic_config(name: &str, server: &MockServer) -> ProviderConfig {
         provider_ignore: Vec::new(),
         provider_allow: Vec::new(),
         thinking_when_absent: llmproxy::config::ThinkingWhenAbsent::Omit,
-    }
+
+        user_agent: None,
+        referer: None,
+        headers: std::collections::BTreeMap::new(),    }
 }
 
 /// Build a Router with the given providers and model chain (first = primary, rest = fallback).

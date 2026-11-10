@@ -284,7 +284,10 @@ fn build_app_full_with_limit(
         provider_ignore: Vec::new(),
         provider_allow: Vec::new(),
         reasoning_echo: false,
-    }];
+
+        user_agent: None,
+        referer: None,
+        headers: std::collections::BTreeMap::new(),    }];
     let fallback_chain = if let Some(backup) = backup {
         providers.insert("backup".to_string(), backup);
         provider_configs.push(ProviderConfig::OpenaiCompat {
@@ -296,7 +299,10 @@ fn build_app_full_with_limit(
             provider_ignore: Vec::new(),
             provider_allow: Vec::new(),
             reasoning_echo: false,
-        });
+
+            user_agent: None,
+            referer: None,
+            headers: std::collections::BTreeMap::new(),        });
         vec!["backup".to_string()]
     } else {
         vec![]
@@ -1157,7 +1163,10 @@ fn build_app_with_sse_error_provider(
         provider_ignore: Vec::new(),
         provider_allow: Vec::new(),
         reasoning_echo: false,
-    };
+
+        user_agent: None,
+        referer: None,
+        headers: std::collections::BTreeMap::new(),    };
     let provider = llmproxy::providers::build(
         &provider_config,
         reqwest::Client::new(),
@@ -1406,7 +1415,10 @@ async fn streaming_fallback_with_an_illegal_provider_name_still_returns_200() {
             provider_ignore: Vec::new(),
             provider_allow: Vec::new(),
             reasoning_echo: false,
-        }],
+
+            user_agent: None,
+            referer: None,
+            headers: std::collections::BTreeMap::new(),        }],
         models: vec![ModelConfig {
             name: "claude-test".to_string(),
             primary: illegal_name.to_string(),
@@ -1608,7 +1620,10 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
-            },
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),            },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
                 api_key: secret_string("unused"),
@@ -1618,7 +1633,10 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
-            },
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),            },
             // Declared but never registered in the router map: both model
             // endpoints must skip it gracefully instead of panicking.
             ProviderConfig::OpenaiCompat {
@@ -1630,7 +1648,10 @@ async fn list_models_aggregates_static_and_provider_discovered_models() {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
-            },
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),            },
         ],
         models: vec![
             ModelConfig {
@@ -1765,7 +1786,10 @@ async fn list_models_collision_winner_follows_chain_order_deterministically() {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
-            },
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),            },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
                 api_key: secret_string("unused"),
@@ -1775,7 +1799,10 @@ async fn list_models_collision_winner_follows_chain_order_deterministically() {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
-            },
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),            },
         ],
         models: vec![ModelConfig {
             name: "shared-model".to_string(),
@@ -1875,7 +1902,10 @@ async fn admin_models_lists_every_provider_without_dedup() {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
-            },
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),            },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
                 api_key: secret_string("unused"),
@@ -1888,7 +1918,10 @@ async fn admin_models_lists_every_provider_without_dedup() {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
-            },
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),            },
             // Declared but absent from the router map: must appear as a
             // degraded group instead of breaking the endpoint.
             ProviderConfig::OpenaiCompat {
@@ -1900,7 +1933,10 @@ async fn admin_models_lists_every_provider_without_dedup() {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
-            },
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),            },
         ],
         models: vec![ModelConfig {
             name: "claude-test".to_string(),
@@ -2015,7 +2051,10 @@ async fn admin_models_reports_fetch_failed_for_provider_without_catalog() {
             provider_ignore: Vec::new(),
             provider_allow: Vec::new(),
             reasoning_echo: false,
-        }],
+
+            user_agent: None,
+            referer: None,
+            headers: std::collections::BTreeMap::new(),        }],
         models: vec![ModelConfig {
             name: "claude-test".to_string(),
             primary: "primary".to_string(),
@@ -3120,7 +3159,10 @@ async fn admin_usage_excludes_serving_provider_from_failed_providers_on_retry() 
             provider_ignore: Vec::new(),
             provider_allow: Vec::new(),
             reasoning_echo: false,
-        }],
+
+            user_agent: None,
+            referer: None,
+            headers: std::collections::BTreeMap::new(),        }],
         models: vec![ModelConfig {
             name: "claude-test".into(),
             primary: "primary".into(),
@@ -3231,7 +3273,10 @@ async fn admin_usage_keeps_fallback_failures_when_serving_provider_is_different(
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
-            },
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),            },
             ProviderConfig::OpenaiCompat {
                 name: "backup".into(),
                 api_key: secret_string("k"),
@@ -3241,7 +3286,10 @@ async fn admin_usage_keeps_fallback_failures_when_serving_provider_is_different(
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
-            },
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),            },
         ],
         models: vec![ModelConfig {
             name: "claude-test".into(),
