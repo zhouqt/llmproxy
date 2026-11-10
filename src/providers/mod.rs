@@ -161,10 +161,7 @@ pub fn build(
             referer,
             headers,
             ..
-
-            user_agent: None,
-            referer: None,
-            headers: std::collections::BTreeMap::new(),        } => {
+        } => {
             let mut inner = anthropic::AnthropicProvider::new(
                 name.clone(),
                 api_key.clone(),
@@ -195,10 +192,7 @@ pub fn build(
             referer,
             headers,
             ..
-
-            user_agent: None,
-            referer: None,
-            headers: std::collections::BTreeMap::new(),        } => {
+        } => {
             let mut inner = openai_compat::OpenAiCompatProvider::new(
                 name.clone(),
                 api_base.clone(),
@@ -227,10 +221,7 @@ pub fn build(
             referer,
             headers,
             ..
-
-            user_agent: None,
-            referer: None,
-            headers: std::collections::BTreeMap::new(),        } => {
+        } => {
             let mut inner = openai_responses::OpenaiResponsesProvider::new(
                 name.clone(),
                 api_base.clone(),
