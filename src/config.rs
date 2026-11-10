@@ -1,6 +1,6 @@
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use crate::error::{ProxyError, Result};
@@ -48,8 +48,8 @@ pub struct Config {
     pub server: ServerConfig,
     #[serde(default)]
     pub proxy: ProxyConfig,
-    /// User-Agent presented to upstream LLM providers on outbound
-    /// requests (all providers sharing the client pools in
+    /// The **default** User-Agent presented to upstream LLM providers on
+    /// outbound requests (all providers sharing the client pools in
     /// `proxy_client.rs`). Defaults to simulating the Claude Code
     /// client identity (`claude-cli/<ver> (...)` — see
     /// `default_user_agent`) so gateways classify the proxy's traffic
@@ -58,6 +58,10 @@ pub struct Config {
     /// `GitHubCopilotChat/<version>`. A top-level setting because it
     /// describes the client identity, not the `proxy:` outbound HTTP
     /// proxy.
+    ///
+    /// A provider may override it for itself with its own `user_agent:`
+    /// field (see `ProviderConfig`); an unset or illegal value falls back
+    /// to the built-in default rather than failing startup.
     #[serde(default = "default_user_agent")]
     pub user_agent: String,
     #[serde(default)]
@@ -385,6 +389,39 @@ pub enum ProviderConfig {
         /// removed and the request is retried once.
         #[serde(default)]
         thinking_when_absent: ThinkingWhenAbsent,
+        /// Optional User-Agent override for THIS provider.
+        ///
+        /// Absent (the default) ⇒ the global top-level `user_agent:` applies
+        /// (the shared reqwest clients' default header). Set it to present
+        /// this provider as a different client, e.g. `omp/18.14.0`.
+        ///
+        /// An empty or illegal value is dropped with a warning and the
+        /// global default applies — never fatal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_agent: Option<String>,
+        /// Optional app attribution, sent verbatim as the `HTTP-Referer`
+        /// header — the header an app registry (OpenRouter et al.) credits
+        /// traffic on. Without it the request shows up as "Unknown" on the
+        /// registry's activity page, whatever the User-Agent says.
+        ///
+        /// Absent (the default) ⇒ nothing is sent. An empty or illegal
+        /// value is dropped with a warning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        referer: Option<String>,
+        /// Optional custom headers (name → value) sent on every outbound
+        /// request of this provider.
+        ///
+        /// The provider block IS the scope: these headers go to this
+        /// provider only. Names the proxy sets itself are rejected with a
+        /// warning (`user-agent`, `authorization`, `content-type`,
+        /// `accept`, `x-api-key`, `anthropic-version`, `x-app`, …), and an
+        /// empty value omits the header entirely.
+        ///
+        /// Two value sentinels: `"auto"` is one id generated at startup and
+        /// reused for every request of this provider; `"auto-request"` is a
+        /// fresh id per outbound request.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        headers: BTreeMap<String, String>,
     },
     #[serde(rename = "openai_compat")]
     OpenaiCompat {
@@ -435,6 +472,39 @@ pub enum ProviderConfig {
         /// DeepSeek-V4-like upstreams accept it in thinking mode instead of answering
         /// 400. Default `false` (upstreams that follow the OpenAI spec strictly may
         /// reject this non-standard field; other providers keep the wire bytes unchanged).
+        /// Optional User-Agent override for THIS provider.
+        ///
+        /// Absent (the default) ⇒ the global top-level `user_agent:` applies
+        /// (the shared reqwest clients' default header). Set it to present
+        /// this provider as a different client, e.g. `omp/18.14.0`.
+        ///
+        /// An empty or illegal value is dropped with a warning and the
+        /// global default applies — never fatal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_agent: Option<String>,
+        /// Optional app attribution, sent verbatim as the `HTTP-Referer`
+        /// header — the header an app registry (OpenRouter et al.) credits
+        /// traffic on. Without it the request shows up as "Unknown" on the
+        /// registry's activity page, whatever the User-Agent says.
+        ///
+        /// Absent (the default) ⇒ nothing is sent. An empty or illegal
+        /// value is dropped with a warning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        referer: Option<String>,
+        /// Optional custom headers (name → value) sent on every outbound
+        /// request of this provider.
+        ///
+        /// The provider block IS the scope: these headers go to this
+        /// provider only. Names the proxy sets itself are rejected with a
+        /// warning (`user-agent`, `authorization`, `content-type`,
+        /// `accept`, `x-api-key`, `anthropic-version`, `x-app`, …), and an
+        /// empty value omits the header entirely.
+        ///
+        /// Two value sentinels: `"auto"` is one id generated at startup and
+        /// reused for every request of this provider; `"auto-request"` is a
+        /// fresh id per outbound request.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        headers: BTreeMap<String, String>,
         #[serde(default)]
         reasoning_echo: bool,
     },
@@ -454,6 +524,39 @@ pub enum ProviderConfig {
         model_rewrite: HashMap<String, String>,
         #[serde(default)]
         use_proxy: bool,
+        /// Optional User-Agent override for THIS provider.
+        ///
+        /// Absent (the default) ⇒ the global top-level `user_agent:` applies
+        /// (the shared reqwest clients' default header). Set it to present
+        /// this provider as a different client, e.g. `omp/18.14.0`.
+        ///
+        /// An empty or illegal value is dropped with a warning and the
+        /// global default applies — never fatal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_agent: Option<String>,
+        /// Optional app attribution, sent verbatim as the `HTTP-Referer`
+        /// header — the header an app registry (OpenRouter et al.) credits
+        /// traffic on. Without it the request shows up as "Unknown" on the
+        /// registry's activity page, whatever the User-Agent says.
+        ///
+        /// Absent (the default) ⇒ nothing is sent. An empty or illegal
+        /// value is dropped with a warning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        referer: Option<String>,
+        /// Optional custom headers (name → value) sent on every outbound
+        /// request of this provider.
+        ///
+        /// The provider block IS the scope: these headers go to this
+        /// provider only. Names the proxy sets itself are rejected with a
+        /// warning (`user-agent`, `authorization`, `content-type`,
+        /// `accept`, `x-api-key`, `anthropic-version`, `x-app`, …), and an
+        /// empty value omits the header entirely.
+        ///
+        /// Two value sentinels: `"auto"` is one id generated at startup and
+        /// reused for every request of this provider; `"auto-request"` is a
+        /// fresh id per outbound request.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        headers: BTreeMap<String, String>,
     },
 }
 
@@ -1556,7 +1659,10 @@ models:
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
                     thinking_when_absent: ThinkingWhenAbsent::Omit,
-                },
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),                },
                 "anthropic",
             ),
             (
@@ -1569,7 +1675,10 @@ models:
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
                     reasoning_echo: false,
-                },
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),                },
                 "openai_compat",
             ),
             (
@@ -1579,7 +1688,10 @@ models:
                     api_base: "https://example.test/v1".into(),
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
-                },
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),                },
                 "openai_responses",
             ),
         ];
@@ -1750,7 +1862,10 @@ models:
                 api_base,
                 model_rewrite,
                 use_proxy,
-            } => {
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),            } => {
                 assert_eq!(name, "openai_direct");
                 assert_eq!(api_base, "https://api.openai.com/v1");
                 // api_key is the env-expanded value of ${OPENAI_API_KEY}
@@ -2351,7 +2466,10 @@ models:
             provider_ignore: Vec::new(),
             provider_allow: Vec::new(),
             reasoning_echo: false,
-        }
+
+            user_agent: None,
+            referer: None,
+            headers: std::collections::BTreeMap::new(),        }
     }
 
     #[test]

@@ -22,6 +22,7 @@ use crate::conversion::{
     anthropic_to_openai_request, make_message_id, openai_to_anthropic_response,
 };
 use crate::error::{ProxyError, Result};
+use crate::identity::OutboundIdentity;
 use crate::openai::{looks_like_error_envelope, ChatMessage, ChatRequest};
 use crate::providers::{Provider, ProviderOutput};
 
@@ -63,6 +64,11 @@ pub struct OpenAiCompatProvider {
     /// Passed to the SSE adapter: when `false`, the `event: error` frames
     /// it synthesises itself carry no upstream text.
     expose_upstream_details: bool,
+    /// This provider's outbound identity (User-Agent override, referer,
+    /// custom headers). Set by `providers::build` from the provider's
+    /// config block; the default is the empty identity, i.e. the global
+    /// User-Agent applies and nothing else is sent.
+    identity: OutboundIdentity,
 }
 
 impl OpenAiCompatProvider {
@@ -111,7 +117,13 @@ impl OpenAiCompatProvider {
             reasoning_echo,
             http,
             expose_upstream_details: true,
+            identity: OutboundIdentity::default(),
         })
+    }
+
+    /// Sets this provider's outbound identity (see `providers::build`).
+    pub fn set_outbound_identity(&mut self, identity: OutboundIdentity) {
+        self.identity = identity;
     }
 
     /// Sets `server.expose_upstream_details` (see `providers::build`).
@@ -359,14 +371,12 @@ impl Provider for OpenAiCompatProvider {
 
     async fn list_models(&self) -> Option<Vec<serde_json::Value>> {
         let url = self.models_url();
-        let resp = self
+        let req = self
             .http
             .get(&url)
             .bearer_auth(self.api_key.expose_secret())
-            .header("accept", "application/json")
-            .send()
-            .await
-            .ok()?;
+            .header("accept", "application/json");
+        let resp = self.identity.apply(req).send().await.ok()?;
         if !resp.status().is_success() {
             tracing::warn!(
                 status = %resp.status(),
@@ -433,14 +443,13 @@ impl Provider for OpenAiCompatProvider {
         let mut format_downgraded = false;
         loop {
             attempt += 1;
-            let resp = self
+            let req = self
                 .http
                 .post(self.chat_url())
                 .bearer_auth(self.api_key.expose_secret())
                 .header("content-type", "application/json")
-                .json(&openai_req)
-                .send()
-                .await?;
+                .json(&openai_req);
+            let resp = self.identity.apply(req).send().await?;
 
             let status = resp.status();
             let body = resp.text().await?;
@@ -545,14 +554,13 @@ impl Provider for OpenAiCompatProvider {
         let mut format_downgraded = false;
         loop {
             attempt += 1;
-            let resp = self
+            let req = self
                 .http
                 .post(self.chat_url())
                 .bearer_auth(self.api_key.expose_secret())
                 .header("content-type", "application/json")
-                .json(&openai_req)
-                .send()
-                .await?;
+                .json(&openai_req);
+            let resp = self.identity.apply(req).send().await?;
 
             let status = resp.status();
             if status.is_success() {

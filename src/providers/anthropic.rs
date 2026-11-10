@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 
 use crate::anthropic::{ContentBlock, MessageContent, MessagesRequest};
 use crate::config::ThinkingWhenAbsent;
+use crate::identity::OutboundIdentity;
 use crate::error::{ProxyError, Result};
 use crate::providers::{Provider, ProviderOutput};
 
@@ -73,6 +74,11 @@ pub struct AnthropicProvider {
     /// M3.1-Flash). See the same-named field in config and
     /// plans/feat-disable-thinking-when-absent.md.
     thinking_when_absent: ThinkingWhenAbsent,
+    /// This provider's outbound identity (User-Agent override, referer,
+    /// custom headers). Set by `providers::build` from the provider's
+    /// config block; the default is the empty identity, i.e. the global
+    /// User-Agent applies and nothing else is sent.
+    identity: OutboundIdentity,
     http: reqwest::Client,
 }
 
@@ -143,6 +149,7 @@ impl AnthropicProvider {
             provider_allow,
             is_openrouter,
             thinking_when_absent,
+            identity: OutboundIdentity::default(),
             http,
         })
     }
@@ -178,6 +185,11 @@ impl AnthropicProvider {
             thinking_when_absent,
             http,
         })
+    }
+
+    /// Sets this provider's outbound identity (see `providers::build`).
+    pub fn set_outbound_identity(&mut self, identity: OutboundIdentity) {
+        self.identity = identity;
     }
 
     /// Apply the configured `thinking_when_absent` mode to the outbound
@@ -360,16 +372,14 @@ impl Provider for AnthropicProvider {
 
     async fn list_models(&self) -> Option<Vec<serde_json::Value>> {
         let url = self.models_url();
-        let resp = self
+        let req = self
             .http
             .get(&url)
             .header("x-api-key", self.api_key.expose_secret())
             .header("anthropic-version", "2023-06-01")
             .header("x-app", X_APP)
-            .header("accept", "application/json")
-            .send()
-            .await
-            .ok()?;
+            .header("accept", "application/json");
+        let resp = self.identity.apply(req).send().await.ok()?;
         if !resp.status().is_success() {
             tracing::warn!(
                 status = %resp.status(),
@@ -431,16 +441,15 @@ impl Provider for AnthropicProvider {
         let max_attempts: u32 = 2;
         loop {
             attempt += 1;
-            let resp = self
+            let req = self
                 .http
                 .post(&url)
                 .bearer_auth(api_key.expose_secret())
                 .header("content-type", "application/json")
                 .header("anthropic-version", "2023-06-01")
                 .header("x-app", X_APP)
-                .json(&body)
-                .send()
-                .await?;
+                .json(&body);
+            let resp = self.identity.apply(req).send().await?;
             let status = resp.status();
             let text = resp.text().await?;
             if status.is_success() {
@@ -555,7 +564,7 @@ impl Provider for AnthropicProvider {
         let max_attempts: u32 = 2;
         loop {
             attempt += 1;
-            let resp = self
+            let req = self
                 .http
                 .post(&url)
                 .bearer_auth(api_key.expose_secret())
@@ -563,9 +572,8 @@ impl Provider for AnthropicProvider {
                 .header("anthropic-version", "2023-06-01")
                 .header("x-app", X_APP)
                 .header("accept", "text/event-stream")
-                .json(&body)
-                .send()
-                .await?;
+                .json(&body);
+            let resp = self.identity.apply(req).send().await?;
             let status = resp.status();
             if status.is_success() {
                 let stream = resp.bytes_stream();

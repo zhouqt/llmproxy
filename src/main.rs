@@ -7,7 +7,8 @@ use tracing_subscriber::EnvFilter;
 
 #[allow(unused_imports)]
 use llmproxy::{
-    anthropic, auth, config, conversion, cooldown, error, oauth, openai, providers, proxy_client,
+    anthropic, auth, config, conversion, cooldown, error, identity, oauth, openai, providers,
+    proxy_client,
     router, server, state,
 };
 
@@ -46,8 +47,13 @@ async fn async_main() -> anyhow::Result<()> {
 
     let listen = resolve_listen_addr(&args, &cfg);
     let max_request_bytes = cfg.server.max_request_bytes;
-    let proxied_http = proxy_client::build_client(&cfg.proxy, &cfg.user_agent)?;
-    let direct_http = proxy_client::build_direct_client(&cfg.proxy, &cfg.user_agent)?;
+    // The global default User-Agent. Resolved before the clients are
+    // built, because an illegal value would make `ClientBuilder::build()`
+    // fail — and abort startup. An empty or illegal value degrades to
+    // the built-in Claude Code default with a warning.
+    let global_user_agent = identity::resolve_global_user_agent(&cfg.user_agent);
+    let proxied_http = proxy_client::build_client(&cfg.proxy, &global_user_agent)?;
+    let direct_http = proxy_client::build_direct_client(&cfg.proxy, &global_user_agent)?;
 
     let (state, bg_handles) =
         build_state(cfg, proxied_http, direct_http).map_err(|e| anyhow::anyhow!("{e}"))?;
