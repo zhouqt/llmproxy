@@ -2718,7 +2718,9 @@ models:
         // grow empty identity keys.
         let cfg = Config::parse(IDENTITY_PROVIDER_YAML).unwrap();
         let dumped = serde_saphyr::to_string(&cfg).unwrap();
-        assert!(!dumped.contains("user_agent"), "{dumped}");
+        // The top-level `user_agent:` is always present; the provider's
+        // own identity fields must not add a second one.
+        assert_eq!(dumped.matches("user_agent").count(), 1, "{dumped}");
         assert!(!dumped.contains("referer"), "{dumped}");
         assert!(!dumped.contains("headers"), "{dumped}");
     }

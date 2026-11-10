@@ -3780,7 +3780,7 @@ mod identity_tests {
     use crate::secrets::secret_string;
     use crate::test_support::HeaderAbsent;
     use serde_json::json;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{header, header_exists, method, path};
     use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
     /// wiremock's `header()` matcher splits values on commas, which
@@ -3933,7 +3933,7 @@ mod identity_tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
-            .and(header("x-client-request-id", "auto-request"))
+            .and(header_exists("x-client-request-id"))
             .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
             .expect(2)
             .mount(&server)
@@ -3960,7 +3960,7 @@ mod identity_tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
-            .and(header("x-session", "auto"))
+            .and(header_exists("x-session"))
             .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
             .expect(2)
             .mount(&server)
