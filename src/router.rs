@@ -944,6 +944,10 @@ mod tests {
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
                     reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -954,6 +958,10 @@ mod tests {
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
                     reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
                 },
             ],
             models: vec![ModelConfig {
@@ -1034,6 +1042,10 @@ mod tests {
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
                     reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -1044,6 +1056,10 @@ mod tests {
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
                     reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
                 },
             ],
             models: vec![ModelConfig {
@@ -1357,6 +1373,10 @@ mod tests {
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
                     reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -1367,6 +1387,10 @@ mod tests {
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
                     reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
                 },
             ],
             models: vec![ModelConfig {
@@ -1447,6 +1471,10 @@ mod tests {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             }],
             models: vec![ModelConfig {
                 name: "m".into(),
@@ -1663,6 +1691,10 @@ mod tests {
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
                     reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -1673,6 +1705,10 @@ mod tests {
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
                     reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
                 },
             ],
             models: vec![ModelConfig {
@@ -1736,6 +1772,10 @@ mod tests {
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
                     reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -1746,6 +1786,10 @@ mod tests {
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
                     reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
                 },
             ],
             models: vec![ModelConfig {
@@ -1837,6 +1881,10 @@ mod tests {
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
                     reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -1847,6 +1895,10 @@ mod tests {
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
                     reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
                 },
             ],
             models: vec![ModelConfig {
@@ -2036,6 +2088,10 @@ mod tests {
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
                     reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -2046,6 +2102,10 @@ mod tests {
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
                     reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
                 },
             ],
             models: vec![ModelConfig {
@@ -2219,6 +2279,10 @@ mod tests {
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
                     reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -2229,6 +2293,10 @@ mod tests {
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
                     reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
                 },
             ],
             models: vec![ModelConfig {
@@ -2442,6 +2510,10 @@ mod tests {
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
                     reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -2452,6 +2524,10 @@ mod tests {
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
                     reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
                 },
             ],
             models: vec![ModelConfig {
@@ -2530,6 +2606,10 @@ mod tests {
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
                     reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -2540,6 +2620,10 @@ mod tests {
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
                     reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
                 },
             ],
             models: vec![ModelConfig {
@@ -2612,6 +2696,10 @@ mod tests {
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
                     reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -2622,6 +2710,10 @@ mod tests {
                     provider_ignore: Vec::new(),
                     provider_allow: Vec::new(),
                     reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
                 },
             ],
             models: vec![ModelConfig {
