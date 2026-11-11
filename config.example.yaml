@@ -165,6 +165,49 @@ server:
 # `GitHubCopilotChat/<version>` regardless of this setting.
 #
 # user_agent: "claude-cli/2.1.224 (external, claude-vscode, agent-sdk/0.3.224)"
+#
+# This is the GLOBAL default: it is attached to the shared HTTP clients
+# and therefore reaches every provider that does not override it.
+# A provider may override it for itself with its own `user_agent:` key
+# (see the provider blocks below) — the provider block IS the scope, no
+# routing table is involved.
+#
+# An empty or illegal global value is not a startup error: it degrades to
+# the built-in default above with a warning.
+#
+# ───────────────────────────────────────────────────────────────────────
+# per-provider identity (anthropic / openai_compat / openai_responses)
+# ───────────────────────────────────────────────────────────────────────
+# Each of these three provider types accepts three optional keys, applied
+# to that provider only:
+#
+#   user_agent — overrides the global `user_agent:` for this provider.
+#                Unset (default) ⇒ the global default applies.
+#                An empty or illegal value is dropped with a warning and
+#                the global default applies — never fatal.
+#   referer    — sent verbatim as the `HTTP-Referer` header. This is the
+#                header an app registry (OpenRouter et al.) credits the
+#                traffic on: without it the request shows up as
+#                "Unknown" on the registry's activity page, whatever the
+#                User-Agent says. `X-Title` only *names* a new app the
+#                first time that referer is seen; `X-OpenRouter-Title` is
+#                ignored by OpenRouter.
+#   headers    — optional map of extra headers sent on every outbound
+#                request of this provider (name → value).
+#                An empty value omits the header entirely.
+#                Two value sentinels:
+#                  "auto"         — one id generated at startup, reused
+#                                    for every request of this provider
+#                  "auto-request" — a fresh id per outbound request
+#
+# Names the proxy sets itself are rejected with a warning, so an
+# operator cannot clobber the credential or the framing: user-agent,
+# authorization, proxy-authorization, content-type, content-length, host,
+# accept, transfer-encoding, connection, x-api-key, anthropic-version,
+# x-app.
+#
+# The github_copilot provider has none of these keys: GitHub gates on the
+# client version, and Copilot sends `GitHubCopilotChat/<version>` itself.
 
 # ───────────────────────────────────────────────────────────────────────
 # usage_capacity: in-memory ring buffer size for /admin/usage
@@ -273,6 +316,8 @@ providers:
   #                   a non-empty table is an explicit allow-list (the
   #                   router skips this provider for unmapped names).
   #   use_proxy     — see proxy section. Default: false.
+  #   user_agent / referer / headers — optional per-provider identity
+  #                   overrides; see the global `user_agent:` section above.
   #   thinking_when_absent — `disabled` (default) | `omit` | `effort_low`.
   #                   What to inject when the client sent no thinking
   #                   field; see the detailed comment below.
@@ -282,6 +327,21 @@ providers:
     api_key: "${OPENROUTER_API_KEY}"
     api_base: "https://openrouter.ai/api/v1"
     use_proxy: true
+    # Per-provider identity (optional, all three keys are independent):
+    #
+    #   user_agent — overrides the global `user_agent:` for THIS provider.
+    #   referer    — sent as `HTTP-Referer`; this is the header OpenRouter
+    #                credits traffic on, so without it the request shows up
+    #                as "Unknown" on the activity page.
+    #   headers    — extra headers for this provider only. `"auto"` is one
+    #                id reused for every request of this provider,
+    #                `"auto-request"` a fresh id per request.
+    #
+    # user_agent: "omp/<version>"
+    # referer: "https://omp.sh/"
+    # headers:
+    #   X-Title: "omp"
+    #   x-client-request-id: "auto-request"
     # `provider_ignore` is honored by both `openai_compat` and `anthropic`
     # provider types when their `api_base` points to `openrouter.ai`. The
     # field is injected as `provider: {ignore: [...]}` into the request
@@ -401,6 +461,8 @@ providers:
   #                  unsatisfiable list makes OpenRouter return 503, which
   #                  llmproxy treats as cooldownable (silent fallback, not
   #                  a config error). Default: empty (no injection).
+  #   user_agent / referer / headers — optional per-provider identity
+  #                  overrides; see the global `user_agent:` section above.
   #   reasoning_echo — when true, thinking requests have every historical
   #                  assistant message padded with `reasoning_content: ""`
   #                  so DeepSeek-V4-style upstreams in thinking mode
@@ -489,6 +551,8 @@ providers:
   #                   Empty (default) accepts any model name verbatim;
   #                   a non-empty table is an explicit allow-list.
   #   use_proxy     — see proxy section. Default: false.
+  #   user_agent / referer / headers — optional per-provider identity
+  #                   overrides; see the global `user_agent:` section above.
   #
   # NOTE: GitHub Copilot also speaks the Responses API but routes
   # automatically per-model by its `/models` cache — see the github_copilot
