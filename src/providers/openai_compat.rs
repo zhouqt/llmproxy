@@ -22,6 +22,7 @@ use crate::conversion::{
     anthropic_to_openai_request, make_message_id, openai_to_anthropic_response,
 };
 use crate::error::{ProxyError, Result};
+use crate::identity::OutboundIdentity;
 use crate::openai::{looks_like_error_envelope, ChatMessage, ChatRequest};
 use crate::providers::{Provider, ProviderOutput};
 
@@ -63,6 +64,11 @@ pub struct OpenAiCompatProvider {
     /// Passed to the SSE adapter: when `false`, the `event: error` frames
     /// it synthesises itself carry no upstream text.
     expose_upstream_details: bool,
+    /// This provider's outbound identity (User-Agent override, referer,
+    /// custom headers). Set by `providers::build` from the provider's
+    /// config block; the default is the empty identity, i.e. the global
+    /// User-Agent applies and nothing else is sent.
+    identity: OutboundIdentity,
 }
 
 impl OpenAiCompatProvider {
@@ -111,7 +117,13 @@ impl OpenAiCompatProvider {
             reasoning_echo,
             http,
             expose_upstream_details: true,
+            identity: OutboundIdentity::default(),
         })
+    }
+
+    /// Sets this provider's outbound identity (see `providers::build`).
+    pub fn set_outbound_identity(&mut self, identity: OutboundIdentity) {
+        self.identity = identity;
     }
 
     /// Sets `server.expose_upstream_details` (see `providers::build`).
@@ -204,6 +216,7 @@ impl OpenAiCompatProvider {
             reasoning_echo,
             http,
             expose_upstream_details: true,
+            identity: OutboundIdentity::default(),
         })
     }
 
@@ -359,14 +372,12 @@ impl Provider for OpenAiCompatProvider {
 
     async fn list_models(&self) -> Option<Vec<serde_json::Value>> {
         let url = self.models_url();
-        let resp = self
+        let rb = self
             .http
             .get(&url)
             .bearer_auth(self.api_key.expose_secret())
-            .header("accept", "application/json")
-            .send()
-            .await
-            .ok()?;
+            .header("accept", "application/json");
+        let resp = self.identity.apply(rb).send().await.ok()?;
         if !resp.status().is_success() {
             tracing::warn!(
                 status = %resp.status(),
@@ -433,14 +444,13 @@ impl Provider for OpenAiCompatProvider {
         let mut format_downgraded = false;
         loop {
             attempt += 1;
-            let resp = self
+            let rb = self
                 .http
                 .post(self.chat_url())
                 .bearer_auth(self.api_key.expose_secret())
                 .header("content-type", "application/json")
-                .json(&openai_req)
-                .send()
-                .await?;
+                .json(&openai_req);
+            let resp = self.identity.apply(rb).send().await?;
 
             let status = resp.status();
             let body = resp.text().await?;
@@ -545,14 +555,13 @@ impl Provider for OpenAiCompatProvider {
         let mut format_downgraded = false;
         loop {
             attempt += 1;
-            let resp = self
+            let rb = self
                 .http
                 .post(self.chat_url())
                 .bearer_auth(self.api_key.expose_secret())
                 .header("content-type", "application/json")
-                .json(&openai_req)
-                .send()
-                .await?;
+                .json(&openai_req);
+            let resp = self.identity.apply(rb).send().await?;
 
             let status = resp.status();
             if status.is_success() {
@@ -4194,5 +4203,171 @@ mod tests {
             }
             ProviderOutput::Json(v) => panic!("expected Stream, got JSON: {v}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use crate::expect_variant;
+    use crate::identity::OutboundIdentity;
+    use crate::secrets::secret_string;
+    use crate::test_support::HeaderAbsent;
+    use serde_json::json;
+    use wiremock::matchers::{header, header_exists, method, path};
+    use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
+
+    /// wiremock's `header()` matcher splits values on commas, which
+    /// breaks a User-Agent like `claude-cli/2.1.224 (external, ...)`.
+    /// Compare the raw value verbatim instead.
+    struct HeaderVerbatim(&'static str, &'static str);
+
+    impl Match for HeaderVerbatim {
+        fn matches(&self, request: &Request) -> bool {
+            request.headers.get(self.0).and_then(|v| v.to_str().ok()) == Some(self.1)
+        }
+    }
+
+    fn request() -> MessagesRequest {
+        serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 32,
+            "stream": false,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap()
+    }
+
+    fn provider(server: &MockServer, identity: OutboundIdentity) -> OpenAiCompatProvider {
+        let mut provider = OpenAiCompatProvider::new(
+            "compat".to_string(),
+            server.uri(),
+            secret_string("compat-key"),
+            HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        provider.set_outbound_identity(identity);
+        provider
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_user_agent_override_reaches_the_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(HeaderVerbatim("user-agent", "omp/18.14.0"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(crate::test_support::chat_response()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let identity =
+            OutboundIdentity::from_parts("compat", Some("omp/18.14.0"), None, &Default::default());
+        let provider = provider(&server, identity);
+        let output = provider
+            .complete(&request(), &HashMap::new())
+            .await
+            .unwrap();
+        expect_variant!(output, ProviderOutput::Json(_) => {});
+    }
+
+    #[tokio::test]
+    async fn the_referer_and_custom_headers_reach_the_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("http-referer", "https://omp.sh/"))
+            .and(header("x-title", "omp"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(crate::test_support::chat_response()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let identity = OutboundIdentity::from_parts(
+            "compat",
+            None,
+            Some("https://omp.sh/"),
+            &headers(&[("x-title", "omp")]),
+        );
+        let provider = provider(&server, identity);
+        let output = provider
+            .complete(&request(), &HashMap::new())
+            .await
+            .unwrap();
+        expect_variant!(output, ProviderOutput::Json(_) => {});
+    }
+
+    #[tokio::test]
+    async fn an_unset_referer_is_not_sent() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(HeaderAbsent("http-referer"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(crate::test_support::chat_response()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider(&server, OutboundIdentity::default());
+        let output = provider
+            .complete(&request(), &HashMap::new())
+            .await
+            .unwrap();
+        expect_variant!(output, ProviderOutput::Json(_) => {});
+    }
+
+    #[tokio::test]
+    async fn the_per_request_id_differs_between_outbound_requests() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header_exists("x-client-request-id"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(crate::test_support::chat_response()),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let identity = OutboundIdentity::from_parts(
+            "compat",
+            None,
+            None,
+            &headers(&[("x-client-request-id", "auto-request")]),
+        );
+        let provider = provider(&server, identity);
+        provider
+            .complete(&request(), &HashMap::new())
+            .await
+            .unwrap();
+        provider
+            .complete(&request(), &HashMap::new())
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let first = requests[0].headers.get("x-client-request-id").unwrap();
+        let second = requests[1].headers.get("x-client-request-id").unwrap();
+        assert_ne!(
+            first, second,
+            "auto-request must produce a fresh id per request"
+        );
     }
 }

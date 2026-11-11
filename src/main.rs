@@ -7,8 +7,8 @@ use tracing_subscriber::EnvFilter;
 
 #[allow(unused_imports)]
 use llmproxy::{
-    anthropic, auth, config, conversion, cooldown, error, oauth, openai, providers, proxy_client,
-    router, server, state,
+    anthropic, auth, config, conversion, cooldown, error, identity, oauth, openai, providers,
+    proxy_client, router, server, state,
 };
 
 use crate::config::Config;
@@ -46,8 +46,13 @@ async fn async_main() -> anyhow::Result<()> {
 
     let listen = resolve_listen_addr(&args, &cfg);
     let max_request_bytes = cfg.server.max_request_bytes;
-    let proxied_http = proxy_client::build_client(&cfg.proxy, &cfg.user_agent)?;
-    let direct_http = proxy_client::build_direct_client(&cfg.proxy, &cfg.user_agent)?;
+    // The global default User-Agent. Resolved before the clients are
+    // built, because an illegal value would make `ClientBuilder::build()`
+    // fail — and abort startup. An empty or illegal value degrades to
+    // the built-in Claude Code default with a warning.
+    let global_user_agent = identity::resolve_global_user_agent(&cfg.user_agent);
+    let proxied_http = proxy_client::build_client(&cfg.proxy, &global_user_agent)?;
+    let direct_http = proxy_client::build_direct_client(&cfg.proxy, &global_user_agent)?;
 
     let (state, bg_handles) =
         build_state(cfg, proxied_http, direct_http).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -297,6 +302,37 @@ models:
     primary: compat
 "#;
         Config::parse(yaml).unwrap()
+    }
+
+    /// An illegal global `user_agent:` must not stop the proxy: the
+    /// value is degraded to the built-in default *before* the shared
+    /// reqwest clients are built, because `ClientBuilder::build()`
+    /// would otherwise return `Err` and abort startup.
+    #[test]
+    fn an_illegal_global_user_agent_still_lets_the_clients_be_built() {
+        let yaml = r#"
+user_agent: "omp/1.0\nX: 1"
+providers:
+  - name: compat
+    type: openai_compat
+    api_key: "test-key"
+    api_base: "https://example.test/v1"
+models:
+  - name: m
+    primary: compat
+"#;
+        let cfg = Config::parse(yaml).unwrap();
+        let global_user_agent = identity::resolve_global_user_agent(&cfg.user_agent);
+        assert_eq!(
+            global_user_agent,
+            llmproxy::config::default_user_agent(),
+            "an illegal global User-Agent degrades to the built-in default"
+        );
+        let proxied = llmproxy::proxy_client::build_client(&cfg.proxy, &global_user_agent)
+            .expect("the proxy client is built");
+        let direct = llmproxy::proxy_client::build_direct_client(&cfg.proxy, &global_user_agent)
+            .expect("the direct client is built");
+        drop((proxied, direct));
     }
 
     #[tokio::test]

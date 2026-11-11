@@ -210,6 +210,10 @@ async fn mock_llm_provider_primary_succeeds_returns_anthropic_response() {
             provider_ignore: Vec::new(),
             provider_allow: Vec::new(),
             reasoning_echo: false,
+
+            user_agent: None,
+            referer: None,
+            headers: std::collections::BTreeMap::new(),
         }],
         models: vec![ModelConfig {
             name: "claude-test".into(),
@@ -287,6 +291,10 @@ async fn mock_llm_provider_falls_back_when_primary_returns_429() {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -297,6 +305,10 @@ async fn mock_llm_provider_falls_back_when_primary_returns_429() {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
         ],
         models: vec![ModelConfig {
@@ -390,6 +402,10 @@ async fn copilot_endpoint_rejection_400_triggers_fallback() {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -400,6 +416,10 @@ async fn copilot_endpoint_rejection_400_triggers_fallback() {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
         ],
         models: vec![ModelConfig {
@@ -487,6 +507,10 @@ async fn mock_llm_provider_falls_back_when_primary_returns_402_quota() {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -497,6 +521,10 @@ async fn mock_llm_provider_falls_back_when_primary_returns_402_quota() {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
         ],
         models: vec![ModelConfig {
@@ -583,6 +611,10 @@ async fn mock_llm_provider_falls_back_when_primary_returns_empty_body_402() {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -593,6 +625,10 @@ async fn mock_llm_provider_falls_back_when_primary_returns_empty_body_402() {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
         ],
         models: vec![ModelConfig {
@@ -677,6 +713,10 @@ async fn mock_llm_provider_does_not_fall_back_on_403() {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -687,6 +727,10 @@ async fn mock_llm_provider_does_not_fall_back_on_403() {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
         ],
         models: vec![ModelConfig {
@@ -765,6 +809,10 @@ async fn mock_llm_provider_chain_exhausted_returns_last_upstream_error() {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -775,6 +823,10 @@ async fn mock_llm_provider_chain_exhausted_returns_last_upstream_error() {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
         ],
         models: vec![ModelConfig {
@@ -886,6 +938,10 @@ async fn mock_llm_provider_per_provider_retry_three_times_before_chain_advance()
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -896,6 +952,10 @@ async fn mock_llm_provider_per_provider_retry_three_times_before_chain_advance()
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
         ],
         models: vec![ModelConfig {
@@ -998,6 +1058,10 @@ async fn http_end_to_end_anthropic_provider_strips_and_succeeds() {
             provider_ignore: Vec::new(),
             provider_allow: Vec::new(),
             thinking_when_absent: llmproxy::config::ThinkingWhenAbsent::Omit,
+
+            user_agent: None,
+            referer: None,
+            headers: std::collections::BTreeMap::new(),
         }],
         models: vec![ModelConfig {
             name: "claude-test".into(),
@@ -1115,6 +1179,10 @@ async fn http_end_to_end_anthropic_provider_strip_max_attempts_then_passthrough(
             provider_ignore: Vec::new(),
             provider_allow: Vec::new(),
             thinking_when_absent: llmproxy::config::ThinkingWhenAbsent::Omit,
+
+            user_agent: None,
+            referer: None,
+            headers: std::collections::BTreeMap::new(),
         }],
         models: vec![ModelConfig {
             name: "claude-test".into(),
@@ -1271,6 +1339,10 @@ async fn http_end_to_end_primary_succeeds_returns_requested_model_name() {
         provider_ignore: Vec::new(),
         provider_allow: Vec::new(),
         reasoning_echo: false,
+
+        user_agent: None,
+        referer: None,
+        headers: std::collections::BTreeMap::new(),
     }];
     let app = build_axum_app(providers, configs, vec!["primary".to_string()]);
 
@@ -1347,6 +1419,10 @@ async fn http_end_to_end_hosted_web_search_tool_passes_through_extractor() {
         provider_ignore: Vec::new(),
         provider_allow: Vec::new(),
         reasoning_echo: false,
+
+        user_agent: None,
+        referer: None,
+        headers: std::collections::BTreeMap::new(),
     }];
     let app = build_axum_app(providers, configs, vec!["primary".to_string()]);
 
@@ -1406,6 +1482,10 @@ async fn http_end_to_end_429_falls_back_to_backup_with_failed_providers_header()
             provider_ignore: Vec::new(),
             provider_allow: Vec::new(),
             reasoning_echo: false,
+
+            user_agent: None,
+            referer: None,
+            headers: std::collections::BTreeMap::new(),
         },
         ProviderConfig::OpenaiCompat {
             name: "backup".to_string(),
@@ -1416,6 +1496,10 @@ async fn http_end_to_end_429_falls_back_to_backup_with_failed_providers_header()
             provider_ignore: Vec::new(),
             provider_allow: Vec::new(),
             reasoning_echo: false,
+
+            user_agent: None,
+            referer: None,
+            headers: std::collections::BTreeMap::new(),
         },
     ];
     let app = build_axum_app(providers, configs, vec!["primary".into(), "backup".into()]);
@@ -1471,6 +1555,10 @@ async fn http_end_to_end_chain_exhausted_returns_status_and_failed_providers_hea
             provider_ignore: Vec::new(),
             provider_allow: Vec::new(),
             reasoning_echo: false,
+
+            user_agent: None,
+            referer: None,
+            headers: std::collections::BTreeMap::new(),
         },
         ProviderConfig::OpenaiCompat {
             name: "backup".to_string(),
@@ -1481,6 +1569,10 @@ async fn http_end_to_end_chain_exhausted_returns_status_and_failed_providers_hea
             provider_ignore: Vec::new(),
             provider_allow: Vec::new(),
             reasoning_echo: false,
+
+            user_agent: None,
+            referer: None,
+            headers: std::collections::BTreeMap::new(),
         },
     ];
     let app = build_axum_app(providers, configs, vec!["primary".into(), "backup".into()]);
@@ -1674,6 +1766,10 @@ async fn mock_llm_provider_short_cooldown_for_non_429_upstream_error() {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -1684,6 +1780,10 @@ async fn mock_llm_provider_short_cooldown_for_non_429_upstream_error() {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
         ],
         models: vec![ModelConfig {
@@ -1785,6 +1885,10 @@ async fn mock_llm_provider_402_uses_configured_cooldown_seconds_and_skips_primar
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -1795,6 +1899,10 @@ async fn mock_llm_provider_402_uses_configured_cooldown_seconds_and_skips_primar
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
         ],
         models: vec![ModelConfig {
@@ -1908,6 +2016,10 @@ async fn mock_llm_provider_subsequent_request_skips_cooldown_provider_directly()
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -1918,6 +2030,10 @@ async fn mock_llm_provider_subsequent_request_skips_cooldown_provider_directly()
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
         ],
         models: vec![ModelConfig {
@@ -2048,6 +2164,10 @@ async fn mock_llm_provider_skips_provider_with_unsupported_model_via_runtime_400
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -2058,6 +2178,10 @@ async fn mock_llm_provider_skips_provider_with_unsupported_model_via_runtime_400
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
         ],
         models: vec![ModelConfig {
@@ -2179,6 +2303,10 @@ async fn output_config_propagation_through_router() {
         provider_ignore: Vec::new(),
         provider_allow: Vec::new(),
         reasoning_echo: false,
+
+        user_agent: None,
+        referer: None,
+        headers: std::collections::BTreeMap::new(),
     }];
     let app = build_axum_app(providers, configs, vec!["primary".to_string()]);
 

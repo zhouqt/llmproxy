@@ -19,6 +19,7 @@ use std::sync::Arc;
 use crate::anthropic::MessagesRequest;
 use crate::config::ProviderConfig;
 use crate::error::Result;
+use crate::identity::OutboundIdentity;
 
 /// Output of a Provider call. Either a complete JSON response body or a
 /// byte stream of SSE-encoded Anthropic events.
@@ -156,9 +157,12 @@ pub fn build(
             provider_ignore,
             provider_allow,
             thinking_when_absent,
+            user_agent,
+            referer,
+            headers,
             ..
         } => {
-            let inner = anthropic::AnthropicProvider::new(
+            let mut inner = anthropic::AnthropicProvider::new(
                 name.clone(),
                 api_key.clone(),
                 api_base.clone(),
@@ -168,6 +172,12 @@ pub fn build(
                 *thinking_when_absent,
                 http,
             )?;
+            inner.set_outbound_identity(OutboundIdentity::from_parts(
+                name,
+                user_agent.as_deref(),
+                referer.as_deref(),
+                headers,
+            ));
             Ok(Arc::new(inner))
         }
         ProviderConfig::OpenaiCompat {
@@ -178,6 +188,9 @@ pub fn build(
             provider_ignore,
             provider_allow,
             reasoning_echo,
+            user_agent,
+            referer,
+            headers,
             ..
         } => {
             let mut inner = openai_compat::OpenAiCompatProvider::new(
@@ -191,6 +204,12 @@ pub fn build(
                 http,
             )?;
             inner.set_expose_upstream_details(expose_upstream_details);
+            inner.set_outbound_identity(OutboundIdentity::from_parts(
+                name,
+                user_agent.as_deref(),
+                referer.as_deref(),
+                headers,
+            ));
             Ok(Arc::new(inner))
         }
         ProviderConfig::OpenaiResponses {
@@ -198,6 +217,9 @@ pub fn build(
             api_key,
             api_base,
             model_rewrite,
+            user_agent,
+            referer,
+            headers,
             ..
         } => {
             let mut inner = openai_responses::OpenaiResponsesProvider::new(
@@ -208,6 +230,12 @@ pub fn build(
                 http,
             )?;
             inner.set_expose_upstream_details(expose_upstream_details);
+            inner.set_outbound_identity(OutboundIdentity::from_parts(
+                name,
+                user_agent.as_deref(),
+                referer.as_deref(),
+                headers,
+            ));
             Ok(Arc::new(inner))
         }
     }
@@ -231,6 +259,10 @@ mod tests {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
             reqwest::Client::new(),
             true,
@@ -249,6 +281,10 @@ mod tests {
                 provider_ignore: Vec::new(),
                 provider_allow: Vec::new(),
                 thinking_when_absent: crate::config::ThinkingWhenAbsent::Omit,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
             reqwest::Client::new(),
             true,
@@ -267,6 +303,10 @@ mod tests {
                 api_base: "https://example.test/v1".to_string(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
             },
             reqwest::Client::new(),
             true,
