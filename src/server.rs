@@ -19,7 +19,7 @@ use serde_json::json;
 
 use crate::anthropic::{MessagesRequest, MessagesResponse};
 use crate::error::{ProxyError, Result};
-use crate::extractor::{AppJson, AppQuery, InboundBodyLimit};
+use crate::extractor::{AppJson, AppMessages, AppQuery, InboundBodyLimit};
 use crate::providers::ProviderOutput;
 use crate::state::AppState;
 use crate::tokenize::estimate_request_tokens;
@@ -74,7 +74,7 @@ async fn health_handler() -> &'static str {
 
 async fn messages_handler(
     State(state): State<AppState>,
-    AppJson(req): AppJson<MessagesRequest>,
+    AppMessages(req): AppMessages,
 ) -> Result<Response> {
     // The `expose_upstream_details` switch is applied here, at the one
     // place every client-visible error passes through. The inner

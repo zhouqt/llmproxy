@@ -169,7 +169,11 @@ impl Provider for OpenaiResponsesProvider {
             .bearer_auth(self.api_key.expose_secret())
             .header("content-type", "application/json")
             .json(&responses_req);
-        let resp = self.identity.apply(rb).send().await?;
+        let resp = self
+            .identity
+            .apply_with_session(rb, req.client_session.as_deref())
+            .send()
+            .await?;
 
         let status = resp.status();
         let body = resp.text().await?;
@@ -202,7 +206,11 @@ impl Provider for OpenaiResponsesProvider {
             .bearer_auth(self.api_key.expose_secret())
             .header("content-type", "application/json")
             .json(&responses_req);
-        let resp = self.identity.apply(rb).send().await?;
+        let resp = self
+            .identity
+            .apply_with_session(rb, req.client_session.as_deref())
+            .send()
+            .await?;
 
         let status = resp.status();
         if !status.is_success() {

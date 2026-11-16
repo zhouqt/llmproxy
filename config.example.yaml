@@ -195,10 +195,25 @@ server:
 #   headers    — optional map of extra headers sent on every outbound
 #                request of this provider (name → value).
 #                An empty value omits the header entirely.
-#                Two value sentinels:
-#                  "auto"         — one id generated at startup, reused
-#                                    for every request of this provider
-#                  "auto-request" — a fresh id per outbound request
+#                Three value sentinels:
+#                  "auto"           — one id generated at startup, reused
+#                                     for every request of this provider
+#                  "auto-request"   — a fresh id per outbound request
+#                  "client-session" — the *client's* conversation id,
+#                                     taken from the inbound request
+#                                     headers (`x-claude-code-session-id`,
+#                                     then `x-session-id`, then
+#                                     `x-conversation-id`) and falling
+#                                     back to the provider's startup id
+#                                     when the client sent none. This is
+#                                     the per-conversation form of
+#                                     "auto": use it for upstreams whose
+#                                     session header drives routing
+#                                     affinity and prompt caching, e.g.
+#                                     OpenCode Go's required
+#                                     `x-opencode-session`:
+#                                       headers:
+#                                         x-opencode-session: "client-session"
 #
 # Names the proxy sets itself are rejected with a warning, so an
 # operator cannot clobber the credential or the framing: user-agent,
@@ -335,7 +350,9 @@ providers:
     #                as "Unknown" on the activity page.
     #   headers    — extra headers for this provider only. `"auto"` is one
     #                id reused for every request of this provider,
-    #                `"auto-request"` a fresh id per request.
+    #                `"auto-request"` a fresh id per request,
+    #                `"client-session"` the client's conversation id
+    #                (falling back to the startup id).
     #
     # user_agent: "omp/<version>"
     # referer: "https://omp.sh/"
