@@ -1215,6 +1215,128 @@ fn build_app_with_sse_error_provider(
     })
 }
 
+/// App whose single OpenAiCompat provider sends the client's conversation
+/// id as `x-opencode-session` — the OpenCode Go requirement.
+fn build_app_with_client_session_provider(api_base: String) -> axum::Router {
+    use llmproxy::secrets::secret_string;
+
+    let mut headers = std::collections::BTreeMap::new();
+    headers.insert(
+        "x-opencode-session".to_string(),
+        "client-session".to_string(),
+    );
+    let provider_config = ProviderConfig::OpenaiCompat {
+        name: "primary".to_string(),
+        api_key: secret_string("unused"),
+        api_base,
+        model_rewrite: HashMap::new(),
+        use_proxy: false,
+        provider_ignore: Vec::new(),
+        provider_allow: Vec::new(),
+        reasoning_echo: false,
+        user_agent: None,
+        referer: None,
+        headers,
+    };
+    let provider = llmproxy::providers::build(
+        &provider_config,
+        reqwest::Client::new(),
+        true,
+    )
+    .unwrap();
+
+    let mut providers = HashMap::new();
+    providers.insert("primary".to_string(), provider);
+
+    let config = Arc::new(Config {
+        server: ServerConfig {
+            listen: "127.0.0.1:0".to_string(),
+            api_key: None,
+            expose_upstream_details: true,
+            max_request_bytes: llmproxy::config::default_max_request_bytes(),
+        },
+        proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
+        providers: vec![provider_config],
+        models: vec![ModelConfig {
+            name: "claude-test".to_string(),
+            primary: "primary".to_string(),
+            fallback_chain: vec![],
+            cooldown_seconds: 60,
+            max_retries_per_provider: 1,
+            max_retries_total: 2,
+        }],
+        ..Config::default()
+    });
+    let cooldown = CooldownCache::new();
+    let router = Arc::new(Router::new(config.clone(), providers, cooldown.clone()));
+    llmproxy::server::build_router(AppState {
+        config,
+        router,
+        cooldown,
+        http: reqwest::Client::new(),
+        copilot: None,
+        usage: UsageStats::new(0),
+        auth_limiter: llmproxy::auth::AuthRateLimiter::new(),
+        expose_upstream_details: true,
+    })
+}
+
+/// The client's inbound `x-claude-code-session-id` must reach the
+/// upstream as the provider's `client-session` header, per conversation.
+/// This is the end-to-end proof that the extractor → request-field →
+/// identity path is wired: a per-process id would still pass a
+/// single-conversation test, so the test also drives a second
+/// conversation and asserts the two ids differ.
+#[tokio::test]
+async fn the_client_session_id_reaches_the_upstream_sentinel_header() {
+    use wiremock::matchers::{header, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let upstream = MockServer::start().await;
+    let ok_body = || {
+        json!({
+            "id": "cmpl_1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "claude-test",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })
+    };
+    Mock::given(method("POST"))
+        .and(header("x-opencode-session", "conv-aaa"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(header("x-opencode-session", "conv-bbb"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let app = build_app_with_client_session_provider(upstream.uri());
+
+    for session in ["conv-aaa", "conv-bbb"] {
+        let mut req = test_request(
+            Method::POST,
+            "/v1/messages",
+            Some(messages_request(false)),
+        );
+        req.headers_mut()
+            .insert("x-claude-code-session-id", session.parse().unwrap());
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
 #[tokio::test]
 async fn sse_error_envelope_respects_expose_upstream_details() {
     use wiremock::matchers::method;

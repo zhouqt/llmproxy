@@ -450,7 +450,11 @@ impl Provider for AnthropicProvider {
                 .header("anthropic-version", "2023-06-01")
                 .header("x-app", X_APP)
                 .json(&body);
-            let resp = self.identity.apply(rb).send().await?;
+            let resp = self
+                .identity
+                .apply_with_session(rb, req.client_session.as_deref())
+                .send()
+                .await?;
             let status = resp.status();
             let text = resp.text().await?;
             if status.is_success() {
@@ -574,7 +578,11 @@ impl Provider for AnthropicProvider {
                 .header("x-app", X_APP)
                 .header("accept", "text/event-stream")
                 .json(&body);
-            let resp = self.identity.apply(rb).send().await?;
+            let resp = self
+                .identity
+                .apply_with_session(rb, req.client_session.as_deref())
+                .send()
+                .await?;
             let status = resp.status();
             if status.is_success() {
                 let stream = resp.bytes_stream();
@@ -3857,6 +3865,32 @@ mod identity_tests {
             .complete(&request(), &HashMap::new())
             .await
             .unwrap();
+        expect_variant!(output, ProviderOutput::Json(_) => {});
+    }
+
+    #[tokio::test]
+    async fn the_client_session_sentinel_reaches_the_wire_per_conversation() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(HeaderVerbatim("x-opencode-session", "conv-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let identity = OutboundIdentity::from_parts(
+            "router",
+            None,
+            None,
+            &[("x-opencode-session".to_string(), "client-session".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let provider = provider(&server, identity);
+        let mut req = request();
+        req.client_session = Some("conv-1".to_string());
+        let output = provider.complete(&req, &HashMap::new()).await.unwrap();
         expect_variant!(output, ProviderOutput::Json(_) => {});
     }
 

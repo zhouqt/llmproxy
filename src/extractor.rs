@@ -27,10 +27,11 @@ use axum::extract::rejection::QueryRejection;
 use axum::extract::{FromRequest, FromRequestParts, Query, Request};
 use axum::http::header;
 use axum::http::request::Parts;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::Json;
 use serde::de::DeserializeOwned;
 
+use crate::anthropic::MessagesRequest;
 use crate::error::ProxyError;
 
 /// The effective inbound request-body limit, in bytes.
@@ -112,6 +113,70 @@ where
             }
         }
     }
+}
+
+/// Inbound headers searched, in order, for the client's conversation id.
+///
+/// The first is what Claude Code sends on every request (one UUID per
+/// session, per Anthropic's gateway protocol docs); the other two are
+/// the conventional spellings other clients use. The id is *client
+/// context*, never part of the request body.
+pub const CLIENT_SESSION_HEADERS: &[&str] =
+    &["x-claude-code-session-id", "x-session-id", "x-conversation-id"];
+
+/// Upper bound on a client-supplied session id, in bytes.
+///
+/// Generous for a UUID (36) with room for prefixes; the cap keeps a
+/// hostile client from parking a multi-kilobyte value in every outbound
+/// header.
+const MAX_CLIENT_SESSION_LEN: usize = 256;
+
+/// The `MessagesRequest` extractor: `AppJson<MessagesRequest>` plus the
+/// client's conversation id, lifted from the inbound headers into
+/// [`MessagesRequest::client_session`].
+///
+/// Everything else — the Content-Type check, the body limit, the
+/// `ProxyError` rejection mapping — is `AppJson`'s, delegated to it, so
+/// the two extractors can never drift apart.
+#[derive(Debug, Clone)]
+pub struct AppMessages(pub MessagesRequest);
+
+impl<S> FromRequest<S> for AppMessages
+where
+    Json<MessagesRequest>: FromRequest<S, Rejection = axum::extract::rejection::JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = ProxyError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        // Read the session id before the request (and its headers) is
+        // consumed by the body extractor.
+        let client_session = client_session_of(req.headers());
+        let AppJson(mut request) = AppJson::<MessagesRequest>::from_request(req, state).await?;
+        request.client_session = client_session;
+        Ok(AppMessages(request))
+    }
+}
+
+/// The client's conversation id, from the first usable
+/// [`CLIENT_SESSION_HEADERS`] entry.
+///
+/// A value is usable when it is non-empty after trimming, within
+/// [`MAX_CLIENT_SESSION_LEN`], and a legal `HeaderValue` — it is echoed
+/// on an outbound request, so anything that could not be sent is
+/// dropped here rather than failing the upstream call later. Best
+/// effort by design: a bad value must never reject the request; the
+/// provider's `client-session` sentinel then falls back to its stable
+/// per-process id.
+pub fn client_session_of(headers: &HeaderMap) -> Option<String> {
+    CLIENT_SESSION_HEADERS.iter().find_map(|name| {
+        let raw = headers.get(*name)?.to_str().ok()?.trim();
+        if raw.is_empty() || raw.len() > MAX_CLIENT_SESSION_LEN {
+            return None;
+        }
+        HeaderValue::from_str(raw).ok()?;
+        Some(raw.to_string())
+    })
 }
 
 fn is_json_content_type(headers: &axum::http::HeaderMap) -> bool {
@@ -306,6 +371,122 @@ mod tests {
             axum::http::HeaderValue::from_bytes(b"application/json\xff").unwrap(),
         );
         assert!(!is_json_content_type(&h));
+    }
+
+    /// A request whose body is a minimal valid `MessagesRequest`, with
+    /// the given extra headers attached.
+    fn messages_request(extra: &[(&str, &str)]) -> Request<axum::body::Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json");
+        for (name, value) in extra {
+            builder = builder.header(*name, *value);
+        }
+        let mut req = builder
+            .body(axum::body::Body::from(
+                r#"{"model":"m","max_tokens":8,"messages":[]}"#.to_string(),
+            ))
+            .expect("request builds");
+        axum::extract::DefaultBodyLimit::max(4096).apply(&mut req);
+        req
+    }
+
+    #[tokio::test]
+    async fn app_messages_captures_the_claude_code_session_id() {
+        let req = messages_request(&[("x-claude-code-session-id", "8f0c1a9e-session")]);
+        let AppMessages(req) = AppMessages::from_request(req, &())
+            .await
+            .expect("a valid body must parse");
+        assert_eq!(req.client_session.as_deref(), Some("8f0c1a9e-session"));
+        // Proxy-side context: it must never appear in an outbound body.
+        assert_eq!(req.extra.len(), 0);
+        assert!(!serde_json::to_string(&req)
+            .unwrap()
+            .contains("client_session"));
+    }
+
+    #[tokio::test]
+    async fn app_messages_falls_back_through_the_session_header_names() {
+        let req = messages_request(&[("x-conversation-id", "conv-9")]);
+        let AppMessages(req) = AppMessages::from_request(req, &())
+            .await
+            .expect("a valid body must parse");
+        assert_eq!(req.client_session.as_deref(), Some("conv-9"));
+    }
+
+    #[tokio::test]
+    async fn app_messages_prefers_the_claude_code_header() {
+        let req = messages_request(&[
+            ("x-session-id", "generic"),
+            ("x-claude-code-session-id", "claude"),
+        ]);
+        let AppMessages(req) = AppMessages::from_request(req, &())
+            .await
+            .expect("a valid body must parse");
+        assert_eq!(req.client_session.as_deref(), Some("claude"));
+    }
+
+    #[tokio::test]
+    async fn app_messages_leaves_the_session_absent_when_no_header_is_usable() {
+        // No header at all.
+        let req = messages_request(&[]);
+        let AppMessages(req) = AppMessages::from_request(req, &())
+            .await
+            .expect("a valid body must parse");
+        assert_eq!(req.client_session, None);
+
+        // Empty after trimming.
+        let req = messages_request(&[("x-claude-code-session-id", "   ")]);
+        let AppMessages(req) = AppMessages::from_request(req, &())
+            .await
+            .expect("a valid body must parse");
+        assert_eq!(req.client_session, None);
+    }
+
+    #[test]
+    fn client_session_of_drops_unusable_values() {
+        let mut h = HeaderMap::new();
+        assert_eq!(client_session_of(&h), None);
+
+        // Whitespace is trimmed, the trimmed value is what is kept.
+        h.insert("x-claude-code-session-id", "  abc  ".parse().unwrap());
+        assert_eq!(client_session_of(&h).as_deref(), Some("abc"));
+
+        // A value longer than the cap is not forwarded.
+        h.insert(
+            "x-claude-code-session-id",
+            HeaderValue::from_str(&"x".repeat(MAX_CLIENT_SESSION_LEN + 1)).unwrap(),
+        );
+        assert_eq!(client_session_of(&h), None);
+
+        // A legal value of exactly the cap is kept.
+        h.insert(
+            "x-claude-code-session-id",
+            HeaderValue::from_str(&"x".repeat(MAX_CLIENT_SESSION_LEN)).unwrap(),
+        );
+        assert!(client_session_of(&h).is_some());
+    }
+
+    #[tokio::test]
+    async fn app_messages_keeps_the_standard_rejection_mapping() {
+        // The extractor delegates to `AppJson`, so the 413/400 mapping
+        // cannot drift.
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(r#"{"padding":"0123456789abcdef"}"#))
+            .expect("request builds");
+        axum::extract::DefaultBodyLimit::max(16).apply(&mut req);
+        req.extensions_mut().insert(InboundBodyLimit(16));
+        let err = AppMessages::from_request(req, &())
+            .await
+            .expect_err("oversize body must be rejected");
+        assert!(
+            matches!(err, ProxyError::PayloadTooLarge { .. }),
+            "expected PayloadTooLarge, got {err:?}"
+        );
     }
 
     #[tokio::test]

@@ -53,6 +53,16 @@ pub struct MessagesRequest {
     /// User profile id (sent as `anthropic-user-profile-id` header).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_profile_id: Option<String>,
+    /// The client's own conversation id, captured by the extractor from
+    /// the inbound request headers (see `extractor::AppMessages`).
+    ///
+    /// Proxy-side context, **not** part of the Anthropic wire format:
+    /// `skip` keeps it out of every outbound body — including the
+    /// `anthropic` passthrough, which serializes this struct verbatim.
+    /// It exists so a provider can echo the id upstream under another
+    /// name (the `client-session` header sentinel in `identity.rs`).
+    #[serde(skip)]
+    pub client_session: Option<String>,
     /// Any additional fields not modelled above must still round-trip.
     #[serde(default, flatten, skip_serializing_if = "HashMap::is_empty")]
     pub extra: std::collections::HashMap<String, Value>,

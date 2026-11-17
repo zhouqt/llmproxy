@@ -65,6 +65,16 @@ const REFERER_HEADER: &str = "http-referer";
 const VALUE_AUTO: &str = "auto";
 /// Value sentinel: a fresh UUID per outbound request.
 const VALUE_AUTO_REQUEST: &str = "auto-request";
+/// Value sentinel: the *client's* conversation id, captured from the
+/// inbound request headers (`x-claude-code-session-id` et al. — see
+/// `extractor::CLIENT_SESSION_HEADERS`), falling back to the stable
+/// per-process id when the client sent none.
+///
+/// This is the per-conversation form of `"auto"`: it exists for
+/// upstreams that use a session header for routing affinity and prompt
+/// caching (OpenCode Go's `x-opencode-session`), where one id for every
+/// conversation would defeat the purpose.
+const VALUE_CLIENT_SESSION: &str = "client-session";
 
 /// A configured header value, still unresolved for the per-request form.
 #[derive(Debug, Clone)]
@@ -72,6 +82,8 @@ enum OutboundValue {
     Literal(HeaderValue),
     /// The provider's stable session id.
     Session,
+    /// The client's conversation id, with the stable id as fallback.
+    ClientSession,
     /// A fresh id per outbound request.
     PerRequest,
 }
@@ -150,6 +162,7 @@ impl OutboundIdentity {
             }
             let resolved = match value.as_str() {
                 VALUE_AUTO => OutboundValue::Session,
+                VALUE_CLIENT_SESSION => OutboundValue::ClientSession,
                 VALUE_AUTO_REQUEST => OutboundValue::PerRequest,
                 _ => match HeaderValue::from_str(value) {
                     Ok(v) => OutboundValue::Literal(v),
@@ -199,11 +212,32 @@ impl OutboundIdentity {
         rb.headers(self.header_map())
     }
 
+    /// [`apply`](Self::apply), with the client's conversation id
+    /// available to `"client-session"` headers.
+    ///
+    /// `client_session` is the value the extractor lifted from the
+    /// inbound request; `None` (no client id, or an outbound request
+    /// that has no client behind it — `list_models`) resolves to the
+    /// provider's stable id, so the header is still sent.
+    pub fn apply_with_session(
+        &self,
+        rb: RequestBuilder,
+        client_session: Option<&str>,
+    ) -> RequestBuilder {
+        rb.headers(self.header_map_with_session(client_session))
+    }
+
     /// The header map this identity contributes.
+    pub fn header_map(&self) -> HeaderMap {
+        self.header_map_with_session(None)
+    }
+
+    /// The header map this identity contributes, with the client's
+    /// conversation id available to `"client-session"` headers.
     ///
     /// The `"auto-request"` id is resolved **here**, at request time — a
     /// per-request id cannot exist at materialisation time.
-    pub fn header_map(&self) -> HeaderMap {
+    pub fn header_map_with_session(&self, client_session: Option<&str>) -> HeaderMap {
         let mut map = HeaderMap::new();
         if let Some(ua) = &self.user_agent {
             map.insert(USER_AGENT, ua.clone());
@@ -213,6 +247,12 @@ impl OutboundIdentity {
                 OutboundValue::Literal(v) => v.clone(),
                 OutboundValue::Session => HeaderValue::from_str(&self.session_id)
                     .expect("a uuid is a legal http header value"),
+                OutboundValue::ClientSession => client_session
+                    .and_then(|s| HeaderValue::from_str(s).ok())
+                    .unwrap_or_else(|| {
+                        HeaderValue::from_str(&self.session_id)
+                            .expect("a uuid is a legal http header value")
+                    }),
                 OutboundValue::PerRequest => {
                     HeaderValue::from_str(&uuid::Uuid::new_v4().to_string())
                         .expect("a uuid is a legal http header value")
@@ -424,5 +464,63 @@ mod tests {
         let identity = OutboundIdentity::default();
         assert!(identity.user_agent.is_none());
         assert!(identity.header_map().is_empty());
+    }
+
+    #[test]
+    fn the_client_session_sentinel_uses_the_clients_id() {
+        let identity = OutboundIdentity::from_parts(
+            "p",
+            None,
+            None,
+            &headers(&[("x-opencode-session", VALUE_CLIENT_SESSION)]),
+        );
+        let map = identity.header_map_with_session(Some("session-abc"));
+        assert_eq!(map.get("x-opencode-session").unwrap(), "session-abc");
+    }
+
+    #[test]
+    fn the_client_session_sentinel_falls_back_to_the_stable_id() {
+        // No client id (an internal request, or a client that sends no
+        // session header): the header must still be sent, so it carries
+        // the provider's stable per-process id.
+        let identity = OutboundIdentity::from_parts(
+            "p",
+            None,
+            None,
+            &headers(&[("x-opencode-session", VALUE_CLIENT_SESSION)]),
+        );
+        let with_none = identity.header_map_with_session(None);
+        let with_illegal = identity.header_map_with_session(Some("bad\nvalue"));
+        let stable = HeaderValue::from_str(&identity.session_id).unwrap();
+        assert_eq!(with_none.get("x-opencode-session").unwrap(), &stable);
+        assert_eq!(
+            with_illegal.get("x-opencode-session").unwrap(),
+            &stable,
+            "an unforwardable client id must not fail the request"
+        );
+        // And it stays stable across requests, like `"auto"`.
+        assert_eq!(
+            identity
+                .header_map_with_session(None)
+                .get("x-opencode-session")
+                .unwrap(),
+            with_none.get("x-opencode-session").unwrap()
+        );
+    }
+
+    #[test]
+    fn different_conversations_get_different_client_session_values() {
+        let identity = OutboundIdentity::from_parts(
+            "p",
+            None,
+            None,
+            &headers(&[("x-opencode-session", VALUE_CLIENT_SESSION)]),
+        );
+        let first = identity.header_map_with_session(Some("conv-1"));
+        let second = identity.header_map_with_session(Some("conv-2"));
+        assert_ne!(
+            first.get("x-opencode-session").unwrap(),
+            second.get("x-opencode-session").unwrap()
+        );
     }
 }
