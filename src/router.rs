@@ -994,6 +994,7 @@ impl Router {
 mod tests {
     use super::*;
     use crate::config::{ModelConfig, ProviderConfig, RateLimitConfig};
+    use crate::expect_variant;
     use crate::providers::Provider;
     use crate::secrets::secret_string;
     use async_trait::async_trait;
@@ -1507,6 +1508,112 @@ mod tests {
             other => panic!("expected RouteStep::Failed, got {other:?}"),
         }
         assert!(router.cooldown().is_cooling_down("primary").await);
+    }
+
+    /// Streaming twin of the rpm-exhaustion scenario: the gate refuses
+    /// pre-first-byte, the chain advances to backup, and the throttle is
+    /// a *local skip* — the provider must NOT land in the cooldown cache
+    /// (pacing exhaustion is transient local state, not an upstream
+    /// fault, so the provider stays available once the window slides).
+    #[tokio::test]
+    async fn stream_throttle_is_a_local_skip_without_cooldown() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "primary".to_string(),
+            Arc::new(MockProvider {
+                name: "primary".into(),
+                fail_status: 0,
+                fail_count: 0,
+                call_count: AtomicU32::new(0),
+            }) as SharedProvider,
+        );
+        providers.insert(
+            "backup".to_string(),
+            Arc::new(MockProvider {
+                name: "backup".into(),
+                fail_status: 0,
+                fail_count: 0,
+                call_count: AtomicU32::new(0),
+            }) as SharedProvider,
+        );
+        let cfg = Config {
+            server: Default::default(),
+            proxy: Default::default(),
+            user_agent: crate::config::default_user_agent(),
+            providers: vec![
+                ProviderConfig::OpenaiCompat {
+                    name: "primary".into(),
+                    api_key: secret_string("k"),
+                    api_base: "http://x".into(),
+                    model_rewrite: Default::default(),
+                    use_proxy: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
+                    rate_limit: Some(RateLimitConfig {
+                        rpm: Some(1),
+                        tpm: None,
+                        max_concurrency: None,
+                        max_wait_ms: Some(0),
+                    }),
+                },
+                ProviderConfig::OpenaiCompat {
+                    name: "backup".into(),
+                    api_key: secret_string("k"),
+                    api_base: "http://x".into(),
+                    model_rewrite: Default::default(),
+                    use_proxy: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
+                },
+            ],
+            models: vec![ModelConfig {
+                name: "m".into(),
+                primary: "primary".into(),
+                fallback_chain: vec!["backup".into()],
+                cooldown_seconds: 60,
+                max_retries_per_provider: 1,
+                max_retries_total: 3,
+            }],
+            ..Config::default()
+        };
+        let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
+        let model = router.find_model("m").unwrap();
+        let req = dummy_request();
+
+        // First request: admitted, served by the primary.
+        let (provider, output, attempts, _ticket) =
+            router.stream(model, &req).await.unwrap();
+        assert_eq!(provider.name(), "primary");
+        assert!(
+            attempts.is_empty(),
+            "healthy dispatch records no attempts, got {attempts:?}"
+        );
+        assert!(matches!(output, ProviderOutput::Stream(_)));
+
+        // Second request: the gate refuses instantly (max_wait 0 — the
+        // first request's entry is still inside the 60 s window) and the
+        // chain advances to backup. LocalSkip, never a cooldown.
+        let (provider, output, attempts, _ticket) =
+            router.stream(model, &req).await.unwrap();
+        assert_eq!(provider.name(), "backup");
+        assert!(matches!(output, ProviderOutput::Stream(_)));
+        assert_eq!(attempts.len(), 1, "the throttled primary is the only step");
+        expect_variant!(&attempts[0], RouteStep::LocalSkip { provider, reason } => {
+            assert_eq!(provider, "primary");
+            assert_eq!(*reason, LocalSkipReason::Throttled);
+        });
+        assert!(!router.cooldown().is_cooling_down("primary").await);
     }
 
     /// Streaming twin of `falls_back_on_429`: a 402 returned by primary's
@@ -2937,6 +3044,132 @@ mod tests {
             other => panic!("expected Upstream 400, got {other:?}"),
         }
         assert_eq!(primary.call_count.load(Ordering::SeqCst), 1);
+    }
+
+    // ─── attempt classification: FailReason / failure() / render ────────
+
+    fn failed_step(provider: &str, status: u16) -> RouteStep {
+        RouteStep::Failed {
+            provider: provider.to_string(),
+            status,
+            body: "boom".to_string(),
+        }
+    }
+
+    fn skipped_step(provider: &str, reason: LocalSkipReason) -> RouteStep {
+        RouteStep::LocalSkip {
+            provider: provider.to_string(),
+            reason,
+        }
+    }
+
+    #[test]
+    fn fail_reason_display_covers_every_classification() {
+        // One assertion per variant keeps the log vocabulary (`fail_reason=`)
+        // stable — a renamed label here silently changes operator greps.
+        assert_eq!(
+            derive_fail_reason(&[failed_step("p", 429)]).unwrap().to_string(),
+            "upstream"
+        );
+        assert_eq!(
+            derive_fail_reason(&[skipped_step("p", LocalSkipReason::Cooldown)])
+                .unwrap()
+                .to_string(),
+            "cooldown"
+        );
+        assert_eq!(
+            derive_fail_reason(&[skipped_step("p", LocalSkipReason::ModelUnmapped)])
+                .unwrap()
+                .to_string(),
+            "model_skip"
+        );
+        assert_eq!(
+            derive_fail_reason(&[skipped_step("p", LocalSkipReason::Throttled)])
+                .unwrap()
+                .to_string(),
+            "throttled"
+        );
+        assert_eq!(
+            derive_fail_reason(&[
+                skipped_step("p", LocalSkipReason::Cooldown),
+                skipped_step("b", LocalSkipReason::Throttled),
+            ])
+            .unwrap()
+            .to_string(),
+            "mixed"
+        );
+    }
+
+    #[test]
+    fn derive_fail_reason_shapes() {
+        assert_eq!(derive_fail_reason(&[]), None, "empty slice → None");
+        // Any upstream failure dominates, whatever the local skips say.
+        assert_eq!(
+            derive_fail_reason(&[
+                skipped_step("p", LocalSkipReason::Throttled),
+                failed_step("p", 429),
+            ]),
+            Some(FailReason::Upstream)
+        );
+        // A single skip class, no upstream call → that class.
+        assert_eq!(
+            derive_fail_reason(&[
+                skipped_step("a", LocalSkipReason::Cooldown),
+                skipped_step("b", LocalSkipReason::Cooldown),
+            ]),
+            Some(FailReason::Cooldown)
+        );
+        assert_eq!(
+            derive_fail_reason(&[skipped_step("a", LocalSkipReason::ModelUnmapped)]),
+            Some(FailReason::ModelSkip)
+        );
+        assert_eq!(
+            derive_fail_reason(&[
+                skipped_step("a", LocalSkipReason::Throttled),
+                skipped_step("b", LocalSkipReason::Throttled),
+            ]),
+            Some(FailReason::Throttled)
+        );
+    }
+
+    #[test]
+    fn local_skip_failure_labels_and_render() {
+        assert_eq!(
+            skipped_step("mm", LocalSkipReason::Throttled).failure().as_ref(),
+            "throttled"
+        );
+        assert_eq!(
+            skipped_step("mm", LocalSkipReason::Cooldown).failure().as_ref(),
+            "cooldown"
+        );
+        assert_eq!(
+            skipped_step("mm", LocalSkipReason::ModelUnmapped)
+                .failure()
+                .as_ref(),
+            "model_skip"
+        );
+        assert_eq!(skipped_step("mm", LocalSkipReason::Throttled).render(), "mm:throttled");
+        assert_eq!(failed_step("mm", 429).render(), "mm:429");
+    }
+
+    #[test]
+    fn last_failed_provider_scans_in_reverse() {
+        let steps = [
+            failed_step("first", 429),
+            skipped_step("skipped", LocalSkipReason::Cooldown),
+            failed_step("last", 503),
+        ];
+        assert_eq!(last_failed_provider(&steps), Some("last"));
+        assert_eq!(last_failed_provider(&[skipped_step("p", LocalSkipReason::Throttled)]), None);
+    }
+
+    #[test]
+    fn extract_output_usage_total_of_a_stream_output_is_zero() {
+        // A stream output carries no usage JSON: the helper contributes 0
+        // to the settle, so the pre-flight estimate stays charged (the
+        // conservative direction) instead of refunding unseen tokens.
+        let out = ProviderOutput::Stream(Box::new(stream::empty()));
+        assert_eq!(Router::extract_output_usage_total(&out), 0);
     }
 
     #[test]

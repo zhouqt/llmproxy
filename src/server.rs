@@ -1925,6 +1925,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mapped_stream_settles_the_rate_limit_ticket_at_finalize() {
+        // Streaming settle path: the ticket rides in `MappedStream` and
+        // is reconciled at finalize with the same total the usage row
+        // carries (input 3 + output 7 = 10), replacing the 600-token
+        // pre-flight estimate charged at acquire.
+        use crate::config::RateLimitConfig;
+        use crate::rate_limit::ProviderLimiter;
+        use std::sync::Arc;
+
+        let lim = Arc::new(ProviderLimiter::new(&RateLimitConfig {
+            rpm: None,
+            tpm: Some(1000),
+            max_concurrency: None,
+            max_wait_ms: None,
+        }));
+        let ticket = lim.acquire(600).await.expect("600 admits under tpm 1000");
+
+        let mut s = fresh_mapped();
+        s.inner = make_stream(vec![Ok(Bytes::from_static(
+            b"event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":3}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n",
+        ))]);
+        s.ticket = Some(ticket);
+
+        let waker = futures_util::task::noop_waker_ref();
+        let mut cx = std::task::Context::from_waker(waker);
+        let _ = assert_poll_ready_some_ok(Pin::new(&mut s).poll_next(&mut cx), "usage frame");
+        expect_poll_none(Pin::new(&mut s).poll_next(&mut cx));
+
+        // The window now holds the settled total, not the estimate.
+        assert_eq!(
+            lim.charged_tokens(),
+            10,
+            "finalize must settle the estimate down to the stream-reported total"
+        );
+        // Cross-check: the usage row carries the same figure settle used.
+        let recs = s.stats.snapshot(None, None, None);
+        assert_eq!(recs.len(), 1, "one usage row for one stream");
+        assert_eq!(recs[0].total_tokens, 10);
+    }
+
+    #[tokio::test]
     async fn stream_response_contract_violation_settles_the_ticket() {
         // A provider answering a stream request with Json still reached
         // the upstream and carries usage: the ticket must settle from

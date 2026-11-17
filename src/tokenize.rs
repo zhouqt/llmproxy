@@ -366,6 +366,78 @@ mod tests {
     }
 
     #[test]
+    fn typed_estimate_walks_every_text_bearing_block_kind() {
+        // Every ContentBlock variant with a text/structured payload must
+        // map to its intended arm of `block_tokens` — a shape that fell
+        // into the `Unknown` catch-all would silently contribute 0 to
+        // the TPM pre-charge.
+        let req = typed_request(serde_json::json!({
+            "model": "mm-model",
+            "max_tokens": 8,
+            "system": [{"type": "text", "text": "sys"}],
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "thoughts", "signature": "sig"},
+                    {"type": "redacted_thinking", "data": "opaque-b64"},
+                    {"type": "mid_conversation_system", "content": "mid system"},
+                    {"type": "search_result", "title": "result title",
+                     "source": {"type": "url", "url": "https://x"},
+                     "content": [{"type": "text", "text": "search body"}]},
+                    {"type": "document", "title": "doc title", "context": "doc context",
+                     "source": {"type": "text", "media_type": "text/plain", "data": "d"}},
+                    {"type": "web_search_tool_result", "tool_use_id": "w1", "content": {"query": "q"}},
+                    {"type": "web_fetch_tool_result", "tool_use_id": "w2", "content": {"url": "u"}},
+                    {"type": "code_execution_tool_result", "tool_use_id": "w3", "content": {}},
+                    {"type": "bash_code_execution_tool_result", "tool_use_id": "w4", "content": {}},
+                    {"type": "text_editor_code_execution_tool_result", "tool_use_id": "w5", "content": {}},
+                    {"type": "tool_search_tool_result", "tool_use_id": "w6", "content": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "w1", "content": "plain string result"}
+                ]}
+            ],
+            "tools": [
+                {"name": "t", "input_schema": {"type": "object"},
+                 "extra_key": {"deep": {"value": "extra leaves"}}}
+            ],
+        }));
+        // Parse integrity: every block must have matched its intended
+        // variant (Unknown contributes 0 — checked via the contribution
+        // floor below — but the enum match is the real assertion).
+        let MessageContent::Blocks(blocks) = &req.messages[0].content else {
+            panic!("expected block content");
+        };
+        for b in blocks {
+            assert!(
+                !matches!(b, ContentBlock::Unknown),
+                "block {b:?} fell into the Unknown catch-all"
+            );
+        }
+        // Contribution: reserve + ≥1 token per text-bearing component
+        // (11 assistant blocks with payloads + plain-string tool_result
+        // + system + tool name + tool extra leaves).
+        let est = estimate_typed_tokens(&req);
+        assert!(est >= 8 + 11, "estimate {est} below the component floor");
+        // Unknown fallback would have capped the walk at reserve +
+        // system + tool bits — the floor above distinguishes.
+    }
+
+    #[test]
+    fn typed_estimate_counts_blocks_system_prompt() {
+        // The `system:` field accepts either a bare string or a list of
+        // blocks (cache_control-annotated prompts); both must count.
+        let req = typed_request(serde_json::json!({
+            "model": "mm-model",
+            "max_tokens": 4,
+            "system": [{"type": "text", "text": "sys"}, {"type": "text", "text": "prompt"}],
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        let est = estimate_typed_tokens(&req);
+        // 2 system blocks + user text + reserve.
+        assert!(est >= 4 + 3, "estimate {est} below floor");
+    }
+
+    #[test]
     fn typed_estimate_counts_document_source_and_extra_fields() {
         // The document payload lives in `source.data` (plain text or
         // base64) and is billed upstream — a block counted at

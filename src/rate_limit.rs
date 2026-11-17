@@ -601,6 +601,22 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn settle_zero_keeps_the_estimate_charged() {
+        // A zero total means "upstream reported no usage": settling to 0
+        // would refund the pre-charge and make the window optimistic
+        // about tokens that were very likely billed — the estimate must
+        // stay instead.
+        let lim = limiter(None, Some(1000), None, Some(120_000));
+        let ticket = lim.acquire(600).await.expect("fits an empty window");
+        ticket.settle(0);
+        // 600 (kept estimate) + 600 > 1000 → the next request must pace,
+        // proving the pre-charge survived the zero settle.
+        let t0 = Instant::now();
+        lim.acquire(600).await.expect("admitted once the estimate slides out");
+        assert!(Instant::now() - t0 >= WINDOW - Duration::from_millis(1));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn max_wait_zero_throttles_without_waiting() {
         let lim = limiter(Some(1), None, None, Some(0));
         lim.acquire(0).await.expect("first free");
@@ -707,6 +723,26 @@ mod tests {
         lim.acquire(0).await.expect("refund 2");
         let st = lim.state.lock().unwrap();
         assert_eq!(st.reqs.len(), 3, "held + two admitted; refunded never charged");
+    }
+
+    #[tokio::test]
+    async fn semaphore_timeout_refunds_the_token_charge() {
+        // Same refund path for the TPM window: the timed-out requests'
+        // token entries must come off tok_sum, not linger and eat quota.
+        let lim = limiter(None, Some(2000), Some(1), Some(30));
+        let held = lim.acquire(100).await.expect("occupies the only slot");
+        for _ in 0..2 {
+            lim.acquire(100).await.expect_err("no slot free within 30ms");
+        }
+        drop(held);
+        // 2000 - 2×100 (refunded) - 100 (held settled in-window) leaves
+        // room for the next 1500-token request without pacing.
+        lim.acquire(1500).await.expect("tok_sum back to the held charge only");
+        let st = lim.state.lock().unwrap();
+        assert_eq!(
+            st.tok_sum, 1600,
+            "held's 100 + admitted's 1500; the two refunded entries are gone"
+        );
     }
 
     #[tokio::test(start_paused = true)]
