@@ -301,6 +301,10 @@ providers:
   #                    mapped value is sent upstream (useful when routing
   #                    `claude-sonnet-4.6` to a Copilot-side alias).
   #   use_proxy      — see top-of-file proxy section. Default: false.
+  #   rate_limit     — optional client-side pacing block (`rpm` / `tpm` /
+  #                    `max_concurrency` / `max_wait_ms`); see the `minimax`
+  #                    provider below for the full explanation and worked
+  #                    examples. Absent (default) = no pacing.
   - name: copilot
     type: github_copilot
     vscode_version: "1.95.0"
@@ -336,6 +340,10 @@ providers:
   #   thinking_when_absent — `disabled` (default) | `omit` | `effort_low`.
   #                   What to inject when the client sent no thinking
   #                   field; see the detailed comment below.
+  #   rate_limit    — optional client-side pacing block (`rpm` / `tpm` /
+  #                   `max_concurrency` / `max_wait_ms`); see the `minimax`
+  #                   provider below for the full explanation and worked
+  #                   examples. Absent (default) = no pacing.
 
   - name: openrouter_anthropic
     type: anthropic
@@ -442,6 +450,63 @@ providers:
     # `thinking:{type:"disabled"}`; switch this provider to the effort
     # knob instead:
     # thinking_when_absent: effort_low
+    #
+    # `rate_limit` — pace THIS provider's outbound requests so the
+    # upstream never sees a limit-violating request. The point is to
+    # avoid the 429 → cooldown → fallback cascade entirely instead of
+    # reacting to it: a bursty client (parallel subagents + background
+    # calls) waits a few hundred ms at the gate and the provider keeps
+    # serving, rather than the proxy eating a 429 and marking the
+    # provider down for `cooldown_seconds`.
+    #
+    # Three independent knobs (any combination; at least one required):
+    #   rpm             — max requests in any rolling 60 s window
+    #                     (MiniMax Token Plan paid tier: 200; Aliyun
+    #                     Bailian per-model quotas; OpenRouter free
+    #                     models: 20).
+    #   tpm             — max input+output tokens in any rolling 60 s
+    #                     window (MiniMax paid tier: 10,000,000). The
+    #                     request is charged with a local estimate
+    #                     before dispatch and the estimate is replaced
+    #                     by the upstream-reported usage after the
+    #                     response, so drift self-corrects.
+    #
+    #                     NOTE: the pre-dispatch charge is the input
+    #                     estimate PLUS the request's `max_tokens`
+    #                     reserve (the output size is unknowable before
+    #                     dispatch, and the upstream counts input+output
+    #                     against its TPM). The window therefore has to
+    #                     hold `typical input + max_tokens` per
+    #                     concurrent request: set `tpm` well above
+    #                     `max_tokens`, or a request whose estimate
+    #                     exceeds the whole budget is skipped outright
+    #                     (the proxy logs "rate_limit.tpm is below the
+    #                     estimated request size" once per minute and
+    #                     the provider serves nothing).
+    #   max_concurrency — max in-flight requests (holds from dispatch
+    #                     until the response completes — for streams,
+    #                     until the stream ends, including a client
+    #                     disconnect). Zhipu GLM and DeepSeek publish
+    #                     concurrency limits, not RPM/TPM.
+    #   max_wait_ms     — longest a request may wait at the gate before
+    #                     the router skips this provider FOR THAT
+    #                     REQUEST and moves to the next chain entry.
+    #                     Default 2000; 0 = never wait. The skip is a
+    #                     local skip: NO cooldown is recorded, the very
+    #                     next request paces normally, and the skip
+    #                     shows up in the fallback log / /admin/usage as
+    #                     `throttled`.
+    #
+    # The windows are sliding ("at most N in any 60 s"), which is
+    # strictly stronger than any fixed-minute window the upstream
+    # enforces — exact documented values are safe. Operators may still
+    # set lower numbers for margin (below: 5% headroom against
+    # estimation drift). Providers without this block are never gated.
+    rate_limit:
+      rpm: 190
+      tpm: 9500000
+      # max_concurrency: 20
+      # max_wait_ms: 2000
     model_rewrite:
       "claude-haiku-4.6":  "MiniMax-M2.7"
       "claude-sonnet-4.6": "MiniMax-M3"
@@ -489,6 +554,10 @@ providers:
   #                  Only enable on upstreams that tolerate the field on
   #                  empty-reasoning turns. Default: false (strict OpenAI
   #                  spec upstreams may reject the non-standard field).
+  #   rate_limit    — optional client-side pacing block (`rpm` / `tpm` /
+  #                  `max_concurrency` / `max_wait_ms`); see the `minimax`
+  #                  provider below for the full explanation and worked
+  #                  examples. Absent (default) = no pacing.
 
   - name: deepseek
     type: openai_compat
@@ -570,6 +639,10 @@ providers:
   #   use_proxy     — see proxy section. Default: false.
   #   user_agent / referer / headers — optional per-provider identity
   #                   overrides; see the global `user_agent:` section above.
+  #   rate_limit    — optional client-side pacing block (`rpm` / `tpm` /
+  #                   `max_concurrency` / `max_wait_ms`); see the `minimax`
+  #                   provider below for the full explanation and worked
+  #                   examples. Absent (default) = no pacing.
   #
   # NOTE: GitHub Copilot also speaks the Responses API but routes
   # automatically per-model by its `/models` cache — see the github_copilot
