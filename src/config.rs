@@ -259,6 +259,88 @@ pub enum ThinkingWhenAbsent {
     EffortLow,
 }
 
+/// Client-side rate limiting for one provider (the `rate_limit:` block on
+/// a provider). The proxy paces its own outbound requests so the upstream
+/// never sees a limit-violating request — the point is to avoid the
+/// 429 → cooldown → fallback cascade entirely, not to react to it.
+///
+/// Industry limits come in three locally-modelable shapes, so three
+/// independent knobs are offered (any combination, each optional):
+///
+/// - `rpm` / `tpm` — per-minute quotas (MiniMax Token Plan: paid tier
+///   200 requests / 10,000,000 input+output tokens per minute; Aliyun
+///   Bailian per-model quotas; OpenRouter free-model 20 RPM). Both are
+///   enforced over a rolling 60-second window, which is strictly
+///   stronger than any fixed-minute window an upstream may use.
+/// - `max_concurrency` — cap on in-flight upstream requests (Zhipu
+///   GLM and DeepSeek publish concurrency, not RPM/TPM; a request
+///   counts as concurrent from dispatch until its response completes).
+///
+/// Token estimates are reconciled with the upstream-reported usage
+/// after each response, so estimation drift self-corrects. Unset
+/// (the default) = no pacing, byte-identical dispatch behavior.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitConfig {
+    /// Maximum upstream requests in any rolling 60-second window.
+    /// `None` = no request-count limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpm: Option<u32>,
+    /// Maximum input+output tokens in any rolling 60-second window.
+    /// The request is charged with an estimate (string-leaf heuristic
+    /// plus a `max_tokens` reserve) *before* dispatch, then the
+    /// estimate is replaced by the upstream-reported usage after the
+    /// response. `None` = no token limit.
+    ///
+    /// The pre-dispatch charge includes the `max_tokens` reserve (the
+    /// output size is unknowable before dispatch and the upstream
+    /// counts input+output), so the budget must hold
+    /// `typical input + max_tokens` per concurrent request. A `tpm`
+    /// below a single request's estimate skips that request outright
+    /// — the proxy logs `rate_limit.tpm is below the estimated request
+    /// size` once per minute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tpm: Option<u64>,
+    /// Maximum concurrent in-flight upstream requests. A request
+    /// holds its slot from dispatch until its response completes
+    /// (for streams: until the stream terminates, including a client
+    /// disconnect). `None` = no concurrency limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u32>,
+    /// Longest a request may wait at the gate before the router gives
+    /// up on this provider for that request and moves to the next
+    /// chain entry (a local skip — no cooldown is recorded, the
+    /// provider is not penalized). Default 2000 ms; `0` disables
+    /// waiting entirely (never wait, always skip). Capped at
+    /// `MAX_WAIT_MS_CEILING`: waiting longer than one window slide can
+    /// never buy more capacity, and larger values overflow the
+    /// monotonic clock arithmetic inside the gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_wait_ms: Option<u64>,
+}
+
+/// Sanity ceiling for `rate_limit.max_wait_ms`. The windows are 60 s:
+/// a wait beyond one slide can never help (the whole window cycles),
+/// so anything past a few minutes is an operator typo rather than a
+/// tuning choice — and values near `u64::MAX` ms would panic inside
+/// `ProviderLimiter::acquire` on `now + max_wait` clock overflow.
+pub const MAX_WAIT_MS_CEILING: u64 = 600_000; // 10 minutes
+
+impl RateLimitConfig {
+    /// Effective wait cap: the configured `max_wait_ms` or the 2 s
+    /// default.
+    pub fn max_wait(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.max_wait_ms.unwrap_or(2000))
+    }
+
+    /// Whether at least one limit knob is set. A block with none of
+    /// `rpm`/`tpm`/`max_concurrency` is a configuration mistake —
+    /// `Config::validate` rejects it.
+    fn has_a_limit(&self) -> bool {
+        self.rpm.is_some() || self.tpm.is_some() || self.max_concurrency.is_some()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProviderConfig {
@@ -306,6 +388,14 @@ pub enum ProviderConfig {
         /// regionally blocked.
         #[serde(default)]
         use_proxy: bool,
+        /// Client-side rate limiting for this provider. The proxy paces
+        /// its own outbound requests so the upstream never sees a
+        /// limit-violating request — no 429, no cooldown, no fallback.
+        /// Absent (the default) = no pacing. See `RateLimitConfig` for
+        /// the three knobs (`rpm` / `tpm` / `max_concurrency`) and which
+        /// upstream limit style each models.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rate_limit: Option<RateLimitConfig>,
     },
     /// Native Anthropic Messages passthrough provider. Sends the
     /// Anthropic request body verbatim to `{api_base}/messages` and
@@ -422,6 +512,14 @@ pub enum ProviderConfig {
         /// fresh id per outbound request.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         headers: BTreeMap<String, String>,
+        /// Client-side rate limiting for this provider. The proxy paces
+        /// its own outbound requests so the upstream never sees a
+        /// limit-violating request — no 429, no cooldown, no fallback.
+        /// Absent (the default) = no pacing. See `RateLimitConfig` for
+        /// the three knobs (`rpm` / `tpm` / `max_concurrency`) and which
+        /// upstream limit style each models.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rate_limit: Option<RateLimitConfig>,
     },
     #[serde(rename = "openai_compat")]
     OpenaiCompat {
@@ -507,6 +605,14 @@ pub enum ProviderConfig {
         headers: BTreeMap<String, String>,
         #[serde(default)]
         reasoning_echo: bool,
+        /// Client-side rate limiting for this provider. The proxy paces
+        /// its own outbound requests so the upstream never sees a
+        /// limit-violating request — no 429, no cooldown, no fallback.
+        /// Absent (the default) = no pacing. See `RateLimitConfig` for
+        /// the three knobs (`rpm` / `tpm` / `max_concurrency`) and which
+        /// upstream limit style each models.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rate_limit: Option<RateLimitConfig>,
     },
     /// OpenAI Responses API passthrough provider. Sends an
     /// Anthropic-converted request to `{api_base}/responses` and
@@ -557,6 +663,14 @@ pub enum ProviderConfig {
         /// fresh id per outbound request.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         headers: BTreeMap<String, String>,
+        /// Client-side rate limiting for this provider. The proxy paces
+        /// its own outbound requests so the upstream never sees a
+        /// limit-violating request — no 429, no cooldown, no fallback.
+        /// Absent (the default) = no pacing. See `RateLimitConfig` for
+        /// the three knobs (`rpm` / `tpm` / `max_concurrency`) and which
+        /// upstream limit style each models.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rate_limit: Option<RateLimitConfig>,
     },
 }
 
@@ -617,6 +731,18 @@ impl ProviderConfig {
             | ProviderConfig::Anthropic { model_rewrite, .. }
             | ProviderConfig::OpenaiCompat { model_rewrite, .. }
             | ProviderConfig::OpenaiResponses { model_rewrite, .. } => model_rewrite,
+        }
+    }
+
+    /// The provider's optional client-side rate-limit block (`rate_limit:`).
+    /// `None` when absent — the provider then dispatches with no pacing,
+    /// exactly as before the knob existed.
+    pub fn rate_limit(&self) -> Option<&RateLimitConfig> {
+        match self {
+            ProviderConfig::GithubCopilot { rate_limit, .. }
+            | ProviderConfig::Anthropic { rate_limit, .. }
+            | ProviderConfig::OpenaiCompat { rate_limit, .. }
+            | ProviderConfig::OpenaiResponses { rate_limit, .. } => rate_limit.as_ref(),
         }
     }
 }
@@ -798,6 +924,46 @@ impl Config {
                 return Err(ProxyError::Config(format!(
                     "provider name '{name}' must be non-empty and contain only ASCII \
                      letters, digits, '.', '_' or '-'"
+                )));
+            }
+        }
+
+        // A `rate_limit` block must carry at least one knob, and every
+        // knob present must be positive. `0` is never "unlimited" — a
+        // zero rpm/tpm/concurrency would reject every request to the
+        // provider, which is a configuration mistake, not a throttle.
+        for p in &self.providers {
+            let Some(rl) = p.rate_limit() else {
+                continue;
+            };
+            let name = p.name();
+            if rl.rpm == Some(0) {
+                return Err(ProxyError::Config(format!(
+                    "provider '{name}': rate_limit.rpm must be at least 1 (0 would reject every request)"
+                )));
+            }
+            if rl.tpm == Some(0) {
+                return Err(ProxyError::Config(format!(
+                    "provider '{name}': rate_limit.tpm must be at least 1 (0 would reject every request)"
+                )));
+            }
+            if rl.max_concurrency == Some(0) {
+                return Err(ProxyError::Config(format!(
+                    "provider '{name}': rate_limit.max_concurrency must be at least 1 (0 would reject every request)"
+                )));
+            }
+            if let Some(wait) = rl.max_wait_ms {
+                if wait > MAX_WAIT_MS_CEILING {
+                    return Err(ProxyError::Config(format!(
+                        "provider '{name}': rate_limit.max_wait_ms must be at most {MAX_WAIT_MS_CEILING} (got {wait}); \
+                         waiting past one window slide can never buy more capacity"
+                    )));
+                }
+            }
+            if !rl.has_a_limit() {
+                return Err(ProxyError::Config(format!(
+                    "provider '{name}': rate_limit block carries no limit; \
+                     set at least one of rpm, tpm or max_concurrency"
                 )));
             }
         }
@@ -1045,6 +1211,246 @@ mod tests {
     use super::*;
     use crate::expect_variant;
     use crate::secrets::{secret_string, SecretsProvider};
+
+    #[test]
+    fn rate_limit_parses_on_all_four_provider_types() {
+        // The knob must deserialize identically on every variant — the
+        // `deny_unknown_fields` tagged enum repeats the field per variant
+        // (model_rewrite precedent), so a field declared on only one
+        // variant would surface here as a parse error on the others.
+        let blocks = [
+            r#"
+providers:
+  - name: p
+    type: github_copilot
+    rate_limit:
+      rpm: 190
+      tpm: 9500000
+      max_concurrency: 8
+      max_wait_ms: 1500
+models:
+  - name: gpt-4
+    primary: p
+"#,
+            r#"
+providers:
+  - name: p
+    type: anthropic
+    api_key: sk-test
+    rate_limit:
+      rpm: 190
+      tpm: 9500000
+      max_concurrency: 8
+      max_wait_ms: 1500
+models:
+  - name: gpt-4
+    primary: p
+"#,
+            r#"
+providers:
+  - name: p
+    type: openai_compat
+    api_key: sk-test
+    api_base: https://x.example/v1
+    rate_limit:
+      rpm: 190
+      tpm: 9500000
+      max_concurrency: 8
+      max_wait_ms: 1500
+models:
+  - name: gpt-4
+    primary: p
+"#,
+            r#"
+providers:
+  - name: p
+    type: openai_responses
+    api_key: sk-test
+    api_base: https://x.example/v1
+    rate_limit:
+      rpm: 190
+      tpm: 9500000
+      max_concurrency: 8
+      max_wait_ms: 1500
+models:
+  - name: gpt-4
+    primary: p
+"#,
+        ];
+        for raw in blocks {
+            let cfg = Config::parse(raw).unwrap_or_else(|e| panic!("parse failed: {e}"));
+            let rl = cfg.providers[0].rate_limit().expect("rate_limit present");
+            assert_eq!(rl.rpm, Some(190), "rpm on {}", cfg.providers[0].type_label());
+            assert_eq!(rl.tpm, Some(9_500_000), "tpm");
+            assert_eq!(rl.max_concurrency, Some(8), "max_concurrency");
+            assert_eq!(rl.max_wait_ms, Some(1500), "max_wait_ms");
+            assert_eq!(rl.max_wait(), std::time::Duration::from_millis(1500));
+        }
+    }
+
+    #[test]
+    fn rate_limit_accessor_reads_every_variant() {
+        // Keep the shared accessor honest for the variants the parse
+        // test above can't pattern-match: copilot (concurrency knob),
+        // openai_compat, openai_responses.
+        let raws = [
+            ("github_copilot", "", 190u32),
+            ("openai_compat", "    api_key: sk-test\n    api_base: https://x.example/v1\n", 20u32),
+            ("openai_responses", "    api_key: sk-test\n    api_base: https://x.example/v1\n", 20u32),
+        ];
+        for (kind, extra, rpm) in raws {
+            let raw = format!(
+                r#"
+providers:
+  - name: p
+    type: {kind}
+{extra}    rate_limit:
+      rpm: {rpm}
+models:
+  - name: gpt-4
+    primary: p
+"#
+            );
+            let cfg = Config::parse(&raw).unwrap_or_else(|e| panic!("parse failed: {e}"));
+            let rl = cfg.providers[0].rate_limit().expect("rate_limit present");
+            assert_eq!(rl.rpm, Some(rpm), "variant {kind}");
+        }
+    }
+
+    #[test]
+    fn rate_limit_block_without_any_limit_is_rejected() {
+        // A block with none of rpm/tpm/max_concurrency does nothing but
+        // cost a lock per request — refuse it instead of silently
+        // accepting a no-op.
+        let raw = r#"
+providers:
+  - name: p
+    type: anthropic
+    api_key: sk-test
+    rate_limit: {}
+models:
+  - name: gpt-4
+    primary: p
+"#;
+        let err = Config::parse(raw).unwrap_err();
+        assert!(
+            format!("{err}").contains("set at least one of rpm, tpm or max_concurrency"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rate_limit_zero_values_are_rejected() {
+        // 0 is not "unlimited" — a zero knob would reject every request
+        // to the provider.
+        for (field, yaml) in [
+            ("rpm", "      rpm: 0\n"),
+            ("tpm", "      tpm: 0\n"),
+            ("max_concurrency", "      max_concurrency: 0\n"),
+        ] {
+            let raw = format!(
+                r#"
+providers:
+  - name: p
+    type: anthropic
+    api_key: sk-test
+    rate_limit:
+{yaml}models:
+  - name: gpt-4
+    primary: p
+"#
+            );
+            let err = Config::parse(&raw).unwrap_err();
+            assert!(
+                format!("{err}").contains(&format!("rate_limit.{field} must be at least 1")),
+                "field {field}: unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rate_limit_absurd_max_wait_is_rejected() {
+        // `Instant::now() + max_wait` panics on clock overflow, and a
+        // wait past one window slide can never buy more capacity — both
+        // make an absurd value an operator typo, not a tuning choice.
+        let raw = r#"
+providers:
+  - name: p
+    type: anthropic
+    api_key: sk-test
+    rate_limit:
+      rpm: 1
+      max_wait_ms: 99999999999999999
+models:
+  - name: gpt-4
+    primary: p
+"#;
+        let err = Config::parse(raw).unwrap_err();
+        assert!(
+            format!("{err}").contains("rate_limit.max_wait_ms must be at most"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rate_limit_max_wait_at_the_ceiling_is_accepted() {
+        // The boundary itself is fine — the ceiling rejects absurd
+        // values, not the whole upper range.
+        let raw = format!(
+            r#"
+providers:
+  - name: p
+    type: anthropic
+    api_key: sk-test
+    rate_limit:
+      rpm: 1
+      max_wait_ms: {MAX_WAIT_MS_CEILING}
+models:
+  - name: gpt-4
+    primary: p
+"#
+        );
+        let cfg = Config::parse(&raw).expect("ceiling value parses");
+        expect_variant!(&cfg.providers[0], ProviderConfig::Anthropic { rate_limit, .. } => {
+            let rl = rate_limit.as_ref().expect("rate_limit present");
+            assert_eq!(rl.max_wait_ms, Some(MAX_WAIT_MS_CEILING));
+        });
+    }
+
+    #[test]
+    fn rate_limit_unknown_subfield_is_a_parse_error() {
+        // `deny_unknown_fields` must extend into the rate_limit block:
+        // a typo'd knob (`rps`) must not silently vanish.
+        let raw = r#"
+providers:
+  - name: p
+    type: anthropic
+    api_key: sk-test
+    rate_limit:
+      rps: 5
+models:
+  - name: gpt-4
+    primary: p
+"#;
+        let err = Config::parse(raw).unwrap_err();
+        assert!(format!("{err}").contains("rps"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rate_limit_max_wait_defaults_to_2000ms() {
+        let rl = RateLimitConfig {
+            rpm: Some(1),
+            tpm: None,
+            max_concurrency: None,
+            max_wait_ms: None,
+        };
+        assert_eq!(rl.max_wait(), std::time::Duration::from_millis(2000));
+        let rl = RateLimitConfig {
+            max_wait_ms: Some(0),
+            ..rl
+        };
+        assert_eq!(rl.max_wait(), std::time::Duration::ZERO);
+    }
 
     #[test]
     fn env_var_expansion() {
@@ -1392,6 +1798,7 @@ models:
                 token_store_key: None,
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
+            rate_limit: None,
             }],
             ..Config::default()
         }
@@ -1454,6 +1861,7 @@ models:
                     token_store_key: Some(secret_string(value)),
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
+                rate_limit: None,
                 }],
                 models: vec![ModelConfig {
                     name: "model".to_string(),
@@ -1565,6 +1973,7 @@ models:
                 token_store_key: None,
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
+            rate_limit: None,
             }],
             models: vec![ModelConfig {
                 name: "model".to_string(),
@@ -1646,6 +2055,7 @@ models:
                     token_store_key: None,
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
+                rate_limit: None,
                 },
                 "github_copilot",
             ),
@@ -1663,6 +2073,7 @@ models:
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
                 "anthropic",
             ),
@@ -1680,6 +2091,7 @@ models:
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
                 "openai_compat",
             ),
@@ -1694,6 +2106,7 @@ models:
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
                 "openai_responses",
             ),
@@ -2471,6 +2884,7 @@ models:
             user_agent: None,
             referer: None,
             headers: std::collections::BTreeMap::new(),
+            rate_limit: None,
         }
     }
 

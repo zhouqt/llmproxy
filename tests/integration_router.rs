@@ -37,7 +37,7 @@ use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use llmproxy::anthropic::MessagesRequest;
-use llmproxy::config::{Config, ModelConfig, ProviderConfig, ServerConfig};
+use llmproxy::config::{Config, ModelConfig, ProviderConfig, RateLimitConfig, ServerConfig};
 use llmproxy::cooldown::CooldownCache;
 use llmproxy::error::{ProxyError, Result};
 use llmproxy::providers::{Provider, ProviderOutput, SharedProvider};
@@ -214,6 +214,7 @@ async fn mock_llm_provider_primary_succeeds_returns_anthropic_response() {
             user_agent: None,
             referer: None,
             headers: std::collections::BTreeMap::new(),
+            rate_limit: None,
         }],
         models: vec![ModelConfig {
             name: "claude-test".into(),
@@ -295,6 +296,7 @@ async fn mock_llm_provider_falls_back_when_primary_returns_429() {
                 user_agent: None,
                 referer: None,
                 headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -309,6 +311,7 @@ async fn mock_llm_provider_falls_back_when_primary_returns_429() {
                 user_agent: None,
                 referer: None,
                 headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
             },
         ],
         models: vec![ModelConfig {
@@ -345,6 +348,328 @@ async fn mock_llm_provider_falls_back_when_primary_returns_429() {
         }
         other => panic!("expected RouteStep::Failed, got {other:?}"),
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Client-side rate limit (`rate_limit:` provider block).
+// ────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn rate_limit_rpm_exhaustion_falls_back_without_cooldown() {
+    // rpm 1 + max_wait 0: the first request admits and serves from the
+    // primary; the second request's gate refuses instantly (the window
+    // entry from the first is still inside the 60 s window) and the
+    // chain moves on. Crucially the throttle is a *local skip*: the
+    // provider must NOT land in the cooldown cache — a third request
+    // made after the window has room again would go straight to it.
+    let primary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(anthropic_ok("from primary", "claude-test")),
+        )
+        .expect(1)
+        .mount(&primary)
+        .await;
+    let backup = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(anthropic_ok("from backup", "claude-test")),
+        )
+        .expect(1)
+        .mount(&backup)
+        .await;
+
+    let mut providers = HashMap::new();
+    providers.insert("primary".to_string(), wiremock_provider("primary", &primary));
+    providers.insert("backup".to_string(), wiremock_provider("backup", &backup));
+
+    let cfg = Config {
+        server: ServerConfig {
+            listen: "127.0.0.1:0".to_string(),
+            api_key: None,
+            expose_upstream_details: true,
+            max_request_bytes: llmproxy::config::default_max_request_bytes(),
+        },
+        proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
+        providers: vec![
+            ProviderConfig::OpenaiCompat {
+                name: "primary".to_string(),
+                api_key: secret_string("k"),
+                api_base: primary.uri(),
+                model_rewrite: HashMap::new(),
+                use_proxy: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
+                rate_limit: Some(RateLimitConfig {
+                    rpm: Some(1),
+                    tpm: None,
+                    max_concurrency: None,
+                    max_wait_ms: Some(0),
+                }),
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
+            },
+            ProviderConfig::OpenaiCompat {
+                name: "backup".to_string(),
+                api_key: secret_string("k"),
+                api_base: backup.uri(),
+                model_rewrite: HashMap::new(),
+                use_proxy: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
+            },
+        ],
+        models: vec![ModelConfig {
+            name: "claude-test".into(),
+            primary: "primary".into(),
+            fallback_chain: vec!["backup".into()],
+            cooldown_seconds: 60,
+            max_retries_per_provider: 1,
+            max_retries_total: 2,
+        }],
+        ..Config::default()
+    };
+    let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
+
+    let model_cfg = router.find_model("claude-test").unwrap();
+
+    // First request: admitted, served by the primary.
+    let (out, attempts) = {
+        let (out, attempts, _served) = router
+            .complete(model_cfg, &make_req("claude-test"))
+            .await
+            .unwrap();
+        (out, attempts)
+    };
+    let ProviderOutput::Json(body) = out else {
+        panic!("expected JSON output");
+    };
+    assert_eq!(body["content"][0]["text"], "from primary");
+    assert!(
+        attempts.is_empty(),
+        "healthy dispatch records no attempts, got {attempts:?}"
+    );
+
+    // Second request: the gate throttles the primary instantly (max_wait
+    // 0 — never waits), the chain advances to backup. No cooldown was
+    // recorded, so this is a LocalSkip, not a Failed step.
+    let (out, attempts, _served) = router
+        .complete(model_cfg, &make_req("claude-test"))
+        .await
+        .unwrap();
+    let ProviderOutput::Json(body) = out else {
+        panic!("expected JSON output");
+    };
+    assert_eq!(body["content"][0]["text"], "from backup");
+    assert_eq!(attempts.len(), 1, "the throttled primary is the only step");
+    llmproxy::expect_variant!(&attempts[0], RouteStep::LocalSkip { provider, reason } => {
+        assert_eq!(provider, "primary");
+        assert_eq!(*reason, LocalSkipReason::Throttled);
+    });
+}
+
+#[tokio::test]
+async fn rate_limit_generous_window_serves_every_request_from_primary() {
+    // A window the two requests never exhaust must not perturb
+    // dispatch: both requests go straight to the primary, no attempts
+    // recorded, no fallback log noise.
+    let primary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(anthropic_ok("from primary", "claude-test")),
+        )
+        .expect(2)
+        .mount(&primary)
+        .await;
+
+    let mut providers = HashMap::new();
+    providers.insert("primary".to_string(), wiremock_provider("primary", &primary));
+
+    let cfg = Config {
+        server: ServerConfig {
+            listen: "127.0.0.1:0".to_string(),
+            api_key: None,
+            expose_upstream_details: true,
+            max_request_bytes: llmproxy::config::default_max_request_bytes(),
+        },
+        proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
+        providers: vec![ProviderConfig::OpenaiCompat {
+            name: "primary".to_string(),
+            api_key: secret_string("k"),
+            api_base: primary.uri(),
+            model_rewrite: HashMap::new(),
+            use_proxy: false,
+            provider_ignore: Vec::new(),
+            provider_allow: Vec::new(),
+            reasoning_echo: false,
+
+            user_agent: None,
+            referer: None,
+            headers: std::collections::BTreeMap::new(),
+            rate_limit: Some(RateLimitConfig {
+                rpm: Some(100),
+                tpm: None,
+                max_concurrency: None,
+                max_wait_ms: None,
+            }),
+        }],
+        models: vec![ModelConfig {
+            name: "claude-test".into(),
+            primary: "primary".into(),
+            fallback_chain: vec![],
+            cooldown_seconds: 60,
+            max_retries_per_provider: 1,
+            max_retries_total: 2,
+        }],
+        ..Config::default()
+    };
+    let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
+    let model_cfg = router.find_model("claude-test").unwrap();
+
+    for _ in 0..2 {
+        let (out, attempts, _served) = router
+            .complete(model_cfg, &make_req("claude-test"))
+            .await
+            .unwrap();
+        let ProviderOutput::Json(body) = out else {
+            panic!("expected JSON output");
+        };
+        assert_eq!(body["content"][0]["text"], "from primary");
+        assert!(attempts.is_empty(), "got {attempts:?}");
+    }
+}
+
+#[tokio::test]
+async fn rate_limit_concurrency_slot_sends_the_second_request_to_backup() {
+    // max_concurrency 1: while the first request is in flight (the
+    // primary's mock answers with a small delay to hold the slot), a
+    // concurrent second request cannot admit within max_wait 0 and
+    // falls to the backup. Exactly one request may reach each mock.
+    let primary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(anthropic_ok("from primary", "claude-test"))
+                .set_delay(Duration::from_millis(150)),
+        )
+        .expect(1)
+        .mount(&primary)
+        .await;
+    let backup = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(anthropic_ok("from backup", "claude-test")),
+        )
+        .expect(1)
+        .mount(&backup)
+        .await;
+
+    let mut providers = HashMap::new();
+    providers.insert("primary".to_string(), wiremock_provider("primary", &primary));
+    providers.insert("backup".to_string(), wiremock_provider("backup", &backup));
+
+    let cfg = Config {
+        server: ServerConfig {
+            listen: "127.0.0.1:0".to_string(),
+            api_key: None,
+            expose_upstream_details: true,
+            max_request_bytes: llmproxy::config::default_max_request_bytes(),
+        },
+        proxy: Default::default(),
+        user_agent: llmproxy::config::default_user_agent(),
+        secrets: Default::default(),
+        providers: vec![
+            ProviderConfig::OpenaiCompat {
+                name: "primary".to_string(),
+                api_key: secret_string("k"),
+                api_base: primary.uri(),
+                model_rewrite: HashMap::new(),
+                use_proxy: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
+                rate_limit: Some(RateLimitConfig {
+                    rpm: None,
+                    tpm: None,
+                    max_concurrency: Some(1),
+                    max_wait_ms: Some(0),
+                }),
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
+            },
+            ProviderConfig::OpenaiCompat {
+                name: "backup".to_string(),
+                api_key: secret_string("k"),
+                api_base: backup.uri(),
+                model_rewrite: HashMap::new(),
+                use_proxy: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
+            },
+        ],
+        models: vec![ModelConfig {
+            name: "claude-test".into(),
+            primary: "primary".into(),
+            fallback_chain: vec!["backup".into()],
+            cooldown_seconds: 60,
+            max_retries_per_provider: 1,
+            max_retries_total: 2,
+        }],
+        ..Config::default()
+    };
+    let router = Arc::new(Router::new(Arc::new(cfg), providers, CooldownCache::new()));
+
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let router = Arc::clone(&router);
+        handles.push(tokio::spawn(async move {
+            let model_cfg = router.find_model("claude-test").unwrap();
+            router
+                .complete(model_cfg, &make_req("claude-test"))
+                .await
+                .unwrap()
+        }));
+    }
+    let mut bodies = Vec::new();
+    for h in handles {
+        let (out, _attempts, _served) = h.await.unwrap();
+        let ProviderOutput::Json(body) = out else {
+            panic!("expected JSON output");
+        };
+        bodies.push(body["content"][0]["text"].as_str().unwrap().to_string());
+    }
+    bodies.sort();
+    assert_eq!(
+        bodies,
+        vec!["from backup".to_string(), "from primary".to_string()],
+        "exactly one request per backend: the in-flight slot admits one, the other throttles to the fallback"
+    );
 }
 
 #[tokio::test]
@@ -406,6 +731,7 @@ async fn copilot_endpoint_rejection_400_triggers_fallback() {
                 user_agent: None,
                 referer: None,
                 headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -420,6 +746,7 @@ async fn copilot_endpoint_rejection_400_triggers_fallback() {
                 user_agent: None,
                 referer: None,
                 headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
             },
         ],
         models: vec![ModelConfig {
@@ -511,6 +838,7 @@ async fn mock_llm_provider_falls_back_when_primary_returns_402_quota() {
                 user_agent: None,
                 referer: None,
                 headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -525,6 +853,7 @@ async fn mock_llm_provider_falls_back_when_primary_returns_402_quota() {
                 user_agent: None,
                 referer: None,
                 headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
             },
         ],
         models: vec![ModelConfig {
@@ -615,6 +944,7 @@ async fn mock_llm_provider_falls_back_when_primary_returns_empty_body_402() {
                 user_agent: None,
                 referer: None,
                 headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -629,6 +959,7 @@ async fn mock_llm_provider_falls_back_when_primary_returns_empty_body_402() {
                 user_agent: None,
                 referer: None,
                 headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
             },
         ],
         models: vec![ModelConfig {
@@ -717,6 +1048,7 @@ async fn mock_llm_provider_does_not_fall_back_on_403() {
                 user_agent: None,
                 referer: None,
                 headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -731,6 +1063,7 @@ async fn mock_llm_provider_does_not_fall_back_on_403() {
                 user_agent: None,
                 referer: None,
                 headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
             },
         ],
         models: vec![ModelConfig {
@@ -813,6 +1146,7 @@ async fn mock_llm_provider_chain_exhausted_returns_last_upstream_error() {
                 user_agent: None,
                 referer: None,
                 headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -827,6 +1161,7 @@ async fn mock_llm_provider_chain_exhausted_returns_last_upstream_error() {
                 user_agent: None,
                 referer: None,
                 headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
             },
         ],
         models: vec![ModelConfig {
@@ -942,6 +1277,7 @@ async fn mock_llm_provider_per_provider_retry_three_times_before_chain_advance()
                 user_agent: None,
                 referer: None,
                 headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -956,6 +1292,7 @@ async fn mock_llm_provider_per_provider_retry_three_times_before_chain_advance()
                 user_agent: None,
                 referer: None,
                 headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
             },
         ],
         models: vec![ModelConfig {
@@ -1062,6 +1399,7 @@ async fn http_end_to_end_anthropic_provider_strips_and_succeeds() {
             user_agent: None,
             referer: None,
             headers: std::collections::BTreeMap::new(),
+            rate_limit: None,
         }],
         models: vec![ModelConfig {
             name: "claude-test".into(),
@@ -1183,6 +1521,7 @@ async fn http_end_to_end_anthropic_provider_strip_max_attempts_then_passthrough(
             user_agent: None,
             referer: None,
             headers: std::collections::BTreeMap::new(),
+            rate_limit: None,
         }],
         models: vec![ModelConfig {
             name: "claude-test".into(),
@@ -1343,6 +1682,7 @@ async fn http_end_to_end_primary_succeeds_returns_requested_model_name() {
         user_agent: None,
         referer: None,
         headers: std::collections::BTreeMap::new(),
+        rate_limit: None,
     }];
     let app = build_axum_app(providers, configs, vec!["primary".to_string()]);
 
@@ -1423,6 +1763,7 @@ async fn http_end_to_end_hosted_web_search_tool_passes_through_extractor() {
         user_agent: None,
         referer: None,
         headers: std::collections::BTreeMap::new(),
+        rate_limit: None,
     }];
     let app = build_axum_app(providers, configs, vec!["primary".to_string()]);
 
@@ -1486,6 +1827,7 @@ async fn http_end_to_end_429_falls_back_to_backup_with_failed_providers_header()
             user_agent: None,
             referer: None,
             headers: std::collections::BTreeMap::new(),
+            rate_limit: None,
         },
         ProviderConfig::OpenaiCompat {
             name: "backup".to_string(),
@@ -1500,6 +1842,7 @@ async fn http_end_to_end_429_falls_back_to_backup_with_failed_providers_header()
             user_agent: None,
             referer: None,
             headers: std::collections::BTreeMap::new(),
+            rate_limit: None,
         },
     ];
     let app = build_axum_app(providers, configs, vec!["primary".into(), "backup".into()]);
@@ -1559,6 +1902,7 @@ async fn http_end_to_end_chain_exhausted_returns_status_and_failed_providers_hea
             user_agent: None,
             referer: None,
             headers: std::collections::BTreeMap::new(),
+            rate_limit: None,
         },
         ProviderConfig::OpenaiCompat {
             name: "backup".to_string(),
@@ -1573,6 +1917,7 @@ async fn http_end_to_end_chain_exhausted_returns_status_and_failed_providers_hea
             user_agent: None,
             referer: None,
             headers: std::collections::BTreeMap::new(),
+            rate_limit: None,
         },
     ];
     let app = build_axum_app(providers, configs, vec!["primary".into(), "backup".into()]);
@@ -1770,6 +2115,7 @@ async fn mock_llm_provider_short_cooldown_for_non_429_upstream_error() {
                 user_agent: None,
                 referer: None,
                 headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -1784,6 +2130,7 @@ async fn mock_llm_provider_short_cooldown_for_non_429_upstream_error() {
                 user_agent: None,
                 referer: None,
                 headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
             },
         ],
         models: vec![ModelConfig {
@@ -1889,6 +2236,7 @@ async fn mock_llm_provider_402_uses_configured_cooldown_seconds_and_skips_primar
                 user_agent: None,
                 referer: None,
                 headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -1903,6 +2251,7 @@ async fn mock_llm_provider_402_uses_configured_cooldown_seconds_and_skips_primar
                 user_agent: None,
                 referer: None,
                 headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
             },
         ],
         models: vec![ModelConfig {
@@ -2020,6 +2369,7 @@ async fn mock_llm_provider_subsequent_request_skips_cooldown_provider_directly()
                 user_agent: None,
                 referer: None,
                 headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -2034,6 +2384,7 @@ async fn mock_llm_provider_subsequent_request_skips_cooldown_provider_directly()
                 user_agent: None,
                 referer: None,
                 headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
             },
         ],
         models: vec![ModelConfig {
@@ -2168,6 +2519,7 @@ async fn mock_llm_provider_skips_provider_with_unsupported_model_via_runtime_400
                 user_agent: None,
                 referer: None,
                 headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
             },
             ProviderConfig::OpenaiCompat {
                 name: "backup".to_string(),
@@ -2182,6 +2534,7 @@ async fn mock_llm_provider_skips_provider_with_unsupported_model_via_runtime_400
                 user_agent: None,
                 referer: None,
                 headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
             },
         ],
         models: vec![ModelConfig {
@@ -2307,6 +2660,7 @@ async fn output_config_propagation_through_router() {
         user_agent: None,
         referer: None,
         headers: std::collections::BTreeMap::new(),
+        rate_limit: None,
     }];
     let app = build_axum_app(providers, configs, vec!["primary".to_string()]);
 

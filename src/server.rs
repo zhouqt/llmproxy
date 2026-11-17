@@ -21,6 +21,7 @@ use crate::anthropic::{MessagesRequest, MessagesResponse};
 use crate::error::{ProxyError, Result};
 use crate::extractor::{AppJson, AppMessages, AppQuery, InboundBodyLimit};
 use crate::providers::ProviderOutput;
+use crate::rate_limit::RateTicket;
 use crate::state::AppState;
 use crate::tokenize::estimate_request_tokens;
 use crate::usage::{
@@ -144,7 +145,12 @@ async fn messages_inner(state: &AppState, req: MessagesRequest) -> Result<Respon
 
     if req.stream {
         let stream_result = state.router.stream(&model_cfg, &req).await;
-        let (provider, output, attempts) = match stream_result {
+        // The rate-limit ticket (4th element) rides with the stream:
+        // `MappedStream` settles the token-window estimate at the
+        // terminal frame and releases the concurrency slot when the
+        // stream ends (a client disconnect drops the ticket with the
+        // body — the slot returns either way).
+        let (provider, output, attempts, ticket) = match stream_result {
             Ok(t) => t,
             Err(e) => {
                 // Router-level failure (e.g. AllProvidersCoolingDown)
@@ -189,6 +195,7 @@ async fn messages_inner(state: &AppState, req: MessagesRequest) -> Result<Respon
             start,
             state.usage.clone(),
             state.expose_upstream_details,
+            ticket,
         ));
     }
 
@@ -812,6 +819,7 @@ fn stream_response(
     start: StartedAt,
     stats: UsageStats,
     expose_upstream_details: bool,
+    ticket: Option<RateTicket>,
 ) -> Response {
     // C9: even when the router returns Ok with a non-Stream output
     // (a provider that ignores `stream` mode and hands back JSON),
@@ -826,6 +834,16 @@ fn stream_response(
     // skips remain -- the row keeps full-history (third-party policy).
     let failed_providers = filter_failed_providers_for(&attempts, provider_name);
     let ProviderOutput::Stream(stream) = output else {
+        // Settle the ticket with the usage the Json output carries —
+        // the same figure the complete path settles from. The request
+        // did reach the upstream, so the pre-flight estimate should
+        // reflect what it actually cost; absent usage fields settle to
+        // 0, which keeps the estimate charged (the conservative
+        // direction). Dropping the ticket releases the concurrency
+        // slot either way.
+        if let Some(t) = ticket {
+            t.settle(crate::router::Router::extract_output_usage_total(&output));
+        }
         // Phase 2 §3: contract-violation branch (router returned
         // `ProviderOutput::Json` for a `stream:true` request). The
         // request started line was already emitted in
@@ -902,6 +920,7 @@ fn stream_response(
         stats,
         failed_providers, // moved into the stream wrapper
         expose_upstream_details,
+        ticket, // settles the TPM estimate at the terminal frame
     ));
 
     let mut resp = Response::new(body);
@@ -966,6 +985,13 @@ pub struct MappedStream {
     /// own words (audit R0). `false` replaces them with generic
     /// wording; the log line still carries the full text.
     expose_upstream_details: bool,
+    /// Rate-limit ticket from the router's acquire gate (absent when
+    /// the provider has no `rate_limit`). Settling replaces the
+    /// pre-charged token estimate with the stream-reported usage, and
+    /// the concurrency permit returns on Drop — including the client
+    /// disconnect path (this struct's `Drop`), which never reaches
+    /// `finalize_and_record`.
+    ticket: Option<RateTicket>,
 }
 
 impl MappedStream {
@@ -977,6 +1003,7 @@ impl MappedStream {
         stats: UsageStats,
         failed_providers: Vec<String>,
         expose_upstream_details: bool,
+        ticket: Option<RateTicket>,
     ) -> Self {
         Self {
             provider: provider.to_string(),
@@ -989,6 +1016,7 @@ impl MappedStream {
             usage_scanner: Some(UsageScanner::new()),
             errored: false,
             expose_upstream_details,
+            ticket,
         }
     }
 
@@ -1014,6 +1042,14 @@ impl MappedStream {
         let provider = std::mem::take(&mut self.provider);
         let model = std::mem::take(&mut self.model);
         let was_errored = self.errored || saw_error;
+        // Settle the rate-limit ticket with the same total the usage row
+        // carries: the pre-charged window estimate is replaced by the
+        // stream-reported input+output+cache_creation. A silent stream
+        // reports 0 — `settle` then keeps the estimate charged (the
+        // conservative direction) rather than refunding it.
+        if let Some(t) = self.ticket.take() {
+            t.settle(total_tokens);
+        }
         let record = UsageRecord {
             started_at: self.start.started_at(),
             ended_at,
@@ -1719,6 +1755,7 @@ mod tests {
             usage_scanner: Some(UsageScanner::new()),
             errored: false,
             expose_upstream_details: true,
+            ticket: None,
         }
     }
 
@@ -1763,6 +1800,7 @@ mod tests {
             usage_scanner: Some(UsageScanner::new()),
             errored: false,
             expose_upstream_details: true,
+            ticket: None,
         };
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
@@ -1785,6 +1823,7 @@ mod tests {
             usage_scanner: Some(UsageScanner::new()),
             errored: false,
             expose_upstream_details: true,
+            ticket: None,
         };
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
@@ -1811,6 +1850,7 @@ mod tests {
             usage_scanner: Some(UsageScanner::new()),
             errored: false,
             expose_upstream_details: true,
+            ticket: None,
         };
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
@@ -1855,6 +1895,7 @@ mod tests {
             usage_scanner: Some(UsageScanner::new()),
             errored: false,
             expose_upstream_details: true,
+            ticket: None,
         };
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
@@ -1884,6 +1925,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_response_contract_violation_settles_the_ticket() {
+        // A provider answering a stream request with Json still reached
+        // the upstream and carries usage: the ticket must settle from
+        // it — dropping it silently would keep the whole pre-flight
+        // estimate charged for up to a window and throttle requests
+        // that never needed throttling.
+        use crate::config::RateLimitConfig;
+        use crate::rate_limit::ProviderLimiter;
+        use std::sync::Arc;
+
+        let lim = Arc::new(ProviderLimiter::new(&RateLimitConfig {
+            rpm: None,
+            tpm: Some(1000),
+            max_concurrency: None,
+            max_wait_ms: None,
+        }));
+        let ticket = lim.acquire(600).await.expect("600 admits under tpm 1000");
+
+        let resp = stream_response(
+            "test",
+            "test",
+            ProviderOutput::Json(json!({
+                "content": [{"type": "text", "text": "x"}],
+                "usage": {"input_tokens": 30, "output_tokens": 40},
+            })),
+            Vec::new(),
+            StartedAt::now(),
+            UsageStats::new(8),
+            true,
+            Some(ticket),
+        );
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            lim.charged_tokens(),
+            70,
+            "ticket must settle to the Json usage, not keep the estimate"
+        );
+    }
+
+    #[tokio::test]
     async fn mapped_stream_emits_bytes_then_terminates() {
         let mut s = MappedStream {
             provider: "test".to_string(),
@@ -1899,6 +1980,7 @@ mod tests {
             usage_scanner: Some(UsageScanner::new()),
             errored: false,
             expose_upstream_details: true,
+            ticket: None,
         };
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
@@ -1986,6 +2068,7 @@ mod tests {
                     token_store_key: None,
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
+                rate_limit: None,
                 }],
                 models: vec![ModelConfig {
                     name: "m".to_string(),
@@ -2269,6 +2352,7 @@ mod tests {
                     token_store_key: None,
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
+                rate_limit: None,
                 }],
                 models: vec![ModelConfig {
                     name: "m".to_string(),
@@ -2355,6 +2439,7 @@ mod tests {
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
                 ProviderConfig::GithubCopilot {
                     name: "copilot".to_string(),
@@ -2366,6 +2451,7 @@ mod tests {
                         ("other".to_string(), "gpt-y".to_string()),
                     ]),
                     use_proxy: false,
+                rate_limit: None,
                 },
             ],
             models: vec![ModelConfig {
@@ -2451,6 +2537,7 @@ mod tests {
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
                 ProviderConfig::GithubCopilot {
                     name: "copilot".to_string(),
@@ -2459,6 +2546,7 @@ mod tests {
                     token_store_key: None,
                     model_rewrite: HashMap::from([("other".to_string(), "gpt-x".to_string())]),
                     use_proxy: false,
+                rate_limit: None,
                 },
             ],
             models: vec![ModelConfig {
@@ -2521,6 +2609,7 @@ mod tests {
                     ("m2".to_string(), "u".to_string()),
                 ]),
                 use_proxy: false,
+            rate_limit: None,
             }],
             models: vec![
                 ModelConfig {
@@ -2695,6 +2784,7 @@ mod tests {
                 user_agent: None,
                 referer: None,
                 headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
             },
             reqwest::Client::new(),
             true,

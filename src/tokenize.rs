@@ -16,6 +16,127 @@
 
 use serde_json::Value;
 
+use crate::anthropic::{
+    ContentBlock, MessageContent, MessagesRequest, SystemPrompt, ToolResultContent,
+};
+
+/// Estimate the token cost of a typed Anthropic request *before* it is
+/// dispatched — the pre-flight charge for the per-provider TPM window
+/// (`rate_limit.tpm`). Reuses the [`estimate_text_tokens`] heuristic over
+/// the typed structure instead of re-serializing to JSON: walking the
+/// string leaves avoids allocating a full `Value` tree per request.
+///
+/// The returned figure is **input estimate + `max_tokens` reserve**: the
+/// upstream counts input+output against a TPM limit (MiniMax's documented
+/// definition), and the output size is unknowable before dispatch, so the
+/// configured cap is reserved up front. The estimate is replaced by the
+/// upstream-reported usage once the response lands (rate-limit ticket
+/// settle), so estimation drift self-corrects within one window. Media
+/// blocks (image, container upload) contribute 0 — they are billed as
+/// images, not text tokens.
+pub fn estimate_typed_tokens(req: &MessagesRequest) -> u64 {
+    let mut total: u64 = 0;
+    match &req.system {
+        Some(SystemPrompt::Text(s)) => total += u64::from(estimate_text_tokens(s)),
+        Some(SystemPrompt::Blocks(blocks)) => {
+            for b in blocks {
+                total += u64::from(estimate_text_tokens(&b.text));
+            }
+        }
+        None => {}
+    }
+    for m in &req.messages {
+        match &m.content {
+            MessageContent::Text(s) => total += u64::from(estimate_text_tokens(s)),
+            MessageContent::Blocks(blocks) => {
+                for b in blocks {
+                    total += block_tokens(b);
+                }
+            }
+        }
+    }
+    for t in req.tools.iter().flatten() {
+        total += u64::from(estimate_text_tokens(&t.name));
+        if let Some(d) = &t.description {
+            total += u64::from(estimate_text_tokens(d));
+        }
+        if !t.input_schema.is_null() {
+            total += u64::from(estimate_request_tokens(&t.input_schema));
+        }
+        for v in t.extra.values() {
+            total += u64::from(estimate_request_tokens(v));
+        }
+    }
+    // Unrecognized top-level fields ride the flattened `extra` map and
+    // are billed upstream like everything else — count their string
+    // leaves rather than silently charging 0.
+    for v in req.extra.values() {
+        total += u64::from(estimate_request_tokens(v));
+    }
+    total + u64::from(req.max_tokens)
+}
+
+/// Token estimate for a single content block. Text-bearing variants are
+/// counted with the text heuristic; structured payloads (`Value`) go
+/// through [`estimate_request_tokens`].
+fn block_tokens(b: &ContentBlock) -> u64 {
+    match b {
+        ContentBlock::Text { text, .. } => u64::from(estimate_text_tokens(text)),
+        ContentBlock::Thinking { thinking, .. } => u64::from(estimate_text_tokens(thinking)),
+        // Opaque base64 — still billed upstream as tokens, so count it
+        // rather than silently dropping the block's cost.
+        ContentBlock::RedactedThinking { data } => u64::from(estimate_text_tokens(data)),
+        ContentBlock::MidConversationSystem { content, .. } => {
+            u64::from(estimate_text_tokens(content))
+        }
+        ContentBlock::ToolUse { input, .. } | ContentBlock::ServerToolUse { input, .. } => {
+            u64::from(estimate_request_tokens(input))
+        }
+        ContentBlock::ToolResult { content, .. } => match content {
+            ToolResultContent::Text(s) => u64::from(estimate_text_tokens(s)),
+            ToolResultContent::Blocks(vs) => vs
+                .iter()
+                .map(|v| u64::from(estimate_request_tokens(v)))
+                .sum(),
+        },
+        ContentBlock::SearchResult { source, title, content, .. } => {
+            // `source` (a URL fetch descriptor, sometimes with content)
+            // plus the result blocks are all billed upstream.
+            u64::from(estimate_request_tokens(source))
+                + title.as_deref().map(|t| u64::from(estimate_text_tokens(t)))
+                    .unwrap_or(0)
+                + content
+                    .as_ref()
+                    .map(|vs| vs.iter().map(estimate_request_tokens).sum::<u32>())
+                    .unwrap_or(0) as u64
+        }
+        ContentBlock::Document { source, title, context, .. } => {
+            // `source.data` is the document payload itself (plain text
+            // or base64) and is billed upstream like any other text —
+            // counting it follows the same rule as the RedactedThinking
+            // arm above. A document counted at title+context only would
+            // under-charge the TPM window by the whole document.
+            u64::from(estimate_request_tokens(source))
+                + title.as_deref().map(|t| u64::from(estimate_text_tokens(t)))
+                    .unwrap_or(0)
+                + context
+                    .as_deref()
+                    .map(|t| u64::from(estimate_text_tokens(t)))
+                    .unwrap_or(0)
+        }
+        ContentBlock::WebSearchToolResult { content, .. }
+        | ContentBlock::WebFetchToolResult { content, .. }
+        | ContentBlock::CodeExecutionToolResult { content, .. }
+        | ContentBlock::BashCodeExecutionToolResult { content, .. }
+        | ContentBlock::TextEditorCodeExecutionToolResult { content, .. }
+        | ContentBlock::ToolSearchToolResult { content, .. } => {
+            u64::from(estimate_request_tokens(content))
+        }
+        // Media / unrecognized blocks: no text tokens we can estimate.
+        ContentBlock::Image { .. } | ContentBlock::ContainerUpload { .. } | ContentBlock::Unknown => 0,
+    }
+}
+
 /// Estimate the number of input tokens for a JSON request body sent to
 /// `/v1/messages/count_tokens`. The input is treated as opaque — we
 /// walk the JSON tree and sum `estimate_text_tokens` over every
@@ -157,5 +278,115 @@ mod tests {
         // Non-recursive leaves contribute 0 text tokens, but the wrapper
         // object still floors at 1.
         assert!(tokens >= 1);
+    }
+
+    // ─── typed estimate (rate-limit TPM pre-charge) ────────────────────
+
+    use crate::anthropic::MessagesRequest;
+
+    fn typed_request(json: serde_json::Value) -> MessagesRequest {
+        serde_json::from_value(json).expect("MessagesRequest parse")
+    }
+
+    #[test]
+    fn typed_estimate_includes_max_tokens_reserve_exactly() {
+        // The output reserve is the full configured cap: input estimate
+        // is unchanged by it, so stripping the reserve must shift the
+        // total by exactly max_tokens.
+        let mut body = serde_json::json!({
+            "model": "mm-model",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hello there friend"}],
+        });
+        let req = typed_request(body.clone());
+        let with_reserve = estimate_typed_tokens(&req);
+        body["max_tokens"] = serde_json::json!(0);
+        let without_reserve = estimate_typed_tokens(&typed_request(body));
+        assert_eq!(with_reserve - without_reserve, 1024);
+    }
+
+    #[test]
+    fn typed_estimate_counts_system_messages_tools_and_tool_payloads() {
+        let req = typed_request(serde_json::json!({
+            "model": "mm-model",
+            "max_tokens": 32,
+            "system": "you are helpful",
+            "messages": [
+                {"role": "user", "content": "hello there friend"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "你好世界"},
+                    {"type": "tool_use", "id": "t1", "name": "read_file",
+                     "input": {"path": "/tmp/log.txt", "hint": "system log"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1",
+                     "content": [{"type": "text", "text": "file contents here"}]}
+                ]},
+            ],
+            "tools": [
+                {"name": "read_file", "description": "Read a file",
+                 "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}}
+            ],
+        }));
+        let est = estimate_typed_tokens(&req);
+        // Every component is a positive contributor; assert the total is
+        // at least their sum under a coarse floor (1 token per short
+        // string) plus the 32-token reserve — the exact heuristic values
+        // are pinned by the estimate_text_tokens tests above.
+        let floor = 1 /*system*/ + 3 /*hello there friend*/ + 2 /*CJK*/ + 1 /*tool name*/
+            + 1 /*tool desc*/ + 1 /*schema*/ + 1 /*tool_use input*/ + 1 /*tool_result*/
+            + 32 /*reserve*/;
+        assert!(est as u32 >= floor, "estimate {est} below floor {floor}");
+        // And it stays in a sane range for this small request.
+        assert!(est < 200, "estimate {est} implausibly large");
+    }
+
+    #[test]
+    fn typed_estimate_ignores_media_and_unknown_blocks() {
+        let req = typed_request(serde_json::json!({
+            "model": "mm-model",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+                {"type": "future_block_kind", "mystery": "field"},
+            ]}],
+        }));
+        // Media + Unknown contribute 0; only the reserve survives.
+        assert_eq!(estimate_typed_tokens(&req), 16);
+    }
+
+    #[test]
+    fn typed_estimate_on_empty_messages_is_the_reserve() {
+        let req = typed_request(serde_json::json!({
+            "model": "mm-model",
+            "max_tokens": 64,
+            "messages": [],
+        }));
+        assert_eq!(estimate_typed_tokens(&req), 64);
+    }
+
+    #[test]
+    fn typed_estimate_counts_document_source_and_extra_fields() {
+        // The document payload lives in `source.data` (plain text or
+        // base64) and is billed upstream — a block counted at
+        // title+context only would under-charge the TPM window by the
+        // whole document. Same rule for the flattened `extra`
+        // top-level fields (unknown keys ride along billed).
+        let req = typed_request(serde_json::json!({
+            "model": "mm-model",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": [
+                {"type": "document",
+                 "source": {"type": "text", "media_type": "text/plain",
+                            "data": "one two three four five"},
+                 "title": "t"}
+            ]}],
+            "mystery_top_level": {"deep": "values here"},
+        }));
+        let est = estimate_typed_tokens(&req);
+        // Floor: reserve 8 + 5 source words + 1 title + 2 extra-leaf
+        // words ("deep" is a key — the walk counts values only).
+        let floor = 8u64 + 5 + 1 + 2;
+        assert!(est >= floor, "estimate {est} below floor {floor}");
     }
 }

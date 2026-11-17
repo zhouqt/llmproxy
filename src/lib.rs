@@ -12,6 +12,7 @@ pub mod oauth;
 pub mod openai;
 pub mod providers;
 pub mod proxy_client;
+pub mod rate_limit;
 pub mod responses;
 pub mod router;
 pub mod secrets;

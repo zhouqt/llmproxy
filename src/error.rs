@@ -15,12 +15,13 @@ pub enum ProxyError {
     #[error("provider not found: {0}")]
     ProviderNotFound(String),
 
-    #[error("all providers cooling down for model {model}")]
+    #[error("no provider available for model {model} (cooling down or locally throttled)")]
     AllProvidersCoolingDown {
         model: String,
         /// Every step taken before giving up — each entry is a
-        /// `RouteStep::LocalSkip` (cooldown or model_rewrite miss; no
-        /// upstream call fired for this chain) or an upstream `Failed`.
+        /// `RouteStep::LocalSkip` (cooldown, model_rewrite miss, or
+        /// local rate-limit throttle; no upstream call fired for this
+        /// chain entry) or an upstream `Failed`.
         /// Populated by `Router::complete`/`stream` at the terminal arm
         /// so the `fail_reason=` log field, the `/admin/usage` row and
         /// the response header can all be derived from it (plan §Phase 1
@@ -29,19 +30,20 @@ pub enum ProxyError {
         /// field empty and the terminal label defaults to `cooldown`).
         attempts: Vec<RouteStep>,
         /// `Retry-After` hint (seconds) for the caller. `None` means
-        /// every candidate provider is on cooldown but no further
-        /// information is available (e.g. the chain has no known
-        /// providers); `Some(0)` is reserved for "retry immediately"
-        /// and is not currently produced.
+        /// every candidate provider was skipped locally — cooldown,
+        /// rate-limit throttle, model_rewrite miss, or an unknown name
+        /// — but no further information is available (e.g. the chain
+        /// has no known providers); `Some(0)` is reserved for "retry
+        /// immediately" and is not currently produced.
         retry_after_secs: Option<u64>,
     },
 
     /// Every candidate provider either failed an upstream call or was
-    /// on cooldown; `attempts` records the upstream attempts that
+    /// skipped locally; `attempts` records the upstream attempts that
     /// actually fired (used to populate the `x-llmproxy-failed-providers`
     /// header), and `last` is the most recent upstream error so the
-    /// caller can see the real cause instead of a generic "all cooling
-    /// down" message.
+    /// caller can see the real cause instead of a generic
+    /// "no provider available" message.
     #[error("all providers failed for model {model}: last error: {last}")]
     AllProvidersFailed {
         model: String,
