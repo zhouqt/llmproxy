@@ -12,6 +12,7 @@ use crate::config::{Config, ModelConfig};
 use crate::cooldown::CooldownCache;
 use crate::error::{ProxyError, Result};
 use crate::providers::{ProviderOutput, SharedProvider};
+use crate::rate_limit::{ProviderRateLimiters, RateTicket, Throttled};
 use serde::Serialize;
 
 /// Detect "this upstream cannot serve the requested model" responses
@@ -61,6 +62,12 @@ pub struct Router {
     cfg: Arc<Config>,
     providers: HashMap<String, SharedProvider>,
     cooldown: CooldownCache,
+    /// Per-provider client-side rate limiters (`rate_limit:` blocks).
+    /// Built once from `cfg` here — `Router` already owns the config,
+    /// so no construction-site anywhere (main or tests) needs to thread
+    /// the map through. Providers without a block are simply absent
+    /// and their dispatch is never gated.
+    rate_limits: ProviderRateLimiters,
 }
 
 /// One step in a request's fallback chain. Three terminal facts we want
@@ -106,6 +113,11 @@ pub enum LocalSkipReason {
     /// `!provider.can_serve_model(&req.model)` (provider's
     /// `model_rewrite` excludes the requested model).
     ModelUnmapped,
+    /// The provider's client-side rate limiter (`rate_limit:` block)
+    /// could not admit the request within `max_wait` — pacing
+    /// exhaustion, not an upstream fault. No cooldown is recorded;
+    /// the very next request paces normally.
+    Throttled,
 }
 
 /// Why a streaming response terminated before normal completion. The
@@ -136,8 +148,11 @@ pub enum FailReason {
     /// Every step was `LocalSkip::ModelUnmapped` — no upstream call
     /// fired (configuration gap).
     ModelSkip,
-    /// Mixed `LocalSkip::Cooldown` + `LocalSkip::ModelUnmapped` —
-    /// chain contains both skip classes and no upstream attempt.
+    /// Every step was `LocalSkip::Throttled` — the chain's client-side
+    /// rate limiters could not admit the request within `max_wait`.
+    /// No upstream call fired and no cooldown was recorded.
+    Throttled,
+    /// Mixed local-skip classes, no upstream attempt.
     Mixed,
 }
 
@@ -147,6 +162,7 @@ impl std::fmt::Display for FailReason {
             FailReason::Upstream => "upstream",
             FailReason::Cooldown => "cooldown",
             FailReason::ModelSkip => "model_skip",
+            FailReason::Throttled => "throttled",
             FailReason::Mixed => "mixed",
         })
     }
@@ -165,20 +181,22 @@ impl RouteStep {
     /// Stable label for the `failure=` field on per-step fallback
     /// lines. For a real upstream response this is the status code
     /// as a decimal string (`"429"`, `"503"`); for a local skip it's
-    /// the reason name (`"cooldown"` / `"model_skip"`).
+    /// the reason name (`"cooldown"` / `"model_skip"` /
+    /// `"throttled"`).
     pub fn failure(&self) -> std::borrow::Cow<'static, str> {
         match self {
             RouteStep::Failed { status, .. } => std::borrow::Cow::Owned(status.to_string()),
             RouteStep::LocalSkip { reason, .. } => std::borrow::Cow::Borrowed(match reason {
                 LocalSkipReason::Cooldown => "cooldown",
                 LocalSkipReason::ModelUnmapped => "model_skip",
+                LocalSkipReason::Throttled => "throttled",
             }),
         }
     }
 
     /// `"<provider>:<status>"` for `Failed`, `"<provider>:cooldown"` /
-    /// `"<provider>:model_skip"` for `LocalSkip`. Used by log
-    /// `failed_providers=` fields and the
+    /// `"<provider>:model_skip"` / `"<provider>:throttled"` for
+    /// `LocalSkip`. Used by log `failed_providers=` fields and the
     /// `x-llmproxy-failed-providers` header.
     pub fn render(&self) -> String {
         format!("{}:{}", self.provider(), self.failure())
@@ -210,18 +228,19 @@ const FAILED_BODY_LOG_CAP_BYTES: usize = 4096;
 /// Classification:
 /// - any `Failed` → `Upstream` (a real upstream call returned an
 ///   error and the chain gave up)
-/// - all `LocalSkip::Cooldown` → `Cooldown`
-/// - all `LocalSkip::ModelUnmapped` → `ModelSkip`
-/// - both skip classes, no `Failed` → `Mixed`
+/// - all `LocalSkip` of one reason → that reason (`Cooldown` /
+///   `ModelSkip` / `Throttled`)
+/// - mixed skip classes, no `Failed` → `Mixed`
 pub fn derive_fail_reason(steps: &[RouteStep]) -> Option<FailReason> {
     if steps.is_empty() {
         return None;
     }
-    // Single pass collecting both skip flags — code review #8. The
+    // Single pass collecting the skip flags — code review #8. The
     // upstream check short-circuits so a chain with any `Failed` skips
     // the LocalSkip scan entirely.
     let mut has_cooldown = false;
     let mut has_unmapped = false;
+    let mut has_throttled = false;
     for s in steps {
         if s.is_upstream_failure() {
             return Some(FailReason::Upstream);
@@ -235,27 +254,30 @@ pub fn derive_fail_reason(steps: &[RouteStep]) -> Option<FailReason> {
                 reason: LocalSkipReason::ModelUnmapped,
                 ..
             } => has_unmapped = true,
+            RouteStep::LocalSkip {
+                reason: LocalSkipReason::Throttled,
+                ..
+            } => has_throttled = true,
             RouteStep::Failed { .. } => unreachable!("filtered above"),
         }
-        // Early exit: once both flags are set we know the answer is
+        // Early exit: once two flags are set we know the answer is
         // `Mixed` without scanning the rest.
-        if has_cooldown && has_unmapped {
+        if usize::from(has_cooldown)
+            + usize::from(has_unmapped)
+            + usize::from(has_throttled)
+            > 1
+        {
             return Some(FailReason::Mixed);
         }
     }
-    match (has_cooldown, has_unmapped) {
-        (true, false) => Some(FailReason::Cooldown),
-        (false, true) => Some(FailReason::ModelSkip),
-        // The `(true, true)` arm is unreachable: the early-exit
-        // `if has_cooldown && has_unmapped` above returns
-        // `Some(Mixed)` before we reach this match. Listed here so
-        // the compiler accepts the exhaustive tuple pattern.
-        (true, true) => unreachable!("early-exit above returns Mixed when both flags are set"),
-        // Non-empty steps + no `Failed` implies at least one
-        // `LocalSkip`, which implies `Cooldown` or `ModelUnmapped`.
-        (false, false) => unreachable!(
-            "derive_fail_reason: non-empty steps with no Failed implies at least one LocalSkip"
-        ),
+    match (has_cooldown, has_unmapped, has_throttled) {
+        (true, false, false) => Some(FailReason::Cooldown),
+        (false, true, false) => Some(FailReason::ModelSkip),
+        (false, false, true) => Some(FailReason::Throttled),
+        // More than one flag was set: the early-exit above returned
+        // `Some(Mixed)` before we reach this match. Listed so the
+        // compiler accepts the exhaustive tuple pattern.
+        _ => unreachable!("early-exit above returns Mixed when multiple flags are set"),
     }
 }
 
@@ -381,10 +403,12 @@ impl Router {
         providers: HashMap<String, SharedProvider>,
         cooldown: CooldownCache,
     ) -> Self {
+        let rate_limits = ProviderRateLimiters::build(&cfg);
         Self {
             cfg,
             providers,
             cooldown,
+            rate_limits,
         }
     }
 
@@ -512,6 +536,10 @@ impl Router {
         let mut unmappable: Vec<String> = Vec::new();
         let chain: Vec<String> = model.chain().map(String::from).collect();
         let max_total = (model.max_retries_total as usize) * chain.len().max(1);
+        // One estimate per request, shared by every chain entry and
+        // every retry (the figure depends on the request, not on the
+        // provider).
+        let token_estimate = self.chain_token_estimate(&chain, req);
 
         for round in 0..chain.len() {
             let name = &chain[round];
@@ -572,8 +600,38 @@ impl Router {
             // loop which moves to the next provider. We do NOT `break` on
             // the first error — that's the whole point of this counter.
             for _ in 0..model.max_retries_per_provider {
+                let ticket = match self.acquire_rate_ticket(name, req, token_estimate).await {
+                    Ok(t) => t,
+                    Err(th) => {
+                        tracing::warn!(
+                            provider = name.as_str(),
+                            eta_ms = th.eta.as_millis() as u64,
+                            "provider throttled by local rate limit; moving to the next chain entry"
+                        );
+                        attempts.push(RouteStep::LocalSkip {
+                            provider: name.clone(),
+                            reason: LocalSkipReason::Throttled,
+                        });
+                        // Pacing exhaustion is transient and local: no
+                        // cooldown, no further retry against this
+                        // provider — let the chain's next entry take
+                        // the request.
+                        break;
+                    }
+                };
                 match provider.complete(req, &HashMap::new()).await {
-                    Ok(out) => return Ok((out, attempts, Some(name.clone()))),
+                    Ok(out) => {
+                        // Reconcile the token-window estimate with the
+                        // upstream-reported usage. On the error arms
+                        // below the ticket simply drops: the estimate
+                        // stays charged (conservative, self-heals in
+                        // one window) and the concurrency slot is
+                        // released by the same drop.
+                        if let Some(t) = ticket {
+                            t.settle(Self::extract_output_usage_total(&out));
+                        }
+                        return Ok((out, attempts, Some(name.clone())));
+                    }
                     Err(e) if e.is_cooldownable() => {
                         if let ProxyError::Upstream { status, body } = &e {
                             attempts.push(RouteStep::Failed {
@@ -666,10 +724,11 @@ impl Router {
                 attempts: std::mem::take(&mut attempts),
             });
         }
-        // Every candidate was on cooldown from the start, or every
-        // configured provider name was unknown — we never even fired a
-        // request, so the "all cooling down" framing is accurate. The
-        // skipped chain is carried so the terminal WARN / /admin/usage
+        // Every candidate was skipped locally (cooldown, rate-limit
+        // throttle, model_rewrite miss, or unknown name) — we never even
+        // fired a request, so no `last_error` exists and the 503 names
+        // both possible causes ("cooling down or locally throttled").
+        // The skipped chain is carried so the terminal WARN / /admin/usage
         // row can show which providers were skipped and why (plan
         // empty-slice semantics).
         Err(ProxyError::AllProvidersCoolingDown {
@@ -686,12 +745,14 @@ impl Router {
         &self,
         model: &ModelConfig,
         req: &MessagesRequest,
-    ) -> Result<(SharedProvider, ProviderOutput, Vec<RouteStep>)> {
+    ) -> Result<(SharedProvider, ProviderOutput, Vec<RouteStep>, Option<RateTicket>)> {
         let mut attempts: Vec<RouteStep> = Vec::new();
         let mut last_error: Option<ProxyError> = None;
         let mut tried: Vec<String> = Vec::new();
         let mut unmappable: Vec<String> = Vec::new();
         let chain: Vec<String> = model.chain().map(String::from).collect();
+        // One estimate per request (see `complete`).
+        let token_estimate = self.chain_token_estimate(&chain, req);
 
         for round in 0..chain.len() {
             let name = &chain[round];
@@ -748,8 +809,32 @@ impl Router {
             // success. Retrying after the first byte has flowed is unsafe
             // (we'd double-emit content to the client), so the per-provider
             // attempt count for streaming is implicitly 1.
+            //
+            // The rate-limit gate still sits before dispatch: a wait
+            // here is pre-first-byte by construction. A throttle moves
+            // straight to the chain's next entry (the ticket, if any,
+            // would already have been refused). On success the ticket
+            // travels with the stream so `MappedStream` can settle the
+            // token estimate at the terminal frame and release the
+            // concurrency slot when the stream ends — including a
+            // client disconnect, where the ticket drops with the body.
+            let ticket = match self.acquire_rate_ticket(name, req, token_estimate).await {
+                Ok(t) => t,
+                Err(th) => {
+                    tracing::warn!(
+                        provider = name.as_str(),
+                        eta_ms = th.eta.as_millis() as u64,
+                        "provider throttled by local rate limit; moving to the next chain entry"
+                    );
+                    attempts.push(RouteStep::LocalSkip {
+                        provider: name.clone(),
+                        reason: LocalSkipReason::Throttled,
+                    });
+                    continue;
+                }
+            };
             match provider.stream(req, &HashMap::new()).await {
-                Ok(out) => return Ok((provider, out, attempts)),
+                Ok(out) => return Ok((provider, out, attempts, ticket)),
                 Err(e) if e.is_cooldownable() => {
                     if let ProxyError::Upstream { status, body } = &e {
                         attempts.push(RouteStep::Failed {
@@ -811,18 +896,105 @@ impl Router {
                 attempts: std::mem::take(&mut attempts),
             });
         }
+        // Same terminal arm as `complete()`: every candidate was skipped
+        // locally (cooldown, throttle, model_rewrite miss) or the chain
+        // never fired — see the comment there for why the 503 wording
+        // covers both causes.
         Err(ProxyError::AllProvidersCoolingDown {
             model: model.name.clone(),
             attempts: std::mem::take(&mut attempts),
             retry_after_secs: None,
         })
     }
+
+    /// Gate one dispatch through the provider's client-side rate
+    /// limiter (`rate_limit:` block). `Ok(None)` — the provider has no
+    /// limiter, dispatch immediately. `Ok(Some(ticket))` — admitted,
+    /// possibly after a bounded wait; the ticket carries the
+    /// token-window charge to settle and the concurrency slot that
+    /// releases when it drops. `Err(throttled)` — the wait cap was
+    /// exceeded; the caller treats the provider as a local skip (no
+    /// cooldown — pacing exhaustion is transient local state, not an
+    /// upstream fault).
+    ///
+    /// Sits at the dispatch point inside the chain walk on purpose: a
+    /// wait here is still fully pre-first-byte for streaming, every
+    /// retry re-acquires (each upstream attempt consumes its own
+    /// budget), and a throttle skip composes with the existing
+    /// cooldown/fallback semantics.
+    async fn acquire_rate_ticket(
+        &self,
+        name: &str,
+        req: &MessagesRequest,
+        est_cache: Option<u64>,
+    ) -> std::result::Result<Option<RateTicket>, Throttled> {
+        let Some(limiter) = self.rate_limits.get(name) else {
+            return Ok(None);
+        };
+        // Pre-flight token estimate (input + max_tokens reserve) for
+        // the TPM window; the ticket's settle replaces it with the
+        // upstream-reported usage. rpm-only and concurrency-only
+        // limiters never look at it, and walking a long session's text
+        // per dispatch is real CPU — skip the walk for them (zero-config
+        // providers never reach this line at all). `est_cache` carries
+        // the value computed once per request (the estimate depends
+        // only on the request, never on the provider).
+        let est = if limiter.needs_token_estimate() {
+            est_cache.unwrap_or_else(|| crate::tokenize::estimate_typed_tokens(req))
+        } else {
+            0
+        };
+        limiter.acquire(est).await.map(Some)
+    }
+
+    /// The token estimate for this request, computed **once** per
+    /// dispatch: the chain walk and every retry re-enter the gate, and
+    /// the estimate depends only on the request. `None` when no
+    /// provider in the chain has a token window — then nobody needs the
+    /// figure and the walk is skipped entirely.
+    fn chain_token_estimate(&self, chain: &[String], req: &MessagesRequest) -> Option<u64> {
+        let needed = chain.iter().any(|name| {
+            self.rate_limits
+                .get(name)
+                .map(|l| l.needs_token_estimate())
+                .unwrap_or(false)
+        });
+        if needed {
+            Some(crate::tokenize::estimate_typed_tokens(req))
+        } else {
+            None
+        }
+    }
+
+    /// Total tokens (input + output + cache writes) the upstream
+    /// reports for a completed response — the figure that replaces the
+    /// pre-flight estimate in the rate-limit token window. Mirrors
+    /// `UsageRecord::compute_total_tokens`'s trio so `/admin/usage`
+    /// totals and the limiter account the same number (pinned together
+    /// by `settle_total_matches_compute_total_tokens` below). Absent
+    /// usage fields (some compat backends omit them) count as 0: the
+    /// estimate stays charged, which is the conservative direction.
+    pub(crate) fn extract_output_usage_total(out: &ProviderOutput) -> u64 {
+        let ProviderOutput::Json(v) = out else {
+            return 0;
+        };
+        fn num(v: &serde_json::Value) -> u64 {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                .unwrap_or(0)
+        }
+        let usage = &v["usage"];
+        num(&usage["input_tokens"])
+            + num(&usage["output_tokens"])
+            + num(&usage["cache_creation_input_tokens"])
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ModelConfig, ProviderConfig};
+    use crate::config::{ModelConfig, ProviderConfig, RateLimitConfig};
+    use crate::expect_variant;
     use crate::providers::Provider;
     use crate::secrets::secret_string;
     use async_trait::async_trait;
@@ -948,6 +1120,7 @@ mod tests {
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -962,6 +1135,7 @@ mod tests {
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
             ],
             models: vec![ModelConfig {
@@ -1046,6 +1220,7 @@ mod tests {
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -1060,6 +1235,7 @@ mod tests {
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
             ],
             models: vec![ModelConfig {
@@ -1313,7 +1489,8 @@ mod tests {
         let router = build_test_router();
         let model = router.find_model("m").unwrap();
 
-        let (provider, output, attempts) = router.stream(model, &dummy_request()).await.unwrap();
+        let (provider, output, attempts, _ticket) =
+            router.stream(model, &dummy_request()).await.unwrap();
 
         assert_eq!(provider.name(), "backup");
         assert!(matches!(output, ProviderOutput::Stream(_)));
@@ -1331,6 +1508,112 @@ mod tests {
             other => panic!("expected RouteStep::Failed, got {other:?}"),
         }
         assert!(router.cooldown().is_cooling_down("primary").await);
+    }
+
+    /// Streaming twin of the rpm-exhaustion scenario: the gate refuses
+    /// pre-first-byte, the chain advances to backup, and the throttle is
+    /// a *local skip* — the provider must NOT land in the cooldown cache
+    /// (pacing exhaustion is transient local state, not an upstream
+    /// fault, so the provider stays available once the window slides).
+    #[tokio::test]
+    async fn stream_throttle_is_a_local_skip_without_cooldown() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "primary".to_string(),
+            Arc::new(MockProvider {
+                name: "primary".into(),
+                fail_status: 0,
+                fail_count: 0,
+                call_count: AtomicU32::new(0),
+            }) as SharedProvider,
+        );
+        providers.insert(
+            "backup".to_string(),
+            Arc::new(MockProvider {
+                name: "backup".into(),
+                fail_status: 0,
+                fail_count: 0,
+                call_count: AtomicU32::new(0),
+            }) as SharedProvider,
+        );
+        let cfg = Config {
+            server: Default::default(),
+            proxy: Default::default(),
+            user_agent: crate::config::default_user_agent(),
+            providers: vec![
+                ProviderConfig::OpenaiCompat {
+                    name: "primary".into(),
+                    api_key: secret_string("k"),
+                    api_base: "http://x".into(),
+                    model_rewrite: Default::default(),
+                    use_proxy: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
+                    rate_limit: Some(RateLimitConfig {
+                        rpm: Some(1),
+                        tpm: None,
+                        max_concurrency: None,
+                        max_wait_ms: Some(0),
+                    }),
+                },
+                ProviderConfig::OpenaiCompat {
+                    name: "backup".into(),
+                    api_key: secret_string("k"),
+                    api_base: "http://x".into(),
+                    model_rewrite: Default::default(),
+                    use_proxy: false,
+                    provider_ignore: Vec::new(),
+                    provider_allow: Vec::new(),
+                    reasoning_echo: false,
+
+                    user_agent: None,
+                    referer: None,
+                    headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
+                },
+            ],
+            models: vec![ModelConfig {
+                name: "m".into(),
+                primary: "primary".into(),
+                fallback_chain: vec!["backup".into()],
+                cooldown_seconds: 60,
+                max_retries_per_provider: 1,
+                max_retries_total: 3,
+            }],
+            ..Config::default()
+        };
+        let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
+        let model = router.find_model("m").unwrap();
+        let req = dummy_request();
+
+        // First request: admitted, served by the primary.
+        let (provider, output, attempts, _ticket) =
+            router.stream(model, &req).await.unwrap();
+        assert_eq!(provider.name(), "primary");
+        assert!(
+            attempts.is_empty(),
+            "healthy dispatch records no attempts, got {attempts:?}"
+        );
+        assert!(matches!(output, ProviderOutput::Stream(_)));
+
+        // Second request: the gate refuses instantly (max_wait 0 — the
+        // first request's entry is still inside the 60 s window) and the
+        // chain advances to backup. LocalSkip, never a cooldown.
+        let (provider, output, attempts, _ticket) =
+            router.stream(model, &req).await.unwrap();
+        assert_eq!(provider.name(), "backup");
+        assert!(matches!(output, ProviderOutput::Stream(_)));
+        assert_eq!(attempts.len(), 1, "the throttled primary is the only step");
+        expect_variant!(&attempts[0], RouteStep::LocalSkip { provider, reason } => {
+            assert_eq!(provider, "primary");
+            assert_eq!(*reason, LocalSkipReason::Throttled);
+        });
+        assert!(!router.cooldown().is_cooling_down("primary").await);
     }
 
     /// Streaming twin of `falls_back_on_429`: a 402 returned by primary's
@@ -1377,6 +1660,7 @@ mod tests {
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -1391,6 +1675,7 @@ mod tests {
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
             ],
             models: vec![ModelConfig {
@@ -1406,7 +1691,8 @@ mod tests {
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
 
-        let (provider, output, attempts) = router.stream(model, &dummy_request()).await.unwrap();
+        let (provider, output, attempts, _ticket) =
+            router.stream(model, &dummy_request()).await.unwrap();
 
         assert_eq!(provider.name(), "backup");
         assert!(matches!(output, ProviderOutput::Stream(_)));
@@ -1475,6 +1761,7 @@ mod tests {
                 user_agent: None,
                 referer: None,
                 headers: std::collections::BTreeMap::new(),
+                rate_limit: None,
             }],
             models: vec![ModelConfig {
                 name: "m".into(),
@@ -1637,7 +1924,7 @@ mod tests {
         let mut model = base.find_model("m").unwrap().clone();
         model.fallback_chain = vec!["missing".into(), "backup".into()];
 
-        let (provider, output, attempts) = router_clone_with(&base)
+        let (provider, output, attempts, _ticket) = router_clone_with(&base)
             .stream(&model, &dummy_request())
             .await
             .unwrap();
@@ -1695,6 +1982,7 @@ mod tests {
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -1709,6 +1997,7 @@ mod tests {
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
             ],
             models: vec![ModelConfig {
@@ -1776,6 +2065,7 @@ mod tests {
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -1790,6 +2080,7 @@ mod tests {
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
             ],
             models: vec![ModelConfig {
@@ -1885,6 +2176,7 @@ mod tests {
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -1899,6 +2191,7 @@ mod tests {
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
             ],
             models: vec![ModelConfig {
@@ -2092,6 +2385,7 @@ mod tests {
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -2106,6 +2400,7 @@ mod tests {
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
             ],
             models: vec![ModelConfig {
@@ -2283,6 +2578,7 @@ mod tests {
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -2297,6 +2593,7 @@ mod tests {
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
             ],
             models: vec![ModelConfig {
@@ -2312,7 +2609,8 @@ mod tests {
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
 
-        let (provider, _output, attempts) = router.stream(model, &dummy_request()).await.unwrap();
+        let (provider, _output, attempts, _ticket) =
+            router.stream(model, &dummy_request()).await.unwrap();
         assert_eq!(provider.name(), "backup");
         // The streaming twin of `complete_skips_provider_...`:
         // primary is unmappable, so it's recorded as a
@@ -2514,6 +2812,7 @@ mod tests {
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -2528,6 +2827,7 @@ mod tests {
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
             ],
             models: vec![ModelConfig {
@@ -2610,6 +2910,7 @@ mod tests {
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -2624,6 +2925,7 @@ mod tests {
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
             ],
             models: vec![ModelConfig {
@@ -2639,7 +2941,8 @@ mod tests {
         let router = Router::new(Arc::new(cfg), providers, CooldownCache::new());
         let model = router.find_model("m").unwrap();
 
-        let (provider, _out, attempts) = router.stream(model, &dummy_request()).await.unwrap();
+        let (provider, _out, attempts, _ticket) =
+            router.stream(model, &dummy_request()).await.unwrap();
         // Backup served the stream after primary was skipped.
         assert_eq!(provider.name(), "backup");
         assert_eq!(primary.call_count.load(Ordering::SeqCst), 1);
@@ -2700,6 +3003,7 @@ mod tests {
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
                 ProviderConfig::OpenaiCompat {
                     name: "backup".into(),
@@ -2714,6 +3018,7 @@ mod tests {
                     user_agent: None,
                     referer: None,
                     headers: std::collections::BTreeMap::new(),
+                    rate_limit: None,
                 },
             ],
             models: vec![ModelConfig {
@@ -2739,5 +3044,233 @@ mod tests {
             other => panic!("expected Upstream 400, got {other:?}"),
         }
         assert_eq!(primary.call_count.load(Ordering::SeqCst), 1);
+    }
+
+    // ─── attempt classification: FailReason / failure() / render ────────
+
+    fn failed_step(provider: &str, status: u16) -> RouteStep {
+        RouteStep::Failed {
+            provider: provider.to_string(),
+            status,
+            body: "boom".to_string(),
+        }
+    }
+
+    fn skipped_step(provider: &str, reason: LocalSkipReason) -> RouteStep {
+        RouteStep::LocalSkip {
+            provider: provider.to_string(),
+            reason,
+        }
+    }
+
+    #[test]
+    fn fail_reason_display_covers_every_classification() {
+        // One assertion per variant keeps the log vocabulary (`fail_reason=`)
+        // stable — a renamed label here silently changes operator greps.
+        assert_eq!(
+            derive_fail_reason(&[failed_step("p", 429)]).unwrap().to_string(),
+            "upstream"
+        );
+        assert_eq!(
+            derive_fail_reason(&[skipped_step("p", LocalSkipReason::Cooldown)])
+                .unwrap()
+                .to_string(),
+            "cooldown"
+        );
+        assert_eq!(
+            derive_fail_reason(&[skipped_step("p", LocalSkipReason::ModelUnmapped)])
+                .unwrap()
+                .to_string(),
+            "model_skip"
+        );
+        assert_eq!(
+            derive_fail_reason(&[skipped_step("p", LocalSkipReason::Throttled)])
+                .unwrap()
+                .to_string(),
+            "throttled"
+        );
+        assert_eq!(
+            derive_fail_reason(&[
+                skipped_step("p", LocalSkipReason::Cooldown),
+                skipped_step("b", LocalSkipReason::Throttled),
+            ])
+            .unwrap()
+            .to_string(),
+            "mixed"
+        );
+    }
+
+    #[test]
+    fn derive_fail_reason_shapes() {
+        assert_eq!(derive_fail_reason(&[]), None, "empty slice → None");
+        // Any upstream failure dominates, whatever the local skips say.
+        assert_eq!(
+            derive_fail_reason(&[
+                skipped_step("p", LocalSkipReason::Throttled),
+                failed_step("p", 429),
+            ]),
+            Some(FailReason::Upstream)
+        );
+        // A single skip class, no upstream call → that class.
+        assert_eq!(
+            derive_fail_reason(&[
+                skipped_step("a", LocalSkipReason::Cooldown),
+                skipped_step("b", LocalSkipReason::Cooldown),
+            ]),
+            Some(FailReason::Cooldown)
+        );
+        assert_eq!(
+            derive_fail_reason(&[skipped_step("a", LocalSkipReason::ModelUnmapped)]),
+            Some(FailReason::ModelSkip)
+        );
+        assert_eq!(
+            derive_fail_reason(&[
+                skipped_step("a", LocalSkipReason::Throttled),
+                skipped_step("b", LocalSkipReason::Throttled),
+            ]),
+            Some(FailReason::Throttled)
+        );
+    }
+
+    #[test]
+    fn local_skip_failure_labels_and_render() {
+        assert_eq!(
+            skipped_step("mm", LocalSkipReason::Throttled).failure().as_ref(),
+            "throttled"
+        );
+        assert_eq!(
+            skipped_step("mm", LocalSkipReason::Cooldown).failure().as_ref(),
+            "cooldown"
+        );
+        assert_eq!(
+            skipped_step("mm", LocalSkipReason::ModelUnmapped)
+                .failure()
+                .as_ref(),
+            "model_skip"
+        );
+        assert_eq!(skipped_step("mm", LocalSkipReason::Throttled).render(), "mm:throttled");
+        assert_eq!(failed_step("mm", 429).render(), "mm:429");
+    }
+
+    #[test]
+    fn last_failed_provider_scans_in_reverse() {
+        let steps = [
+            failed_step("first", 429),
+            skipped_step("skipped", LocalSkipReason::Cooldown),
+            failed_step("last", 503),
+        ];
+        assert_eq!(last_failed_provider(&steps), Some("last"));
+        assert_eq!(last_failed_provider(&[skipped_step("p", LocalSkipReason::Throttled)]), None);
+    }
+
+    #[test]
+    fn extract_output_usage_total_of_a_stream_output_is_zero() {
+        // A stream output carries no usage JSON: the helper contributes 0
+        // to the settle, so the pre-flight estimate stays charged (the
+        // conservative direction) instead of refunding unseen tokens.
+        let out = ProviderOutput::Stream(Box::new(stream::empty()));
+        assert_eq!(Router::extract_output_usage_total(&out), 0);
+    }
+
+    #[test]
+    fn settle_total_matches_compute_total_tokens() {        // The limiter's settle figure and the /admin/usage row's total
+        // must stay the same number: pin the trio (input + output +
+        // cache_creation; cache_read deliberately excluded by both) on
+        // both implementations so a change to either cannot silently
+        // diverge from the other.
+        let sample = serde_json::json!({
+            "usage": {
+                "input_tokens": 3,
+                "output_tokens": 7,
+                "cache_creation_input_tokens": 2,
+                "cache_read_input_tokens": 100,
+            }
+        });
+        let usage = crate::usage::StreamUsage {
+            input_tokens: Some(3),
+            output_tokens: Some(7),
+            cache_creation_input_tokens: Some(2),
+            cache_read_input_tokens: Some(100),
+            ..Default::default()
+        };
+        let via_router = Router::extract_output_usage_total(&ProviderOutput::Json(sample));
+        let via_usage_record =
+            crate::usage::UsageRecord::compute_total_tokens(Some(&usage));
+        assert_eq!(via_router, 12);
+        assert_eq!(via_router, via_usage_record);
+    }
+
+    /// A router whose `primary` carries the given `rate_limit` block.
+    fn router_with_rate_limit(rl: Option<RateLimitConfig>) -> Router {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "primary".to_string(),
+            Arc::new(MockProvider {
+                name: "primary".into(),
+                fail_status: 0,
+                fail_count: 0,
+                call_count: AtomicU32::new(0),
+            }) as SharedProvider,
+        );
+        let cfg = Config {
+            server: Default::default(),
+            proxy: Default::default(),
+            user_agent: crate::config::default_user_agent(),
+            providers: vec![ProviderConfig::OpenaiCompat {
+                name: "primary".into(),
+                api_key: secret_string("k"),
+                api_base: "http://x".into(),
+                model_rewrite: Default::default(),
+                use_proxy: false,
+                provider_ignore: Vec::new(),
+                provider_allow: Vec::new(),
+                reasoning_echo: false,
+
+                user_agent: None,
+                referer: None,
+                headers: std::collections::BTreeMap::new(),
+                rate_limit: rl,
+            }],
+            models: vec![ModelConfig {
+                name: "m".into(),
+                primary: "primary".into(),
+                fallback_chain: Vec::new(),
+                cooldown_seconds: 60,
+                max_retries_per_provider: 1,
+                max_retries_total: 1,
+            }],
+            ..Config::default()
+        };
+        Router::new(Arc::new(cfg), providers, CooldownCache::new())
+    }
+
+    #[test]
+    fn chain_token_estimate_is_skipped_when_no_limiter_counts_tokens() {
+        // The estimate exists for the TPM window only: an rpm-only (or
+        // concurrency-only) limiter must not pay for the request-text
+        // walk — the request path skips it entirely.
+        let chain = vec!["primary".to_string()];
+        let req = dummy_request();
+
+        let rpm_only = router_with_rate_limit(Some(RateLimitConfig {
+            rpm: Some(1),
+            tpm: None,
+            max_concurrency: None,
+            max_wait_ms: None,
+        }));
+        assert_eq!(
+            rpm_only.chain_token_estimate(&chain, &req),
+            None,
+            "an rpm-only limiter needs no token estimate"
+        );
+
+        let with_tpm = router_with_rate_limit(Some(RateLimitConfig {
+            rpm: None,
+            tpm: Some(1000),
+            max_concurrency: None,
+            max_wait_ms: None,
+        }));
+        let est = with_tpm.chain_token_estimate(&chain, &req).expect("tpm needs it");
+        assert!(est > 0, "the estimate must be computed for a tpm limiter");
     }
 }

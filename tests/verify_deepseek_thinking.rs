@@ -121,6 +121,7 @@ fn make_anthropic_config(name: &str, server: &MockServer) -> ProviderConfig {
         user_agent: None,
         referer: None,
         headers: std::collections::BTreeMap::new(),
+        rate_limit: None,
     }
 }
 
