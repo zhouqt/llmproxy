@@ -19,7 +19,17 @@
 [advisories]
 # Every entry needs a written rationale next to it. An empty list means
 # "no known vulnerability is tolerated".
-ignore = []
+ignore = [
+  # RUSTSEC-2026-0543 (2026-11): chrono is unmaintained. The advisory is
+  # informational -- it reports no vulnerability and explicitly says "no
+  # safe upgrade is available", so no version bump can clear it. chrono is
+  # used only for timestamps: parsing the RFC 3339 strings on the usage
+  # records and formatting the values we write back (src/usage.rs,
+  # src/server.rs). Migrating to one of the suggested replacements
+  # (`jiff` or `time`) is a separate change with its own review, not a
+  # dependency bump. Drop this entry when that migration lands.
+  "RUSTSEC-2026-0543",
+]
 # A yanked crate is a crate its author pulled. Depending on one is almost
 # always a mistake.
 yanked = "deny"
