@@ -681,7 +681,7 @@ version = "1.0.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.uuid]]
-version = "1.29.0"
+version = "1.29.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.valuable]]
