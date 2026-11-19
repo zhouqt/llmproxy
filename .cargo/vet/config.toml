@@ -12,10 +12,6 @@ criteria = "safe-to-deploy"
 version = "1.1.5"
 criteria = "safe-to-deploy"
 
-[[exemptions.android_system_properties]]
-version = "0.1.6"
-criteria = "safe-to-deploy"
-
 [[exemptions.annotate-snippets]]
 version = "0.12.17"
 criteria = "safe-to-deploy"
@@ -100,20 +96,12 @@ criteria = "safe-to-deploy"
 version = "0.10.2"
 criteria = "safe-to-deploy"
 
-[[exemptions.chrono]]
-version = "0.4.45"
-criteria = "safe-to-deploy"
-
 [[exemptions.compression-codecs]]
 version = "0.4.46"
 criteria = "safe-to-deploy"
 
 [[exemptions.compression-core]]
 version = "0.4.34"
-criteria = "safe-to-deploy"
-
-[[exemptions.core-foundation-sys]]
-version = "0.8.7"
 criteria = "safe-to-deploy"
 
 [[exemptions.core_detect]]
@@ -270,14 +258,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.hyper-util]]
 version = "0.1.21"
-criteria = "safe-to-deploy"
-
-[[exemptions.iana-time-zone]]
-version = "0.1.65"
-criteria = "safe-to-deploy"
-
-[[exemptions.iana-time-zone-haiku]]
-version = "0.1.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.icu_collections]]
@@ -752,28 +732,8 @@ criteria = "safe-to-deploy"
 version = "1.0.11"
 criteria = "safe-to-deploy"
 
-[[exemptions.windows-core]]
-version = "0.62.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-implement]]
-version = "0.60.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-interface]]
-version = "0.59.3"
-criteria = "safe-to-deploy"
-
 [[exemptions.windows-link]]
 version = "0.2.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-result]]
-version = "0.4.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-strings]]
-version = "0.5.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.windows-sys]]
