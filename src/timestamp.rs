@@ -407,3 +407,396 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let year = if month <= 2 { y + 1 } else { y };
     (year, month, day)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(s: &str) -> Timestamp {
+        Timestamp::parse_rfc3339(s).unwrap()
+    }
+
+    #[test]
+    fn formats_epoch_and_known_instants() {
+        assert_eq!(
+            Timestamp::from_unix(0, 0).unwrap().to_rfc3339(),
+            "1970-01-01T00:00:00Z"
+        );
+        assert_eq!(
+            Timestamp::from_unix(1_700_000_000, 0).unwrap().to_rfc3339(),
+            "2023-11-14T22:13:20Z"
+        );
+        assert_eq!(
+            Timestamp::from_unix(-1, 0).unwrap().to_rfc3339(),
+            "1969-12-31T23:59:59Z"
+        );
+        // Leap day of a leap year, and the day after a non-leap century.
+        assert_eq!(
+            Timestamp::from_unix(951_782_400, 0).unwrap().to_rfc3339(),
+            "2000-02-29T00:00:00Z"
+        );
+        assert_eq!(
+            Timestamp::from_unix(-2_203_891_200, 0)
+                .unwrap()
+                .to_rfc3339(),
+            "1900-03-01T00:00:00Z"
+        );
+        assert_eq!(
+            Timestamp::from_unix(-62_167_219_200, 0)
+                .unwrap()
+                .to_rfc3339(),
+            "0000-01-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn formats_out_of_range_years_with_explicit_sign() {
+        // chrono's write_rfc3339 uses `{year:+05}` outside 0..=9999.
+        assert_eq!(
+            Timestamp::from_unix(253_402_300_800, 0)
+                .unwrap()
+                .to_rfc3339(),
+            "+10000-01-01T00:00:00Z"
+        );
+        assert_eq!(
+            Timestamp::from_unix(-62_198_755_200, 0)
+                .unwrap()
+                .to_rfc3339(),
+            "-0001-01-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn formats_fractional_seconds_with_auto_si_digits() {
+        let base = 1_700_000_000;
+        let cases = [
+            (500_000_000, ".500"),
+            (123_000_000, ".123"),
+            (100_000_000, ".100"),
+            (123_456_000, ".123456"),
+            (120_000_000, ".120"),
+            (123_456_789, ".123456789"),
+            (1, ".000000001"),
+        ];
+        for (nanos, expected_suffix) in cases {
+            let ts = Timestamp::from_unix(base, nanos).unwrap();
+            assert_eq!(
+                ts.to_rfc3339(),
+                format!("2023-11-14T22:13:20{expected_suffix}Z")
+            );
+        }
+    }
+
+    #[test]
+    fn zero_nanos_has_no_fraction() {
+        let ts = Timestamp::from_unix(1_700_000_000, 0).unwrap();
+        assert!(!ts.to_rfc3339().contains('.'));
+    }
+
+    #[test]
+    fn from_unix_rejects_out_of_range_nanos() {
+        assert!(Timestamp::from_unix(0, 1_000_000_000).is_none());
+        assert!(Timestamp::from_unix(0, u32::MAX).is_none());
+    }
+
+    #[test]
+    fn unix_timestamp_floors_negative_fractions() {
+        let ts = Timestamp::from_unix(-1, 500_000_000).unwrap();
+        assert_eq!(ts.unix_timestamp(), -1);
+        assert_eq!(ts.unix_timestamp_nanos(), -500_000_000);
+    }
+
+    #[test]
+    fn parses_utc_and_offset_timestamps() {
+        assert_eq!(
+            parse("2026-09-09T10:00:00Z").to_rfc3339(),
+            "2026-09-09T10:00:00Z"
+        );
+        // Lowercase separators are legal RFC 3339.
+        assert_eq!(
+            parse("2026-09-09t10:00:00z").to_rfc3339(),
+            "2026-09-09T10:00:00Z"
+        );
+        // Space separator.
+        assert_eq!(
+            parse("2026-09-09 10:00:00Z").to_rfc3339(),
+            "2026-09-09T10:00:00Z"
+        );
+        // Offsets normalise to UTC.
+        assert_eq!(
+            parse("2026-09-09T18:00:00+08:00").to_rfc3339(),
+            "2026-09-09T10:00:00Z"
+        );
+        assert_eq!(
+            parse("2026-09-09T04:30:00-05:30").to_rfc3339(),
+            "2026-09-09T10:00:00Z"
+        );
+        assert_eq!(
+            parse("2026-09-09T10:00:00+00:00").to_rfc3339(),
+            "2026-09-09T10:00:00Z"
+        );
+        assert_eq!(
+            parse("2026-09-09T10:00:00-00:00").to_rfc3339(),
+            "2026-09-09T10:00:00Z"
+        );
+        // U+2212 MINUS SIGN, accepted by chrono's strict parser.
+        assert_eq!(
+            parse("2026-09-09T10:00:00\u{2212}08:00").to_rfc3339(),
+            "2026-09-09T18:00:00Z"
+        );
+        // Upper bound of the offset range.
+        assert_eq!(
+            parse("2026-09-09T10:00:00+23:59").to_rfc3339(),
+            "2026-09-08T10:01:00Z"
+        );
+    }
+
+    #[test]
+    fn parses_fractional_seconds() {
+        assert_eq!(
+            parse("2026-09-09T10:00:00.5Z").to_rfc3339(),
+            "2026-09-09T10:00:00.500Z"
+        );
+        assert_eq!(
+            parse("2026-09-09T10:00:00.123456Z").to_rfc3339(),
+            "2026-09-09T10:00:00.123456Z"
+        );
+        assert_eq!(
+            parse("2026-09-09T10:00:00.123456789Z").to_rfc3339(),
+            "2026-09-09T10:00:00.123456789Z"
+        );
+        // Digits beyond nanosecond precision are ignored.
+        assert_eq!(
+            parse("2026-09-09T10:00:00.123456789999Z").to_rfc3339(),
+            "2026-09-09T10:00:00.123456789Z"
+        );
+    }
+
+    #[test]
+    fn parses_leap_second_as_next_second() {
+        assert_eq!(
+            parse("2016-12-31T23:59:60Z").to_rfc3339(),
+            "2017-01-01T00:00:00Z"
+        );
+        assert_eq!(
+            parse("2016-12-31T23:59:60.0Z").to_rfc3339(),
+            "2017-01-01T00:00:00Z"
+        );
+        // chrono keeps a fractional leap second (59s + 1e9 + frac).
+        assert_eq!(
+            parse("2016-12-31T23:59:60.5Z").to_rfc3339(),
+            "2017-01-01T00:00:00.500Z"
+        );
+    }
+
+    #[test]
+    fn parse_round_trips_format_output() {
+        let cases = [
+            Timestamp::from_unix(0, 0).unwrap(),
+            Timestamp::from_unix(1_700_000_000, 0).unwrap(),
+            Timestamp::from_unix(1_700_000_000, 123_000_000).unwrap(),
+            Timestamp::from_unix(1_700_000_000, 123_456_789).unwrap(),
+            Timestamp::from_unix(-1, 0).unwrap(),
+            Timestamp::from_unix(-2_208_988_800, 500_000_000).unwrap(), // 1900-01-01
+            Timestamp::from_unix(-62_167_219_200, 0).unwrap(),          // 0000-01-01
+        ];
+        for ts in cases {
+            assert_eq!(parse(&ts.to_rfc3339()), ts);
+        }
+    }
+
+    #[test]
+    fn parse_rejects_invalid_calendar_fields() {
+        for bad in [
+            "2026-13-01T00:00:00Z",
+            "2026-00-01T00:00:00Z",
+            "2026-02-30T00:00:00Z",
+            "2026-02-29T00:00:00Z", // 2026 is not a leap year
+            "1900-02-29T00:00:00Z", // 1900 is not a leap year (century rule)
+            "2026-04-31T00:00:00Z",
+            "2026-09-00T00:00:00Z",
+            "2026-09-32T00:00:00Z",
+            "2026-09-09T24:00:00Z",
+            "2026-09-09T00:60:00Z",
+            "2026-09-09T00:00:61Z",
+        ] {
+            assert!(
+                Timestamp::parse_rfc3339(bad).is_err(),
+                "{bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_rejects_malformed_timestamps() {
+        for bad in [
+            "",
+            "2026-09-09T10:00:00",       // no zone
+            "2026-09-09T10:00:00+24:00", // offset out of range
+            "2026-09-09T10:00:00+08",    // colon required
+            "2026-09-09T10:00:00+0860",  // colon required
+            "2026-09-09T10:00:00+08:60", // minutes out of range
+            "2026-09-09T10:00:00Zx",     // trailing junk
+            "2026-09-09T10:00:00.Z",     // empty fraction
+            "2026-09-09T10:00:00.X",     // non-digit fraction
+            "2026-09-09X10:00:00Z",      // wrong date/time separator
+            "2026-09-09T10-00:00Z",      // wrong time separator
+            "2026-9-09T10:00:00Z",       // short month field
+            "2026-09-09T10:00:00+08:0Z",
+            "x026-09-09T10:00:00Z",
+            "2026-09-09T10:00:0", // too short
+        ] {
+            assert!(
+                Timestamp::parse_rfc3339(bad).is_err(),
+                "{bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn multibyte_input_is_rejected_without_panicking() {
+        for bad in [
+            "２０２６-09-09T10:00:00Z", // full-width digits in the year
+            "2026-０9-09T10:00:00Z",
+            "2026-09-09T10:00:00Zé", // trailing multi-byte character
+            "2026-09-09T10:00:00é",  // multi-byte where the zone belongs
+            "2026-09-09T10:00:00.éZ",
+            "2026-09-09T10:00:00−08",   // U+2212 without the offset
+            "2026-09-09T10:00:00−8:00", // U+2212 with a one-digit hour
+        ] {
+            assert!(
+                Timestamp::parse_rfc3339(bad).is_err(),
+                "{bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn error_message_is_human_readable() {
+        let err = Timestamp::parse_rfc3339("nope").unwrap_err();
+        assert!(!err.to_string().is_empty());
+        // It is a real `std::error::Error`.
+        fn assert_error<E: std::error::Error>(_: &E) {}
+        assert_error(&err);
+    }
+
+    #[test]
+    fn serde_round_trips_rfc3339_strings() {
+        let ts = Timestamp::from_unix(1_700_000_000, 123_000_000).unwrap();
+        let json = serde_json::to_string(&ts).unwrap();
+        assert_eq!(json, "\"2023-11-14T22:13:20.123Z\"");
+        let back: Timestamp = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ts);
+    }
+
+    #[test]
+    fn serde_deserialize_rejects_invalid_input() {
+        let err = serde_json::from_str::<Timestamp>("\"not a timestamp\"").unwrap_err();
+        assert!(err.to_string().contains("timestamp is too short"));
+        // Non-string JSON is a type error, not a panic.
+        for bad in ["42", "{\"a\":1}", "[1]", "null"] {
+            assert!(serde_json::from_str::<Timestamp>(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn system_time_to_parts_handles_both_epoch_sides() {
+        assert_eq!(
+            system_time_to_parts(UNIX_EPOCH + Duration::from_millis(500)),
+            (0, 500_000_000)
+        );
+        assert_eq!(
+            system_time_to_parts(UNIX_EPOCH - Duration::from_millis(500)),
+            (-1, 500_000_000)
+        );
+        assert_eq!(
+            system_time_to_parts(UNIX_EPOCH - Duration::from_secs(2)),
+            (-2, 0)
+        );
+        assert_eq!(system_time_to_parts(UNIX_EPOCH), (0, 0));
+    }
+
+    #[test]
+    fn now_is_near_system_time() {
+        let before = system_time_to_parts(SystemTime::now()).0;
+        let now = Timestamp::now();
+        let after = system_time_to_parts(SystemTime::now()).0;
+        assert!(now.unix_timestamp() >= before - 1);
+        assert!(now.unix_timestamp() <= after + 1);
+    }
+
+    #[test]
+    fn add_duration_carries_into_seconds() {
+        let ts = Timestamp::from_unix(1_700_000_000, 900_000_000).unwrap();
+        let later = ts + Duration::from_millis(200);
+        assert_eq!(later.to_rfc3339(), "2023-11-14T22:13:21.100Z");
+        let later = ts + Duration::from_secs(2);
+        assert_eq!(later.to_rfc3339(), "2023-11-14T22:13:22.900Z");
+        // Sub-second arithmetic within the same second.
+        let later = ts + Duration::from_nanos(1);
+        assert_eq!(later.unix_timestamp_nanos(), ts.unix_timestamp_nanos() + 1);
+    }
+
+    #[test]
+    fn add_duration_saturates_at_the_top_of_the_range() {
+        let ts = Timestamp::from_unix(i64::MAX, 0).unwrap();
+        let later = ts + Duration::from_secs(1);
+        assert_eq!(later.unix_timestamp(), i64::MAX);
+        let later = ts + Duration::from_millis(1_500);
+        assert_eq!(later.unix_timestamp(), i64::MAX);
+        assert_eq!(
+            later.unix_timestamp_nanos(),
+            i64::MAX as i128 * 1_000_000_000 + 500_000_000
+        );
+    }
+
+    #[test]
+    fn ordering_matches_time_order() {
+        let a = Timestamp::from_unix(1_700_000_000, 0).unwrap();
+        let b = Timestamp::from_unix(1_700_000_000, 1).unwrap();
+        let c = Timestamp::from_unix(1_700_000_001, 0).unwrap();
+        assert!(a < b && b < c);
+        let mut v = vec![c, a, b];
+        v.sort();
+        assert_eq!(v, vec![a, b, c]);
+        assert_eq!(a, Timestamp::from_unix(1_700_000_000, 0).unwrap());
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn display_and_debug_use_rfc3339() {
+        let ts = Timestamp::from_unix(0, 0).unwrap();
+        assert_eq!(ts.to_string(), "1970-01-01T00:00:00Z");
+        assert_eq!(format!("{ts:?}"), "Timestamp(1970-01-01T00:00:00Z)");
+    }
+
+    #[test]
+    fn hash_is_consistent_with_equality() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        assert!(set.insert(Timestamp::from_unix(0, 0).unwrap()));
+        assert!(!set.insert(Timestamp::from_unix(0, 0).unwrap()));
+    }
+
+    #[test]
+    fn civil_and_days_are_inverse() {
+        for days in [-800_000i64, -719_468, -1, 0, 1, 10_957, 19_000, 2_932_896] {
+            let (y, m, d) = civil_from_days(days);
+            assert_eq!(days_from_civil(y, m, d), days, "days={days} -> {y}-{m}-{d}");
+        }
+    }
+
+    #[test]
+    fn leap_year_rule() {
+        assert!(is_leap_year(2000));
+        assert!(is_leap_year(2024));
+        assert!(!is_leap_year(1900));
+        assert!(!is_leap_year(2026));
+        assert_eq!(days_in_month(2000, 2), 29);
+        assert_eq!(days_in_month(1900, 2), 28);
+        assert_eq!(days_in_month(2026, 2), 28);
+        assert_eq!(days_in_month(2026, 4), 30);
+        assert_eq!(days_in_month(2026, 12), 31);
+        assert_eq!(days_in_month(2026, 13), 0);
+    }
+}

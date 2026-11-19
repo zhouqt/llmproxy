@@ -2266,13 +2266,13 @@ async fn admin_models_reports_fetch_failed_for_provider_without_catalog() {
 //   - collection path coverage: non-streaming + streaming record a row
 // ---------------------------------------------------------------------------
 
-use chrono::{DateTime, Utc};
 use llmproxy::secrets::secret_string;
+use llmproxy::timestamp::Timestamp;
 use llmproxy::usage::StreamUsage;
 
-fn ts(s: &str) -> DateTime<Utc> {
+fn ts(s: &str) -> Timestamp {
     // RFC 3339 fixed timestamp; the offset is normalized to UTC.
-    DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    Timestamp::parse_rfc3339(s).unwrap()
 }
 
 fn mk_record(
@@ -2297,7 +2297,7 @@ fn mk_record(
     let total_tokens = UsageRecord::compute_total_tokens(Some(&usage));
     UsageRecord {
         started_at: sa,
-        ended_at: sa + chrono::Duration::milliseconds(100),
+        ended_at: sa + std::time::Duration::from_millis(100),
         elapsed_ms: 100,
         provider: provider.into(),
         model: model.into(),
