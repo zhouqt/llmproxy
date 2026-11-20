@@ -12,7 +12,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{middleware, Json, Router as AxumRouter};
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
 use futures_util::Stream;
 use serde::Deserialize;
 use serde_json::json;
@@ -23,6 +22,7 @@ use crate::extractor::{AppJson, AppMessages, AppQuery, InboundBodyLimit};
 use crate::providers::ProviderOutput;
 use crate::rate_limit::RateTicket;
 use crate::state::AppState;
+use crate::timestamp::Timestamp;
 use crate::tokenize::estimate_request_tokens;
 use crate::usage::{
     Outcome, StreamUsage, UsageRecord, UsageScanner, UsageStats, DEFAULT_LIMIT, MAX_LIMIT,
@@ -292,7 +292,7 @@ async fn messages_inner(state: &AppState, req: MessagesRequest) -> Result<Respon
     let elapsed_ms = start.elapsed_ms();
     state.usage.record(UsageRecord {
         started_at: start.started_at(),
-        ended_at: Utc::now(),
+        ended_at: Timestamp::now(),
         elapsed_ms,
         provider: provider_label.clone(),
         model: req.model.clone(),
@@ -393,7 +393,7 @@ async fn messages_inner(state: &AppState, req: MessagesRequest) -> Result<Respon
 }
 
 /// Pair a monotonic `Instant` (for elapsed math) with the
-/// wall-clock `DateTime<Utc>` captured at the same moment. Review
+/// wall-clock `Timestamp` captured at the same moment. Review
 /// #4 forbids deriving wall-clock from `Instant` (NTP corrections
 /// and host suspend/resume would corrupt it). Review #1 caught that
 /// `start.elapsed()` was being read twice — once for `started_at`,
@@ -403,21 +403,21 @@ async fn messages_inner(state: &AppState, req: MessagesRequest) -> Result<Respon
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct StartedAt {
     pub instant: Instant,
-    pub wall: DateTime<Utc>,
+    pub wall: Timestamp,
 }
 
 impl StartedAt {
     pub fn now() -> Self {
         // Capture wall-clock before the Instant so `wall` is the
         // first observable timestamp — never behind `ended_at`.
-        let wall = Utc::now();
+        let wall = Timestamp::now();
         let instant = Instant::now();
         Self { instant, wall }
     }
 
     /// Wall-clock start of the request. Review #4: never derived from
     /// `Instant`. This is the snapshot we took at entry.
-    pub fn started_at(&self) -> DateTime<Utc> {
+    pub fn started_at(&self) -> Timestamp {
         self.wall
     }
 
@@ -654,7 +654,7 @@ fn record_errored(
 ) {
     stats.record(UsageRecord {
         started_at: start.started_at(),
-        ended_at: Utc::now(),
+        ended_at: Timestamp::now(),
         elapsed_ms: start.elapsed_ms(),
         provider: provider.to_string(),
         model: model.to_string(),
@@ -1027,7 +1027,7 @@ impl MappedStream {
         let Some(scanner) = self.usage_scanner.take() else {
             return;
         };
-        let ended_at = Utc::now();
+        let ended_at = Timestamp::now();
         let saw_error = scanner.saw_error();
         let usage = scanner.finalize();
         let total_tokens = UsageRecord::compute_total_tokens(Some(&usage));
@@ -1664,9 +1664,8 @@ fn group_by_label(g: crate::usage::GroupBy) -> &'static str {
     }
 }
 
-fn parse_rfc3339(s: &str) -> crate::error::Result<chrono::DateTime<Utc>> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .map(|d| d.with_timezone(&Utc))
+fn parse_rfc3339(s: &str) -> crate::error::Result<Timestamp> {
+    Timestamp::parse_rfc3339(s)
         .map_err(|e| ProxyError::BadRequest(format!("invalid RFC3339 timestamp: {e}")))
 }
 /// Trigger GitHub Copilot OAuth bootstrap on demand.

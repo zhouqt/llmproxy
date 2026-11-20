@@ -20,6 +20,7 @@ pub mod server;
 pub mod state;
 #[cfg(test)]
 pub mod test_support;
+pub mod timestamp;
 pub mod tokenize;
 pub mod tracing_capture;
 pub mod usage;

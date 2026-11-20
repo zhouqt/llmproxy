@@ -22,7 +22,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+
+use crate::timestamp::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -87,7 +88,8 @@ pub enum Outcome {
 /// One row in the `/admin/usage` snapshot.
 ///
 /// `started_at` and `ended_at` are RFC 3339 strings on the wire
-/// (chrono default `to_rfc3339`). `elapsed_ms` has different semantics
+/// ([`Timestamp`]'s `AutoSi` formatter, identical to the previous
+/// `chrono` output). `elapsed_ms` has different semantics
 /// across collection sites:
 ///
 /// - non-streaming: identical to the `"request completed"` log
@@ -97,8 +99,8 @@ pub enum Outcome {
 ///   at time-to-first-byte.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageRecord {
-    pub started_at: DateTime<Utc>,
-    pub ended_at: DateTime<Utc>,
+    pub started_at: Timestamp,
+    pub ended_at: Timestamp,
     pub elapsed_ms: u64,
     pub provider: String,
     pub model: String,
@@ -357,7 +359,7 @@ pub struct UsageStats {
     /// Wall-clock store creation. Surfaces as `started_at` in the
     /// endpoint response so clients can distinguish accumulated
     /// history from "since the last restart".
-    started_at: DateTime<Utc>,
+    started_at: Timestamp,
     /// Cumulative eviction count, bumped every time `record()` drops
     /// the oldest entry at capacity. Surfaced via `/admin/usage` so
     /// an undersized capacity is observable, not silent.
@@ -415,7 +417,7 @@ impl UsageStats {
         Self {
             inner,
             capacity: effective,
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             evicted_total: Arc::new(AtomicU64::new(0)),
             // `1` → first eviction always logs. Subsequent thresholds
             // are `prev + capacity/10`.
@@ -431,7 +433,7 @@ impl UsageStats {
     /// `/admin/usage` endpoint so consumers can distinguish
     /// "accumulated history" from "since the last restart" (plan
     /// L434-438, L610-615).
-    pub fn started_at(&self) -> DateTime<Utc> {
+    pub fn started_at(&self) -> Timestamp {
         self.started_at
     }
 
@@ -504,8 +506,8 @@ impl UsageStats {
     /// L462-464, L593).
     pub fn snapshot(
         &self,
-        since: Option<DateTime<Utc>>,
-        until: Option<DateTime<Utc>>,
+        since: Option<Timestamp>,
+        until: Option<Timestamp>,
         limit: Option<usize>,
     ) -> Vec<UsageRecord> {
         if self.capacity == 0 {
@@ -546,8 +548,8 @@ impl UsageStats {
     /// order (caller decides limit vs rollup).
     pub fn snapshot_filtered(
         &self,
-        since: Option<DateTime<Utc>>,
-        until: Option<DateTime<Utc>>,
+        since: Option<Timestamp>,
+        until: Option<Timestamp>,
         model: Option<&str>,
         provider: Option<&str>,
     ) -> Vec<UsageRecord> {
@@ -580,8 +582,8 @@ impl UsageStats {
     /// skews totals (plan L591, L601).
     pub fn query(
         &self,
-        since: Option<DateTime<Utc>>,
-        until: Option<DateTime<Utc>>,
+        since: Option<Timestamp>,
+        until: Option<Timestamp>,
         model: Option<&str>,
         provider: Option<&str>,
         group_by: GroupBy,
@@ -1387,11 +1389,10 @@ fn _assert_send_sync() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
     use std::time::Duration;
 
-    fn ts(s: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    fn ts(s: &str) -> Timestamp {
+        Timestamp::parse_rfc3339(s).unwrap()
     }
 
     fn scanner() -> UsageScanner {
@@ -1679,8 +1680,8 @@ mod tests {
         let stats = UsageStats::new(8);
         for i in 0..3u32 {
             stats.record(UsageRecord {
-                started_at: Utc.timestamp_opt(1_700_000_000 + i as i64, 0).unwrap(),
-                ended_at: Utc.timestamp_opt(1_700_000_000 + i as i64, 0).unwrap(),
+                started_at: Timestamp::from_unix(1_700_000_000 + i as i64, 0).unwrap(),
+                ended_at: Timestamp::from_unix(1_700_000_000 + i as i64, 0).unwrap(),
                 elapsed_ms: i as u64,
                 provider: "p".into(),
                 model: "m".into(),
@@ -1705,8 +1706,8 @@ mod tests {
         let stats = UsageStats::new(2);
         for i in 0..4u32 {
             stats.record(UsageRecord {
-                started_at: Utc.timestamp_opt(1_700_000_000 + i as i64, 0).unwrap(),
-                ended_at: Utc.timestamp_opt(1_700_000_000 + i as i64, 0).unwrap(),
+                started_at: Timestamp::from_unix(1_700_000_000 + i as i64, 0).unwrap(),
+                ended_at: Timestamp::from_unix(1_700_000_000 + i as i64, 0).unwrap(),
                 elapsed_ms: 0,
                 provider: "p".into(),
                 model: "m".into(),
@@ -1722,11 +1723,11 @@ mod tests {
         assert_eq!(snap.len(), 2);
         assert_eq!(
             snap[0].started_at,
-            Utc.timestamp_opt(1_700_000_002, 0).unwrap()
+            Timestamp::from_unix(1_700_000_002, 0).unwrap()
         );
         assert_eq!(
             snap[1].started_at,
-            Utc.timestamp_opt(1_700_000_003, 0).unwrap()
+            Timestamp::from_unix(1_700_000_003, 0).unwrap()
         );
     }
 
@@ -1776,7 +1777,7 @@ mod tests {
     async fn usage_stats_snapshot_filters_by_time_window_and_limit() {
         let stats = UsageStats::new(8);
         for i in 0..5u32 {
-            let t = Utc.timestamp_opt(1_700_000_000 + i as i64, 0).unwrap();
+            let t = Timestamp::from_unix(1_700_000_000 + i as i64, 0).unwrap();
             stats.record(UsageRecord {
                 started_at: t,
                 ended_at: t,
@@ -1791,17 +1792,17 @@ mod tests {
             });
         }
         // Window covers the middle three (i=1,2,3); limit caps at 2.
-        let since = Utc.timestamp_opt(1_700_000_001, 0).unwrap();
-        let until = Utc.timestamp_opt(1_700_000_003, 0).unwrap();
+        let since = Timestamp::from_unix(1_700_000_001, 0).unwrap();
+        let until = Timestamp::from_unix(1_700_000_003, 0).unwrap();
         let snap = stats.snapshot(Some(since), Some(until), Some(2));
         assert_eq!(snap.len(), 2);
         assert_eq!(
             snap[0].started_at,
-            Utc.timestamp_opt(1_700_000_001, 0).unwrap()
+            Timestamp::from_unix(1_700_000_001, 0).unwrap()
         );
         assert_eq!(
             snap[1].started_at,
-            Utc.timestamp_opt(1_700_000_002, 0).unwrap()
+            Timestamp::from_unix(1_700_000_002, 0).unwrap()
         );
     }
 
@@ -1930,8 +1931,8 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 for _ in 0..4 {
                     s.record(UsageRecord {
-                        started_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
-                        ended_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+                        started_at: Timestamp::from_unix(1_700_000_000, 0).unwrap(),
+                        ended_at: Timestamp::from_unix(1_700_000_000, 0).unwrap(),
                         elapsed_ms: 0,
                         provider: "p".into(),
                         model: "m".into(),
@@ -2393,8 +2394,8 @@ mod tests {
         // Three records with distinct started_at values, then exercise
         // each filter branch in turn.
         let mk = |secs: i64| UsageRecord {
-            started_at: Utc.timestamp_opt(1_700_000_000 + secs, 0).unwrap(),
-            ended_at: Utc.timestamp_opt(1_700_000_000 + secs, 0).unwrap(),
+            started_at: Timestamp::from_unix(1_700_000_000 + secs, 0).unwrap(),
+            ended_at: Timestamp::from_unix(1_700_000_000 + secs, 0).unwrap(),
             elapsed_ms: 0,
             provider: "p".into(),
             model: "m".into(),
@@ -2410,15 +2411,15 @@ mod tests {
 
         // since=10 inclusive (>=), until=20 exclusive (<) per plan
         // L604-605 → only the record at exactly 10 falls in [10, 20).
-        let since = Utc.timestamp_opt(1_700_000_010, 0).unwrap();
-        let until = Utc.timestamp_opt(1_700_000_020, 0).unwrap();
+        let since = Timestamp::from_unix(1_700_000_010, 0).unwrap();
+        let until = Timestamp::from_unix(1_700_000_020, 0).unwrap();
         let snap = stats.snapshot(Some(since), Some(until), None);
         assert_eq!(snap.len(), 1);
 
         // Half-open windows compose: query [0, 10) then [10, 20)
         // covers every row exactly once.
-        let from_zero = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
-        let until_ten = Utc.timestamp_opt(1_700_000_010, 0).unwrap();
+        let from_zero = Timestamp::from_unix(1_700_000_000, 0).unwrap();
+        let until_ten = Timestamp::from_unix(1_700_000_010, 0).unwrap();
         let snap = stats.snapshot(Some(from_zero), Some(until_ten), None);
         assert_eq!(snap.len(), 1);
 
@@ -2435,7 +2436,7 @@ mod tests {
         assert_eq!(snap.len(), 2);
         // until=10 exclusive (<) — record at exactly 10 is excluded, so
         // only the record at 0 falls in (-inf, 10).
-        let until_only = Utc.timestamp_opt(1_700_000_010, 0).unwrap();
+        let until_only = Timestamp::from_unix(1_700_000_010, 0).unwrap();
         let snap = stats.snapshot(None, Some(until_only), None);
         assert_eq!(snap.len(), 1);
     }
@@ -2447,8 +2448,8 @@ mod tests {
         // follow-up snapshot() to assert the empty buffer path.
         let stats = UsageStats::new(0);
         let rec = UsageRecord {
-            started_at: Utc.timestamp_opt(1, 0).unwrap(),
-            ended_at: Utc.timestamp_opt(1, 0).unwrap(),
+            started_at: Timestamp::from_unix(1, 0).unwrap(),
+            ended_at: Timestamp::from_unix(1, 0).unwrap(),
             elapsed_ms: 0,
             provider: "p".into(),
             model: "m".into(),
@@ -2470,8 +2471,8 @@ mod tests {
         usage: Option<StreamUsage>,
     ) -> UsageRecord {
         UsageRecord {
-            started_at: Utc.timestamp_opt(secs, 0).unwrap(),
-            ended_at: Utc.timestamp_opt(secs, 0).unwrap(),
+            started_at: Timestamp::from_unix(secs, 0).unwrap(),
+            ended_at: Timestamp::from_unix(secs, 0).unwrap(),
             elapsed_ms: 0,
             provider: provider.into(),
             model: model.into(),
@@ -2686,7 +2687,7 @@ mod tests {
         stats.record(mk_with_usage(1, "p", "m", None));
         stats.record(mk_with_usage(2, "p", "m", None));
         assert_eq!(stats.retained(), 2);
-        let from_epoch = Utc.timestamp_opt(1, 0).unwrap();
+        let from_epoch = Timestamp::from_unix(1, 0).unwrap();
         // snapshot() with a window that excludes everything returns 0
         // but `retained()` keeps reporting the absolute store size.
         let snap = stats.snapshot(Some(from_epoch), Some(from_epoch), None);
@@ -2698,8 +2699,8 @@ mod tests {
     async fn usage_stats_evicts_oldest_when_over_capacity() {
         let stats = UsageStats::new(2);
         let mk = |secs: i64| UsageRecord {
-            started_at: Utc.timestamp_opt(secs, 0).unwrap(),
-            ended_at: Utc.timestamp_opt(secs, 0).unwrap(),
+            started_at: Timestamp::from_unix(secs, 0).unwrap(),
+            ended_at: Timestamp::from_unix(secs, 0).unwrap(),
             elapsed_ms: 0,
             provider: "p".into(),
             model: "m".into(),
@@ -2715,8 +2716,8 @@ mod tests {
         let snap = stats.snapshot(None, None, None);
         assert_eq!(snap.len(), 2);
         // Oldest (secs=1) evicted.
-        assert_eq!(snap[0].started_at.timestamp(), 2);
-        assert_eq!(snap[1].started_at.timestamp(), 3);
+        assert_eq!(snap[0].started_at.unix_timestamp(), 2);
+        assert_eq!(snap[1].started_at.unix_timestamp(), 3);
     }
 
     #[test]
@@ -2750,8 +2751,8 @@ mod tests {
         // single eviction (1 → 2 → 3 → ...).
         let stats = UsageStats::new(4);
         let mk = |secs: i64| UsageRecord {
-            started_at: Utc.timestamp_opt(secs, 0).unwrap(),
-            ended_at: Utc.timestamp_opt(secs, 0).unwrap(),
+            started_at: Timestamp::from_unix(secs, 0).unwrap(),
+            ended_at: Timestamp::from_unix(secs, 0).unwrap(),
             elapsed_ms: 0,
             provider: "p".into(),
             model: "m".into(),
