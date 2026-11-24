@@ -416,4 +416,41 @@ mod tests {
         assert!(!is_openrouter_api_base("not-a-url"));
         assert!(!is_openrouter_api_base(""));
     }
+
+    #[test]
+    fn openrouter_provider_object_omits_absent_and_empty_blocks() {
+        assert!(openrouter_provider_object(None).is_none());
+        assert!(
+            openrouter_provider_object(Some(&crate::config::ProviderRouting::default()))
+                .is_none(),
+            "an all-absent block must not emit `provider: {{}}`"
+        );
+
+        let routing = crate::config::ProviderRouting {
+            ignore: Some(vec!["Azure".to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            openrouter_provider_object(Some(&routing)),
+            Some(serde_json::json!({"ignore": ["Azure"]}))
+        );
+    }
+
+    #[test]
+    fn routing_summary_counts_lists_and_renders_the_rest() {
+        use crate::config::ProviderRouting;
+        let routing = ProviderRouting {
+            only: Some(vec!["DeepInfra".to_string(), "Together".to_string()]),
+            ignore: Some(vec!["Azure".to_string()]),
+            allow_fallbacks: Some(false),
+            data_collection: Some(crate::config::DataCollection::Deny),
+            ..Default::default()
+        };
+        // `serde_json::Map` iteration is key-sorted, so the order is
+        // deterministic: allow_fallbacks < data_collection < ignore < only.
+        assert_eq!(
+            routing_summary(&routing),
+            "allow_fallbacks:false,data_collection:deny,ignore:1,only:2"
+        );
+    }
 }

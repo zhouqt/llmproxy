@@ -3278,4 +3278,156 @@ mod tests {
         let est = with_tpm.chain_token_estimate(&chain, &req).expect("tpm needs it");
         assert!(est > 0, "the estimate must be computed for a tpm limiter");
     }
+    // ─── provider_routing: 503 warning (plan §6.1) ────────────────────
+
+    /// A router whose primary fails with `status`, optionally carrying a
+    /// `provider_routing` block on an OpenRouter host.
+    fn build_router_with_routing(
+        status: u16,
+        routing: Option<crate::config::ProviderRouting>,
+    ) -> Router {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "primary".to_string(),
+            Arc::new(MockProvider {
+                name: "primary".into(),
+                fail_status: status,
+                fail_count: u32::MAX,
+                call_count: AtomicU32::new(0),
+            }) as SharedProvider,
+        );
+        providers.insert(
+            "backup".to_string(),
+            Arc::new(MockProvider {
+                name: "backup".into(),
+                fail_status: 0,
+                fail_count: 0,
+                call_count: AtomicU32::new(0),
+            }) as SharedProvider,
+        );
+        let compat = |name: &str, routing| ProviderConfig::OpenaiCompat {
+            name: name.into(),
+            api_key: secret_string("k"),
+            api_base: "https://openrouter.ai/api/v1".into(),
+            model_rewrite: Default::default(),
+            use_proxy: false,
+            provider_routing: routing,
+            reasoning_echo: false,
+            user_agent: None,
+            referer: None,
+            headers: std::collections::BTreeMap::new(),
+            rate_limit: None,
+        };
+        let cfg = Config {
+            providers: vec![compat("primary", routing), compat("backup", None)],
+            models: vec![ModelConfig {
+                name: "m".into(),
+                primary: "primary".into(),
+                fallback_chain: vec!["backup".into()],
+                cooldown_seconds: 60,
+                max_retries_per_provider: 1,
+                max_retries_total: 3,
+            }],
+            ..Config::default()
+        };
+        Router::new(Arc::new(cfg), providers, CooldownCache::new())
+    }
+
+    /// 503 + a routing block → the unsatisfiable-policy WARN fires, the
+    /// chain still falls through, and the cooldown TTL stays the fixed
+    /// 5 s (not `cooldown_seconds`).
+    #[tokio::test]
+    async fn a_503_with_a_routing_block_warns_and_keeps_the_five_second_cooldown() {
+        let capture = crate::tracing_capture::TracingCapture::install();
+        let routing = crate::config::ProviderRouting {
+            sort: Some(crate::config::SortPreference::Name(
+                crate::config::SortKey::Throughput,
+            )),
+            only: Some(vec!["DeepInfra".into()]),
+            ..Default::default()
+        };
+        let router = build_router_with_routing(503, Some(routing));
+        let model = router.find_model("m").unwrap();
+
+        let (_, _, served) = router
+            .complete(model, &dummy_request())
+            .await
+            .expect("backup serves the request");
+        assert_eq!(served.as_deref(), Some("backup"));
+
+        let log = capture.take();
+        assert!(
+            log.contains("upstream 503 on a provider with provider_routing"),
+            "expected the routing 503 WARN, got:\n{log}"
+        );
+        assert!(log.contains("sort"), "the block summary must be logged: {log}");
+        let active = router.cooldown().active().await;
+        let (_, status, remaining) = active
+            .iter()
+            .find(|(name, _, _)| name == "primary")
+            .expect("primary cooled down");
+        assert_eq!(*status, 503);
+        assert!(
+            *remaining <= Duration::from_secs(5),
+            "503 uses the fixed 5 s TTL, got {remaining:?}"
+        );
+    }
+
+    /// The gate is block-presence, not upstream wording: a differently
+    /// worded 503 still warns.
+    #[tokio::test]
+    async fn the_routing_503_warn_does_not_depend_on_the_upstream_wording() {
+        let capture = crate::tracing_capture::TracingCapture::install();
+        let router = build_router_with_routing(
+            503,
+            Some(crate::config::ProviderRouting {
+                max_price: Some(crate::config::MaxPrice {
+                    completion: Some("1.20".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        );
+        let model = router.find_model("m").unwrap();
+        let _ = router.complete(model, &dummy_request()).await.unwrap();
+        let log = capture.take();
+        assert!(
+            log.contains("upstream 503 on a provider with provider_routing"),
+            "{log}"
+        );
+    }
+
+    /// A 503 without a routing block, and a non-503 with one, are
+    /// ordinary routing events and must not emit the warning.
+    #[tokio::test]
+    async fn the_routing_503_warn_is_scoped_to_the_503_plus_block_case() {
+        // 503, no block.
+        let capture = crate::tracing_capture::TracingCapture::install();
+        let router = build_router_with_routing(503, None);
+        let model = router.find_model("m").unwrap();
+        let _ = router.complete(model, &dummy_request()).await.unwrap();
+        let log = capture.take();
+        assert!(
+            !log.contains("upstream 503 on a provider with provider_routing"),
+            "a provider without a routing block must not warn: {log}"
+        );
+        drop(capture);
+
+        // 429, block present.
+        let capture = crate::tracing_capture::TracingCapture::install();
+        let router = build_router_with_routing(
+            429,
+            Some(crate::config::ProviderRouting {
+                only: Some(vec!["DeepInfra".into()]),
+                ..Default::default()
+            }),
+        );
+        let model = router.find_model("m").unwrap();
+        let _ = router.complete(model, &dummy_request()).await.unwrap();
+        let log = capture.take();
+        assert!(
+            !log.contains("upstream 503 on a provider with provider_routing"),
+            "a 429 must not warn: {log}"
+        );
+    }
 }

@@ -807,6 +807,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        DataCollection, LatencyCutoffs, MaxPrice, Partition, PercentileMap, Quantization,
+        SortConfig, SortKey, SortPreference, ThroughputCutoffs,
+    };
     use crate::expect_variant;
     use crate::secrets::secret_string;
     use crate::test_support::JsonFieldAbsent;
@@ -2665,6 +2669,217 @@ mod tests {
             }),
             "both sub-fields must share one `provider` object"
         );
+    }
+
+    /// A routing block exercising every key, including explicit `false`
+    /// values and string `max_price` entries.
+    fn full_routing() -> ProviderRouting {
+        ProviderRouting {
+            only: Some(vec!["DeepInfra".to_string()]),
+            ignore: Some(vec!["Azure".to_string()]),
+            sort: Some(SortPreference::Config(SortConfig {
+                by: Some(SortKey::Throughput),
+                partition: Some(Partition::Model),
+            })),
+            order: Some(vec!["DeepInfra".to_string()]),
+            allow_fallbacks: Some(false),
+            require_parameters: Some(false),
+            data_collection: Some(DataCollection::Deny),
+            zdr: Some(true),
+            enforce_distillable_text: Some(false),
+            quantizations: Some(vec![Quantization::Fp8, Quantization::Int8]),
+            max_price: Some(MaxPrice {
+                prompt: Some("0.50".to_string()),
+                completion: Some("1.5".to_string()),
+                ..Default::default()
+            }),
+            preferred_min_throughput: Some(ThroughputCutoffs::Number(50.0)),
+            preferred_max_latency: Some(LatencyCutoffs::Percentiles(PercentileMap {
+                p90: Some(2.0),
+                p99: Some(4.5),
+                ..Default::default()
+            })),
+        }
+    }
+
+    /// Every `provider_routing` key must reach the wire inside ONE
+    /// `provider` object, verbatim: `max_price` values stay strings,
+    /// explicit `false` values survive serialization (field-omission is
+    /// correctness in this repo — a vanished `allow_fallbacks: false`
+    /// changes the upstream's behaviour), and `sort` keeps the object
+    /// form.
+    #[tokio::test]
+    async fn complete_forwards_the_full_provider_routing_block() {
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(move |req: &wiremock::Request| {
+                *captured_for_responder.lock().unwrap() =
+                    Some(serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({})));
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "msg_ok",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "model": "claude-model",
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new_for_test(
+            "openrouter_ds".to_string(),
+            secret_string("k"),
+            format!("{}/", server.uri()),
+            HashMap::new(),
+            Some(full_routing()),
+            true,
+            ThinkingWhenAbsent::Omit,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let _ = provider
+            .complete(&request(false), &empty_rewrite())
+            .await
+            .unwrap();
+
+        let sent = captured.lock().unwrap().clone().expect("body captured");
+        assert_eq!(
+            sent["provider"],
+            json!({
+                "only": ["DeepInfra"],
+                "ignore": ["Azure"],
+                "sort": {"by": "throughput", "partition": "model"},
+                "order": ["DeepInfra"],
+                "allow_fallbacks": false,
+                "require_parameters": false,
+                "data_collection": "deny",
+                "zdr": true,
+                "enforce_distillable_text": false,
+                "quantizations": ["fp8", "int8"],
+                "max_price": {"prompt": "0.50", "completion": "1.5"},
+                "preferred_min_throughput": 50.0,
+                "preferred_max_latency": {"p90": 2.0, "p99": 4.5}
+            })
+        );
+    }
+
+    /// OpenRouter's `/messages` accepts a client-supplied `provider`
+    /// object; the config block must REPLACE it wholesale — no merging,
+    /// no intersection, nothing of the client's policy may leak through.
+    #[tokio::test]
+    async fn a_client_supplied_provider_object_is_replaced_by_the_config_block() {
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(move |req: &wiremock::Request| {
+                *captured_for_responder.lock().unwrap() =
+                    Some(serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({})));
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "msg_ok",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "model": "claude-model",
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new_for_test(
+            "openrouter_ds".to_string(),
+            secret_string("k"),
+            format!("{}/", server.uri()),
+            HashMap::new(),
+            routing(&["Azure"], &["DeepInfra"]),
+            true,
+            ThinkingWhenAbsent::Omit,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        // `provider` is not a typed field, so it lands in `extra`.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 32,
+            "stream": false,
+            "messages": [{"role": "user", "content": "hello"}],
+            "provider": {"only": ["ClientChoice"], "sort": "latency"}
+        }))
+        .unwrap();
+
+        let _ = provider.complete(&req, &empty_rewrite()).await.unwrap();
+
+        let sent = captured.lock().unwrap().clone().expect("body captured");
+        assert_eq!(
+            sent["provider"],
+            json!({"only": ["DeepInfra"], "ignore": ["Azure"]}),
+            "the config block must win outright: {sent}"
+        );
+    }
+
+    /// `thinking_when_absent` and `provider_routing` write different
+    /// top-level keys and must coexist in the same outbound body.
+    #[tokio::test]
+    async fn thinking_when_absent_and_provider_routing_coexist() {
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(move |req: &wiremock::Request| {
+                *captured_for_responder.lock().unwrap() =
+                    Some(serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({})));
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "msg_ok",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "model": "claude-model",
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new_for_test(
+            "openrouter_ds".to_string(),
+            secret_string("k"),
+            format!("{}/", server.uri()),
+            HashMap::new(),
+            routing(&["Azure"], &[]),
+            true,
+            ThinkingWhenAbsent::Disabled,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        // The request carries no `thinking` key, so the provider injects
+        // `{"type":"disabled"}` — independently of the routing block.
+        let _ = provider
+            .complete(&request(false), &empty_rewrite())
+            .await
+            .unwrap();
+
+        let sent = captured.lock().unwrap().clone().expect("body captured");
+        assert_eq!(sent["thinking"], json!({"type": "disabled"}), "{sent}");
+        assert_eq!(sent["provider"], json!({"ignore": ["Azure"]}), "{sent}");
     }
 
     /// A multi-entry `provider_allow` must reach the wire as a multi-entry

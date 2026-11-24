@@ -3877,6 +3877,50 @@ mod tests {
         assert_eq!(req.extra, Value::Null);
     }
 
+    /// The config block REPLACES a `provider` already sitting in
+    /// `extra` — the operator's policy wins outright, no key survives
+    /// from the pre-existing object. The gate-OFF path leaves that
+    /// pre-existing object untouched.
+    #[test]
+    fn inject_provider_routing_replaces_an_existing_provider_object() {
+        let p = OpenAiCompatProvider::new_for_test(
+            "p".to_string(),
+            "https://example.test/v1".to_string(),
+            secret_string("k"),
+            HashMap::new(),
+            routing(&[], &["DeepInfra"]),
+            false,
+            true,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let mut req = minimal_chat_request();
+        req.extra = json!({"provider": {"only": ["ClientChoice"], "sort": "latency"}});
+        p.inject_provider_routing(&mut req);
+        assert_eq!(
+            req.extra["provider"],
+            json!({"only": ["DeepInfra"]}),
+            "nothing of the pre-existing object may survive"
+        );
+
+        // Gate OFF → the pre-existing object is left alone.
+        let p = OpenAiCompatProvider::new_for_test(
+            "p".to_string(),
+            "https://example.test/v1".to_string(),
+            secret_string("k"),
+            HashMap::new(),
+            routing(&[], &["DeepInfra"]),
+            false,
+            false,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let mut req = minimal_chat_request();
+        req.extra = json!({"provider": {"only": ["ClientChoice"]}});
+        p.inject_provider_routing(&mut req);
+        assert_eq!(req.extra["provider"], json!({"only": ["ClientChoice"]}));
+    }
+
     /// Build a `ChatRequest` carrying only the fields exercised by the
     /// `provider_ignore` / `provider_allow` tests (everything else is
     /// `None` / empty). Keeping the constructor inline avoids the ~25-field
