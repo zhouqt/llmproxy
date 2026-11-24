@@ -118,6 +118,50 @@ pub(crate) fn is_openrouter_api_base(api_base: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Serialize the operator's `provider_routing` block into the OpenRouter
+/// `provider` request object.
+///
+/// Returns `None` when the block is absent (or serializes to nothing), so
+/// the wire body never carries an empty `provider: {}`. The block maps
+/// 1:1 onto `ProviderPreferences`: no merging, no intersection, no local
+/// transformation — the operator's policy is forwarded verbatim, and
+/// OpenRouter applies its own ordering (plan §4).
+///
+/// The gating (OpenRouter host, injection point) stays with the provider:
+/// this helper is pure serialization so both providers — and their tests —
+/// share one implementation.
+pub(crate) fn openrouter_provider_object(
+    routing: Option<&crate::config::ProviderRouting>,
+) -> Option<serde_json::Value> {
+    let value = serde_json::to_value(routing?).ok()?;
+    match &value {
+        serde_json::Value::Object(map) if map.is_empty() => None,
+        _ => Some(value),
+    }
+}
+
+/// One-line, secret-free summary of a routing block for the startup log:
+/// `sort:{"by":"throughput"},only:2,ignore:5`. Lists render as counts,
+/// scalars verbatim; the API key is not part of the block and never
+/// appears (plan §7.1).
+pub(crate) fn routing_summary(routing: &crate::config::ProviderRouting) -> String {
+    let Ok(serde_json::Value::Object(map)) = serde_json::to_value(routing) else {
+        return "<unserializable>".to_string();
+    };
+    map.iter()
+        .map(|(key, value)| match value {
+            serde_json::Value::Array(items) => format!("{key}:{}", items.len()),
+            serde_json::Value::Object(_) => match serde_json::to_string(value) {
+                Ok(rendered) => format!("{key}:{rendered}"),
+                Err(_) => format!("{key}:<unserializable>"),
+            },
+            serde_json::Value::String(s) => format!("{key}:{s}"),
+            other => format!("{key}:{other}"),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Build a provider instance from a ProviderConfig.
 ///
 /// `expose_upstream_details` is the value of `server.expose_upstream_details`:
@@ -154,8 +198,7 @@ pub fn build(
             api_key,
             api_base,
             model_rewrite,
-            provider_ignore,
-            provider_allow,
+            provider_routing,
             thinking_when_absent,
             user_agent,
             referer,
@@ -167,8 +210,7 @@ pub fn build(
                 api_key.clone(),
                 api_base.clone(),
                 model_rewrite.clone(),
-                provider_ignore.clone(),
-                provider_allow.clone(),
+                provider_routing.clone(),
                 *thinking_when_absent,
                 http,
             )?;
@@ -185,8 +227,7 @@ pub fn build(
             api_key,
             api_base,
             model_rewrite,
-            provider_ignore,
-            provider_allow,
+            provider_routing,
             reasoning_echo,
             user_agent,
             referer,
@@ -198,8 +239,7 @@ pub fn build(
                 api_base.clone(),
                 api_key.clone(),
                 model_rewrite.clone(),
-                provider_ignore.clone(),
-                provider_allow.clone(),
+                provider_routing.clone(),
                 reasoning_echo.clone(),
                 http,
             )?;
@@ -256,8 +296,7 @@ mod tests {
                 api_base: "https://example.test/v1".to_string(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
+                provider_routing: None,
                 reasoning_echo: false,
 
                 user_agent: None,
@@ -279,8 +318,7 @@ mod tests {
                 api_base: "https://openrouter.ai/api/v1".to_string(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
+                provider_routing: None,
                 thinking_when_absent: crate::config::ThinkingWhenAbsent::Omit,
 
                 user_agent: None,

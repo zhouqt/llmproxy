@@ -97,8 +97,7 @@ fn make_anthropic_provider(name: &str, server: &MockServer) -> SharedProvider {
             secret_string("k"),
             format!("{}/v1", server.uri()),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             llmproxy::config::ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
@@ -114,8 +113,7 @@ fn make_anthropic_config(name: &str, server: &MockServer) -> ProviderConfig {
         api_base: format!("{}/v1", server.uri()),
         model_rewrite: HashMap::new(),
         use_proxy: false,
-        provider_ignore: Vec::new(),
-        provider_allow: Vec::new(),
+        provider_routing: None,
         thinking_when_absent: llmproxy::config::ThinkingWhenAbsent::Omit,
 
         user_agent: None,

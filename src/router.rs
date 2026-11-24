@@ -516,6 +516,35 @@ impl Router {
         })
     }
 
+    /// Log the routing block when a 503 arrives from a provider that
+    /// carries one.
+    ///
+    /// Hard filters can empty OpenRouter's candidate set, which surfaces
+    /// as a cooldown rather than a config error — the operator needs the
+    /// block in the log to see why the provider was skipped.
+    fn warn_on_routing_503(&self, name: &str, status: u16, body: &str) {
+        if status != 503 {
+            return;
+        }
+        let Some(provider) = self.cfg.find_provider(name) else {
+            return;
+        };
+        let Some(routing) = provider.provider_routing() else {
+            return;
+        };
+        tracing::warn!(
+            provider = name,
+            status,
+            api_base = provider.api_base().unwrap_or_default(),
+            openrouter_routing = %crate::providers::routing_summary(routing),
+            upstream_body = %crate::util::truncate_for_log(body, FAILED_BODY_LOG_CAP_BYTES),
+            "upstream 503 on a provider with provider_routing: the policy may be \
+             unsatisfiable (empty candidate set); it cools down and the chain \
+             falls through — check openrouter_routing against the model's \
+             available endpoints"
+        );
+    }
+
     /// Execute a complete request with retries across the chain.
     ///
     /// Returns the response, the attempt log, and the **serving
@@ -643,6 +672,7 @@ impl Router {
                                 )
                                 .to_string(),
                             });
+                            self.warn_on_routing_503(name, *status, body);
                             let ttl = if matches!(*status, 402 | 429) {
                                 Duration::from_secs(model.cooldown_seconds)
                             } else {
@@ -843,6 +873,7 @@ impl Router {
                             body: crate::util::truncate_for_log(body, FAILED_BODY_LOG_CAP_BYTES)
                                 .to_string(),
                         });
+                        self.warn_on_routing_503(name, *status, body);
                         let ttl = if matches!(*status, 402 | 429) {
                             Duration::from_secs(model.cooldown_seconds)
                         } else {
@@ -1113,8 +1144,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -1128,8 +1158,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -1213,8 +1242,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -1228,8 +1256,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -1547,8 +1574,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -1567,8 +1593,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -1653,8 +1678,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -1668,8 +1692,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -1754,8 +1777,7 @@ mod tests {
                 api_base: "http://x".into(),
                 model_rewrite: Default::default(),
                 use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
+                provider_routing: None,
                 reasoning_echo: false,
 
                 user_agent: None,
@@ -1975,8 +1997,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -1990,8 +2011,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -2058,8 +2078,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -2073,8 +2092,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -2169,8 +2187,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -2184,8 +2201,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -2378,8 +2394,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -2393,8 +2408,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -2571,8 +2585,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -2586,8 +2599,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -2805,8 +2817,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -2820,8 +2831,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -2903,8 +2913,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -2918,8 +2927,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -2996,8 +3004,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -3011,8 +3018,7 @@ mod tests {
                     api_base: "http://x".into(),
                     model_rewrite: Default::default(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -3222,8 +3228,7 @@ mod tests {
                 api_base: "http://x".into(),
                 model_rewrite: Default::default(),
                 use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
+                provider_routing: None,
                 reasoning_echo: false,
 
                 user_agent: None,
