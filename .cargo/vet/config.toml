@@ -77,7 +77,7 @@ version = "3.20.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.bytes]]
-version = "1.12.1"
+version = "1.12.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.cc]]
@@ -117,7 +117,7 @@ version = "1.5.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.ctor]]
-version = "1.0.13"
+version = "1.0.14"
 criteria = "safe-to-run"
 
 [[exemptions.deadpool]]
@@ -213,7 +213,7 @@ version = "0.4.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.granit-parser]]
-version = "2.1.0"
+version = "2.2.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.h2]]
@@ -321,7 +321,7 @@ version = "0.2.191"
 criteria = "safe-to-deploy"
 
 [[exemptions.link-section]]
-version = "0.19.3"
+version = "0.19.4"
 criteria = "safe-to-run"
 
 [[exemptions.linktime-proc-macro]]
@@ -501,7 +501,7 @@ version = "1.0.229"
 criteria = "safe-to-deploy"
 
 [[exemptions.serde-saphyr]]
-version = "2.1.1"
+version = "2.2.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.serde_core]]
@@ -681,7 +681,7 @@ version = "1.0.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.uuid]]
-version = "1.29.2"
+version = "1.29.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.valuable]]
