@@ -367,36 +367,58 @@ providers:
     # headers:
     #   X-Title: "omp"
     #   x-client-request-id: "auto-request"
-    # `provider_ignore` is honored by both `openai_compat` and `anthropic`
-    # provider types when their `api_base` points to `openrouter.ai`. The
-    # field is injected as `provider: {ignore: [...]}` into the request
-    # body so OpenRouter skips the listed backend providers at routing
-    # time (useful when a specific upstream is broken or misconfigured
-    # and you can't gate it server-side via the OpenRouter team account).
-    # Empty list (default) omits the `provider` key entirely.
-    # On non-OpenRouter `api_base` values the field is logged as a warning
+    # `provider_routing` is OpenRouter's `provider` request object, honored
+    # by both `openai_compat` and `anthropic` provider types when their
+    # `api_base` points to `openrouter.ai`. Every key is optional; the
+    # block is forwarded verbatim and OpenRouter applies its own ordering.
+    # Absent (the default) omits the `provider` key entirely.
+    # On non-OpenRouter `api_base` values the block is logged as a warning
     # at startup and the wire body stays clean (strict Anthropic-compat
     # backends like DeepSeek reject unknown top-level fields with 400).
-    provider_ignore:
-      - "Inceptron"
-    # `provider_allow` is the allowlist counterpart, injected as
-    # `provider: {only: [...]}`. OpenRouter treats `only` as a HARD ceiling:
-    # if none of the listed providers can serve the requested model the
-    # request fails with 503 ("No available model provider meets your
-    # routing requirements"). llmproxy treats 503 as cooldownable, so a
-    # mistyped slug silently cools this provider down and the router falls
-    # through to the next provider in the chain rather than reporting a
-    # config error — watch `x-llmproxy-failed-providers` for
-    # `openrouter_anthropic:503` after changing this list.
-    # Slugs are passed through verbatim (no normalization); copy the exact
-    # slug from the model's page on openrouter.ai. Note a BASE slug such
-    # as "deepinfra" matches every endpoint of that provider including
-    # variants like "deepinfra/turbo" — use a suffixed slug to pin one
-    # endpoint. When both lists are set, both sub-fields are forwarded in
-    # the same `provider` object and the proxy does not intersect them.
-    provider_allow:
-      - "DeepInfra"
-      - "Together"
+    #
+    # Selection / ranking:
+    #   only / ignore — backend-provider slug allowlist / denylist.
+    #                   `only` is a HARD ceiling: if none of the listed
+    #                   providers can serve the requested model the request
+    #                   fails with 503. llmproxy treats 503 as cooldownable,
+    #                   so a mistyped slug silently cools this provider and
+    #                   the chain falls through — watch for the
+    #                   "upstream 503 on a provider with provider_routing"
+    #                   warning and `openrouter_anthropic:503` in
+    #                   `x-llmproxy-failed-providers`. Slugs are verbatim;
+    #                   a BASE slug ("deepinfra") matches every endpoint
+    #                   variant ("deepinfra/turbo") of that provider.
+    #   sort          — price | throughput | latency | exacto, or
+    #                   {by: <same>, partition: model|none}. When set,
+    #                   OpenRouter performs no load balancing: the top
+    #                   ranked endpoint gets every request. `partition:
+    #                   none` may promote a fallback model ahead of the
+    #                   requested one (unsupported for us).
+    #   order         — explicit provider sequence; incompatible with sort.
+    #
+    # Hard filters (can leave zero endpoints → 503):
+    #   max_price       — {prompt, completion, image, audio, request};
+    #                     prompt/completion are USD per MILLION tokens,
+    #                     values are strings, forwarded verbatim.
+    #   zdr             — Zero Data Retention endpoints only.
+    #   data_collection — allow | deny.
+    #   quantizations   — allowlist of int4,int8,fp4,mxfp4,nvfp4,fp6,fp8,
+    #                     mxfp8,fp16,bf16,fp32,unknown.
+    #   require_parameters — only endpoints that support every parameter
+    #                     in the request (shrinks the candidate set a lot
+    #                     for our tool-heavy bodies; off unless testing).
+    #
+    # Ordering / fallback:
+    #   allow_fallbacks — false: use only the primary/ordered provider and
+    #                     return its upstream error instead of falling back.
+    #   preferred_min_throughput / preferred_max_latency — SOFT hints
+    #                     (scalar p50 or {p50,p75,p90,p99}); endpoints are
+    #                     deprioritized, not excluded. Latency is seconds.
+    provider_routing:
+      only: ["DeepInfra", "Together"]
+      ignore: ["Inceptron"]
+      sort: throughput
+      allow_fallbacks: true
     # `thinking_when_absent` — what to send when the CLIENT request has
     # no `thinking` field (or an explicit null). Values:
     #   disabled (default) — inject {"type":"disabled"} into `thinking`.
@@ -529,20 +551,14 @@ providers:
   #                  (the router skips them when a non-empty upstream-
   #                  model mapping is required — see `can_serve_model`).
   #   use_proxy     — see proxy section. Default: false.
-  #   provider_ignore — optional list of OpenRouter backend-provider slugs
-  #                  to exclude (e.g. ["Azure"]). Injects
-  #                  `provider: {ignore: [...]}` only when api_base points
-  #                  at openrouter.ai; ignored with a startup warning on
-  #                  other backends (DeepSeek etc. 400 on unknown fields).
-  #                  Default: empty (no injection).
-  #   provider_allow  — optional list of OpenRouter backend-provider slugs
-  #                  to RESTRICT routing to (allowlist). Injects
-  #                  `provider: {only: [...]}` only when api_base points
-  #                  at openrouter.ai; same host gate and startup warning
-  #                  as provider_ignore. `only` is a hard ceiling — an
-  #                  unsatisfiable list makes OpenRouter return 503, which
-  #                  llmproxy treats as cooldownable (silent fallback, not
-  #                  a config error). Default: empty (no injection).
+  #   provider_routing — optional OpenRouter `provider` object: only/ignore
+  #                  lists, sort/order ranking, hard filters (max_price,
+  #                  zdr, data_collection, quantizations,
+  #                  require_parameters) and preferences. Forwarded verbatim
+  #                  only when api_base points at openrouter.ai; ignored with
+  #                  a startup warning on other backends (DeepSeek etc. 400
+  #                  on unknown fields). See the anthropic example above for
+  #                  the full key reference. Default: absent (no injection).
   #   user_agent / referer / headers — optional per-provider identity
   #                  overrides; see the global `user_agent:` section above.
   #   reasoning_echo — when true, thinking requests have every historical
@@ -594,21 +610,16 @@ providers:
     type: openai_compat
     api_key: "${OPENROUTER_API_KEY}"
     api_base: "https://openrouter.ai/api/v1"
-    # OpenRouter-specific: exclude backend providers that are misconfigured
-    # or unreliable. Values are provider slugs (case-sensitive), e.g.
-    # "Azure", "Together", "Fireworks". Only effective when api_base points
-    # to openrouter.ai; on other OpenAI-compat backends the field is ignored
-    # and a startup warning is logged (strict validators like DeepSeek would
-    # reject unknown top-level fields with 400). Leave empty (or omit) to
-    # allow all providers.
-    provider_ignore:
-      - "Azure"
-    # Allowlist counterpart — see the `openrouter_anthropic` block above
-    # for the full caveat. A base slug admits every endpoint variant of
-    # that provider, so this list restricts *which providers* may serve the
-    # request, not which single endpoint.
-    provider_allow:
-      - "DeepInfra"
+    # OpenRouter provider routing (see the `openrouter_anthropic` block above
+    # for the full key reference). Only effective when api_base points to
+    # openrouter.ai; on other OpenAI-compat backends the block is ignored and
+    # a startup warning is logged (strict validators like DeepSeek would
+    # reject unknown top-level fields with 400). Omit to allow all providers
+    # with OpenRouter's default load balancing.
+    provider_routing:
+      ignore: ["Azure"]
+      only: ["DeepInfra"]
+      sort: throughput
     model_rewrite:
       "gpt-4o":            "openai/gpt-4o"
       "claude-haiku-4.6":  "anthropic/claude-haiku-4.5"

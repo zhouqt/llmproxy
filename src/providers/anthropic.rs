@@ -21,7 +21,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::{json, Value};
 
 use crate::anthropic::{ContentBlock, MessageContent, MessagesRequest};
-use crate::config::ThinkingWhenAbsent;
+use crate::config::{ProviderRouting, ThinkingWhenAbsent};
 use crate::error::{ProxyError, Result};
 use crate::identity::OutboundIdentity;
 use crate::providers::{Provider, ProviderOutput};
@@ -41,25 +41,11 @@ pub struct AnthropicProvider {
     api_key: SecretString,
     api_base: String,
     model_rewrite: HashMap<String, String>,
-    /// The list of OpenRouter backend-provider slugs to exclude.
-    /// When non-empty and `is_openrouter == true`, a
-    /// `provider: {ignore: [...]}` field is injected into the request body
-    /// (OpenRouter's `/v1/messages` endpoint accepts the field for client-side
-    /// routing). On other backends the setting is ignored with a startup warning.
-    provider_ignore: Vec<String>,
-    /// OpenRouter backend provider slugs to restrict routing to.
-    /// Non-empty + `is_openrouter == true` → the request body carries
-    /// `provider: {only: [...]}`. OpenRouter treats `only` as a hard
-    /// ceiling: if no listed provider can serve the model the request
-    /// fails with 503, which llmproxy treats as cooldownable — so a
-    /// mistyped allowlist silently cools this provider down rather than
-    /// surfacing a config error. See plans/openrouter-provider-allow-plan.md
-    /// §7.11.
-    ///
-    /// Slugs are opaque, operator-supplied strings, forwarded verbatim.
-    /// Forwarded alongside `provider_ignore` in the same `provider`
-    /// object; the proxy never computes the intersection locally.
-    provider_allow: Vec<String>,
+    /// OpenRouter provider routing (`provider_routing:` in the config):
+    /// the `provider` request object — allow/deny lists, ranking and the
+    /// hard filters. Injected verbatim when `is_openrouter == true`;
+    /// ignored (startup warning already logged) on other backends.
+    routing: Option<ProviderRouting>,
     /// The cached result of the `api_base` host check: `true` if and only if the host is
     /// `openrouter.ai` (case-insensitive; subdomains such as `www.openrouter.ai` are allowed).
     /// Computed once in `new()` so that it is not re-parsed on every request.
@@ -100,8 +86,7 @@ impl AnthropicProvider {
         api_key: SecretString,
         api_base: String,
         model_rewrite: HashMap<String, String>,
-        provider_ignore: Vec<String>,
-        provider_allow: Vec<String>,
+        routing: Option<ProviderRouting>,
         thinking_when_absent: ThinkingWhenAbsent,
         http: reqwest::Client,
     ) -> Result<Self> {
@@ -115,14 +100,25 @@ impl AnthropicProvider {
 
         // Warn once at startup instead of on every request. Misconfigured for a strict
         // backend such as DeepSeek or Minimax, the request body stays clean (no `provider` field is injected).
-        if !is_openrouter && (!provider_ignore.is_empty() || !provider_allow.is_empty()) {
+        if !is_openrouter && routing.is_some() {
             tracing::warn!(
                 provider = %name,
                 api_base = %api_base,
-                "provider_allow/provider_ignore configured but api_base is not \
-                 openrouter.ai; fields will be ignored (strict Anthropic-compat \
-                 backends like DeepSeek may reject unknown top-level fields)"
+                "provider_routing configured but api_base is not openrouter.ai; \
+                 the block will be ignored (strict Anthropic-compat backends like \
+                 DeepSeek may reject unknown top-level fields)"
             );
+        }
+        // One INFO line naming the effective policy (key names and
+        // counts only — never the API key, never a config dump).
+        if is_openrouter {
+            if let Some(routing) = &routing {
+                tracing::info!(
+                    provider = %name,
+                    openrouter_routing = %crate::providers::routing_summary(routing),
+                    "OpenRouter provider routing enabled"
+                );
+            }
         }
 
         // Attribution for the wire change lives at debug level: the feature
@@ -145,8 +141,7 @@ impl AnthropicProvider {
             api_key,
             api_base,
             model_rewrite,
-            provider_ignore,
-            provider_allow,
+            routing,
             is_openrouter,
             thinking_when_absent,
             identity: OutboundIdentity::default(),
@@ -167,8 +162,7 @@ impl AnthropicProvider {
         api_key: SecretString,
         api_base: String,
         model_rewrite: HashMap<String, String>,
-        provider_ignore: Vec<String>,
-        provider_allow: Vec<String>,
+        routing: Option<ProviderRouting>,
         force_openrouter: bool,
         thinking_when_absent: ThinkingWhenAbsent,
         http: reqwest::Client,
@@ -179,8 +173,7 @@ impl AnthropicProvider {
             api_key,
             api_base,
             model_rewrite,
-            provider_ignore,
-            provider_allow,
+            routing,
             is_openrouter: force_openrouter,
             thinking_when_absent,
             identity: OutboundIdentity::default(),
@@ -261,46 +254,31 @@ impl AnthropicProvider {
         format!("{}/v1/models", stripped)
     }
 
-    /// Inject the OpenRouter routing preferences into the Anthropic request
-    /// body as a SINGLE `provider` object, when at least one list is
-    /// non-empty and `api_base` points at OpenRouter.
+    /// Inject the OpenRouter `provider` routing object into the Anthropic
+    /// request body, when a `provider_routing` block is configured and
+    /// `api_base` points at OpenRouter.
     ///
-    /// - `only` ← `provider_allow` (allowlist, hard ceiling)
-    /// - `ignore` ← `provider_ignore` (denylist)
-    ///
-    /// When both are configured both sub-fields are written verbatim into the
-    /// same object; this function deliberately does NOT compute the
-    /// intersection locally (operator decision: `only` governs, `ignore`
-    /// applies beneath it — plans/openrouter-provider-allow-plan.md §1.4).
-    ///
-    /// Gate:
-    /// - both lists empty → no-op (default; never emits an empty `provider`).
-    /// - non-empty and OpenRouter → inject the corresponding sub-field(s).
-    /// - non-empty and not OpenRouter → no-op (startup warning already logged).
+    /// The block is serialized verbatim by
+    /// [`crate::providers::openrouter_provider_object`] — no merging, no
+    /// intersection, no local transformation. A client-supplied
+    /// `provider` object (legal on OpenRouter's `/messages`) is
+    /// **replaced** by the config one: the config is the operator's
+    /// policy and wins.
     ///
     /// The injection must happen before the retry loop, because
-    /// `strip_thinking_blocks()` never touches the top-level `provider` key,
-    /// so retry bodies keep carrying it (the correct semantic — the
-    /// constrained/excluded providers apply to every attempt).
-    fn inject_provider_ignore(&self, body: &mut Value) {
-        if self.provider_allow.is_empty() && self.provider_ignore.is_empty() {
-            return;
-        }
+    /// `strip_thinking_blocks()` never touches the top-level `provider`
+    /// key, so retry bodies keep carrying it (the correct semantic — the
+    /// routing policy applies to every attempt).
+    fn inject_provider_routing(&self, body: &mut Value) {
         if !self.is_openrouter {
             return;
         }
-        // Only write non-empty sub-fields so an ignore-only (or allow-only)
-        // configuration never emits a half-populated `provider` object —
-        // field presence on the wire is correctness here.
-        let mut prefs = serde_json::Map::with_capacity(2);
-        if !self.provider_allow.is_empty() {
-            prefs.insert("only".to_string(), json!(self.provider_allow));
-        }
-        if !self.provider_ignore.is_empty() {
-            prefs.insert("ignore".to_string(), json!(self.provider_ignore));
-        }
+        let Some(provider) = crate::providers::openrouter_provider_object(self.routing.as_ref())
+        else {
+            return;
+        };
         if let Some(obj) = body.as_object_mut() {
-            obj.insert("provider".to_string(), Value::Object(prefs));
+            obj.insert("provider".to_string(), provider);
         }
     }
 
@@ -430,7 +408,7 @@ impl Provider for AnthropicProvider {
         // Must happen BEFORE the retry loop so the field survives any
         // strip-think-and-retry passes — those only operate on the
         // `messages` array and the top-level `thinking` key.
-        self.inject_provider_ignore(&mut body);
+        self.inject_provider_routing(&mut body);
         // Same constraint: arm the 400 fallback before the loop. Tracks
         // whether — and what — *this* provider injected, so the rollback
         // below never strips a field the client actually sent.
@@ -557,7 +535,7 @@ impl Provider for AnthropicProvider {
         let api_key = self.api_key.clone();
         let merged = self.merged_rewrite(model_rewrite);
         let mut body = build_body(req, &merged, true)?;
-        self.inject_provider_ignore(&mut body);
+        self.inject_provider_routing(&mut body);
         let injected = self.apply_thinking_when_absent(&mut body);
 
         // A 400 arrives before any SSE byte flows, so retrying here does
@@ -829,6 +807,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        DataCollection, LatencyCutoffs, MaxPrice, Partition, PercentileMap, Quantization,
+        SortConfig, SortKey, SortPreference, ThroughputCutoffs,
+    };
     use crate::expect_variant;
     use crate::secrets::secret_string;
     use crate::test_support::JsonFieldAbsent;
@@ -849,6 +831,20 @@ mod tests {
 
     fn empty_rewrite() -> HashMap<String, String> {
         HashMap::new()
+    }
+
+    /// Supply a `provider_routing` block from the two legacy lists
+    /// (ignore, allow) that the old wire tests were written against.
+    /// `None` when both are empty — no block, no `provider` key.
+    fn routing(ignore: &[&str], only: &[&str]) -> Option<ProviderRouting> {
+        if ignore.is_empty() && only.is_empty() {
+            return None;
+        }
+        Some(ProviderRouting {
+            ignore: (!ignore.is_empty()).then(|| ignore.iter().map(|s| s.to_string()).collect()),
+            only: (!only.is_empty()).then(|| only.iter().map(|s| s.to_string()).collect()),
+            ..Default::default()
+        })
     }
 
     #[test]
@@ -956,8 +952,7 @@ mod tests {
             secret_string("router-key"),
             format!("{}/", server.uri()),
             rewrite,
-            Vec::new(),
-            Vec::new(),
+            None,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
@@ -1061,8 +1056,7 @@ mod tests {
             secret_string("router-key"),
             format!("{}/", server.uri()),
             empty_rewrite(),
-            Vec::new(),
-            Vec::new(),
+            None,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
@@ -1115,8 +1109,7 @@ mod tests {
             secret_string("router-key"),
             format!("{}/", server.uri()),
             rewrite,
-            Vec::new(),
-            Vec::new(),
+            None,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
@@ -1166,8 +1159,7 @@ mod tests {
             secret_string("k"),
             "https://example.test/v1".to_string(),
             configured,
-            Vec::new(),
-            Vec::new(),
+            None,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
@@ -1208,8 +1200,7 @@ mod tests {
             secret_string("router-key"),
             format!("{}/api/v1/", server.uri()),
             rewrite,
-            Vec::new(),
-            Vec::new(),
+            None,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
@@ -1245,8 +1236,7 @@ mod tests {
             secret_string("key"),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
-            Vec::new(),
-            Vec::new(),
+            None,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
@@ -1279,8 +1269,7 @@ mod tests {
             secret_string("key"),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
-            Vec::new(),
-            Vec::new(),
+            None,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
@@ -1619,8 +1608,7 @@ mod tests {
             secret_string("key"),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
-            Vec::new(),
-            Vec::new(),
+            None,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
@@ -1691,8 +1679,7 @@ mod tests {
             secret_string("key"),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
-            Vec::new(),
-            Vec::new(),
+            None,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
@@ -1756,8 +1743,7 @@ mod tests {
             secret_string("key"),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
-            Vec::new(),
-            Vec::new(),
+            None,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
@@ -1829,8 +1815,7 @@ mod tests {
             secret_string("key"),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
-            Vec::new(),
-            Vec::new(),
+            None,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
@@ -1890,8 +1875,7 @@ mod tests {
             secret_string("key"),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
-            Vec::new(),
-            Vec::new(),
+            None,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
@@ -1972,8 +1956,7 @@ mod tests {
             secret_string("key"),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
-            Vec::new(),
-            Vec::new(),
+            None,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
@@ -2017,8 +2000,7 @@ mod tests {
             secret_string("key"),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
-            Vec::new(),
-            Vec::new(),
+            None,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
@@ -2059,8 +2041,7 @@ mod tests {
             secret_string("key"),
             format!("{}/v1", server.uri()),
             rewrite,
-            Vec::new(),
-            Vec::new(),
+            None,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
@@ -2107,8 +2088,7 @@ mod tests {
             secret_string("key"),
             format!("{}/v1", server.uri()),
             empty_rewrite(),
-            Vec::new(),
-            Vec::new(),
+            None,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
@@ -2149,8 +2129,7 @@ mod tests {
             secret_string("test-key"),
             server.uri(),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
@@ -2195,8 +2174,7 @@ mod tests {
             secret_string("test-key"),
             server.uri(),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
@@ -2221,8 +2199,7 @@ mod tests {
             secret_string("test-key"),
             server.uri(),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
@@ -2246,8 +2223,7 @@ mod tests {
             secret_string("test-key"),
             "http://127.0.0.1:1".to_string(),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
@@ -2271,8 +2247,7 @@ mod tests {
             secret_string("test-key"),
             server.uri(),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
@@ -2298,8 +2273,7 @@ mod tests {
             secret_string("test-key"),
             server.uri(),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
@@ -2351,8 +2325,7 @@ mod tests {
             secret_string("k"),
             format!("{}/", server.uri()),
             HashMap::new(),
-            vec!["Inceptron".to_string()],
-            Vec::new(),
+            routing(&["Inceptron"], &[]),
             true, // force_openrouter
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
@@ -2394,8 +2367,7 @@ mod tests {
             secret_string("k"),
             format!("{}/", server.uri()),
             HashMap::new(),
-            vec!["Inceptron".to_string()],
-            Vec::new(),
+            routing(&["Inceptron"], &[]),
             false, // force_openrouter
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
@@ -2435,8 +2407,7 @@ mod tests {
             secret_string("k"),
             format!("{}/", server.uri()),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             true, // force_openrouter — but empty list still means no injection
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
@@ -2495,8 +2466,7 @@ mod tests {
             secret_string("k"),
             format!("{}/v1", server.uri()),
             HashMap::new(),
-            vec!["Inceptron".to_string(), "Azure".to_string()],
-            Vec::new(),
+            routing(&["Inceptron", "Azure"], &[]),
             true,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
@@ -2547,8 +2517,7 @@ mod tests {
             secret_string("k"),
             server.uri(),
             HashMap::new(),
-            vec!["Inceptron".to_string()],
-            Vec::new(),
+            routing(&["Inceptron"], &[]),
             true,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
@@ -2574,7 +2543,7 @@ mod tests {
     /// `is_openrouter_api_base_matches_canonical_subdomains_and_case`).
     /// This test pins the integration: the production `new()` with a
     /// canonical OpenRouter URL must cache `is_openrouter = true`, so a
-    /// subsequent `inject_provider_ignore` actually injects.
+    /// subsequent `inject_provider_routing` actually injects.
     #[test]
     fn openrouter_host_detection_covers_subdomains_and_case() {
         let p = AnthropicProvider::new(
@@ -2582,18 +2551,17 @@ mod tests {
             secret_string("k"),
             "https://openrouter.ai/api/v1".to_string(),
             HashMap::new(),
-            vec!["Azure".to_string()],
-            Vec::new(),
+            routing(&["Azure"], &[]),
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
         .unwrap();
         assert_eq!(p.name(), "p");
         // The flag is private; the strongest public-surface check is
-        // that `inject_provider_ignore` actually mutates the body when
+        // that `inject_provider_routing` actually mutates the body when
         // the production constructor detected an OpenRouter api_base.
         let mut body = json!({"model": "m", "messages": []});
-        p.inject_provider_ignore(&mut body);
+        p.inject_provider_routing(&mut body);
         assert_eq!(body["provider"], json!({"ignore": ["Azure"]}));
     }
 
@@ -2633,8 +2601,7 @@ mod tests {
             secret_string("k"),
             format!("{}/", server.uri()),
             HashMap::new(),
-            Vec::new(),
-            vec!["DeepInfra".to_string()],
+            routing(&[], &["DeepInfra"]),
             true, // force_openrouter
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
@@ -2681,8 +2648,7 @@ mod tests {
             secret_string("k"),
             format!("{}/", server.uri()),
             HashMap::new(),
-            vec!["Azure".to_string()],
-            vec!["DeepInfra".to_string(), "Together".to_string()],
+            routing(&["Azure"], &["DeepInfra", "Together"]),
             true,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
@@ -2703,6 +2669,217 @@ mod tests {
             }),
             "both sub-fields must share one `provider` object"
         );
+    }
+
+    /// A routing block exercising every key, including explicit `false`
+    /// values and string `max_price` entries.
+    fn full_routing() -> ProviderRouting {
+        ProviderRouting {
+            only: Some(vec!["DeepInfra".to_string()]),
+            ignore: Some(vec!["Azure".to_string()]),
+            sort: Some(SortPreference::Config(SortConfig {
+                by: Some(SortKey::Throughput),
+                partition: Some(Partition::Model),
+            })),
+            order: Some(vec!["DeepInfra".to_string()]),
+            allow_fallbacks: Some(false),
+            require_parameters: Some(false),
+            data_collection: Some(DataCollection::Deny),
+            zdr: Some(true),
+            enforce_distillable_text: Some(false),
+            quantizations: Some(vec![Quantization::Fp8, Quantization::Int8]),
+            max_price: Some(MaxPrice {
+                prompt: Some("0.50".to_string()),
+                completion: Some("1.5".to_string()),
+                ..Default::default()
+            }),
+            preferred_min_throughput: Some(ThroughputCutoffs::Number(50.0)),
+            preferred_max_latency: Some(LatencyCutoffs::Percentiles(PercentileMap {
+                p90: Some(2.0),
+                p99: Some(4.5),
+                ..Default::default()
+            })),
+        }
+    }
+
+    /// Every `provider_routing` key must reach the wire inside ONE
+    /// `provider` object, verbatim: `max_price` values stay strings,
+    /// explicit `false` values survive serialization (field-omission is
+    /// correctness in this repo — a vanished `allow_fallbacks: false`
+    /// changes the upstream's behaviour), and `sort` keeps the object
+    /// form.
+    #[tokio::test]
+    async fn complete_forwards_the_full_provider_routing_block() {
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(move |req: &wiremock::Request| {
+                *captured_for_responder.lock().unwrap() =
+                    Some(serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({})));
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "msg_ok",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "model": "claude-model",
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new_for_test(
+            "openrouter_ds".to_string(),
+            secret_string("k"),
+            format!("{}/", server.uri()),
+            HashMap::new(),
+            Some(full_routing()),
+            true,
+            ThinkingWhenAbsent::Omit,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let _ = provider
+            .complete(&request(false), &empty_rewrite())
+            .await
+            .unwrap();
+
+        let sent = captured.lock().unwrap().clone().expect("body captured");
+        assert_eq!(
+            sent["provider"],
+            json!({
+                "only": ["DeepInfra"],
+                "ignore": ["Azure"],
+                "sort": {"by": "throughput", "partition": "model"},
+                "order": ["DeepInfra"],
+                "allow_fallbacks": false,
+                "require_parameters": false,
+                "data_collection": "deny",
+                "zdr": true,
+                "enforce_distillable_text": false,
+                "quantizations": ["fp8", "int8"],
+                "max_price": {"prompt": "0.50", "completion": "1.5"},
+                "preferred_min_throughput": 50.0,
+                "preferred_max_latency": {"p90": 2.0, "p99": 4.5}
+            })
+        );
+    }
+
+    /// OpenRouter's `/messages` accepts a client-supplied `provider`
+    /// object; the config block must REPLACE it wholesale — no merging,
+    /// no intersection, nothing of the client's policy may leak through.
+    #[tokio::test]
+    async fn a_client_supplied_provider_object_is_replaced_by_the_config_block() {
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(move |req: &wiremock::Request| {
+                *captured_for_responder.lock().unwrap() =
+                    Some(serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({})));
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "msg_ok",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "model": "claude-model",
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new_for_test(
+            "openrouter_ds".to_string(),
+            secret_string("k"),
+            format!("{}/", server.uri()),
+            HashMap::new(),
+            routing(&["Azure"], &["DeepInfra"]),
+            true,
+            ThinkingWhenAbsent::Omit,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        // `provider` is not a typed field, so it lands in `extra`.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-model",
+            "max_tokens": 32,
+            "stream": false,
+            "messages": [{"role": "user", "content": "hello"}],
+            "provider": {"only": ["ClientChoice"], "sort": "latency"}
+        }))
+        .unwrap();
+
+        let _ = provider.complete(&req, &empty_rewrite()).await.unwrap();
+
+        let sent = captured.lock().unwrap().clone().expect("body captured");
+        assert_eq!(
+            sent["provider"],
+            json!({"only": ["DeepInfra"], "ignore": ["Azure"]}),
+            "the config block must win outright: {sent}"
+        );
+    }
+
+    /// `thinking_when_absent` and `provider_routing` write different
+    /// top-level keys and must coexist in the same outbound body.
+    #[tokio::test]
+    async fn thinking_when_absent_and_provider_routing_coexist() {
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(move |req: &wiremock::Request| {
+                *captured_for_responder.lock().unwrap() =
+                    Some(serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({})));
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "msg_ok",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "model": "claude-model",
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new_for_test(
+            "openrouter_ds".to_string(),
+            secret_string("k"),
+            format!("{}/", server.uri()),
+            HashMap::new(),
+            routing(&["Azure"], &[]),
+            true,
+            ThinkingWhenAbsent::Disabled,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        // The request carries no `thinking` key, so the provider injects
+        // `{"type":"disabled"}` — independently of the routing block.
+        let _ = provider
+            .complete(&request(false), &empty_rewrite())
+            .await
+            .unwrap();
+
+        let sent = captured.lock().unwrap().clone().expect("body captured");
+        assert_eq!(sent["thinking"], json!({"type": "disabled"}), "{sent}");
+        assert_eq!(sent["provider"], json!({"ignore": ["Azure"]}), "{sent}");
     }
 
     /// A multi-entry `provider_allow` must reach the wire as a multi-entry
@@ -2749,8 +2926,10 @@ mod tests {
             secret_string("k"),
             format!("{}/", server.uri()),
             HashMap::new(),
-            Vec::new(),
-            allow.clone(),
+            Some(ProviderRouting {
+                only: Some(allow.clone()),
+                ..Default::default()
+            }),
             true,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
@@ -2810,8 +2989,7 @@ mod tests {
             secret_string("k"),
             format!("{}/", server.uri()),
             HashMap::new(),
-            vec!["Inceptron".to_string()],
-            Vec::new(),
+            routing(&["Inceptron"], &[]),
             true,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
@@ -2858,8 +3036,7 @@ mod tests {
             secret_string("k"),
             format!("{}/", server.uri()),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             true,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
@@ -2900,8 +3077,7 @@ mod tests {
             secret_string("k"),
             format!("{}/", server.uri()),
             HashMap::new(),
-            Vec::new(),
-            vec!["DeepInfra".to_string()],
+            routing(&[], &["DeepInfra"]),
             false, // force_openrouter
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
@@ -2958,8 +3134,7 @@ mod tests {
             secret_string("k"),
             format!("{}/v1", server.uri()),
             HashMap::new(),
-            Vec::new(),
-            vec!["DeepInfra".to_string(), "Together".to_string()],
+            routing(&[], &["DeepInfra", "Together"]),
             true,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
@@ -3010,8 +3185,7 @@ mod tests {
             secret_string("k"),
             server.uri(),
             HashMap::new(),
-            Vec::new(),
-            vec!["DeepInfra".to_string()],
+            routing(&[], &["DeepInfra"]),
             true,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
@@ -3083,8 +3257,7 @@ mod tests {
             secret_string("k"),
             format!("{}/", server.uri()),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             setting,
             reqwest::Client::new(),
@@ -3818,8 +3991,7 @@ mod identity_tests {
             secret_string("router-key"),
             server.uri(),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             ThinkingWhenAbsent::Omit,
             reqwest::Client::new(),
         )
@@ -3914,8 +4086,7 @@ mod identity_tests {
             secret_string("router-key"),
             server.uri(),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             ThinkingWhenAbsent::Omit,
             client,
         )

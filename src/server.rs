@@ -2472,8 +2472,7 @@ mod tests {
                     api_base: "https://x.test".to_string(),
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -2570,8 +2569,7 @@ mod tests {
                     api_base: "https://x.test".to_string(),
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -2817,8 +2815,7 @@ mod tests {
                 api_base: server.uri(),
                 model_rewrite: HashMap::new(),
                 use_proxy: false,
-                provider_ignore: Vec::new(),
-                provider_allow: Vec::new(),
+                provider_routing: None,
                 reasoning_echo: false,
 
                 user_agent: None,

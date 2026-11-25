@@ -341,6 +341,417 @@ impl RateLimitConfig {
     }
 }
 
+/// OpenRouter provider-routing for one provider (the `provider_routing:`
+/// block). The block is serialized 1:1 into the upstream `provider`
+/// request field (`#/components/schemas/ProviderPreferences`) and only
+/// takes effect when the provider's `api_base` points at OpenRouter —
+/// other backends ignore it with a startup warning, because strict
+/// Anthropic-/OpenAI-compatible backends answer 400 on unknown
+/// top-level fields.
+///
+/// Design notes:
+///
+/// - Every key is optional and independent. Absence is what keeps the
+///   outbound body byte-identical to a config without the block; an
+///   explicit `false` (`allow_fallbacks`, `zdr`, ...) is meaningful and
+///   is therefore emitted.
+/// - `only` / `ignore` absorb the former top-level `provider_allow` /
+///   `provider_ignore` fields using OpenRouter's own keywords
+///   (plans/openrouter-provider-routing-plan.md §3.3).
+/// - The hard filters (`max_price`, `zdr`, `data_collection`,
+///   `quantizations`, `require_parameters`) can leave zero eligible
+///   endpoints; OpenRouter then answers 503, which the router cools
+///   down. The router warns about that case when a provider carries a
+///   routing block (§6.1).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRouting {
+    /// Provider slugs routing is restricted to (OpenRouter's `only`).
+    /// A hard ceiling; merged upstream with account-wide dashboard
+    /// settings. Absent = no restriction; an empty list is a config
+    /// error (it can only mean "no filter", which is spelled by
+    /// omitting the key).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub only: Option<Vec<String>>,
+    /// Provider slugs to exclude (OpenRouter's `ignore`). Absent = no
+    /// exclusions; empty is a config error, as for `only`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore: Option<Vec<String>>,
+    /// Ranking strategy: `price` | `throughput` | `latency` | `exacto`,
+    /// or `{by: <same>, partition: model|none}`. When set, OpenRouter
+    /// performs no load balancing across the ranked endpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<SortPreference>,
+    /// Explicit provider order. Takes precedence over `sort` upstream
+    /// (which is then ignored), so configuring both is rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<Vec<String>>,
+    /// `false` → use only the primary/`order` provider and return its
+    /// upstream error instead of falling back to another endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_fallbacks: Option<bool>,
+    /// Only route to endpoints that declare support for every parameter
+    /// in the request. Can shrink the candidate set drastically for our
+    /// tool-heavy bodies; off unless an experiment needs it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_parameters: Option<bool>,
+    /// `allow` | `deny` — whether endpoints that store or train on
+    /// prompts may be used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_collection: Option<DataCollection>,
+    /// Restrict routing to Zero Data Retention endpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zdr: Option<bool>,
+    /// Restrict routing to models that allow text distillation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enforce_distillable_text: Option<bool>,
+    /// Allow-list of quantization levels. Empty is a config error (it
+    /// can only mean "matches nothing").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantizations: Option<Vec<Quantization>>,
+    /// Per-unit price ceiling. Values are **strings** on the wire and
+    /// are forwarded exactly as the operator wrote them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_price: Option<MaxPrice>,
+    /// Soft preference: endpoints below the threshold are deprioritized,
+    /// not excluded. Scalar = p50; or `{p50,p75,p90,p99}` (all must be
+    /// met to be preferred).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_min_throughput: Option<ThroughputCutoffs>,
+    /// Soft preference, same shape as `preferred_min_throughput`, in
+    /// **seconds**.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_max_latency: Option<LatencyCutoffs>,
+}
+
+impl ProviderRouting {
+    /// `true` when no key is set — `provider_routing: {}` is a config
+    /// error (same rule as an empty `rate_limit: {}`).
+    pub fn is_empty(&self) -> bool {
+        self.only.is_none()
+            && self.ignore.is_none()
+            && self.sort.is_none()
+            && self.order.is_none()
+            && self.allow_fallbacks.is_none()
+            && self.require_parameters.is_none()
+            && self.data_collection.is_none()
+            && self.zdr.is_none()
+            && self.enforce_distillable_text.is_none()
+            && self.quantizations.is_none()
+            && self.max_price.is_none()
+            && self.preferred_min_throughput.is_none()
+            && self.preferred_max_latency.is_none()
+    }
+}
+
+/// OpenRouter `sort`: either one of the named strategies or the object
+/// form `{by, partition}`.
+///
+/// `untagged` is used only here (never on the wire types' config path);
+/// the config tests pin that a typo still produces an actionable
+/// message — if serde-saphyr cannot do that through `untagged`, this
+/// type is replaced by the raw value plus validation (plan §3.1).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum SortPreference {
+    Name(SortKey),
+    Config(SortConfig),
+}
+
+/// Object form of `sort`. A named struct, not an inline enum variant:
+/// `deny_unknown_fields` is a serde *container* attribute and cannot be
+/// applied to a variant, so `partiton:` would otherwise be accepted
+/// silently.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SortConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<SortKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition: Option<Partition>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortKey {
+    Price,
+    Throughput,
+    Latency,
+    /// OpenRouter-defined strategy listed alongside the other three;
+    /// its exact semantics are not in the spec (plan §3.1).
+    Exacto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Partition {
+    /// Group endpoints by model before sorting (default upstream).
+    Model,
+    /// Sort all endpoints together, which may promote a fallback model
+    /// ahead of the requested one — documented as unsupported for us
+    /// (the echoed `model` would disagree with what the client asked).
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DataCollection {
+    Allow,
+    Deny,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Quantization {
+    Int4,
+    Int8,
+    Fp4,
+    Mxfp4,
+    Nvfp4,
+    Fp6,
+    Fp8,
+    Mxfp8,
+    Fp16,
+    Bf16,
+    Fp32,
+    Unknown,
+}
+
+/// Per-unit price ceiling, **USD**; `prompt`/`completion` are USD per
+/// million tokens, the other keys are per image / audio unit / request.
+/// Values are strings on the wire and are forwarded verbatim.
+///
+/// `deny_unknown_fields`: the upstream schema tolerates junk keys, but a
+/// config typo like `completiont:` would then silently drop the output
+/// ceiling — an overspend with no 503 and no warning.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MaxPrice {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<String>,
+}
+
+impl MaxPrice {
+    pub fn is_empty(&self) -> bool {
+        self.prompt.is_none()
+            && self.completion.is_none()
+            && self.image.is_none()
+            && self.audio.is_none()
+            && self.request.is_none()
+    }
+
+    fn values(&self) -> impl Iterator<Item = (&'static str, &String)> {
+        [
+            ("prompt", self.prompt.as_ref()),
+            ("completion", self.completion.as_ref()),
+            ("image", self.image.as_ref()),
+            ("audio", self.audio.as_ref()),
+            ("request", self.request.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(k, v)| v.map(|v| (k, v)))
+    }
+}
+
+/// Scalar (p50) or per-percentile throughput thresholds, tokens/second.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ThroughputCutoffs {
+    Number(f64),
+    Percentiles(PercentileMap),
+}
+
+/// Scalar (p50) or per-percentile latency thresholds, **seconds**.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum LatencyCutoffs {
+    Number(f64),
+    Percentiles(PercentileMap),
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PercentileMap {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p50: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p75: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p90: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p99: Option<f64>,
+}
+
+impl PercentileMap {
+    pub fn is_empty(&self) -> bool {
+        self.p50.is_none() && self.p75.is_none() && self.p90.is_none() && self.p99.is_none()
+    }
+
+    fn values(&self) -> impl Iterator<Item = (&'static str, f64)> {
+        [
+            ("p50", self.p50),
+            ("p75", self.p75),
+            ("p90", self.p90),
+            ("p99", self.p99),
+        ]
+        .into_iter()
+        .filter_map(|(k, v)| v.map(|v| (k, v)))
+    }
+}
+
+/// Shared validation of a `preferred_*` cutoff: positive and finite,
+/// whether scalar or percentile map.
+fn validate_cutoffs(name: &str, field: &str, value: Option<f64>) -> Result<()> {
+    if let Some(v) = value {
+        if !v.is_finite() || v <= 0.0 {
+            return Err(ProxyError::Config(format!(
+                "provider '{name}': provider_routing.{field} must be a positive, finite number (got {v})"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Startup validation of one provider's `provider_routing` block.
+///
+/// Everything here is a local-shape rule; satisfiability (a filter
+/// combination no endpoint can meet, a ceiling below the cheapest
+/// endpoint) is deliberately not checked — that depends on OpenRouter's
+/// live catalogue and surfaces as the router's 503 warning.
+fn validate_provider_routing(name: &str, routing: &ProviderRouting) -> Result<()> {
+    if routing.is_empty() {
+        return Err(ProxyError::Config(format!(
+            "provider '{name}': provider_routing block carries no setting; \
+             remove the block or configure at least one key"
+        )));
+    }
+    if routing.sort.is_some() && routing.order.is_some() {
+        return Err(ProxyError::Config(format!(
+            "provider '{name}': provider_routing.sort and provider_routing.order cannot be \
+             combined (OpenRouter ignores sort when order is set)"
+        )));
+    }
+    if let Some(SortPreference::Config(cfg)) = &routing.sort {
+        if cfg.by.is_none() {
+            return Err(ProxyError::Config(format!(
+                "provider '{name}': provider_routing.sort.by is required in the object form \
+                 (use `sort: <strategy>` or `sort: {{by: <strategy>}}`)"
+            )));
+        }
+    }
+    for (field, list) in [
+        ("only", routing.only.as_ref()),
+        ("ignore", routing.ignore.as_ref()),
+        ("order", routing.order.as_ref()),
+    ] {
+        let Some(list) = list else { continue };
+        if list.is_empty() {
+            return Err(ProxyError::Config(format!(
+                "provider '{name}': provider_routing.{field} is empty; \
+                 an empty list cannot mean anything — omit the key instead"
+            )));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for slug in list {
+            if slug.trim().is_empty() {
+                return Err(ProxyError::Config(format!(
+                    "provider '{name}': provider_routing.{field} contains an empty slug"
+                )));
+            }
+            if !seen.insert(slug.as_str()) {
+                return Err(ProxyError::Config(format!(
+                    "provider '{name}': provider_routing.{field} lists '{slug}' more than once"
+                )));
+            }
+        }
+    }
+    if let Some(q) = &routing.quantizations {
+        if q.is_empty() {
+            return Err(ProxyError::Config(format!(
+                "provider '{name}': provider_routing.quantizations is empty; \
+                 an empty allow-list matches no endpoint"
+            )));
+        }
+    }
+    if let Some(price) = &routing.max_price {
+        if price.is_empty() {
+            return Err(ProxyError::Config(format!(
+                "provider '{name}': provider_routing.max_price carries no key"
+            )));
+        }
+        for (key, raw) in price.values() {
+            let parsed: f64 = raw.parse().map_err(|_| {
+                ProxyError::Config(format!(
+                    "provider '{name}': provider_routing.max_price.{key} must be a decimal \
+                     number of USD (got '{raw}')"
+                ))
+            })?;
+            if !parsed.is_finite() || parsed < 0.0 {
+                return Err(ProxyError::Config(format!(
+                    "provider '{name}': provider_routing.max_price.{key} must be a finite, \
+                     non-negative number (got '{raw}')"
+                )));
+            }
+        }
+    }
+    for (field, cutoffs) in [
+        (
+            "preferred_min_throughput",
+            routing.preferred_min_throughput.as_ref().map(Cutoffs::from_throughput),
+        ),
+        (
+            "preferred_max_latency",
+            routing.preferred_max_latency.as_ref().map(Cutoffs::from_latency),
+        ),
+    ] {
+        let Some(cutoffs) = cutoffs else { continue };
+        match cutoffs {
+            Cutoffs::Number(v) => validate_cutoffs(name, field, Some(v))?,
+            Cutoffs::Percentiles(map) => {
+                if map.is_empty() {
+                    return Err(ProxyError::Config(format!(
+                        "provider '{name}': provider_routing.{field} has no percentile set"
+                    )));
+                }
+                for (key, v) in map.values() {
+                    validate_cutoffs(name, &format!("{field}.{key}"), Some(v))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Borrowing view over the two cutoff types, which differ only in unit.
+enum Cutoffs<'a> {
+    Number(f64),
+    Percentiles(&'a PercentileMap),
+}
+
+impl<'a> Cutoffs<'a> {
+    fn from_throughput(c: &'a ThroughputCutoffs) -> Self {
+        match c {
+            ThroughputCutoffs::Number(v) => Cutoffs::Number(*v),
+            ThroughputCutoffs::Percentiles(m) => Cutoffs::Percentiles(m),
+        }
+    }
+
+    fn from_latency(c: &'a LatencyCutoffs) -> Self {
+        match c {
+            LatencyCutoffs::Number(v) => Cutoffs::Number(*v),
+            LatencyCutoffs::Percentiles(m) => Cutoffs::Percentiles(m),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProviderConfig {
@@ -414,40 +825,20 @@ pub enum ProviderConfig {
         /// through the global SOCKS/HTTP proxy. Defaults to `false`.
         #[serde(default)]
         use_proxy: bool,
-        /// The list of OpenRouter backend-provider slugs to exclude (e.g. `["Inceptron"]`).
-        /// When non-empty, the request body carries a `provider: {ignore: [...]}` field,
-        /// which makes OpenRouter skip those providers. It only applies when `api_base` points at
-        /// `openrouter.ai`; other Anthropic-compatible backends (e.g.
-        /// DeepSeek, Minimax, Alibaba Bailian) ignore this setting and produce a
-        /// startup warning, because strict Anthropic-compatible backends answer 400 on
-        /// unknown top-level fields.
-        /// An empty list (the default) injects no `provider` field at all.
-        #[serde(default)]
-        provider_ignore: Vec<String>,
-        /// OpenRouter backend provider slugs to RESTRICT routing to.
-        /// Non-empty → the request body carries `provider: {only: [...]}`,
-        /// which OpenRouter treats as a hard ceiling: the request is only
-        /// routed to providers in the list, and if none of them can serve
-        /// the model it fails with 503 ("No available model provider meets
-        /// your routing requirements").
+        /// OpenRouter provider routing for this provider: the
+        /// `provider` request object — allow-list (`only`), deny-list
+        /// (`ignore`), ranking (`sort` / `order`), the
+        /// fallback/parameter switches and the hard filters
+        /// (`max_price`, `zdr`, `data_collection`, `quantizations`,
+        /// `require_parameters`). See [`ProviderRouting`].
         ///
-        /// Only active when `api_base` points at `openrouter.ai`; other
-        /// Anthropic-compatible backends ignore the config and emit a
-        /// startup warning, because strict backends 400 on unknown
-        /// top-level fields.
-        ///
-        /// Slugs are passed through verbatim — exact, operator-supplied
-        /// strings, no normalization or validation. Note that a base slug
-        /// (e.g. `deepinfra`) matches every endpoint of that provider,
-        /// including variants like `deepinfra/turbo`; use a suffixed slug
-        /// to pin a single endpoint.
-        ///
-        /// When both `provider_allow` and `provider_ignore` are set, both
-        /// sub-fields are forwarded verbatim in the same `provider` object;
-        /// the proxy does not compute the intersection locally.
-        /// Empty list (default) injects no `provider.only` key.
-        #[serde(default)]
-        provider_allow: Vec<String>,
+        /// Only active when `api_base` points at `openrouter.ai`; on
+        /// other backends the block is ignored with a startup warning,
+        /// because strict Anthropic-compatible backends (e.g. DeepSeek,
+        /// Minimax, Alibaba Bailian) 400 on unknown top-level fields.
+        /// Absent (the default) injects no `provider` field at all.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_routing: Option<ProviderRouting>,
         /// Inject `{"thinking": {"type": "disabled"}}` into the request
         /// body when the outbound request has **no** `thinking` field
         /// (or an explicit `null`). This suppresses third-party
@@ -531,39 +922,20 @@ pub enum ProviderConfig {
         model_rewrite: HashMap<String, String>,
         #[serde(default)]
         use_proxy: bool,
-        /// The list of OpenRouter backend-provider slugs to exclude (e.g. `["Azure"]`).
-        /// When non-empty, the request body carries a `provider: {ignore: [...]}` field,
-        /// which makes OpenRouter skip those providers. It only applies when `api_base` points at
-        /// `openrouter.ai`; other OpenAI-compatible backends ignore this setting
-        /// and produce a startup warning (strict OpenAI-compatible backends such
-        /// as DeepSeek answer 400 on unknown top-level fields).
-        /// An empty list (the default) injects no `provider` field at all.
-        #[serde(default)]
-        provider_ignore: Vec<String>,
-        /// OpenRouter backend provider slugs to RESTRICT routing to.
-        /// Non-empty → the request body carries `provider: {only: [...]}`,
-        /// which OpenRouter treats as a hard ceiling: the request is only
-        /// routed to providers in the list, and if none of them can serve
-        /// the model it fails with 503 ("No available model provider meets
-        /// your routing requirements").
+        /// OpenRouter provider routing for this provider: the
+        /// `provider` request object — allow-list (`only`), deny-list
+        /// (`ignore`), ranking (`sort` / `order`), the
+        /// fallback/parameter switches and the hard filters
+        /// (`max_price`, `zdr`, `data_collection`, `quantizations`,
+        /// `require_parameters`). See [`ProviderRouting`].
         ///
-        /// Only active when `api_base` points at `openrouter.ai`; other
-        /// OpenAI-compat backends ignore the config and emit a startup
-        /// warning, because strict backends such as DeepSeek 400 on
-        /// unknown top-level fields.
-        ///
-        /// Slugs are passed through verbatim — exact, operator-supplied
-        /// strings, no normalization or validation. Note that a base slug
-        /// (e.g. `deepinfra`) matches every endpoint of that provider,
-        /// including variants like `deepinfra/turbo`; use a suffixed slug
-        /// to pin a single endpoint.
-        ///
-        /// When both `provider_allow` and `provider_ignore` are set, both
-        /// sub-fields are forwarded verbatim in the same `provider` object;
-        /// the proxy does not compute the intersection locally.
-        /// Empty list (default) injects no `provider.only` key.
-        #[serde(default)]
-        provider_allow: Vec<String>,
+        /// Only active when `api_base` points at `openrouter.ai`; on
+        /// other OpenAI-compatible backends the block is ignored with a
+        /// startup warning, because strict backends such as DeepSeek
+        /// 400 on unknown top-level fields. Absent (the default)
+        /// injects no `provider` field at all.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_routing: Option<ProviderRouting>,
         /// When `true`, every historical assistant message that lacks `reasoning_content`
         /// in a thinking request (a cross-model thinking turn, a redacted_thinking
         /// or a plain-text turn) is sent with `reasoning_content: ""`, so that
@@ -743,6 +1115,33 @@ impl ProviderConfig {
             | ProviderConfig::Anthropic { rate_limit, .. }
             | ProviderConfig::OpenaiCompat { rate_limit, .. }
             | ProviderConfig::OpenaiResponses { rate_limit, .. } => rate_limit.as_ref(),
+        }
+    }
+
+    /// The provider's upstream base URL, when it has one. `github_copilot`
+    /// derives its endpoints internally, so it has none.
+    pub fn api_base(&self) -> Option<&str> {
+        match self {
+            ProviderConfig::GithubCopilot { .. } => None,
+            ProviderConfig::Anthropic { api_base, .. }
+            | ProviderConfig::OpenaiCompat { api_base, .. }
+            | ProviderConfig::OpenaiResponses { api_base, .. } => Some(api_base),
+        }
+    }
+
+    /// The provider's optional OpenRouter routing block
+    /// (`provider_routing:`). `None` on the variants that do not accept
+    /// one (`github_copilot`, `openai_responses`) and when the key is
+    /// absent.
+    pub fn provider_routing(&self) -> Option<&ProviderRouting> {
+        match self {
+            ProviderConfig::GithubCopilot { .. } | ProviderConfig::OpenaiResponses { .. } => None,
+            ProviderConfig::Anthropic {
+                provider_routing, ..
+            }
+            | ProviderConfig::OpenaiCompat {
+                provider_routing, ..
+            } => provider_routing.as_ref(),
         }
     }
 }
@@ -966,6 +1365,19 @@ impl Config {
                      set at least one of rpm, tpm or max_concurrency"
                 )));
             }
+        }
+
+        // A `provider_routing` block must say something (an empty block
+        // is a mistake, same rule as an empty `rate_limit: {}`), and
+        // every list/price/threshold it does carry must be meaningful.
+        // None of this is a *reachability* check: whether the policy can
+        // be satisfied is OpenRouter-side data we do not have offline —
+        // the router warns on a 503 instead (plan §6.1).
+        for p in &self.providers {
+            let Some(routing) = p.provider_routing() else {
+                continue;
+            };
+            validate_provider_routing(p.name(), routing)?;
         }
 
         for m in &self.models {
@@ -2066,8 +2478,7 @@ models:
                     api_base: "https://example.test/v1".into(),
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     thinking_when_absent: ThinkingWhenAbsent::Omit,
 
                     user_agent: None,
@@ -2084,8 +2495,7 @@ models:
                     api_base: "https://example.test/v1".into(),
                     model_rewrite: HashMap::new(),
                     use_proxy: false,
-                    provider_ignore: Vec::new(),
-                    provider_allow: Vec::new(),
+                    provider_routing: None,
                     reasoning_echo: false,
 
                     user_agent: None,
@@ -2383,91 +2793,436 @@ models:
         });
     }
 
-    /// `provider_allow` round-trips through YAML into both variants that
-    /// support it, alongside `provider_ignore`. The list is preserved
-    /// verbatim (no normalization) because slugs are operator-supplied and
-    /// OpenRouter documents no case-folding.
+    /// `provider_routing` round-trips through YAML into both variants
+    /// that support it. Lists are preserved verbatim (no normalization)
+    /// because slugs are operator-supplied and OpenRouter documents no
+    /// case-folding.
     #[test]
-    fn provider_allow_parses_from_yaml() {
+    fn provider_routing_parses_from_yaml() {
         let raw = r#"
 providers:
   - name: or_anthropic
     type: anthropic
     api_key: k
     api_base: https://openrouter.ai/api/v1
-    provider_allow: ["DeepInfra", "Together"]
-    provider_ignore: ["Azure"]
+    provider_routing:
+      only: ["DeepInfra", "Together"]
+      ignore: ["Azure"]
+      sort: throughput
+      allow_fallbacks: false
+      data_collection: deny
+      zdr: true
+      quantizations: ["fp8", "bf16"]
+      max_price: {prompt: "0.30", completion: "1.20"}
+      preferred_min_throughput: {p50: 40, p90: 20}
   - name: or_compat
     type: openai_compat
     api_key: k
     api_base: https://openrouter.ai/api/v1
-    provider_allow: ["DeepInfra"]
+    provider_routing:
+      only: ["DeepInfra"]
+      sort: {by: latency, partition: model}
 models:
   - name: m
     primary: or_anthropic
 "#;
         let cfg = Config::parse(raw).unwrap();
-        expect_variant!(&cfg.providers[0], ProviderConfig::Anthropic { provider_allow, provider_ignore, .. } => {
-            assert_eq!(
-                provider_allow,
-                &vec!["DeepInfra".to_string(), "Together".to_string()]
+        let routing = cfg.providers[0]
+            .provider_routing()
+            .expect("anthropic routing present");
+        assert_eq!(
+            routing.only.as_deref(),
+            Some(["DeepInfra".to_string(), "Together".to_string()].as_slice())
+        );
+        assert_eq!(
+            routing.ignore.as_deref(),
+            Some(["Azure".to_string()].as_slice())
+        );
+        assert_eq!(routing.sort, Some(SortPreference::Name(SortKey::Throughput)));
+        assert_eq!(routing.allow_fallbacks, Some(false));
+        assert_eq!(routing.data_collection, Some(DataCollection::Deny));
+        assert_eq!(routing.zdr, Some(true));
+        assert_eq!(
+            routing.quantizations.as_deref(),
+            Some([Quantization::Fp8, Quantization::Bf16].as_slice())
+        );
+        let price = routing.max_price.as_ref().expect("max_price");
+        assert_eq!(price.prompt.as_deref(), Some("0.30"));
+        assert_eq!(price.completion.as_deref(), Some("1.20"));
+        match routing
+            .preferred_min_throughput
+            .as_ref()
+            .expect("cutoffs")
+        {
+            ThroughputCutoffs::Percentiles(map) => {
+                assert_eq!(map.p50, Some(40.0));
+                assert_eq!(map.p90, Some(20.0));
+            }
+            other => panic!("expected percentile map, got {other:?}"),
+        }
+
+        let routing = cfg.providers[1]
+            .provider_routing()
+            .expect("compat routing present");
+        assert_eq!(
+            routing.sort,
+            Some(SortPreference::Config(SortConfig {
+                by: Some(SortKey::Latency),
+                partition: Some(Partition::Model),
+            }))
+        );
+    }
+
+    /// An omitted block yields `None` on both variants, so every existing
+    /// config keeps its current wire bytes (no `provider` key injected).
+    #[test]
+    fn provider_routing_defaults_to_none() {
+        let raw = r#"
+providers:
+  - name: or_anthropic
+    type: anthropic
+    api_key: k
+    api_base: https://openrouter.ai/api/v1
+  - name: or_compat
+    type: openai_compat
+    api_key: k
+    api_base: https://openrouter.ai/api/v1
+models:
+  - name: m
+    primary: or_anthropic
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        assert!(cfg.providers[0].provider_routing().is_none());
+        assert!(cfg.providers[1].provider_routing().is_none());
+    }
+
+    /// The pre-`provider_routing` top-level keys are removed, not
+    /// aliased: a stale config refuses to start instead of silently
+    /// running unconstrained (plan §3.3). This is the migration guard.
+    #[test]
+    fn removed_top_level_routing_keys_are_a_parse_error() {
+        for key in ["provider_allow", "provider_ignore"] {
+            let raw = format!(
+                r#"
+providers:
+  - name: or_anthropic
+    type: anthropic
+    api_key: k
+    api_base: https://openrouter.ai/api/v1
+    {key}: ["DeepInfra"]
+models:
+  - name: m
+    primary: or_anthropic
+"#
             );
-            assert_eq!(provider_ignore, &vec!["Azure".to_string()]);
-        });
-        expect_variant!(&cfg.providers[1], ProviderConfig::OpenaiCompat { provider_allow, .. } => {
-            assert_eq!(provider_allow, &vec!["DeepInfra".to_string()]);
-        });
+            let err = Config::parse(&raw)
+                .expect_err("a removed top-level routing key must fail to parse");
+            assert!(
+                format!("{err}").contains(key),
+                "error should name the offending key ({key}): {err}"
+            );
+        }
     }
 
-    /// An omitted `provider_allow` defaults to an empty list on both
-    /// variants, so every existing config keeps its current wire bytes
-    /// (no `provider.only` key is injected).
+    /// A misspelled key inside the block is a hard parse error, not a
+    /// silently-ignored constraint.
     #[test]
-    fn provider_allow_defaults_to_empty() {
+    fn provider_routing_rejects_unknown_fields() {
         let raw = r#"
 providers:
   - name: or_anthropic
     type: anthropic
     api_key: k
     api_base: https://openrouter.ai/api/v1
-  - name: or_compat
-    type: openai_compat
-    api_key: k
-    api_base: https://openrouter.ai/api/v1
-models:
-  - name: m
-    primary: or_anthropic
-"#;
-        let cfg = Config::parse(raw).unwrap();
-        expect_variant!(&cfg.providers[0], ProviderConfig::Anthropic { provider_allow, .. } => {
-            assert!(provider_allow.is_empty());
-        });
-        expect_variant!(&cfg.providers[1], ProviderConfig::OpenaiCompat { provider_allow, .. } => {
-            assert!(provider_allow.is_empty());
-        });
-    }
-
-    /// `deny_unknown_fields` on the variants means a typo like
-    /// `provider_allowed:` is a hard YAML parse error rather than a
-    /// silently-ignored key — which for a routing allowlist would be a
-    /// silent under-constraint.
-    #[test]
-    fn provider_allow_rejects_unknown_fields() {
-        let raw = r#"
-providers:
-  - name: or_anthropic
-    type: anthropic
-    api_key: k
-    api_base: https://openrouter.ai/api/v1
-    provider_allowed: ["DeepInfra"]
+    provider_routing:
+      provider_allowed: ["DeepInfra"]
 models:
   - name: m
     primary: or_anthropic
 "#;
         assert!(
             Config::parse(raw).is_err(),
-            "a misspelled provider_allow key must fail to parse"
+            "a misspelled provider_routing key must fail to parse"
         );
+    }
+
+    /// `provider_routing: {}` is a mistake — it means nothing and can
+    /// only mislead. Same rule as an empty `rate_limit: {}`.
+    #[test]
+    fn provider_routing_empty_block_is_rejected() {
+        let raw = r#"
+providers:
+  - name: or_anthropic
+    type: anthropic
+    api_key: k
+    api_base: https://openrouter.ai/api/v1
+    provider_routing: {}
+models:
+  - name: m
+    primary: or_anthropic
+"#;
+        let err = Config::parse(raw).expect_err("empty provider_routing");
+        assert!(format!("{err}").contains("provider_routing"), "{err}");
+    }
+
+    /// `sort: {by, partition}` needs `by`; a bare `partition` cannot
+    /// rank anything.
+    #[test]
+    fn provider_routing_sort_object_requires_by() {
+        let raw = r#"
+providers:
+  - name: or_anthropic
+    type: anthropic
+    api_key: k
+    api_base: https://openrouter.ai/api/v1
+    provider_routing:
+      sort: {partition: model}
+models:
+  - name: m
+    primary: or_anthropic
+"#;
+        let err = Config::parse(raw).expect_err("sort without by");
+        assert!(format!("{err}").contains("sort.by"), "{err}");
+    }
+
+    /// A typo inside the object form must not be silently accepted —
+    /// `deny_unknown_fields` on `SortConfig` is what catches it.
+    #[test]
+    fn provider_routing_sort_object_typo_is_a_parse_error() {
+        let raw = r#"
+providers:
+  - name: or_anthropic
+    type: anthropic
+    api_key: k
+    api_base: https://openrouter.ai/api/v1
+    provider_routing:
+      sort: {by: throughput, partiton: model}
+models:
+  - name: m
+    primary: or_anthropic
+"#;
+        let err = Config::parse(raw).expect_err("partiton typo");
+        let msg = format!("{err}").to_lowercase();
+        assert!(
+            msg.contains("sort") || msg.contains("partiton"),
+            "error should be actionable: {err}"
+        );
+    }
+
+    /// `order` makes `sort` irrelevant upstream; configuring both is
+    /// refused rather than silently dropping one of them.
+    #[test]
+    fn provider_routing_sort_and_order_together_are_rejected() {
+        let raw = r#"
+providers:
+  - name: or_anthropic
+    type: anthropic
+    api_key: k
+    api_base: https://openrouter.ai/api/v1
+    provider_routing:
+      sort: price
+      order: ["DeepInfra"]
+models:
+  - name: m
+    primary: or_anthropic
+"#;
+        let err = Config::parse(raw).expect_err("sort + order");
+        assert!(format!("{err}").contains("sort"), "{err}");
+    }
+
+    /// An empty list can only mean "no filter", which is spelled by
+    /// omitting the key — accepting `only: []` would silently do nothing.
+    /// Blank and duplicated slugs are operator mistakes too.
+    #[test]
+    fn provider_routing_list_rules() {
+        let base = |body: &str| {
+            format!(
+                r#"
+providers:
+  - name: or_anthropic
+    type: anthropic
+    api_key: k
+    api_base: https://openrouter.ai/api/v1
+    provider_routing:
+{body}
+models:
+  - name: m
+    primary: or_anthropic
+"#
+            )
+        };
+        for body in [
+            "      only: []",
+            "      ignore: []",
+            "      order: []",
+            "      only: [\"DeepInfra\", \"DeepInfra\"]",
+            "      ignore: [\"  \"]",
+        ] {
+            assert!(
+                Config::parse(&base(body)).is_err(),
+                "provider_routing with `{body}` must be rejected"
+            );
+        }
+        assert!(Config::parse(&base("      only: [\"DeepInfra\"]")).is_ok());
+    }
+
+    /// `max_price` values are USD strings forwarded verbatim; only their
+    /// shape is validated locally. `"0"` is meaningful (free endpoints),
+    /// `nan`/`inf`/negative are not.
+    #[test]
+    fn provider_routing_max_price_validation() {
+        let base = |body: &str| {
+            format!(
+                r#"
+providers:
+  - name: or_anthropic
+    type: anthropic
+    api_key: k
+    api_base: https://openrouter.ai/api/v1
+    provider_routing:
+      max_price: {body}
+models:
+  - name: m
+    primary: or_anthropic
+"#
+            )
+        };
+        for body in ["{}", "{prompt: cheap}", "{prompt: \"-1\"}", "{prompt: \"inf\"}", "{prompt: \"nan\"}"] {
+            assert!(
+                Config::parse(&base(body)).is_err(),
+                "max_price: {body} must be rejected"
+            );
+        }
+        // A typo'd key is rejected, not silently dropped (an unfiltered
+        // output-price ceiling is exactly the silent-overcharge case).
+        assert!(Config::parse(&base("{completiont: \"1.20\"}")).is_err());
+        // "0" is legal and is forwarded as the same string.
+        let cfg = Config::parse(&base("{prompt: \"0\"}")).unwrap();
+        let routing = cfg.providers[0].provider_routing().expect("routing");
+        let price = routing.max_price.as_ref().expect("max_price");
+        assert_eq!(price.prompt.as_deref(), Some("0"));
+    }
+
+    /// `quantizations` is an allow-list; an empty one matches nothing,
+    /// an unknown level is a typo. Every documented level parses.
+    #[test]
+    fn provider_routing_quantizations_validation() {
+        let base = |body: &str| {
+            format!(
+                r#"
+providers:
+  - name: or_anthropic
+    type: anthropic
+    api_key: k
+    api_base: https://openrouter.ai/api/v1
+    provider_routing:
+      quantizations: {body}
+models:
+  - name: m
+    primary: or_anthropic
+"#
+            )
+        };
+        assert!(Config::parse(&base("[]")).is_err());
+        assert!(Config::parse(&base("[\"fp64\"]")).is_err());
+        let cfg = Config::parse(&base(
+            r#"["int4","int8","fp4","mxfp4","nvfp4","fp6","fp8","mxfp8","fp16","bf16","fp32","unknown"]"#,
+        ))
+        .unwrap();
+        let routing = cfg.providers[0].provider_routing().expect("routing");
+        assert_eq!(
+            routing.quantizations.as_ref().map(Vec::len),
+            Some(12),
+            "every documented quantization level must parse"
+        );
+    }
+
+    /// `preferred_*` cutoffs are positive and finite, scalar or
+    /// percentile map; an object with no percentile set is a mistake.
+    #[test]
+    fn provider_routing_preferred_cutoffs_validation() {
+        let base = |body: &str| {
+            format!(
+                r#"
+providers:
+  - name: or_anthropic
+    type: anthropic
+    api_key: k
+    api_base: https://openrouter.ai/api/v1
+    provider_routing:
+      {body}
+models:
+  - name: m
+    primary: or_anthropic
+"#
+            )
+        };
+        assert!(Config::parse(&base("preferred_min_throughput: 40")).is_ok());
+        assert!(Config::parse(&base("preferred_max_latency: 2.5")).is_ok());
+        assert!(Config::parse(&base("preferred_max_latency: {p50: 1, p99: 4}")).is_ok());
+        for body in [
+            "preferred_min_throughput: 0",
+            "preferred_min_throughput: -5",
+            "preferred_max_latency: {}",
+            "preferred_max_latency: {p50: 0}",
+            "preferred_max_latency: {p50: -1}",
+        ] {
+            assert!(
+                Config::parse(&base(body)).is_err(),
+                "`{body}` must be rejected"
+            );
+        }
+    }
+
+    /// The routing block is only accepted on the two variants that can
+    /// drive OpenRouter's `provider` object. `github_copilot` and
+    /// `openai_responses` reject it (pins the Phase-1 surface; Phase 2
+    /// may extend `openai_responses`).
+    #[test]
+    fn provider_routing_is_rejected_on_variants_without_it() {
+        for ty in [
+            "type: github_copilot",
+            "type: openai_responses\n    api_base: https://api.example.test/v1",
+        ] {
+            let raw = format!(
+                r#"
+providers:
+  - name: p
+    {ty}
+    api_key: k
+    provider_routing:
+      only: ["DeepInfra"]
+models:
+  - name: m
+    primary: p
+"#
+            );
+            assert!(
+                Config::parse(&raw).is_err(),
+                "provider_routing must not parse on `{ty}`"
+            );
+        }
+    }
+
+    /// A routing block on a non-OpenRouter host still parses (the
+    /// provider ignores it with a startup warning); this pins that the
+    /// config layer does not try to police upstream hosts.
+    #[test]
+    fn provider_routing_on_non_openrouter_host_parses() {
+        let raw = r#"
+providers:
+  - name: ds
+    type: anthropic
+    api_key: k
+    api_base: https://api.deepseek.com/anthropic
+    provider_routing:
+      only: ["DeepInfra"]
+models:
+  - name: m
+    primary: ds
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        assert!(cfg.providers[0].provider_routing().is_some());
     }
 
     // ── thinking_when_absent ───────────────────────────────────────
@@ -2877,8 +3632,7 @@ models:
             api_base: "https://example.test/v1".to_string(),
             model_rewrite: HashMap::new(),
             use_proxy: false,
-            provider_ignore: Vec::new(),
-            provider_allow: Vec::new(),
+            provider_routing: None,
             reasoning_echo: false,
 
             user_agent: None,

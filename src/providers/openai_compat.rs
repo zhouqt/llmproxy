@@ -18,6 +18,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::{json, Value};
 
 use crate::anthropic::{MessagesRequest, StreamEvent};
+use crate::config::ProviderRouting;
 use crate::conversion::{
     anthropic_to_openai_request, make_message_id, openai_to_anthropic_response,
 };
@@ -31,23 +32,12 @@ pub struct OpenAiCompatProvider {
     api_base: String,
     api_key: SecretString,
     model_rewrite: HashMap<String, String>,
-    /// The list of OpenRouter backend-provider slugs to exclude.
-    /// When non-empty and `is_openrouter == true`, a `provider: {ignore: [...]}`
-    /// field is injected into the request body; on other backends the setting is ignored
-    provider_ignore: Vec<String>,
-    /// OpenRouter backend provider slugs to restrict routing to.
-    /// Non-empty + `is_openrouter == true` → the request carries
-    /// `provider: {only: [...]}`. OpenRouter treats `only` as a hard
-    /// ceiling: if no listed provider can serve the model the request
-    /// fails with 503, which llmproxy treats as cooldownable — so a
-    /// mistyped allowlist silently cools this provider down rather than
-    /// surfacing a config error. See plans/openrouter-provider-allow-plan.md
-    /// §7.11.
-    ///
-    /// Slugs are opaque, operator-supplied strings, forwarded verbatim.
-    /// Forwarded alongside `provider_ignore` in the same `provider`
-    /// object; the proxy never computes the intersection locally.
-    provider_allow: Vec<String>,
+    /// OpenRouter provider routing (`provider_routing:` in the config):
+    /// the `provider` request object — allow/deny lists, ranking and the
+    /// hard filters. Injected verbatim into `extra` when
+    /// `is_openrouter == true`; ignored (startup warning already logged)
+    /// on other backends.
+    routing: Option<ProviderRouting>,
     /// The cached result of the `api_base` host check: `true` if and only if the host is
     /// `openrouter.ai` (case-insensitive; subdomains such as `www.openrouter.ai` are allowed).
     /// Computed once in `new()` so that it is not re-parsed on every request.
@@ -77,12 +67,7 @@ impl OpenAiCompatProvider {
         api_base: String,
         api_key: SecretString,
         model_rewrite: HashMap<String, String>,
-        provider_ignore: Vec<String>,
-        // Placed immediately after `provider_ignore` (both `Vec<String>`,
-        // so a transposition at a call site would compile silently) rather
-        // than at the end of the parameter list, keeping the two OpenRouter
-        // routing lists adjacent at every call site.
-        provider_allow: Vec<String>,
+        routing: Option<ProviderRouting>,
         reasoning_echo: bool,
         http: reqwest::Client,
     ) -> Result<Self> {
@@ -96,14 +81,25 @@ impl OpenAiCompatProvider {
 
         // Warn once at startup instead of on every request. Misconfigured for a strict
         // backend such as DeepSeek or opencode, the request body stays clean (no `provider` field is injected).
-        if !is_openrouter && (!provider_ignore.is_empty() || !provider_allow.is_empty()) {
+        if !is_openrouter && routing.is_some() {
             tracing::warn!(
                 provider = %name,
                 api_base = %api_base,
-                "provider_allow/provider_ignore configured but api_base is not \
-                 openrouter.ai; fields will be ignored (strict OpenAI-compat \
-                 backends like DeepSeek may reject unknown top-level fields)"
+                "provider_routing configured but api_base is not openrouter.ai; \
+                 the block will be ignored (strict OpenAI-compat backends like \
+                 DeepSeek may reject unknown top-level fields)"
             );
+        }
+        // One INFO line naming the effective policy (key names and
+        // counts only — never the API key, never a config dump).
+        if is_openrouter {
+            if let Some(routing) = &routing {
+                tracing::info!(
+                    provider = %name,
+                    openrouter_routing = %crate::providers::routing_summary(routing),
+                    "OpenRouter provider routing enabled"
+                );
+            }
         }
 
         Ok(Self {
@@ -111,8 +107,7 @@ impl OpenAiCompatProvider {
             api_base,
             api_key,
             model_rewrite,
-            provider_ignore,
-            provider_allow,
+            routing,
             is_openrouter,
             reasoning_echo,
             http,
@@ -139,49 +134,33 @@ impl OpenAiCompatProvider {
         format!("{}/models", self.api_base)
     }
 
-    /// Inject the OpenRouter routing preferences into `ChatRequest.extra` as a
-    /// single `provider` object, when at least one list is non-empty and
-    /// `api_base` points at OpenRouter.
+    /// Inject the OpenRouter `provider` routing object into
+    /// `ChatRequest.extra`, when a `provider_routing` block is configured
+    /// and `api_base` points at OpenRouter.
     ///
-    /// - `only` ← `provider_allow` (allowlist, hard ceiling)
-    /// - `ignore` ← `provider_ignore` (denylist)
-    ///
-    /// When both are configured both sub-fields are written verbatim into the
-    /// same object; this function deliberately does NOT compute the
-    /// intersection locally (operator decision: `only` governs, `ignore`
-    /// applies beneath it — plans/openrouter-provider-allow-plan.md §1.4).
-    ///
-    /// Gate:
-    /// - both lists empty → no-op (default; never emits an empty `provider`).
-    /// - non-empty and OpenRouter → inject.
-    /// - non-empty and not OpenRouter → no-op (startup warning already logged).
+    /// The block is serialized verbatim by
+    /// [`crate::providers::openrouter_provider_object`] — no merging, no
+    /// intersection, no local transformation. A client-supplied
+    /// `provider` object is **replaced** by the config one: the config is
+    /// the operator's policy and wins.
     ///
     /// The injection must happen before the retry loop, because
-    /// `strip_reasoning_echo()` / `downgrade_response_format()` never touch
-    /// `extra.provider`, so retry bodies keep carrying it (the correct
-    /// semantic — the constrained/excluded providers apply to every attempt).
-    fn inject_provider_ignore(&self, req: &mut ChatRequest) {
-        if self.provider_allow.is_empty() && self.provider_ignore.is_empty() {
-            return;
-        }
+    /// `strip_reasoning_echo()` / `downgrade_response_format()` never
+    /// touch `extra.provider`, so retry bodies keep carrying it (the
+    /// correct semantic — the routing policy applies to every attempt).
+    fn inject_provider_routing(&self, req: &mut ChatRequest) {
         if !self.is_openrouter {
             return;
         }
-        // Only write non-empty sub-fields so an ignore-only (or allow-only)
-        // configuration never emits a half-populated `provider` object —
-        // field presence on the wire is correctness here.
-        let mut prefs = serde_json::Map::with_capacity(2);
-        if !self.provider_allow.is_empty() {
-            prefs.insert("only".to_string(), json!(self.provider_allow));
-        }
-        if !self.provider_ignore.is_empty() {
-            prefs.insert("ignore".to_string(), json!(self.provider_ignore));
-        }
+        let Some(provider) = crate::providers::openrouter_provider_object(self.routing.as_ref())
+        else {
+            return;
+        };
         // `extra` is initialized to `Value::Object(Map::new())` by
         // `anthropic_to_openai_request`, so `as_object_mut()` always succeeds
         // on the real path. The `Value::Null` case is a defensive guard.
         if let Some(obj) = req.extra.as_object_mut() {
-            obj.insert("provider".to_string(), Value::Object(prefs));
+            obj.insert("provider".to_string(), provider);
         }
     }
 
@@ -198,8 +177,7 @@ impl OpenAiCompatProvider {
         api_base: String,
         api_key: SecretString,
         model_rewrite: HashMap<String, String>,
-        provider_ignore: Vec<String>,
-        provider_allow: Vec<String>,
+        routing: Option<ProviderRouting>,
         reasoning_echo: bool,
         force_openrouter: bool,
         http: reqwest::Client,
@@ -210,8 +188,7 @@ impl OpenAiCompatProvider {
             api_base,
             api_key,
             model_rewrite,
-            provider_ignore,
-            provider_allow,
+            routing,
             is_openrouter: force_openrouter,
             reasoning_echo,
             http,
@@ -425,7 +402,7 @@ impl Provider for OpenAiCompatProvider {
         let mut openai_req = anthropic_to_openai_request(req, &merged, self.reasoning_echo)?;
         openai_req.stream = false;
         openai_req.stream_options = None;
-        self.inject_provider_ignore(&mut openai_req);
+        self.inject_provider_routing(&mut openai_req);
 
         // Strip-and-retry loop (mirrors `AnthropicProvider::complete`):
         // DeepSeek/opencode in thinking mode reject requests whose assistant
@@ -545,7 +522,7 @@ impl Provider for OpenAiCompatProvider {
 
         let mut openai_req = anthropic_to_openai_request(req, &merged, self.reasoning_echo)?;
         openai_req.stream = true;
-        self.inject_provider_ignore(&mut openai_req);
+        self.inject_provider_routing(&mut openai_req);
 
         // Streaming retry: response_format 400 is safe to retry (the 400 is
         // a synchronous POST response — it arrives before any SSE byte
@@ -837,6 +814,20 @@ mod tests {
         cache_request_with, chat_response, openai_request as request, JsonFieldAbsent,
     };
 
+    /// Supply a `provider_routing` block from the two legacy lists
+    /// (ignore, allow) that the old wire tests were written against.
+    /// `None` when both are empty — no block, no `provider` key.
+    fn routing(ignore: &[&str], only: &[&str]) -> Option<ProviderRouting> {
+        if ignore.is_empty() && only.is_empty() {
+            return None;
+        }
+        Some(ProviderRouting {
+            ignore: (!ignore.is_empty()).then(|| ignore.iter().map(|s| s.to_string()).collect()),
+            only: (!only.is_empty()).then(|| only.iter().map(|s| s.to_string()).collect()),
+            ..Default::default()
+        })
+    }
+
     /// The user-reported upstream 400: OpenAI-style wording on the
     /// /chat/completions path (opencode Zen → deepseek in thinking mode).
     const REASONING_ECHO_400: &str = r#"{"error":{"message":"Upstream request failed: [invalid_request_error] The reasoning_content in the thinking mode must be passed back to the API"}}"#;
@@ -888,8 +879,7 @@ mod tests {
             format!("{}/v1/", server.uri()),
             secret_string("test-key"),
             configured_rewrite,
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -929,8 +919,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -974,8 +963,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -1018,8 +1006,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -1108,8 +1095,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -1175,8 +1161,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -1408,8 +1393,7 @@ mod tests {
             "https://x/v1/".to_string(),
             secret_string("k"),
             rewrite,
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -1502,8 +1486,7 @@ mod tests {
             format!("{}/v1/", server.uri()),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -1540,8 +1523,7 @@ mod tests {
             format!("{}/v1/", server.uri()),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -1580,8 +1562,7 @@ mod tests {
             format!("{}/v1/", server.uri()),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -1616,8 +1597,7 @@ mod tests {
             format!("{}/v1/", server.uri()),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -1734,8 +1714,7 @@ mod tests {
             server.uri(),
             secret_string("test-key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -1775,8 +1754,7 @@ mod tests {
             server.uri(),
             secret_string("test-key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -1800,8 +1778,7 @@ mod tests {
             "http://127.0.0.1:1".to_string(),
             secret_string("test-key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -1825,8 +1802,7 @@ mod tests {
             server.uri(),
             secret_string("test-key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -1852,8 +1828,7 @@ mod tests {
             server.uri(),
             secret_string("test-key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -2100,8 +2075,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -2185,8 +2159,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -2247,8 +2220,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -2288,8 +2260,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -2331,8 +2302,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             rewrite,
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -2604,8 +2574,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -2677,8 +2646,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -2734,8 +2702,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -2787,8 +2754,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -2870,8 +2836,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -2945,8 +2910,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -2999,8 +2963,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
@@ -3046,8 +3009,7 @@ mod tests {
             format!("{}/v1/", server.uri()),
             secret_string("key"),
             HashMap::new(),
-            vec!["Azure".to_string()],
-            Vec::new(),
+            routing(&["Azure"], &[]),
             false,
             true, // force_openrouter
             reqwest::Client::new(),
@@ -3080,8 +3042,7 @@ mod tests {
             format!("{}/v1/", server.uri()),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             false, // force_openrouter
             reqwest::Client::new(),
@@ -3123,8 +3084,7 @@ mod tests {
             format!("{}/v1/", server.uri()),
             secret_string("key"),
             HashMap::new(),
-            vec!["Azure".to_string()],
-            Vec::new(), // non-empty list
+            routing(&["Azure"], &[]), // non-empty list
             false,
             false, // force_openrouter=false → gate suppresses injection
             reqwest::Client::new(),
@@ -3156,8 +3116,7 @@ mod tests {
             format!("{}/v1/", server.uri()),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             true, // force_openrouter (even so, empty list means no injection)
             reqwest::Client::new(),
@@ -3204,8 +3163,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            vec!["Azure".to_string()],
-            Vec::new(),
+            routing(&["Azure"], &[]),
             false,
             true, // force_openrouter
             reqwest::Client::new(),
@@ -3280,8 +3238,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            vec!["Azure".to_string()],
-            Vec::new(),
+            routing(&["Azure"], &[]),
             false,
             true, // force_openrouter
             reqwest::Client::new(),
@@ -3348,8 +3305,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            vec!["Azure".to_string(), "Together".to_string()],
-            Vec::new(),
+            routing(&["Azure", "Together"], &[]),
             false,
             true, // force_openrouter
             reqwest::Client::new(),
@@ -3375,7 +3331,7 @@ mod tests {
     /// `is_openrouter_api_base_matches_canonical_subdomains_and_case`).
     /// This test pins the integration: the production `new()` with a
     /// canonical OpenRouter URL must cache `is_openrouter = true`, so a
-    /// subsequent `inject_provider_ignore` actually injects.
+    /// subsequent `inject_provider_routing` actually injects.
     #[test]
     fn openrouter_host_detection_covers_subdomains_and_case() {
         let p = OpenAiCompatProvider::new(
@@ -3383,19 +3339,18 @@ mod tests {
             "https://openrouter.ai/api/v1".to_string(),
             secret_string("k"),
             HashMap::new(),
-            vec!["Azure".to_string()],
-            Vec::new(),
+            routing(&["Azure"], &[]),
             false,
             reqwest::Client::new(),
         )
         .unwrap();
         assert_eq!(p.name(), "p");
         // The flag is private; the strongest public-surface check is
-        // that `inject_provider_ignore` actually mutates the request
+        // that `inject_provider_routing` actually mutates the request
         // when the production constructor detected an OpenRouter
         // api_base.
         let mut req = minimal_chat_request();
-        p.inject_provider_ignore(&mut req);
+        p.inject_provider_routing(&mut req);
         assert_eq!(
             req.extra["provider"]["ignore"],
             json!(["Azure"]),
@@ -3432,8 +3387,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            vec!["DeepInfra".to_string()],
+            routing(&[], &["DeepInfra"]),
             false,
             true, // force_openrouter
             reqwest::Client::new(),
@@ -3473,8 +3427,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            vec!["Azure".to_string()],
-            vec!["DeepInfra".to_string(), "Together".to_string()],
+            routing(&["Azure"], &["DeepInfra", "Together"]),
             false,
             true,
             reqwest::Client::new(),
@@ -3533,8 +3486,10 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            allow.clone(),
+            Some(ProviderRouting {
+                only: Some(allow.clone()),
+                ..Default::default()
+            }),
             false,
             true,
             reqwest::Client::new(),
@@ -3586,8 +3541,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            vec!["Azure".to_string()],
-            Vec::new(),
+            routing(&["Azure"], &[]),
             false,
             true,
             reqwest::Client::new(),
@@ -3626,8 +3580,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             true,
             reqwest::Client::new(),
@@ -3660,8 +3613,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            vec!["DeepInfra".to_string()],
+            routing(&[], &["DeepInfra"]),
             false,
             false, // force_openrouter = false → gate suppresses injection
             reqwest::Client::new(),
@@ -3706,8 +3658,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            vec!["DeepInfra".to_string(), "Together".to_string()],
+            routing(&[], &["DeepInfra", "Together"]),
             false,
             true,
             reqwest::Client::new(),
@@ -3769,8 +3720,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            vec!["DeepInfra".to_string()],
+            routing(&[], &["DeepInfra"]),
             false,
             true,
             reqwest::Client::new(),
@@ -3830,8 +3780,7 @@ mod tests {
             server.uri(),
             secret_string("key"),
             HashMap::new(),
-            Vec::new(),
-            vec!["DeepInfra".to_string()],
+            routing(&[], &["DeepInfra"]),
             false,
             true,
             reqwest::Client::new(),
@@ -3855,22 +3804,21 @@ mod tests {
     /// initialises `extra` to an empty object) but must not panic if a
     /// future path hands the helper a `Null`.
     #[test]
-    fn inject_provider_ignore_merges_allow_and_ignore_into_one_object() {
+    fn inject_provider_routing_merges_allow_and_ignore_into_one_object() {
         // Both lists set → one object with both keys.
         let p = OpenAiCompatProvider::new_for_test(
             "p".to_string(),
             "https://example.test/v1".to_string(),
             secret_string("k"),
             HashMap::new(),
-            vec!["Azure".to_string()],
-            vec!["DeepInfra".to_string()],
+            routing(&["Azure"], &["DeepInfra"]),
             false,
             true,
             reqwest::Client::new(),
         )
         .unwrap();
         let mut req = minimal_chat_request();
-        p.inject_provider_ignore(&mut req);
+        p.inject_provider_routing(&mut req);
         assert_eq!(
             req.extra["provider"],
             json!({"only": ["DeepInfra"], "ignore": ["Azure"]})
@@ -3882,15 +3830,14 @@ mod tests {
             "https://example.test/v1".to_string(),
             secret_string("k"),
             HashMap::new(),
-            Vec::new(),
-            vec!["DeepInfra".to_string()],
+            routing(&[], &["DeepInfra"]),
             false,
             true,
             reqwest::Client::new(),
         )
         .unwrap();
         let mut req = minimal_chat_request();
-        p.inject_provider_ignore(&mut req);
+        p.inject_provider_routing(&mut req);
         assert_eq!(req.extra["provider"], json!({"only": ["DeepInfra"]}));
 
         // Both empty → no `provider` key at all.
@@ -3899,15 +3846,14 @@ mod tests {
             "https://example.test/v1".to_string(),
             secret_string("k"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             true,
             reqwest::Client::new(),
         )
         .unwrap();
         let mut req = minimal_chat_request();
-        p.inject_provider_ignore(&mut req);
+        p.inject_provider_routing(&mut req);
         assert!(
             req.extra.get("provider").is_none(),
             "both lists empty must not emit an empty provider object"
@@ -3919,8 +3865,7 @@ mod tests {
             "https://example.test/v1".to_string(),
             secret_string("k"),
             HashMap::new(),
-            Vec::new(),
-            vec!["DeepInfra".to_string()],
+            routing(&[], &["DeepInfra"]),
             false,
             true,
             reqwest::Client::new(),
@@ -3928,8 +3873,52 @@ mod tests {
         .unwrap();
         let mut req = minimal_chat_request();
         req.extra = Value::Null;
-        p.inject_provider_ignore(&mut req);
+        p.inject_provider_routing(&mut req);
         assert_eq!(req.extra, Value::Null);
+    }
+
+    /// The config block REPLACES a `provider` already sitting in
+    /// `extra` — the operator's policy wins outright, no key survives
+    /// from the pre-existing object. The gate-OFF path leaves that
+    /// pre-existing object untouched.
+    #[test]
+    fn inject_provider_routing_replaces_an_existing_provider_object() {
+        let p = OpenAiCompatProvider::new_for_test(
+            "p".to_string(),
+            "https://example.test/v1".to_string(),
+            secret_string("k"),
+            HashMap::new(),
+            routing(&[], &["DeepInfra"]),
+            false,
+            true,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let mut req = minimal_chat_request();
+        req.extra = json!({"provider": {"only": ["ClientChoice"], "sort": "latency"}});
+        p.inject_provider_routing(&mut req);
+        assert_eq!(
+            req.extra["provider"],
+            json!({"only": ["DeepInfra"]}),
+            "nothing of the pre-existing object may survive"
+        );
+
+        // Gate OFF → the pre-existing object is left alone.
+        let p = OpenAiCompatProvider::new_for_test(
+            "p".to_string(),
+            "https://example.test/v1".to_string(),
+            secret_string("k"),
+            HashMap::new(),
+            routing(&[], &["DeepInfra"]),
+            false,
+            false,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let mut req = minimal_chat_request();
+        req.extra = json!({"provider": {"only": ["ClientChoice"]}});
+        p.inject_provider_routing(&mut req);
+        assert_eq!(req.extra["provider"], json!({"only": ["ClientChoice"]}));
     }
 
     /// Build a `ChatRequest` carrying only the fields exercised by the
@@ -4024,8 +4013,7 @@ mod tests {
             format!("{}/v1/", server.uri()),
             secret_string("test-key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             true, // reasoning_echo on
             reqwest::Client::new(),
         )
@@ -4065,8 +4053,7 @@ mod tests {
             format!("{}/v1/", server.uri()),
             secret_string("test-key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             true, // reasoning_echo on
             reqwest::Client::new(),
         )
@@ -4143,8 +4130,7 @@ mod tests {
             format!("{}/v1/", server.uri()),
             secret_string("test-key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false, // reasoning_echo off → strip-and-retry path active
             reqwest::Client::new(),
         )
@@ -4191,8 +4177,7 @@ mod tests {
             format!("{}/v1/", server.uri()),
             secret_string("test-key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             true, // reasoning_echo on
             reqwest::Client::new(),
         )
@@ -4252,8 +4237,7 @@ mod identity_tests {
             server.uri(),
             secret_string("compat-key"),
             HashMap::new(),
-            Vec::new(),
-            Vec::new(),
+            None,
             false,
             reqwest::Client::new(),
         )
