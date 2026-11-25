@@ -5368,4 +5368,771 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
 
         assert!(reader.state.tokens.read().await.is_none());
     }
+
+    // ── endpoint negotiation (chat ↔ responses) ──────────────────────
+
+    async fn seed_cache(provider: &CopilotProvider, model: &str, endpoints: &[&str]) {
+        *provider.state.cached_models.write().await = Some(vec![CopilotModel {
+            id: model.to_string(),
+            name: model.to_string(),
+            vendor: "v".to_string(),
+            supported_endpoints: endpoints.iter().map(|s| s.to_string()).collect(),
+        }]);
+    }
+
+    fn chat_sse(text: &str) -> String {
+        format!(
+            "data: {{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+        )
+    }
+
+    fn error_body(message: &str) -> Value {
+        json!({"error": {"message": message, "type": "invalid_request_error"}})
+    }
+
+    async fn collect_stream(output: ProviderOutput) -> String {
+        expect_variant!(output, ProviderOutput::Stream(mut output) => {
+            let mut encoded = String::new();
+            while let Some(item) = output.next().await {
+                encoded.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+            }
+            encoded
+        })
+    }
+
+    #[test]
+    fn normalize_endpoint_token_accepts_observed_variants() {
+        assert_eq!(
+            normalize_endpoint_token("/chat/completions"),
+            Some(CopilotEndpoint::ChatCompletions)
+        );
+        assert_eq!(
+            normalize_endpoint_token("  Chat_Completions  "),
+            Some(CopilotEndpoint::ChatCompletions)
+        );
+        assert_eq!(
+            normalize_endpoint_token("ws:/chat/completions"),
+            Some(CopilotEndpoint::ChatCompletions)
+        );
+        assert_eq!(
+            normalize_endpoint_token("/responses"),
+            Some(CopilotEndpoint::Responses)
+        );
+        assert_eq!(
+            normalize_endpoint_token("RESPONSES"),
+            Some(CopilotEndpoint::Responses)
+        );
+        assert_eq!(
+            normalize_endpoint_token("ws:/responses"),
+            Some(CopilotEndpoint::Responses)
+        );
+        assert_eq!(
+            normalize_endpoint_token("ws:responses"),
+            Some(CopilotEndpoint::Responses)
+        );
+        assert_eq!(normalize_endpoint_token("/completions"), None);
+        assert_eq!(normalize_endpoint_token(""), None);
+    }
+
+    #[test]
+    fn advertised_endpoints_ignores_unknown_tokens() {
+        assert_eq!(
+            advertised_endpoints(&["/chat/completions".to_string(), "nope".to_string()]),
+            (true, false)
+        );
+        assert_eq!(
+            advertised_endpoints(&["ws:/responses".to_string()]),
+            (false, true)
+        );
+        assert_eq!(
+            advertised_endpoints(&["/chat/completions".to_string(), "/responses".to_string()]),
+            (true, true)
+        );
+        assert_eq!(advertised_endpoints(&["nope".to_string()]), (false, false));
+        assert_eq!(advertised_endpoints(&[]), (false, false));
+    }
+
+    #[test]
+    fn heuristic_endpoint_only_gemini_goes_chat() {
+        // The deployed catalog advertises Gemini as chat-only; there is no
+        // evidence for any other family, and `claude-model` must keep its
+        // responses default (existing tests depend on it).
+        let gemini = heuristic_endpoint("gemini-4-hydrogen");
+        assert_eq!(gemini.endpoint, CopilotEndpoint::ChatCompletions);
+        assert_eq!(gemini.source, EndpointSource::Heuristic);
+
+        for model in ["claude-model", "grok-4.5", "", "gpt-5"] {
+            let decision = heuristic_endpoint(model);
+            assert_eq!(decision.endpoint, CopilotEndpoint::Responses, "{model}");
+            assert_eq!(decision.source, EndpointSource::Default, "{model}");
+        }
+    }
+
+    #[test]
+    fn is_learnable_model_name_rejects_unsafe_names() {
+        assert!(is_learnable_model_name("gemini-4-hydrogen"));
+        assert!(!is_learnable_model_name(""));
+        assert!(!is_learnable_model_name("has space"));
+        assert!(!is_learnable_model_name("tab\there"));
+        assert!(!is_learnable_model_name("nul\u{0}byte"));
+        assert!(!is_learnable_model_name(&"x".repeat(257)));
+        assert!(is_learnable_model_name(&"x".repeat(256)));
+    }
+
+    #[tokio::test]
+    async fn endpoint_for_model_unlisted_gemini_uses_chat_heuristic() {
+        // The reported failure: gemini-4-hydrogen is absent from the
+        // catalog, and the responses default produced
+        // "does not support Responses API".
+        let (_dir, p) = test_provider(None, None);
+        let decision = p.endpoint_for_model("gemini-4-hydrogen").await;
+        assert_eq!(decision.endpoint, CopilotEndpoint::ChatCompletions);
+        assert_eq!(decision.source, EndpointSource::Heuristic);
+    }
+
+    #[tokio::test]
+    async fn endpoint_for_model_gemini_with_unusable_entry_uses_heuristic() {
+        let (_dir, p) = test_provider(None, None);
+        seed_cache(&p, "gemini-4-hydrogen", &[]).await;
+        let decision = p.endpoint_for_model("gemini-4-hydrogen").await;
+        assert_eq!(decision.endpoint, CopilotEndpoint::ChatCompletions);
+        assert_eq!(decision.source, EndpointSource::Heuristic);
+
+        seed_cache(&p, "gemini-4-hydrogen", &["unknown-endpoint"]).await;
+        let decision = p.endpoint_for_model("gemini-4-hydrogen").await;
+        assert_eq!(decision.endpoint, CopilotEndpoint::ChatCompletions);
+        assert_eq!(decision.source, EndpointSource::Heuristic);
+    }
+
+    #[tokio::test]
+    async fn endpoint_for_model_cold_cache_gemini_uses_chat_heuristic() {
+        let (_dir, p) = test_provider(None, None);
+        assert!(p.state.cached_models.read().await.is_none());
+        assert_eq!(
+            p.endpoint_for_model("gemini-3.8-flash").await.endpoint,
+            CopilotEndpoint::ChatCompletions
+        );
+        // Non-Gemini keeps the ecosystem default.
+        assert_eq!(
+            p.endpoint_for_model("claude-model").await.endpoint,
+            CopilotEndpoint::Responses
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_for_model_learned_overrides_default() {
+        let (_dir, p) = test_provider(None, None);
+        p.record_learned_endpoint("grok-4.5", CopilotEndpoint::ChatCompletions)
+            .await;
+        let decision = p.endpoint_for_model("grok-4.5").await;
+        assert_eq!(decision.endpoint, CopilotEndpoint::ChatCompletions);
+        assert_eq!(decision.source, EndpointSource::Learned);
+    }
+
+    #[tokio::test]
+    async fn endpoint_for_model_learned_overrides_catalog_and_whitelist_beats_learned() {
+        let (_dir, p) = test_provider(None, None);
+        // Learned chat overrides a responses-only catalog entry until the
+        // next refresh prunes it.
+        seed_cache(&p, "grok-4.6", &["/responses"]).await;
+        p.record_learned_endpoint("grok-4.6", CopilotEndpoint::ChatCompletions)
+            .await;
+        assert_eq!(
+            p.endpoint_for_model("grok-4.6").await.endpoint,
+            CopilotEndpoint::ChatCompletions
+        );
+
+        // EnterWorktree whitelist wins over learned responses when the
+        // catalog advertises chat (correctness constraint).
+        seed_cache(&p, "gpt-5", &["/chat/completions", "/responses"]).await;
+        p.state
+            .learned_endpoints
+            .write()
+            .await
+            .insert("gpt-5".to_string(), CopilotEndpoint::Responses);
+        let decision = p.endpoint_for_model("gpt-5").await;
+        assert_eq!(decision.endpoint, CopilotEndpoint::ChatCompletions);
+        assert_eq!(decision.source, EndpointSource::Catalog);
+    }
+
+    #[tokio::test]
+    async fn record_learned_endpoint_refuses_responses_for_whitelisted_models() {
+        let (_dir, p) = test_provider(None, None);
+        p.record_learned_endpoint("gpt-5.5", CopilotEndpoint::Responses)
+            .await;
+        assert_eq!(p.learned_endpoint("gpt-5.5").await, None);
+
+        p.record_learned_endpoint("gpt-5.5", CopilotEndpoint::ChatCompletions)
+            .await;
+        assert_eq!(
+            p.learned_endpoint("gpt-5.5").await,
+            Some(CopilotEndpoint::ChatCompletions)
+        );
+    }
+
+    #[tokio::test]
+    async fn record_learned_endpoint_refuses_unlearnable_names() {
+        let (_dir, p) = test_provider(None, None);
+        p.record_learned_endpoint("bad name", CopilotEndpoint::ChatCompletions)
+            .await;
+        assert!(p.state.learned_endpoints.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn record_learned_endpoint_respects_capacity() {
+        let (_dir, p) = test_provider(None, None);
+        for i in 0..LEARNED_ENDPOINT_CAP {
+            p.record_learned_endpoint(&format!("m{i}"), CopilotEndpoint::ChatCompletions)
+                .await;
+        }
+        assert_eq!(
+            p.state.learned_endpoints.read().await.len(),
+            LEARNED_ENDPOINT_CAP
+        );
+        p.record_learned_endpoint("one-too-many", CopilotEndpoint::ChatCompletions)
+            .await;
+        assert_eq!(p.learned_endpoint("one-too-many").await, None);
+        // Re-recording an existing key still works at the cap.
+        p.record_learned_endpoint("m0", CopilotEndpoint::Responses)
+            .await;
+        // ... and repeating the same value is a no-op (not a new entry).
+        p.record_learned_endpoint("m0", CopilotEndpoint::Responses)
+            .await;
+        assert_eq!(
+            p.learned_endpoint("m0").await,
+            Some(CopilotEndpoint::Responses)
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_learned_endpoints_drops_listed_models_only() {
+        let (_dir, p) = test_provider(None, None);
+        {
+            let mut map = p.state.learned_endpoints.write().await;
+            map.insert("gemini-4-hydrogen".into(), CopilotEndpoint::ChatCompletions);
+            map.insert("gpt-4.1".into(), CopilotEndpoint::Responses);
+            map.insert("still-absent".into(), CopilotEndpoint::ChatCompletions);
+        }
+        p.prune_learned_endpoints(&[
+            CopilotModel {
+                id: "gemini-4-hydrogen".into(),
+                name: String::new(),
+                vendor: String::new(),
+                supported_endpoints: vec!["/chat/completions".into()],
+            },
+            // Listed but with no usable endpoint: the catalog is not an
+            // authority here, keep the learned value.
+            CopilotModel {
+                id: "gpt-4.1".into(),
+                name: String::new(),
+                vendor: String::new(),
+                supported_endpoints: vec![],
+            },
+        ])
+        .await;
+
+        assert_eq!(p.learned_endpoint("gemini-4-hydrogen").await, None);
+        assert_eq!(
+            p.learned_endpoint("gpt-4.1").await,
+            Some(CopilotEndpoint::Responses)
+        );
+        assert_eq!(
+            p.learned_endpoint("still-absent").await,
+            Some(CopilotEndpoint::ChatCompletions)
+        );
+    }
+
+    #[test]
+    fn endpoint_rejection_recognizes_both_endpoints() {
+        for status in [400u16, 404] {
+            let err = ProxyError::Upstream {
+                status,
+                body: "model gemini-4-hydrogen does not support Responses API.".into(),
+            };
+            assert_eq!(endpoint_rejection(&err), Some(CopilotEndpoint::Responses));
+
+            let err = ProxyError::Upstream {
+                status,
+                body: "Model x is not accessible via the /responses endpoint".into(),
+            };
+            assert_eq!(endpoint_rejection(&err), Some(CopilotEndpoint::Responses));
+
+            let err = ProxyError::Upstream {
+                status,
+                body: "model x is not accessible via the /chat/completions endpoint".into(),
+            };
+            assert_eq!(
+                endpoint_rejection(&err),
+                Some(CopilotEndpoint::ChatCompletions)
+            );
+
+            let err = ProxyError::Upstream {
+                status,
+                body: "Model x does not support the Chat Completions API".into(),
+            };
+            assert_eq!(
+                endpoint_rejection(&err),
+                Some(CopilotEndpoint::ChatCompletions)
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_rejection_ignores_unrelated_errors() {
+        let cases = [
+            (400u16, "invalid parameter: temperature"),
+            (400, "model not found"),
+            (400, "model does not support streaming"),
+            (400, "context_length_exceeded"),
+            (401, "model does not support Responses API"),
+            (402, "model does not support Responses API"),
+            (429, "model does not support Responses API"),
+            (500, "model does not support Responses API"),
+            (503, "model does not support Responses API"),
+        ];
+        for (status, body) in cases {
+            let err = ProxyError::Upstream {
+                status,
+                body: body.to_string(),
+            };
+            assert_eq!(endpoint_rejection(&err), None, "{status} {body}");
+        }
+        assert_eq!(
+            endpoint_rejection(&ProxyError::Other(anyhow::anyhow!("boom"))),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_retries_chat_after_responses_rejection_and_learns() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(body_partial_json(
+                json!({"model": "grok-4.5", "stream": false}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(error_body("model grok-4.5 does not support Responses API.")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(
+                json!({"model": "grok-4.5", "stream": false}),
+            ))
+            .and(JsonFieldAbsent("input"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response("via-chat")))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+
+        let mut req = request(false);
+        req.model = "grok-4.5".to_string();
+
+        let output = provider.complete(&req, &HashMap::new()).await.unwrap();
+        expect_variant!(output, ProviderOutput::Json(body) => {
+            assert_eq!(body["content"][0]["text"], "via-chat");
+        });
+        assert_eq!(
+            provider.learned_endpoint("grok-4.5").await,
+            Some(CopilotEndpoint::ChatCompletions)
+        );
+
+        // The learned endpoint skips the rejected surface entirely
+        // (the /responses mock above still expects exactly one call).
+        let output = provider.complete(&req, &HashMap::new()).await.unwrap();
+        expect_variant!(output, ProviderOutput::Json(body) => {
+            assert_eq!(body["content"][0]["text"], "via-chat");
+        });
+    }
+
+    #[tokio::test]
+    async fn stream_retries_chat_after_responses_rejection_without_duplicate_frames() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(error_body(
+                "model gemini-4-hydrogen does not support Responses API.",
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(json!({"stream": true})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(chat_sse("streamed-via-chat"), "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+
+        // A cold cache would pick responses for this name only if the
+        // heuristic failed; use an unlisted non-Gemini name so the
+        // responses attempt is the first guess.
+        let mut req = request(true);
+        req.model = "grok-4.5".to_string();
+        let encoded = collect_stream(provider.stream(&req, &HashMap::new()).await.unwrap()).await;
+
+        assert_eq!(
+            encoded.matches("event: message_start").count(),
+            1,
+            "{encoded}"
+        );
+        assert_eq!(
+            encoded.matches("event: message_stop").count(),
+            1,
+            "{encoded}"
+        );
+        assert_eq!(
+            encoded.matches("\"text\":\"streamed-via-chat\"").count(),
+            1,
+            "{encoded}"
+        );
+        assert!(!encoded.contains("event: error"), "{encoded}");
+        assert_eq!(
+            provider.learned_endpoint("grok-4.5").await,
+            Some(CopilotEndpoint::ChatCompletions)
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_retries_responses_after_chat_rejection() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(error_body(
+                "model kimi-k3 is not accessible via the /chat/completions endpoint",
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(responses_response_json("via-responses")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+        seed_cache(&provider, "kimi-k3", &["/chat/completions"]).await;
+
+        let mut req = request(false);
+        req.model = "kimi-k3".to_string();
+        let output = provider.complete(&req, &HashMap::new()).await.unwrap();
+        expect_variant!(output, ProviderOutput::Json(body) => {
+            assert_eq!(body["content"][0]["text"], "via-responses");
+        });
+        assert_eq!(
+            provider.learned_endpoint("kimi-k3").await,
+            Some(CopilotEndpoint::Responses)
+        );
+    }
+
+    #[tokio::test]
+    async fn both_endpoints_rejected_surfaces_last_error_without_learning() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(error_body("model grok-4.5 does not support Responses API.")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(error_body(
+                "model grok-4.5 is not accessible via the /chat/completions endpoint",
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+
+        let mut req = request(false);
+        req.model = "grok-4.5".to_string();
+        let err = provider
+            .complete(&req, &HashMap::new())
+            .await
+            .err()
+            .expect("both endpoints rejected");
+        expect_variant!(err, ProxyError::Upstream { status, body } => {
+            assert_eq!(status, 400);
+            assert!(body.contains("/chat/completions"), "{body}");
+        });
+        assert_eq!(provider.learned_endpoint("grok-4.5").await, None);
+    }
+
+    #[tokio::test]
+    async fn non_endpoint_errors_do_not_trigger_endpoint_retry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response("nope")))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+
+        let mut req = request(false);
+        req.model = "grok-4.5".to_string();
+        let err = provider
+            .complete(&req, &HashMap::new())
+            .await
+            .err()
+            .expect("429 must surface");
+        expect_variant!(err, ProxyError::Upstream { status, .. } => {
+            assert_eq!(status, 429);
+        });
+        assert_eq!(provider.learned_endpoint("grok-4.5").await, None);
+    }
+
+    #[tokio::test]
+    async fn generic_400_does_not_trigger_endpoint_retry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(error_body("invalid parameter")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(completion_response("unexpected")),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+
+        let mut req = request(false);
+        req.model = "grok-4.5".to_string();
+        let err = provider
+            .complete(&req, &HashMap::new())
+            .await
+            .err()
+            .unwrap();
+        expect_variant!(err, ProxyError::Upstream { status, body } => {
+            assert_eq!(status, 400);
+            assert!(body.contains("invalid parameter"), "{body}");
+        });
+    }
+
+    #[tokio::test]
+    async fn gpt5_chat_rejection_retries_responses_without_learning() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(error_body(
+                "model gpt-5 is not accessible via the /chat/completions endpoint",
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(responses_response_json("gpt5")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+        seed_cache(&provider, "gpt-5", &["/chat/completions", "/responses"]).await;
+
+        let mut req = request(false);
+        req.model = "gpt-5".to_string();
+        provider.complete(&req, &HashMap::new()).await.unwrap();
+
+        // The whitelist exists because the responses path mangles tool
+        // arguments; a one-off success must not become sticky.
+        assert_eq!(provider.learned_endpoint("gpt-5").await, None);
+    }
+
+    #[tokio::test]
+    async fn responses_stream_200_error_envelope_is_normalized() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(error_body("rate limited")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(completion_response("unexpected")),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+
+        let err = provider
+            .stream(&request(true), &HashMap::new())
+            .await
+            .err()
+            .expect("envelope must surface");
+        expect_variant!(err, ProxyError::Upstream { status, body } => {
+            assert_eq!(status, 400);
+            assert!(body.contains("rate limited"), "{body}");
+        });
+    }
+
+    #[tokio::test]
+    async fn responses_stream_200_json_that_is_not_sse_surfaces_502() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("{\"unexpected\":true}", "application/json"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+
+        let err = provider
+            .stream(&request(true), &HashMap::new())
+            .await
+            .err()
+            .expect("non-SSE 200 must surface");
+        expect_variant!(err, ProxyError::Upstream { status, .. } => {
+            assert_eq!(status, 502);
+        });
+    }
+
+    #[tokio::test]
+    async fn responses_stream_200_endpoint_rejection_envelope_retries_chat() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(error_body(
+                "model gemini-4-hydrogen does not support Responses API.",
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(chat_sse("streamed-via-chat"), "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+
+        let mut req = request(true);
+        req.model = "grok-4.5".to_string();
+        let encoded = collect_stream(provider.stream(&req, &HashMap::new()).await.unwrap()).await;
+        assert!(encoded.contains("streamed-via-chat"), "{encoded}");
+        assert_eq!(
+            provider.learned_endpoint("grok-4.5").await,
+            Some(CopilotEndpoint::ChatCompletions)
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_exposes_supported_endpoints() {
+        let (_dir, provider) = test_provider(None, None);
+        seed_cache(
+            &provider,
+            "gemini-4-argon",
+            &["/chat/completions", "ws:/responses"],
+        )
+        .await;
+
+        let models = provider.list_models().await.expect("cached models");
+        assert_eq!(models.len(), 1);
+        assert_eq!(
+            models[0]["supported_endpoints"],
+            json!(["/chat/completions", "ws:/responses"])
+        );
+    }
+
+    #[test]
+    fn log_upstream_error_ignores_non_upstream_errors() {
+        // Only `Upstream` carries an upstream status/body worth logging;
+        // any other variant (client-side wording) must be a no-op.
+        log_upstream_error(
+            "m",
+            CopilotEndpoint::Responses,
+            &ProxyError::Other(anyhow::anyhow!("client-side")),
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_stream_200_malformed_json_surfaces_502() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "not json",
+                "application/json; charset=utf-8",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, provider) = test_provider(
+            Some(&server),
+            Some(stored_tokens("github-token", "copilot-token", 600)),
+        );
+
+        let err = provider
+            .stream(&request(true), &HashMap::new())
+            .await
+            .err()
+            .expect("malformed JSON must surface");
+        expect_variant!(err, ProxyError::Upstream { status, body } => {
+            assert_eq!(status, 502);
+            assert_eq!(body, "not json");
+        });
+    }
 }
