@@ -40,14 +40,126 @@ pub struct CopilotModel {
     pub vendor: String,
     /// Endpoints Copilot advertises for this model, e.g.
     /// `["/chat/completions", "/responses"]`. Drives endpoint selection in
-    /// [`CopilotProvider::endpoint_for_model`]: routing is responses-default,
-    /// chat chosen only when the model advertises chat alone, or advertises
-    /// both while matching the EnterWorktree whitelist (`gpt-5*` — the
-    /// Responses path risks malformed `name` values that fail Claude Code's
-    /// `Kor(name)` validator). Missing/empty on older Copilot payloads is
-    /// schema drift, treated like a cold cache: responses default.
+    /// [`CopilotProvider::endpoint_for_model`]: chat is chosen when the
+    /// catalog advertises chat alone, responses when it advertises responses
+    /// alone (or both, unless the model matches the EnterWorktree whitelist
+    /// `gpt-5*` — the Responses path risks malformed `name` values that fail
+    /// Claude Code's `Kor(name)` validator). Missing/empty on older Copilot
+    /// payloads is schema drift and falls through to the name heuristic
+    /// (see [`heuristic_endpoint`]) rather than a hard responses default.
     #[serde(default)]
     pub supported_endpoints: Vec<String>,
+}
+
+/// Copilot's two request surfaces. The conversion paths are entirely
+/// different (Chat Completions vs Responses), so this is a typed choice
+/// rather than a stringly one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopilotEndpoint {
+    ChatCompletions,
+    Responses,
+}
+
+impl CopilotEndpoint {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat_completions",
+            Self::Responses => "responses",
+        }
+    }
+
+    fn alternate(self) -> Self {
+        match self {
+            Self::ChatCompletions => Self::Responses,
+            Self::Responses => Self::ChatCompletions,
+        }
+    }
+}
+
+/// Where the endpoint choice came from. Logged and asserted in tests;
+/// never serialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointSource {
+    /// A previous request discovered the working endpoint after the
+    /// catalog was wrong or silent.
+    Learned,
+    /// The `/models` catalog advertised an endpoint set this model supports.
+    Catalog,
+    /// No usable catalog entry; a name-based first guess (see
+    /// [`heuristic_endpoint`]).
+    Heuristic,
+    /// Nothing to go on — the historical responses default.
+    Default,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EndpointDecision {
+    endpoint: CopilotEndpoint,
+    source: EndpointSource,
+}
+
+/// Upper bound for [`CopilotState::learned_endpoints`]. `model_rewrite` is
+/// usually empty, so any client-supplied name can reach the map; the cap
+/// keeps a typo/malicious-name stream from growing it without bound.
+const LEARNED_ENDPOINT_CAP: usize = 256;
+
+/// Normalize one advertised endpoint token. Copilot payloads have been
+/// observed with leading slashes, without them, and with a websocket
+/// `ws:` prefix (e.g. `ws:/responses`).
+fn normalize_endpoint_token(raw: &str) -> Option<CopilotEndpoint> {
+    let lower = raw.trim().to_ascii_lowercase();
+    let without_ws = lower.strip_prefix("ws:").unwrap_or(&lower);
+    match without_ws.trim().trim_start_matches('/') {
+        "chat/completions" | "chat_completions" => Some(CopilotEndpoint::ChatCompletions),
+        "responses" => Some(CopilotEndpoint::Responses),
+        _ => None,
+    }
+}
+
+/// Returns `(advertises_chat, advertises_responses)`. Unknown tokens are
+/// ignored; a set containing only unknown tokens is equivalent to an empty
+/// set (and therefore falls through to the heuristic).
+fn advertised_endpoints(list: &[String]) -> (bool, bool) {
+    let mut chat = false;
+    let mut responses = false;
+    for raw in list {
+        match normalize_endpoint_token(raw) {
+            Some(CopilotEndpoint::ChatCompletions) => chat = true,
+            Some(CopilotEndpoint::Responses) => responses = true,
+            None => {}
+        }
+    }
+    (chat, responses)
+}
+
+/// First guess for a model the catalog does not describe. Only families
+/// with hard evidence belong here: the deployed catalog advertises Gemini
+/// as chat-only, and the observed failure is a Gemini model falling into
+/// the responses default. `claude*` deliberately is NOT listed — there is
+/// no catalog evidence, and the existing `claude-model` tests exercise the
+/// Responses path on a cold cache. A wrong guess is corrected by the
+/// endpoint negotiation retry; this list only saves the first round-trip.
+fn heuristic_endpoint(model: &str) -> EndpointDecision {
+    let lower = model.to_ascii_lowercase();
+    if lower.starts_with("gemini") {
+        EndpointDecision {
+            endpoint: CopilotEndpoint::ChatCompletions,
+            source: EndpointSource::Heuristic,
+        }
+    } else {
+        EndpointDecision {
+            endpoint: CopilotEndpoint::Responses,
+            source: EndpointSource::Default,
+        }
+    }
+}
+
+/// Whether a model name is safe to record in the learned map. Bounds the
+/// map contents as well as its size.
+fn is_learnable_model_name(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= 256
+        && model.chars().all(|c| !c.is_control() && !c.is_whitespace())
 }
 
 pub struct CopilotProvider {
@@ -75,6 +187,10 @@ struct CopilotState {
     store: TokenStore,
     refresh_lock: Mutex<()>,
     cached_models: RwLock<Option<Vec<CopilotModel>>>,
+    /// Endpoint discovered per model by the negotiation retry, kept only
+    /// while the catalog does not describe the model (or describes it
+    /// without a usable endpoint). In-process only.
+    learned_endpoints: RwLock<HashMap<String, CopilotEndpoint>>,
 }
 
 /// Distinguishes credential failures (must clear store + re-authenticate)
@@ -218,48 +334,145 @@ fn refresh_delay(delay_override: Option<Duration>, tokens: Option<&StoredTokens>
 impl CopilotProvider {
     /// Pick the upstream endpoint for a model.
     ///
-    /// Defaults to Copilot's `/responses` endpoint - the ecosystem default
-    /// (Codex dropped `/chat/completions` in Feb 2026; Assistants API shuts
-    /// down 2026-08-26) and the only endpoint for responses-only models such
-    /// as grok-4.5, which used to 400 on a cold cache. Three
-    /// cache-advertised exceptions:
+    /// Resolution order:
     ///
-    /// - chat-only entry -> `/chat/completions`;
-    /// - dual-endpoint entry for an EnterWorktree-whitelisted model (`gpt-5*`)
-    ///   -> `/chat/completions` (the Responses path makes these emit
-    ///   malformed `EnterWorktree` tool args - see
-    ///   [`prefers_chat_via_enterworktree`]);
-    /// - everything else -> `/responses`.
+    /// 1. **EnterWorktree hard constraint** — a `gpt-5*` model whose catalog
+    ///    entry advertises chat always gets `/chat/completions`; the learned
+    ///    map may not override this (the Responses path makes these models
+    ///    emit malformed `EnterWorktree` tool args — see
+    ///    [`prefers_chat_via_enterworktree`]).
+    /// 2. **Learned** — an endpoint a previous request discovered by
+    ///    negotiation. Entries are dropped on the next catalog refresh once
+    ///    the model is listed with a usable endpoint.
+    /// 3. **Catalog** — chat-only -> chat; responses-only -> responses;
+    ///    both -> chat for the EnterWorktree whitelist, responses otherwise.
+    /// 4. **Heuristic** — no usable catalog entry (model absent, empty
+    ///    array, or only unrecognized tokens): [`heuristic_endpoint`].
+    ///    `gemini*` -> chat, everything else -> responses.
     ///
-    /// `Some(entry)` with an empty `supported_endpoints` is schema drift on
-    /// an older Copilot payload and is treated as a cold cache ->
-    /// `/responses`. This silently changes behavior for non-gpt-5 models that
-    /// used to fall back to `/chat/completions`; that is the intended
-    /// direction of travel.
-    async fn endpoint_for_model(&self, model: &str) -> &'static str {
+    /// The choice is always correctable: a 400/404 that names the current
+    /// endpoint triggers one retry on the alternate endpoint (see
+    /// `complete`/`stream`).
+    async fn endpoint_for_model(&self, model: &str) -> EndpointDecision {
         let entry = self
             .cached_models()
             .await
             .and_then(|ms| ms.into_iter().find(|m| m.id == model));
-        match entry {
-            Some(e) => {
-                let chat = e
-                    .supported_endpoints
-                    .iter()
-                    .any(|s| s == "/chat/completions" || s == "chat_completions");
-                let responses = e
-                    .supported_endpoints
-                    .iter()
-                    .any(|s| s == "/responses" || s == "responses");
-                if chat && !responses {
-                    "chat_completions"
-                } else if chat && responses && prefers_chat_via_enterworktree(model) {
-                    "chat_completions"
-                } else {
-                    "responses"
-                }
+        let (chat, responses) = match &entry {
+            Some(e) => advertised_endpoints(&e.supported_endpoints),
+            None => (false, false),
+        };
+        let whitelisted = prefers_chat_via_enterworktree(model);
+
+        let decision = if whitelisted && chat {
+            EndpointDecision {
+                endpoint: CopilotEndpoint::ChatCompletions,
+                source: EndpointSource::Catalog,
             }
-            None => "responses", // cold cache / unlisted -> responses default
+        } else if let Some(endpoint) = self.learned_endpoint(model).await {
+            EndpointDecision {
+                endpoint,
+                source: EndpointSource::Learned,
+            }
+        } else {
+            match (chat, responses) {
+                (true, false) => EndpointDecision {
+                    endpoint: CopilotEndpoint::ChatCompletions,
+                    source: EndpointSource::Catalog,
+                },
+                (false, true) => EndpointDecision {
+                    endpoint: CopilotEndpoint::Responses,
+                    source: EndpointSource::Catalog,
+                },
+                (true, true) => EndpointDecision {
+                    endpoint: if whitelisted {
+                        CopilotEndpoint::ChatCompletions
+                    } else {
+                        CopilotEndpoint::Responses
+                    },
+                    source: EndpointSource::Catalog,
+                },
+                // Absent model, empty array, or only unrecognized tokens.
+                (false, false) => heuristic_endpoint(model),
+            }
+        };
+
+        tracing::debug!(
+            model,
+            endpoint = decision.endpoint.as_str(),
+            source = ?decision.source,
+            catalog = ?entry.as_ref().map(|e| &e.supported_endpoints),
+            "copilot endpoint selected"
+        );
+        decision
+    }
+
+    async fn learned_endpoint(&self, model: &str) -> Option<CopilotEndpoint> {
+        self.state
+            .learned_endpoints
+            .read()
+            .await
+            .get(model)
+            .copied()
+    }
+
+    /// Record an endpoint that actually served the model. Never called on a
+    /// rejection: only a successful alternate attempt proves the endpoint.
+    ///
+    /// EnterWorktree-whitelisted models never commit `responses` — the
+    /// whitelist exists because that path produces malformed tool
+    /// arguments, so a transient success there must not become sticky.
+    async fn record_learned_endpoint(&self, model: &str, endpoint: CopilotEndpoint) {
+        if endpoint == CopilotEndpoint::Responses && prefers_chat_via_enterworktree(model) {
+            tracing::warn!(
+                model,
+                "copilot served an EnterWorktree-whitelisted model via /responses; \
+                 not caching this endpoint (whitelist requires chat)"
+            );
+            return;
+        }
+        if !is_learnable_model_name(model) {
+            return;
+        }
+        let mut map = self.state.learned_endpoints.write().await;
+        if map.len() >= LEARNED_ENDPOINT_CAP && !map.contains_key(model) {
+            tracing::debug!(
+                model,
+                cap = LEARNED_ENDPOINT_CAP,
+                "copilot learned-endpoint map is full; not recording"
+            );
+            return;
+        }
+        if map.insert(model.to_string(), endpoint) != Some(endpoint) {
+            tracing::debug!(
+                model,
+                endpoint = endpoint.as_str(),
+                "copilot learned endpoint"
+            );
+        }
+    }
+
+    /// Drop learned entries for models the new catalog now describes with a
+    /// usable endpoint set. Models still absent (or still advertising no
+    /// usable endpoint) keep their learned value: Copilot never lists some
+    /// models, and clearing those would make every catalog refresh
+    /// re-introduce the 400 on their next request.
+    async fn prune_learned_endpoints(&self, models: &[CopilotModel]) {
+        let mut map = self.state.learned_endpoints.write().await;
+        let stale: Vec<String> = map
+            .keys()
+            .filter(|model| {
+                models.iter().any(|entry| {
+                    &entry.id == *model && {
+                        let (chat, responses) = advertised_endpoints(&entry.supported_endpoints);
+                        chat || responses
+                    }
+                })
+            })
+            .cloned()
+            .collect();
+        for model in stale {
+            map.remove(&model);
         }
     }
 
@@ -342,6 +555,7 @@ impl CopilotProvider {
             store,
             refresh_lock: Mutex::new(()),
             cached_models: RwLock::new(cached_models),
+            learned_endpoints: RwLock::new(HashMap::new()),
         });
         Self {
             name,
@@ -945,6 +1159,9 @@ impl CopilotProvider {
                 // Persist FIRST, then move into memory: `save_models_to_disk`
                 // borrows, `Some(models)` moves.
                 self.save_models_to_disk(&models);
+                // The fresh catalog is authoritative for every model it
+                // describes; only catalog-silent models keep a learned value.
+                self.prune_learned_endpoints(&models).await;
                 *self.state.cached_models.write().await = Some(models);
             }
             Err(CopilotFetchError::Auth(msg)) => {
@@ -1131,17 +1348,13 @@ impl CopilotProvider {
         Ok(resp)
     }
 
-    /// Complete path via the Responses API. Reached when
-    /// [`endpoint_for_model`](Self::endpoint_for_model) selects `/responses`
-    /// — either because the `/models` cache advertises only `/responses` for
-    /// the model, or as the cold-cache fallback for `gpt-5*`.
+    /// Complete path via the Responses API.
     async fn complete_responses(
         &self,
         req: &MessagesRequest,
-        model_rewrite: &HashMap<String, String>,
+        merged: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
-        let merged = self.merged_rewrite(model_rewrite);
-        let mut responses_req = crate::conversion::anthropic_to_responses_request(req, &merged)?;
+        let mut responses_req = crate::conversion::anthropic_to_responses_request(req, merged)?;
         responses_req.stream = false;
         // PR-9: Copilot strips high-risk fields before serialization.
         // Copilot's request-side tolerance is unverified (closed source,
@@ -1161,7 +1374,17 @@ impl CopilotProvider {
                 body: text,
             });
         }
-        let parsed: crate::responses::ResponsesResponse = serde_json::from_str(&text)?;
+        // Copilot (like DeepSeek) can answer HTTP 200 with an OpenAI error
+        // envelope. Normalize it to the same 400 shape the chat path uses so
+        // endpoint negotiation and `is_model_unsupported` see it.
+        let parsed: Value = serde_json::from_str(&text)?;
+        if crate::openai::looks_like_error_envelope(&parsed) {
+            return Err(ProxyError::Upstream {
+                status: 400,
+                body: text,
+            });
+        }
+        let parsed: crate::responses::ResponsesResponse = serde_json::from_value(parsed)?;
         let msg_id = crate::conversion::make_message_id();
         let anthropic =
             crate::conversion::responses_to_anthropic_response(&parsed, &req.model, &msg_id)?;
@@ -1172,10 +1395,9 @@ impl CopilotProvider {
     async fn stream_responses(
         &self,
         req: &MessagesRequest,
-        model_rewrite: &HashMap<String, String>,
+        merged: &HashMap<String, String>,
     ) -> Result<ProviderOutput> {
-        let merged = self.merged_rewrite(model_rewrite);
-        let mut responses_req = crate::conversion::anthropic_to_responses_request(req, &merged)?;
+        let mut responses_req = crate::conversion::anthropic_to_responses_request(req, merged)?;
         responses_req.stream = true;
         // PR-9: strip high-risk fields before serialization (see
         // complete_responses for rationale).
@@ -1191,11 +1413,198 @@ impl CopilotProvider {
                 body: text,
             });
         }
-        let stream = resp.bytes_stream();
-        let sse =
-            crate::providers::openai_responses::ResponsesSseToAnthropic::new(stream, &req.model)
-                .with_expose_upstream_details(self.expose_upstream_details);
+        let resp = check_not_error_envelope(resp).await?;
+        let sse = crate::providers::openai_responses::ResponsesSseToAnthropic::new(
+            resp.bytes_stream(),
+            &req.model,
+        )
+        .with_expose_upstream_details(self.expose_upstream_details);
         Ok(ProviderOutput::Stream(Box::new(sse)))
+    }
+
+    /// Complete path via Chat Completions.
+    async fn complete_chat(
+        &self,
+        req: &MessagesRequest,
+        merged: &HashMap<String, String>,
+    ) -> Result<ProviderOutput> {
+        let mut openai_req = crate::conversion::anthropic_to_openai_request(req, merged, false)?;
+        openai_req.stream = false;
+        openai_req.stream_options = None;
+        // PR-9: strip high-risk fields before serialization (see
+        // complete_responses for rationale).
+        strip_high_risk_fields_chat(&mut openai_req);
+        let body = serde_json::to_value(openai_req)?;
+
+        let resp = self.send_with_token(&self.chat_url(), &body).await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            return Err(ProxyError::Upstream {
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        // GitHub Copilot (like DeepSeek) returns HTTP 200 with an OpenAI
+        // error envelope when the model name isn't recognized, instead of
+        // a 4xx. Detect the envelope before deserializing as ChatResponse
+        // so the client sees the real upstream message rather than a
+        // generic 500 "missing field `object`" — see fix-R8 in
+        // docs/TEST_ISSUES.md.
+        let parsed: Value = serde_json::from_str(&text)?;
+        if crate::openai::looks_like_error_envelope(&parsed) {
+            return Err(ProxyError::Upstream {
+                status: 400,
+                body: text,
+            });
+        }
+        let chat: crate::openai::ChatResponse = serde_json::from_value(parsed)?;
+        let msg_id = crate::conversion::make_message_id();
+        let anthropic =
+            crate::conversion::openai_to_anthropic_response(&chat, &req.model, &msg_id)?;
+        Ok(ProviderOutput::Json(serde_json::to_value(anthropic)?))
+    }
+
+    /// Streaming path via Chat Completions.
+    async fn stream_chat(
+        &self,
+        req: &MessagesRequest,
+        merged: &HashMap<String, String>,
+    ) -> Result<ProviderOutput> {
+        let mut openai_req = crate::conversion::anthropic_to_openai_request(req, merged, false)?;
+        openai_req.stream = true;
+        openai_req.stream_options = Some(crate::openai::StreamOptions {
+            include_usage: true,
+            // PR-9: include_obfuscation has no Anthropic source; keep
+            // absent on the wire (upstream default false).
+            include_obfuscation: None,
+        });
+        // PR-9: strip high-risk fields before serialization (see
+        // complete_responses for rationale).
+        strip_high_risk_fields_chat(&mut openai_req);
+        let body = serde_json::to_value(openai_req)?;
+
+        let resp = self.send_with_token(&self.chat_url(), &body).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await?;
+            return Err(ProxyError::Upstream {
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        let resp = check_not_error_envelope(resp).await?;
+        let sse = OpenAiSseToAnthropic::new(resp.bytes_stream(), &req.model)
+            .with_expose_upstream_details(self.expose_upstream_details);
+        Ok(ProviderOutput::Stream(Box::new(sse)))
+    }
+
+    async fn complete_via(
+        &self,
+        endpoint: CopilotEndpoint,
+        req: &MessagesRequest,
+        merged: &HashMap<String, String>,
+    ) -> Result<ProviderOutput> {
+        match endpoint {
+            CopilotEndpoint::Responses => self.complete_responses(req, merged).await,
+            CopilotEndpoint::ChatCompletions => self.complete_chat(req, merged).await,
+        }
+    }
+
+    async fn stream_via(
+        &self,
+        endpoint: CopilotEndpoint,
+        req: &MessagesRequest,
+        merged: &HashMap<String, String>,
+    ) -> Result<ProviderOutput> {
+        match endpoint {
+            CopilotEndpoint::Responses => self.stream_responses(req, merged).await,
+            CopilotEndpoint::ChatCompletions => self.stream_chat(req, merged).await,
+        }
+    }
+}
+
+/// Detect a 200 response that is really an OpenAI error envelope (Copilot
+/// does this for unknown/unavailable models on both the chat and responses
+/// surfaces). Only JSON content types are buffered: an SSE response must be
+/// returned untouched so it keeps streaming.
+async fn check_not_error_envelope(resp: reqwest::Response) -> Result<reqwest::Response> {
+    let is_json = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase().starts_with("application/json"))
+        .unwrap_or(false);
+    if !is_json {
+        return Ok(resp);
+    }
+    let status = resp.status();
+    let text = resp.text().await?;
+    if let Ok(value) = serde_json::from_str::<Value>(&text) {
+        if crate::openai::looks_like_error_envelope(&value) {
+            return Err(ProxyError::Upstream {
+                status: 400,
+                body: text,
+            });
+        }
+    }
+    // A 200 JSON body where SSE was expected is not something any adapter
+    // can translate; surface it instead of handing an empty stream to the
+    // client.
+    tracing::warn!(
+        upstream_status = status.as_u16(),
+        body = %crate::util::summarize_for_log(&text, "<empty body>"),
+        "copilot returned JSON where SSE was expected"
+    );
+    Err(ProxyError::Upstream {
+        status: 502,
+        body: text,
+    })
+}
+
+/// Log every upstream failure at the provider boundary. The client-facing
+/// message may later be redacted by `server.expose_upstream_details`; the
+/// log keeps the detail operators need. `summarize_for_log` caps the size
+/// and strips control characters (the body can be a multi-KB HTML page).
+fn log_upstream_error(model: &str, endpoint: CopilotEndpoint, err: &ProxyError) {
+    if let ProxyError::Upstream { status, body } = err {
+        tracing::warn!(
+            model,
+            endpoint = endpoint.as_str(),
+            status = *status,
+            body = %crate::util::summarize_for_log(body, "<empty body>"),
+            "copilot upstream error"
+        );
+    }
+}
+
+/// Recognize Copilot's "wrong endpoint for this model" 400/404. Returns the
+/// endpoint the upstream rejected; callers retry only when it equals the
+/// endpoint they just used.
+///
+/// The phrases are deliberately endpoint-specific. A generic 400 such as
+/// `invalid parameter` or `model not found` must NOT match: retrying it on
+/// the other endpoint would just double the failure.
+fn endpoint_rejection(err: &ProxyError) -> Option<CopilotEndpoint> {
+    let ProxyError::Upstream { status, body } = err else {
+        return None;
+    };
+    if !matches!(status, 400 | 404) {
+        return None;
+    }
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("is not accessible via the /responses endpoint")
+        || lower.contains("does not support responses api")
+        || lower.contains("does not support the responses api")
+    {
+        Some(CopilotEndpoint::Responses)
+    } else if lower.contains("is not accessible via the /chat/completions endpoint")
+        || lower.contains("does not support chat completions api")
+        || lower.contains("does not support the chat completions api")
+    {
+        Some(CopilotEndpoint::ChatCompletions)
+    } else {
+        None
     }
 }
 
@@ -1276,6 +1685,10 @@ impl Provider for CopilotProvider {
                         "created": 0,
                         "upstream_owned_by": m.vendor,
                         "display_name": m.name,
+                        // Routing metadata: lets an operator see why a model
+                        // is dispatched to chat vs responses. Extra fields
+                        // are ignored by OpenAI clients.
+                        "supported_endpoints": m.supported_endpoints,
                     })
                 })
                 .collect(),
@@ -1292,46 +1705,27 @@ impl Provider for CopilotProvider {
             .get(&req.model)
             .map(String::as_str)
             .unwrap_or(&req.model);
-        let endpoint = self.endpoint_for_model(upstream_model).await;
-        if endpoint == "responses" {
-            return self.complete_responses(req, &merged).await;
+        let decision = self.endpoint_for_model(upstream_model).await;
+        match self.complete_via(decision.endpoint, req, &merged).await {
+            Ok(output) => Ok(output),
+            Err(err) => {
+                log_upstream_error(upstream_model, decision.endpoint, &err);
+                if endpoint_rejection(&err) != Some(decision.endpoint) {
+                    return Err(err);
+                }
+                let alternate = decision.endpoint.alternate();
+                tracing::warn!(
+                    model = upstream_model,
+                    rejected = decision.endpoint.as_str(),
+                    retrying = alternate.as_str(),
+                    "copilot endpoint rejected for this model; retrying alternate endpoint"
+                );
+                let output = self.complete_via(alternate, req, &merged).await?;
+                self.record_learned_endpoint(upstream_model, alternate)
+                    .await;
+                Ok(output)
+            }
         }
-
-        let mut openai_req = crate::conversion::anthropic_to_openai_request(req, &merged, false)?;
-        openai_req.stream = false;
-        openai_req.stream_options = None;
-        // PR-9: strip high-risk fields before serialization (see
-        // complete_responses for rationale).
-        strip_high_risk_fields_chat(&mut openai_req);
-        let body = serde_json::to_value(openai_req)?;
-
-        let resp = self.send_with_token(&self.chat_url(), &body).await?;
-        let status = resp.status();
-        let text = resp.text().await?;
-        if !status.is_success() {
-            return Err(ProxyError::Upstream {
-                status: status.as_u16(),
-                body: text,
-            });
-        }
-        // GitHub Copilot (like DeepSeek) returns HTTP 200 with an OpenAI
-        // error envelope when the model name isn't recognized, instead of
-        // a 4xx. Detect the envelope before deserializing as ChatResponse
-        // so the client sees the real upstream message rather than a
-        // generic 500 "missing field `object`" — see fix-R8 in
-        // docs/TEST_ISSUES.md.
-        let parsed: serde_json::Value = serde_json::from_str(&text).map_err(ProxyError::Json)?;
-        if crate::openai::looks_like_error_envelope(&parsed) {
-            return Err(ProxyError::Upstream {
-                status: 400,
-                body: text,
-            });
-        }
-        let chat: crate::openai::ChatResponse = serde_json::from_value(parsed)?;
-        let msg_id = crate::conversion::make_message_id();
-        let anthropic =
-            crate::conversion::openai_to_anthropic_response(&chat, &req.model, &msg_id)?;
-        Ok(ProviderOutput::Json(serde_json::to_value(anthropic)?))
     }
 
     async fn stream(
@@ -1344,37 +1738,27 @@ impl Provider for CopilotProvider {
             .get(&req.model)
             .map(String::as_str)
             .unwrap_or(&req.model);
-        let endpoint = self.endpoint_for_model(upstream_model).await;
-        if endpoint == "responses" {
-            return self.stream_responses(req, &merged).await;
+        let decision = self.endpoint_for_model(upstream_model).await;
+        match self.stream_via(decision.endpoint, req, &merged).await {
+            Ok(output) => Ok(output),
+            Err(err) => {
+                log_upstream_error(upstream_model, decision.endpoint, &err);
+                if endpoint_rejection(&err) != Some(decision.endpoint) {
+                    return Err(err);
+                }
+                let alternate = decision.endpoint.alternate();
+                tracing::warn!(
+                    model = upstream_model,
+                    rejected = decision.endpoint.as_str(),
+                    retrying = alternate.as_str(),
+                    "copilot endpoint rejected for this model; retrying alternate endpoint"
+                );
+                let output = self.stream_via(alternate, req, &merged).await?;
+                self.record_learned_endpoint(upstream_model, alternate)
+                    .await;
+                Ok(output)
+            }
         }
-
-        let mut openai_req = crate::conversion::anthropic_to_openai_request(req, &merged, false)?;
-        openai_req.stream = true;
-        openai_req.stream_options = Some(crate::openai::StreamOptions {
-            include_usage: true,
-            // PR-9: include_obfuscation has no Anthropic source; keep
-            // absent on the wire (upstream default false).
-            include_obfuscation: None,
-        });
-        // PR-9: strip high-risk fields before serialization (see
-        // complete_responses for rationale).
-        strip_high_risk_fields_chat(&mut openai_req);
-        let body = serde_json::to_value(openai_req)?;
-
-        let resp = self.send_with_token(&self.chat_url(), &body).await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await?;
-            return Err(ProxyError::Upstream {
-                status: status.as_u16(),
-                body: text,
-            });
-        }
-        let stream = resp.bytes_stream();
-        let sse = OpenAiSseToAnthropic::new(stream, &req.model)
-            .with_expose_upstream_details(self.expose_upstream_details);
-        Ok(ProviderOutput::Stream(Box::new(sse)))
     }
 
     fn spawn_background(self: Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
@@ -1673,6 +2057,7 @@ mod tests {
             store,
             refresh_lock: Mutex::new(()),
             cached_models: RwLock::new(None),
+            learned_endpoints: RwLock::new(HashMap::new()),
         });
         let provider = CopilotProvider {
             name: "copilot".to_string(),
@@ -2058,6 +2443,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
                 store,
                 refresh_lock: Mutex::new(()),
                 cached_models: RwLock::new(None),
+                learned_endpoints: RwLock::new(HashMap::new()),
             }),
             api_base_override: None,
             // 127.0.0.1:1 is in the reserved low-port range; nothing
@@ -2100,6 +2486,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             store,
             refresh_lock: Mutex::new(()),
             cached_models: RwLock::new(None),
+            learned_endpoints: RwLock::new(HashMap::new()),
         });
         let provider = CopilotProvider {
             name: "copilot".to_string(),
@@ -2770,8 +3157,8 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             supported_endpoints: vec!["/chat/completions".to_string()],
         }]);
         assert_eq!(
-            p.endpoint_for_model("claude-sonnet-4.6").await,
-            "chat_completions"
+            p.endpoint_for_model("claude-sonnet-4.6").await.endpoint,
+            CopilotEndpoint::ChatCompletions
         );
     }
 
@@ -2786,7 +3173,10 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             vendor: "openai".to_string(),
             supported_endpoints: vec!["/chat/completions".to_string(), "/responses".to_string()],
         }]);
-        assert_eq!(p.endpoint_for_model("gpt-5").await, "chat_completions");
+        assert_eq!(
+            p.endpoint_for_model("gpt-5").await.endpoint,
+            CopilotEndpoint::ChatCompletions
+        );
     }
 
     #[tokio::test]
@@ -2801,7 +3191,10 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             vendor: "openai".to_string(),
             supported_endpoints: vec!["/chat/completions".to_string(), "/responses".to_string()],
         }]);
-        assert_eq!(p.endpoint_for_model("o3-mini").await, "responses");
+        assert_eq!(
+            p.endpoint_for_model("o3-mini").await.endpoint,
+            CopilotEndpoint::Responses
+        );
     }
 
     #[tokio::test]
@@ -2815,7 +3208,10 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             vendor: "xai".to_string(),
             supported_endpoints: vec![],
         }]);
-        assert_eq!(p.endpoint_for_model("grok-4.5").await, "responses");
+        assert_eq!(
+            p.endpoint_for_model("grok-4.5").await.endpoint,
+            CopilotEndpoint::Responses
+        );
     }
 
     #[tokio::test]
@@ -2827,7 +3223,10 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             vendor: "xai".to_string(),
             supported_endpoints: vec!["responses".to_string()],
         }]);
-        assert_eq!(p.endpoint_for_model("grok-4.6").await, "responses");
+        assert_eq!(
+            p.endpoint_for_model("grok-4.6").await.endpoint,
+            CopilotEndpoint::Responses
+        );
     }
 
     #[test]
@@ -3329,6 +3728,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             store,
             refresh_lock: Mutex::new(()),
             cached_models: RwLock::new(None),
+            learned_endpoints: RwLock::new(HashMap::new()),
         });
         let provider = Arc::new(CopilotProvider {
             name: "copilot".to_string(),
@@ -3424,6 +3824,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             store: store.clone(),
             refresh_lock: Mutex::new(()),
             cached_models: RwLock::new(None),
+            learned_endpoints: RwLock::new(HashMap::new()),
         });
         let provider = Arc::new(CopilotProvider {
             name: "copilot".to_string(),
@@ -3552,6 +3953,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             store,
             refresh_lock: Mutex::new(()),
             cached_models: RwLock::new(None),
+            learned_endpoints: RwLock::new(HashMap::new()),
         });
         let provider = CopilotProvider {
             name: "copilot".to_string(),
@@ -3625,6 +4027,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             store,
             refresh_lock: Mutex::new(()),
             cached_models: RwLock::new(None),
+            learned_endpoints: RwLock::new(HashMap::new()),
         });
         let provider = CopilotProvider {
             name: "copilot".to_string(),
@@ -3703,6 +4106,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             store: store.clone(),
             refresh_lock: Mutex::new(()),
             cached_models: RwLock::new(None),
+            learned_endpoints: RwLock::new(HashMap::new()),
         });
         let provider = CopilotProvider {
             name: "copilot".to_string(),
@@ -3813,6 +4217,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             store: store.clone(),
             refresh_lock: Mutex::new(()),
             cached_models: RwLock::new(None),
+            learned_endpoints: RwLock::new(HashMap::new()),
         });
         let provider = Arc::new(CopilotProvider {
             name: "copilot".to_string(),
@@ -3913,6 +4318,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             store,
             refresh_lock: Mutex::new(()),
             cached_models: RwLock::new(None),
+            learned_endpoints: RwLock::new(HashMap::new()),
         });
         let provider = Arc::new(CopilotProvider {
             name: "copilot".to_string(),
@@ -3978,6 +4384,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             store: store.clone(),
             refresh_lock: Mutex::new(()),
             cached_models: RwLock::new(None),
+            learned_endpoints: RwLock::new(HashMap::new()),
         });
         let provider = CopilotProvider {
             name: "copilot".to_string(),
@@ -4772,6 +5179,7 @@ Please, don't. https://github.com/styleguide/templates/2.0\n-->\n\
             store,
             refresh_lock: Mutex::new(()),
             cached_models: RwLock::new(None),
+            learned_endpoints: RwLock::new(HashMap::new()),
         });
         let provider = Arc::new(CopilotProvider {
             name: "copilot".to_string(),
