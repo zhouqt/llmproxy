@@ -256,19 +256,27 @@ providers:
   #   $XDG_DATA_HOME/llmproxy/github_token.json
   # (defaults to ~/.local/share/llmproxy/github_token.json)
   #
-  # Routing: the proxy auto-routes by model name, defaulting to Copilot's
-  # /v1/responses endpoint (the ecosystem default — Responses is replacing
-  # Chat Completions). Exceptions, driven by the per-model /models cache:
-  #   - a model advertised chat-only  -> /v1/chat/completions
-  #   - gpt-5.x advertising both      -> /v1/chat/completions (EnterWorktree
-  #     whitelist: the Responses path risks malformed tool args for these)
-  #   - everything else               -> /v1/responses
-  #   - cold cache (no /models data)  -> /v1/responses for ALL models
+  # Routing: each model is dispatched to /v1/chat/completions or
+  # /v1/responses, decided in this order:
+  #   1. a gpt-5.x model the /models cache advertises with chat
+  #                                  -> /v1/chat/completions (EnterWorktree
+  #                                     whitelist: Responses risks malformed
+  #                                     tool args for these)
+  #   2. an endpoint learned by a previous negotiation retry
+  #   3. the /models cache: chat-only -> chat, responses-only -> responses,
+  #      both       -> chat for the gpt-5.x whitelist, responses otherwise
+  #   4. undescribed (absent, empty, or unrecognized endpoint list):
+  #      gemini* -> /v1/chat/completions (the deployed catalog advertises
+  #      Gemini as chat-only), everything else -> /v1/responses (the
+  #      ecosystem default)
+  # A 400/404 whose body names the endpoint just used (e.g. "does not
+  # support Responses API") makes the proxy retry the SAME provider once on
+  # the alternate endpoint; only a successful alternate is remembered.
+  # First guesses are therefore self-correcting. If both endpoints reject,
+  # the last error surfaces (and may fall back to the next provider).
   # The /models snapshot is persisted to copilot_models.json next to the
   # token store, so a restart starts warm (and /v1/models reflects it
-  # immediately). A 400 that says a model "is not accessible via the"
-  # selected endpoint is treated as model-unsupported and falls back to
-  # the next provider instead of surfacing to the client.
+  # immediately).
   #
   # Fields:
   #   name           — internal key referenced by `models:`
